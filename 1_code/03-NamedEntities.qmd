@@ -79,66 +79,7 @@ tab$Label[i]
 ```
 
 ```{r}
-#' Validate that NER offsets reconstruct Span from each document's text
-#'
-#' Reads every source document once, rebuilds each candidate's span from its
-#' `[Start, Stop)` offsets, and compares against the stored `Span`. Reconstructs
-#' two ways: `substr()` (what the pipeline uses) and `stringi::stri_sub()` (strictly
-#' code-point based, matching Python's offsets). If a span matches `stri_sub` but not
-#' `substr`, the offsets are correct and `substr` is mis-indexing multibyte text --
-#' switch the pipeline to `stri_sub()`.
-#'
-#' @param .ner_path  Path to an NER output parquet (DocID, Start, Stop, Span, ...).
-#' @param .doc_files Tibble mapping `DocID` -> `Path` (e.g. `utils_list_files(dir)`).
-#' @param .text_col  Name of the text column in the source documents.
-#' @return The failing rows (0 rows = every offset round-trips and sits in bounds),
-#'   invisibly, after a cli summary.
-ner_check_offsets <- function(.ner_path, .doc_files, .text_col = "TextRaw") {
 
-  if (FALSE) {
-    .ner_path  <- "2_output/03-NamedEntities/Cache/NerExtraction/spacy_en_core_web_trf_NER_2005-2.parquet"
-    .doc_files <- utils_list_files(fil_sample_dirs$Path[25])
-    .text_col  <- "TextRaw"
-  }
-
-  cand_ <- arrow::read_parquet(.ner_path) |>
-    dplyr::left_join(.doc_files, by = dplyr::join_by(DocID)) |>
-    dplyr::filter(!is.na(Path))
-
-  out_ <- cand_ |>
-    dplyr::group_by(Path) |>
-    dplyr::group_modify(\(.x, .y) {
-      text_ <- arrow::read_parquet(.y$Path, col_select = dplyr::all_of(.text_col))[[.text_col]]
-      dplyr::mutate(.x,
-                    NChar    = stringi::stri_length(text_),
-                    BySubstr = substr(text_, Start + 1L, Stop),
-                    ByStri   = stringi::stri_sub(text_, Start + 1L, Stop))
-    }) |>
-    dplyr::ungroup() |>
-    dplyr::mutate(InBounds = Start >= 0L & Stop > Start & Stop <= NChar,
-                  NonAscii = !stringi::stri_enc_isascii(Span),
-                  OkSubstr = BySubstr == Span,
-                  OkStri   = ByStri   == Span)
-
-  n_           <- nrow(out_)
-  n_nonascii_  <- sum(out_$NonAscii)
-  n_bad_       <- sum(!out_$OkStri | !out_$InBounds)
-  n_substronly <- sum(out_$OkStri & !out_$OkSubstr)
-
-  cli::cli_h3("Offset check: {.file {fs::path_file(.ner_path)}}")
-  cli::cli_alert_info("{n_} candidate(s); {n_nonascii_} with non-ASCII span(s).")
-  if (n_bad_ == 0L) {
-    cli::cli_alert_success("All spans round-trip (stri_sub) and sit in bounds.")
-  } else {
-    cli::cli_alert_danger("{n_bad_} candidate(s) fail round-trip or bounds.")
-  }
-  if (n_substronly > 0L) {
-    cli::cli_alert_warning(
-      "{n_substronly} span(s) match stri_sub but not substr -> switch the pipeline to stringi::stri_sub() (substr mis-indexes multibyte text).")
-  }
-
-  invisible(dplyr::filter(out_, !(OkSubstr & OkStri & InBounds)))
-}
 ```
 
 ```{r}
