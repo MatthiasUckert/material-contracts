@@ -1,23 +1,18 @@
 # syntax=docker/dockerfile:1
-
 # Pin amd64. LexNLP 2.3.0's pinned deps (psutil, backports.zoneinfo, ...) only ship
 # prebuilt wheels for amd64; on arm64 pip falls back to compiling them, which needs a
 # toolchain this slim image doesn't have. The constant trips a cosmetic BuildKit lint
 # warning -- ignore it. The pin MUST be a constant here: an ARG can expand empty in
 # some builders, silently dropping to the host arch (which is what broke the build).
 FROM --platform=linux/amd64 python:3.8-slim
-
 # Unbuffered so the tqdm bar + summary stream straight through to the caller (R).
 ENV PYTHONUNBUFFERED=1
-
 RUN pip install --no-cache-dir lexnlp==2.3.0 pyarrow tqdm
-
 # Bake the NLTK data LexNLP's NER needs into the image -> runtime is offline + reproducible.
 RUN python -m nltk.downloader -d /usr/share/nltk_data \
       maxent_ne_chunker punkt words averaged_perceptron_tagger
 ENV NLTK_DATA=/usr/share/nltk_data
-
 WORKDIR /work
-COPY geoentities.csv /app/geoentities.csv
+COPY app/geoentities.csv /app/geoentities.csv
 COPY extract_lexnlp.py /app/extract_lexnlp.py
 ENTRYPOINT ["python", "/app/extract_lexnlp.py"]
