@@ -17,10 +17,10 @@
 # here; it is reserved for a later keyword / regex approach.
 
 if (FALSE) {
-  .tab_input   <- fils_class_sample
+  .tab_input <- fils_class_sample
   .path_labels <- .lP$Input$ClassificationSample
-  .path_data   <- .lP$Output$Prepared
-  .runs_root   <- .lP$Output$RunsDir
+  .path_data <- .lP$Output$Prepared
+  .runs_root <- .lP$Output$RunsDir
 }
 
 
@@ -35,9 +35,13 @@ if (FALSE) {
 #' @return Character scalar of document text, or NA.
 clf_read_text <- function(.path) {
   tab_ <- tryCatch(arrow::read_parquet(.path), error = function(e) NULL)
-  if (is.null(tab_) || !"TextRaw" %in% names(tab_)) return(NA_character_)
+  if (is.null(tab_) || !"TextRaw" %in% names(tab_)) {
+    return(NA_character_)
+  }
   txt_ <- tab_[["TextRaw"]]
-  if (length(txt_) == 0L) return(NA_character_)
+  if (length(txt_) == 0L) {
+    return(NA_character_)
+  }
   paste(txt_, collapse = "\n")
 }
 
@@ -61,7 +65,6 @@ clf_read_text <- function(.path) {
 #'   AmendType, LabelRound, Fold.
 clf_prepare_sample <- function(.tab_input, .path_labels = NULL,
                                .round = NULL, .k = 5L, .seed = 42L) {
-
   need_ <- c("DocID", "Path", "Level1", "DocClassFinal1")
   miss_cols_ <- setdiff(need_, names(.tab_input))
   if (length(miss_cols_) > 0L) cli::cli_abort("Input missing columns: {miss_cols_}")
@@ -70,13 +73,14 @@ clf_prepare_sample <- function(.tab_input, .path_labels = NULL,
 
   # NA-fill optional columns so the select/transmute is stable
   if (!"DocClassFinal2" %in% names(.tab_input)) .tab_input <- .tab_input |> dplyr::mutate(DocClassFinal2 = NA_character_)
-  if (!"AmendType"      %in% names(.tab_input)) .tab_input <- .tab_input |> dplyr::mutate(AmendType = NA_character_)
+  if (!"AmendType" %in% names(.tab_input)) .tab_input <- .tab_input |> dplyr::mutate(AmendType = NA_character_)
 
   tab_ <- .tab_input |>
     dplyr::select(DocID, Path,
-                  ClassBroad = Level1, ClassDetailed = DocClassFinal1,
-                  ClassDetailed2 = DocClassFinal2, AmendType,
-                  dplyr::any_of("Provenance"))
+      ClassBroad = Level1, ClassDetailed = DocClassFinal1,
+      ClassDetailed2 = DocClassFinal2, AmendType,
+      dplyr::any_of("Provenance")
+    )
 
   if (!"Provenance" %in% names(tab_)) {
     if (is.null(.path_labels)) {
@@ -91,8 +95,8 @@ clf_prepare_sample <- function(.tab_input, .path_labels = NULL,
     dplyr::mutate(
       LabelRound = dplyr::case_when(
         .data$Provenance == "S1_fallback" ~ "Round1",
-        .data$Provenance == "S2"          ~ "Round2",
-        TRUE                               ~ NA_character_
+        .data$Provenance == "S2" ~ "Round2",
+        TRUE ~ NA_character_
       )
     ) |>
     dplyr::select(-dplyr::any_of("Provenance"))
@@ -112,7 +116,9 @@ clf_prepare_sample <- function(.tab_input, .path_labels = NULL,
   drop_txt_ <- nrow(tab_) - nrow(ready_)
   if (drop_txt_ > 0L) cli::cli_alert_warning("Dropped {drop_txt_} docs with empty/unreadable text")
 
-  thin_ <- ready_ |> dplyr::count(.data$ClassDetailed) |> dplyr::filter(.data$n < .k)
+  thin_ <- ready_ |>
+    dplyr::count(.data$ClassDetailed) |>
+    dplyr::filter(.data$n < .k)
   if (nrow(thin_) > 0L) {
     cli::cli_alert_warning("Classes with < {(.k)} docs (a fold may lack them): {paste(thin_$ClassDetailed, collapse = ', ')}")
   }
@@ -123,8 +129,10 @@ clf_prepare_sample <- function(.tab_input, .path_labels = NULL,
     dplyr::group_by(.data$ClassDetailed) |>
     dplyr::mutate(Fold = ((sample(dplyr::n()) - 1L) %% .k) + 1L) |>
     dplyr::ungroup() |>
-    dplyr::transmute(DocID, Text, ClassBroad, ClassDetailed, ClassDetailed2,
-                     AmendType, LabelRound, Fold)
+    dplyr::transmute(
+      DocID, Text, ClassBroad, ClassDetailed, ClassDetailed2,
+      AmendType, LabelRound, Fold
+    )
 
   cli::cli_alert_success("Prepared {nrow(out_)} docs across {(.k)} folds")
   out_
@@ -148,8 +156,10 @@ clf_fold_overview <- function(.tab, .level = c("ClassDetailed", "ClassBroad", "A
   .tab |>
     dplyr::filter(!is.na(.data[[.level]])) |>
     dplyr::count(Label = .data[[.level]], .data$Fold) |>
-    tidyr::pivot_wider(names_from = "Fold", values_from = "n",
-                       values_fill = 0L, names_prefix = "F") |>
+    tidyr::pivot_wider(
+      names_from = "Fold", values_from = "n",
+      values_fill = 0L, names_prefix = "F"
+    ) |>
     dplyr::rowwise() |>
     dplyr::mutate(Total = sum(dplyr::c_across(dplyr::starts_with("F")))) |>
     dplyr::ungroup() |>
@@ -189,7 +199,6 @@ clf_train <- function(.path_data,
                       .save_model = FALSE,
                       .overwrite = FALSE,
                       .smoke = FALSE) {
-
   .label_col <- match.arg(.label_col)
   if (!fs::file_exists(.python)) cli::cli_abort("Python not found at {(.python)}")
   if (!fs::file_exists(.script)) cli::cli_abort("Trainer not found at {(.script)}")
@@ -209,9 +218,9 @@ clf_train <- function(.path_data,
     "--runs-root", .runs_root
   )
   if (.class_weights) args_ <- c(args_, "--class-weights")
-  if (!.save_model)   args_ <- c(args_, "--no-save-model")
-  if (.overwrite)     args_ <- c(args_, "--overwrite")
-  if (.smoke)         args_ <- c(args_, "--smoke")
+  if (!.save_model) args_ <- c(args_, "--no-save-model")
+  if (.overwrite) args_ <- c(args_, "--overwrite")
+  if (.smoke) args_ <- c(args_, "--smoke")
 
   cli::cli_alert_info("Training {(.label_col)}/{(.text_col)} fold {(.test_fold)} (W={(.class_weights)}, {(.model)}, L{(.max_len)}, E{(.epochs)}) ...")
   status_ <- system2(.python, args = args_, stdout = "", stderr = "")
@@ -249,9 +258,9 @@ clf_leaderboard <- function(.tab_overall) {
   .tab_overall |>
     dplyr::filter(!.data$Smoke) |>
     dplyr::summarise(
-      nFolds        = dplyr::n(),
-      Acc_mean      = mean(.data$Accuracy),    Acc_sd      = sd(.data$Accuracy),
-      F1macro_mean  = mean(.data$F1_macro),    F1macro_sd  = sd(.data$F1_macro),
+      nFolds = dplyr::n(),
+      Acc_mean = mean(.data$Accuracy), Acc_sd = sd(.data$Accuracy),
+      F1macro_mean = mean(.data$F1_macro), F1macro_sd = sd(.data$F1_macro),
       F1weight_mean = mean(.data$F1_weighted), F1weight_sd = sd(.data$F1_weighted),
       .by = c(ConfigName, Model, LabelCol, TextCol, ClassWeights, MaxLen, Epochs, BatchSize, LR, Seed)
     ) |>
@@ -271,8 +280,10 @@ clf_leaderboard_show <- function(.tab_overall, .label_col = NULL, .n = 20L) {
       F1_macro    = sprintf("%.3f +/- %.3f", .data$F1macro_mean, .data$F1macro_sd),
       F1_weighted = sprintf("%.3f +/- %.3f", .data$F1weight_mean, .data$F1weight_sd)
     ) |>
-    dplyr::select(Rank, Model, LabelCol, MaxLen, Epochs, LR, ClassWeights,
-                  nFolds, Accuracy, F1_macro, F1_weighted) |>
+    dplyr::select(
+      Rank, Model, LabelCol, MaxLen, Epochs, LR, ClassWeights,
+      nFolds, Accuracy, F1_macro, F1_weighted
+    ) |>
     head(.n)
 }
 
@@ -291,10 +302,10 @@ clf_effect <- function(.tab_overall, .axis, .label_col = NULL) {
   tab_ |>
     dplyr::filter(!.data$Smoke) |>
     dplyr::summarise(
-      nRuns        = dplyr::n(),
+      nRuns = dplyr::n(),
       F1macro_mean = mean(.data$F1_macro),
-      F1macro_sd   = sd(.data$F1_macro),
-      Acc_mean     = mean(.data$Accuracy),
+      F1macro_sd = sd(.data$F1_macro),
+      Acc_mean = mean(.data$Accuracy),
       .by = dplyr::all_of(.axis)
     ) |>
     dplyr::arrange(dplyr::desc(.data$F1macro_mean))
@@ -372,13 +383,13 @@ clf_perclass <- function(.tab_pred, .lenient = FALSE) {
   true_ <- .tab_pred$TrueLabel
   classes_ <- sort(unique(c(true_, pred_)))
   purrr::map(classes_, function(c_) {
-    pp_      <- sum(pred_ == c_)
-    ap_      <- sum(true_ == c_)
+    pp_ <- sum(pred_ == c_)
+    ap_ <- sum(true_ == c_)
     tp_prec_ <- sum(pred_ == c_ & correct_)
-    tp_rec_  <- sum(true_ == c_ & correct_)
+    tp_rec_ <- sum(true_ == c_ & correct_)
     prec_ <- if (pp_ == 0L) NA_real_ else tp_prec_ / pp_
-    rec_  <- if (ap_ == 0L) NA_real_ else tp_rec_ / ap_
-    f1_   <- if (is.na(prec_) || is.na(rec_) || (prec_ + rec_) == 0) 0 else 2 * prec_ * rec_ / (prec_ + rec_)
+    rec_ <- if (ap_ == 0L) NA_real_ else tp_rec_ / ap_
+    f1_ <- if (is.na(prec_) || is.na(rec_) || (prec_ + rec_) == 0) 0 else 2 * prec_ * rec_ / (prec_ + rec_)
     tibble::tibble(Label = c_, Precision = prec_, Recall = rec_, F1 = f1_, Support = ap_)
   }) |>
     purrr::list_rbind() |>

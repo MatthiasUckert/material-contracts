@@ -1,0 +1,373 @@
+---
+title: "Contract Classification -- BERT Trainer (03B)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r setup, include=FALSE, purl=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(root.dir = here::here(), message = FALSE, warning = FALSE)
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+```{r echo=FALSE}
+source("1_code/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Utils.R", encoding = "UTF-8")
+source("1_code/_Format.R", encoding = "UTF-8")
+
+# 03A owns prep + the shared scoring / leaderboard / plot / cache layer (clf_*).
+# Source it first so this runbook inherits that tooling; then source 03B's own
+# wrapper (bert_*). init_create_script_fun resolves each script's paired .R.
+source(init_create_script_fun(here::here(), "03A-ClassifyPrepare"), encoding = "UTF-8")
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(here::here(), .name_script))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(here::here(), .name_script))
+source(.path_fun)
+```
+
+# What 03B is
+
+03B is the **BERT trainer**. The model search is already done (see the state
+document): the crowned configuration is legal-bert, 6 epochs, unweighted, LR
+2e-5, 256 or 512 tokens. So 03B is not a search -- it is the **re-homing** of that
+validated pipeline into the 03A-consuming, logged, cached layout, reproducing the
+headline numbers off the existing run folders.
+
+It does three things and nothing else:
+
+1. **Isolate the wrapper.** `bert_train` / `bert_cv` / `bert_sweep` deal fold ids
+   to the contracts-engine Python trainer across the CLI + parquet seam. No
+   scoring lives here -- 03A owns that.
+2. **Quiet, logged runs.** The engine streams each fold's epoch logs and warnings
+   into the run's `run.log`; `bert_train` captures the terse stdout and prints one
+   formatted cli line per run. A serial sweep reads as a progress strip.
+3. **Score through 03A.** Pooled out-of-fold predictions go through the same
+   `clf_*` scoring and plotting layer keyword (03C) and the router (03D) use, so
+   every method is compared on byte-for-byte identical folds.
+
+Training is **serial** by design: it is MPS-bound on the M3 Ultra, and concurrent
+jobs contend for the one GPU. (This is the single structural difference from 03C's
+parallel `kw_sweep`.) Disk caching (`clf_cache`, from 03A) makes re-renders free --
+the results sections below read the existing runs once and memoise.
+
+## Path Tree
+
+`prepared.parquet` is read from **03A's** output directory (03A is its sole
+writer). Runs are written under 03B's own `runs/` -- the same tree
+`clf_load_overall` / `clf_pool_predictions` read for the results.
+
+```{r}
+.lP <- list(
+  Input = list(
+    # 03A is the sole writer of prepared.parquet; resolve its path via the same
+    # dir helper 03A used, so this never drifts from where 03A actually wrote it.
+    Prepared = utils_file_path(
+      init_create_script_dir(here::here(), "03A-ClassifyPrepare"), "prepared.parquet"
+    )
+  ),
+  Runs = list(
+    Bert = here::here("2_output", "03B-ClassifyTrainBERT", "runs")
+  ),
+  Engine = list(
+    Python = here::here("contracts-engine", ".venv", "bin", "python"),
+    Script = here::here("contracts-engine", "classify_train.py")
+  )
+)
+```
+
+## Load the prepared sample
+
+03A built and froze the folds; here we only read them back, for the join-side of
+scoring (the dual-class second label, the round slice, the broad rollup) and a
+quick confirmation that the splits we train on are the shared ones.
+
+```{r}
+tab_prep <- arrow::read_parquet(.lP$Input$Prepared)
+cli::cli_alert_info("Loaded {nrow(tab_prep)} prepared docs from 03A")
+
+clf_fold_overview(tab_prep, "ClassDetailed") |>
+  fmt_table(.caption = "Shared folds we train on -- detailed taxonomy (from 03A)")
+```
+
+# Training
+
+The runs already exist (the sweep was executed once and its folders live under
+`.lP$Runs$Bert`). The chunks in this section are therefore the **record of how the
+runs were produced**, marked `eval: false`. They are idempotent -- the engine
+skips any run whose metrics already exist -- so re-running only fills genuine gaps;
+flip a chunk to `eval: true` (or run it interactively) to add or, with
+`.overwrite = TRUE`, redo runs. Nothing here needs to run on render.
+
+## Manual checks
+
+A seconds-long smoke run (lands under `runs/_smoke`, excluded from results) to
+confirm the seam and `[device] mps`, then one real fold with the model saved.
+
+```{r}
+#| eval: false
+bert_train(.lP$Input$Prepared,
+  .label_col = "ClassDetailed",
+  .runs_root = .lP$Runs$Bert, .smoke = TRUE
+)
+```
+
+```{r}
+#| eval: false
+bert_train(.lP$Input$Prepared,
+  .label_col = "ClassDetailed", .test_fold = 1L,
+  .runs_root = .lP$Runs$Bert, .save_model = TRUE
+)
+```
+
+## Sweep -- Phase A (contract-type taxonomy)
+
+The class sweep that produced the crowned config. Axes: model x level x LR x
+max_len x class_weights x folds (epochs swept {3, 6}). 2x2x2x2x2x2x5 = 320 runs,
+~35-40h on the M3 Ultra. Built once; left here as the as-run record.
+
+```{r}
+grid_main <- tidyr::expand_grid(
+  model         = c("roberta-base", "nlpaueb/legal-bert-base-uncased"),
+  label_col     = c("ClassDetailed", "ClassBroad"),
+  lr            = c(2e-5, 3e-5),
+  max_len       = c(256L, 512L),
+  epochs        = c(3, 6),
+  class_weights = c(FALSE, TRUE),
+  fold          = 1:5
+)
+bert_sweep(.lP$Input$Prepared, grid_main, .runs_root = .lP$Runs$Bert)
+```
+
+## Sweep -- Amendment (Original vs Amended)
+
+The binary amendment task off `AmendType`, reusing the same harness
+(`--label-col AmendType`; the engine drops the NA-amendment docs). Mild imbalance,
+front-loaded signal, so a focused grid: 2 models x 2 max_len x 5 folds = 20 runs.
+
+```{r}
+grid_amend <- tidyr::expand_grid(
+  model         = c("roberta-base", "nlpaueb/legal-bert-base-uncased"),
+  label_col     = "AmendType",
+  lr            = 2e-5,
+  max_len       = c(256L, 512L),
+  epochs        = 6,
+  class_weights = FALSE,
+  fold          = 1:5
+)
+bert_sweep(.lP$Input$Prepared, grid_amend, .runs_root = .lP$Runs$Bert)
+```
+
+**Phase B (long-context probe) was dropped.** It was gated on 512 clearly beating
+256; they came in near-identical (~0.002-0.003 macro-F1), so the Longformer probe
+would not change a conclusion -- the contract-type signal is front-loaded in the
+opening pages. No long-context runs are part of the final sweep.
+
+# Results
+
+Everything below reads the **existing** run folders through 03A's scoring layer.
+`clf_cache` memoises the costly reads, so the first render populates the cache and
+every later render is a cache hit. After a fresh sweep, refresh with
+`options(clf.cache.overwrite = TRUE)` once.
+
+```{r}
+tab_overall <- clf_cache("bert_overall", clf_load_overall(.lP$Runs$Bert))
+```
+
+## Leaderboards and axis effects
+
+Per task (tasks differ in difficulty, so view them separately). legal-bert leads;
+6 epochs beats 3; class weighting is roughly neutral at 6 epochs; LR 2e-5 ~ 3e-5;
+256 ~ 512.
+
+```{r}
+clf_leaderboard_show(tab_overall, .label_col = "ClassDetailed", .n = 15L) |>
+  dplyr::select(-ConfigName) |>
+  fmt_table(.caption = "Top configurations -- detailed taxonomy (12 classes)")
+```
+
+```{r}
+clf_leaderboard_show(tab_overall, .label_col = "ClassBroad", .n = 15L) |>
+  dplyr::select(-ConfigName) |>
+  fmt_table(.caption = "Top configurations -- broad taxonomy (7 classes)")
+```
+
+```{r}
+clf_leaderboard_show(tab_overall, .label_col = "AmendType", .n = 10L) |>
+  dplyr::select(-ConfigName) |>
+  fmt_table(.caption = "Top configurations -- amendment task")
+```
+
+```{r}
+#| fig-cap: "Leaderboard: macro-F1 (mean +/- sd across folds), detailed taxonomy."
+clf_plot_leaderboard(tab_overall, .label_col = "ClassDetailed", .n = 15L)
+```
+
+Which lever actually moved macro-F1, within the detailed task (each row averages
+over all other axes on the balanced grid):
+
+```{r}
+purrr::map(
+  c("Model", "MaxLen", "Epochs", "ClassWeights", "LR"),
+  \(.axis) clf_effect(tab_overall, .axis, .label_col = "ClassDetailed") |>
+    dplyr::rename(Level = 1) |>
+    dplyr::mutate(Level = as.character(Level)) |> # axes differ in type; bind as text
+    dplyr::mutate(Axis = .axis) |>
+    dplyr::relocate(Axis)
+) |>
+  purrr::list_rbind() |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Marginal effect of each sweep axis on macro-F1 (detailed)")
+```
+
+## Crowned detailed configuration
+
+The top-ranked detailed config, scored on its pooled out-of-fold predictions
+(each doc predicted once, by a model that did not train on it).
+
+```{r}
+best_det_ <- clf_leaderboard(dplyr::filter(tab_overall, .data$LabelCol == "ClassDetailed")) |>
+  dplyr::slice(1) |>
+  dplyr::pull(.data$ConfigName)
+
+pred_det <- clf_cache("bert_pred_det", clf_pool_predictions(.lP$Runs$Bert, best_det_))
+```
+
+```{r}
+clf_scores(pred_det) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Crowned detailed config -- headline scores (strict, pooled OOF)")
+```
+
+```{r}
+clf_perclass(pred_det) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Crowned detailed config -- per-class precision / recall / F1")
+```
+
+```{r}
+#| fig-cap: "Per-class F1, crowned detailed configuration."
+clf_plot_perclass(pred_det)
+```
+
+```{r}
+#| fig-cap: "Confusion heatmap (row-normalised), crowned detailed configuration."
+#| fig-height: 4.5
+clf_plot_confusion(pred_det, .normalize = TRUE)
+```
+
+## Dual-class: strict vs lenient
+
+Strict scores the primary label only; lenient also accepts a dual-class doc's
+second label. The gap is what the dual-class ambiguity costs, and it is
+retroactive -- no retraining, just a different scoring rule on the same
+predictions.
+
+```{r}
+pred_det_dc <- pred_det |> clf_add_second_label(tab_prep)
+
+dplyr::bind_rows(
+  clf_scores(pred_det_dc, .lenient = FALSE),
+  clf_scores(pred_det_dc, .lenient = TRUE)
+) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Strict vs lenient headline (dual-class second label)")
+```
+
+```{r}
+#| fig-cap: "Strict vs lenient per-class F1; the gap is the dual-class cost."
+#| fig-height: 3.8
+clf_plot_strict_lenient(pred_det_dc)
+```
+
+## Detailed rolled up vs broad direct
+
+Does predicting the fine 12 classes and aggregating to the 7 broad parents beat
+predicting the 7 broad classes directly? Both scored at the broad level. If they
+match, one model serves both granularities.
+
+```{r}
+best_broad_ <- clf_leaderboard(dplyr::filter(tab_overall, .data$LabelCol == "ClassBroad")) |>
+  dplyr::slice(1) |>
+  dplyr::pull(.data$ConfigName)
+
+pred_broad <- clf_cache("bert_pred_broad", clf_pool_predictions(.lP$Runs$Bert, best_broad_))
+rolled_ <- clf_rollup_to_broad(pred_det, tab_prep)
+
+dplyr::bind_rows(
+  clf_scores(rolled_) |> dplyr::mutate(Approach = "ClassDetailed -> rolled up", .before = 1),
+  clf_scores(pred_broad) |> dplyr::mutate(Approach = "ClassBroad direct", .before = 1)
+) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Detailed-rolled-up vs broad-direct (both scored at broad level)")
+```
+
+## Amendment
+
+```{r}
+best_amend_ <- clf_leaderboard(dplyr::filter(tab_overall, .data$LabelCol == "AmendType")) |>
+  dplyr::slice(1) |>
+  dplyr::pull(.data$ConfigName)
+
+pred_amend <- clf_cache("bert_pred_amend", clf_pool_predictions(.lP$Runs$Bert, best_amend_))
+```
+
+```{r}
+clf_scores(pred_amend) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Amendment -- headline scores (strict, pooled OOF)")
+```
+
+```{r}
+clf_perclass(pred_amend) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Amendment -- per-class precision / recall / F1")
+```
+
+```{r}
+clf_confusion(pred_amend) |>
+  fmt_table(.caption = "Amendment -- confusion matrix")
+```
+
+## Round-sliced robustness
+
+Headline detailed metrics on the Round2 (gold) labels only vs all labels. Round2
+is enriched for the hard rare classes, so this is the honest "hard subset" number,
+not a regression -- it shows the result is not propped up by the automated Round1
+labels.
+
+```{r}
+pred_det_round2 <- pred_det |>
+  clf_add_labelround(tab_prep) |>
+  dplyr::filter(.data$LabelRound == "Round2")
+
+dplyr::bind_rows(
+  clf_scores(pred_det) |> dplyr::mutate(Labels = "All (Round1 + Round2)", .before = 1),
+  clf_scores(pred_det_round2) |> dplyr::mutate(Labels = "Round2 only (gold)", .before = 1)
+) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Round-sliced robustness (detailed taxonomy)")
+```
+
+# Next
+
+03B reproduces the crowned numbers under the new layout, scored through 03A. From
+here the runs feed the consumers, both pure readers of this layer:
+
+- **03D-ClassifyOrchestrate** -- pool a BERT config and a keyword config from their
+  separate roots (`clf_pool_predictions(c(.lP$Runs$Bert, .lP$Runs$Kw), ...)`) and
+  test per-class precision routing; expect BERT-dominant, in which case the null
+  result is itself the finding and keyword stands as the interpretable contrast.
+- **03E-ClassifyDocuments** -- retrain the chosen config on all labelled data (no
+  folds, real early stopping on a clean val split), then apply to the full EDGAR
+  Exhibit-10 corpus and persist labels + scores for Stata.

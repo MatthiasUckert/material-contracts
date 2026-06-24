@@ -15,6 +15,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import argparse
+import contextlib
 import json
 import subprocess
 import sys
@@ -75,6 +76,71 @@ def git_commit():
         ).stdout.strip()
     except Exception:
         return None
+
+
+class RunLogger:
+    """Per-run logging: detail to run.log, only key lines to the real console.
+
+    All the per-fold chatter (device, label/data summary, the transformers epoch
+    logs, library warnings) goes to <run_dir>/run.log. The console -- which is the
+    R console during a serial sweep -- receives only the start line and the final
+    acc/f1 line, so a 320-run sweep stays a readable progress strip. The console
+    stream is captured at construction so summary lines survive the fd-level
+    redirection used around training.
+    """
+
+    def __init__(self, log_path, console):
+        self._fh = open(log_path, "w", buffering=1)   # line-buffered
+        self._console = console
+
+    @property
+    def file(self):
+        return self._fh
+
+    def log(self, msg=""):
+        """File only."""
+        self._fh.write(f"{msg}\n")
+        self._fh.flush()
+
+    def say(self, msg=""):
+        """Console + file."""
+        self._console.write(f"{msg}\n")
+        self._console.flush()
+        self.log(msg)
+
+    def close(self):
+        try:
+            self._fh.flush()
+            self._fh.close()
+        except Exception:
+            pass
+
+
+@contextlib.contextmanager
+def redirect_fds(target):
+    """Point stdout/stderr (fd 1/2) at an open file for the duration.
+
+    Operates at the file-descriptor level via os.dup2 so that transformers
+    logging, tqdm, and any C-level writes all land in the log regardless of which
+    stream reference they captured at import time -- the failure mode a plain
+    contextlib.redirect_stdout cannot cover. Original fds are restored on exit,
+    so a traceback from a failed run still reaches the console.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_out, saved_err = os.dup(1), os.dup(2)
+    tfd = target.fileno()
+    os.dup2(tfd, 1)
+    os.dup2(tfd, 2)
+    try:
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_out, 1)
+        os.dup2(saved_err, 2)
+        os.close(saved_out)
+        os.close(saved_err)
 
 
 class TextDataset(torch.utils.data.Dataset):
@@ -159,6 +225,7 @@ def main():
         print(f"[skip  ] run exists: {run_dir} (use --overwrite to redo)")
         return
     run_dir.mkdir(parents=True, exist_ok=True)
+    log = RunLogger(run_dir / "run.log", console=sys.stdout)
 
     df = pd.read_parquet(args.data)
     missing = {"DocID", args.text_col, args.label_col, args.fold_col} - set(df.columns)
@@ -181,66 +248,71 @@ def main():
     id2lab = {i: lab for lab, i in lab2id.items()}
     test_df = test_df[test_df[args.label_col].isin(lab2id)].copy()
 
-    print(f"[run   ] {run_name}")
-    print(f"[device] {device}")
-    print(f"[label ] {args.label_col} | text={args.text_col} | classes={len(labels_sorted)} | "
-          f"weights={bool(args.class_weights)} | test_fold={args.test_fold}")
-    print(f"[data  ] train={len(train_df)} test={len(test_df)}")
+    log.say(f"[run   ] {run_name}")
+    log.log(f"[device] {device}")
+    log.log(f"[label ] {args.label_col} | text={args.text_col} | classes={len(labels_sorted)} | "
+            f"weights={bool(args.class_weights)} | test_fold={args.test_fold}")
+    log.log(f"[data  ] train={len(train_df)} test={len(test_df)}")
 
     started = time.time()
     started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    tok = AutoTokenizer.from_pretrained(args.model)
+    # Heavy compute: silence the console and capture everything (transformers
+    # epoch logs, library warnings, any progress output) into run.log at the fd
+    # level, so the R console sees only the start/done lines above and below.
+    with redirect_fds(log.file):
+        tok = AutoTokenizer.from_pretrained(args.model)
 
-    def encode(texts):
-        # static max_length padding keeps shapes constant, which avoids MPS
-        # kernel recompiles across batches.
-        return tok(texts, truncation=True, max_length=args.max_len,
-                   padding="max_length", return_tensors="pt")
+        def encode(texts):
+            # static max_length padding keeps shapes constant, which avoids MPS
+            # kernel recompiles across batches.
+            return tok(texts, truncation=True, max_length=args.max_len,
+                       padding="max_length", return_tensors="pt")
 
-    train_txt = train_df[args.text_col].fillna("").astype(str).tolist()
-    test_txt = test_df[args.text_col].fillna("").astype(str).tolist()
-    train_enc = encode(train_txt)
-    test_enc = encode(test_txt)
-    train_y = torch.tensor([lab2id[x] for x in train_df[args.label_col]])
-    test_y = torch.tensor([lab2id[x] for x in test_df[args.label_col]])
+        train_txt = train_df[args.text_col].fillna("").astype(str).tolist()
+        test_txt = test_df[args.text_col].fillna("").astype(str).tolist()
+        train_enc = encode(train_txt)
+        test_enc = encode(test_txt)
+        train_y = torch.tensor([lab2id[x] for x in train_df[args.label_col]])
+        test_y = torch.tensor([lab2id[x] for x in test_df[args.label_col]])
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        args.model, num_labels=len(labels_sorted), id2label=id2lab, label2id=lab2id
-    )
+        model = AutoModelForSequenceClassification.from_pretrained(
+            args.model, num_labels=len(labels_sorted), id2label=id2lab, label2id=lab2id
+        )
 
-    targs = TrainingArguments(
-        output_dir=str(run_dir / "hf"),
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        learning_rate=args.lr,
-        seed=args.seed,
-        save_strategy="no",
-        logging_strategy="epoch",
-        report_to="none",
-        dataloader_pin_memory=False,
-        fp16=False,
-        bf16=False,
-    )
+        targs = TrainingArguments(
+            output_dir=str(run_dir / "hf"),
+            num_train_epochs=args.epochs,
+            per_device_train_batch_size=args.batch_size,
+            per_device_eval_batch_size=args.batch_size,
+            learning_rate=args.lr,
+            seed=args.seed,
+            save_strategy="no",
+            logging_strategy="epoch",
+            disable_tqdm=True,          # epoch logs only; keeps run.log readable
+            report_to="none",
+            dataloader_pin_memory=False,
+            fp16=False,
+            bf16=False,
+        )
 
-    if args.class_weights:
-        counts = train_df[args.label_col].value_counts().reindex(labels_sorted).to_numpy()
-        cw = counts.sum() / (len(counts) * counts)            # sklearn "balanced", mean ~1
-        class_weights = torch.tensor(cw, dtype=torch.float)
-        trainer = WeightedTrainer(class_weights=class_weights, model=model, args=targs,
-                                  train_dataset=TextDataset(train_enc, train_y))
-    else:
-        trainer = Trainer(model=model, args=targs,
-                          train_dataset=TextDataset(train_enc, train_y))
+        if args.class_weights:
+            counts = train_df[args.label_col].value_counts().reindex(labels_sorted).to_numpy()
+            cw = counts.sum() / (len(counts) * counts)            # sklearn "balanced", mean ~1
+            class_weights = torch.tensor(cw, dtype=torch.float)
+            trainer = WeightedTrainer(class_weights=class_weights, model=model, args=targs,
+                                      train_dataset=TextDataset(train_enc, train_y))
+        else:
+            trainer = Trainer(model=model, args=targs,
+                              train_dataset=TextDataset(train_enc, train_y))
 
-    trainer.train()
+        trainer.train()
 
-    pred = trainer.predict(TextDataset(test_enc, test_y))
-    probs = torch.softmax(torch.tensor(pred.predictions), dim=-1).numpy()
-    pred_ids = probs.argmax(axis=-1)
-    scores = probs.max(axis=-1)
-    true_ids = test_y.numpy()
+        pred = trainer.predict(TextDataset(test_enc, test_y))
+        probs = torch.softmax(torch.tensor(pred.predictions), dim=-1).numpy()
+        pred_ids = probs.argmax(axis=-1)
+        scores = probs.max(axis=-1)
+        true_ids = test_y.numpy()
 
     ended_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     duration = round(time.time() - started, 1)
@@ -286,7 +358,7 @@ def main():
             run_dir / "train_log.parquet", index=False
         )
     except Exception as e:
-        print(f"[warn  ] could not write train_log: {e}")
+        log.log(f"[warn  ] could not write train_log: {e}")
 
     if args.save_model:
         model.save_pretrained(run_dir / "model")
@@ -310,8 +382,9 @@ def main():
     }
     (run_dir / "config.json").write_text(json.dumps(manifest, indent=2))
 
-    print(f"[done  ] acc={acc:.3f} f1_macro={f1_macro:.3f} f1_weighted={f1_weight:.3f} ({duration}s)")
-    print(f"[write ] {run_dir}")
+    log.say(f"[done  ] acc={acc:.3f} f1_macro={f1_macro:.3f} f1_weighted={f1_weight:.3f} ({duration}s)")
+    log.log(f"[write ] {run_dir}")
+    log.close()
 
 
 if __name__ == "__main__":
