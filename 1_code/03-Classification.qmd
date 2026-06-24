@@ -1,0 +1,313 @@
+---
+title: "Contract Classification"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, purl=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(root.dir = here::here())
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+```{r echo=FALSE}
+source("1_code/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Utils.R", encoding = "UTF-8")
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(here::here(), .name_script))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(here::here(), .name_script))
+source(.path_fun)
+```
+
+## Path Tree
+
+```{r}
+.lP <- list(
+  Input = list(
+    ClassificationSample = "0_data/Classification.parquet",
+    MetaData = "../pMatDisc/2_output/01-GetEDGAR/Output/FullMetaData.parquet",
+    DirContracts = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/"
+  ),
+  Cache = list(
+    ContractFiles = utils_file_path(.dir_main, "Cache", "ContractFiles.parquet")
+  ),
+  Output = list(
+    Prepared = utils_file_path(.dir_main, "prepared.parquet"),
+    RunsDir  = utils_file_path(.dir_main, "runs")
+  )
+)
+```
+
+## Load Sample
+
+```{r}
+# Provenance feeds LabelRound. DocClassFinal2 (dual-class second label) and
+# AmendType are carried for lenient scoring and the amendment task. DocDesc /
+# DocName are joined in but reserved for a later keyword / regex approach.
+fils_contract <- utils_list_project_files(.lP$Input$DirContracts, .lP$Cache$ContractFiles, FALSE)
+fils_class_sample <- arrow::open_dataset(.lP$Input$ClassificationSample) |>
+  dplyr::select(DocID, AmendType, DocClassFinal1, DocClassFinal2, DualClass, Level1, Level2, Provenance) |>
+  dplyr::left_join(
+    y = arrow::open_dataset(.lP$Input$MetaData) |>
+      dplyr::select(DocID, DocDesc, DocName),
+    by = dplyr::join_by(DocID)
+  ) |>
+  dplyr::collect() |>
+  dplyr::left_join(fils_contract, by = dplyr::join_by(DocID))
+```
+
+## Prepare Sample
+
+Full combined sample (Round1 + Round2). Emits ClassBroad (7), ClassDetailed
+(12), ClassDetailed2 (dual-class second label, NA for single-class docs),
+AmendType (Original/Amended/NA), LabelRound, and the frozen Fold. Training is
+single-label on the primary; the second label is used only for lenient scoring.
+
+```{r}
+tab_prep <- clf_prepare_sample(
+  .tab_input   = fils_class_sample,
+  .path_labels = .lP$Input$ClassificationSample,
+  .k           = 5L,
+  .seed        = 42L
+)
+clf_write_prepared(tab_prep, .lP$Output$Prepared)
+```
+
+## Sanity Check
+
+Body length informs the max_len axis (256 vs 512): how much tail is truncated.
+
+```{r}
+tab_prep |>
+  dplyr::mutate(nWords = stringi::stri_count_words(.data$Text)) |>
+  dplyr::summarise(
+    p50           = stats::median(nWords),
+    p90           = stats::quantile(nWords, 0.90),
+    pct_over_200w = mean(nWords > 200), # ~256 tokens
+    pct_over_400w = mean(nWords > 400) # ~512 tokens
+  )
+```
+
+## Fold Overview
+
+```{r}
+clf_fold_overview(tab_prep, "ClassBroad") |> print(n = Inf)
+clf_fold_overview(tab_prep, "ClassDetailed") |> print(n = Inf)
+clf_fold_overview(tab_prep, "AmendType") |> print(n = Inf)
+```
+
+## Train (manual checks)
+
+Run one at a time. Smoke takes seconds and lands under runs/_smoke; confirm
+[device] = mps. Then one real fold with the model saved, and ls the run folder.
+
+```{r}
+clf_train(.lP$Output$Prepared,
+  .label_col = "ClassDetailed",
+  .runs_root = .lP$Output$RunsDir, .smoke = TRUE
+)
+```
+
+```{r}
+clf_train(.lP$Output$Prepared,
+  .label_col = "ClassDetailed", .test_fold = 1L,
+  .runs_root = .lP$Output$RunsDir, .save_model = TRUE
+)
+```
+
+## Sweep -- Phase A (class taxonomy, 512-cap models)
+
+Axes: model x level x LR x max_len x class_weights x folds; epochs swept {3,6}
+(CV picks). 1e-5 dropped. Caching skips runs already on disk.
+  2 x 2 x 2 x 2 x 2 x 2 x 5 = 320 runs, ~35-40h.
+
+```{r}
+grid_main <- tidyr::expand_grid(
+  model         = c("roberta-base", "nlpaueb/legal-bert-base-uncased"),
+  label_col     = c("ClassDetailed", "ClassBroad"),
+  lr            = c(2e-5, 3e-5),
+  max_len       = c(256L, 512L),
+  epochs        = c(3, 6),
+  class_weights = c(FALSE, TRUE),
+  fold          = 1:5
+)
+purrr::pwalk(grid_main, function(model, label_col, lr, max_len, epochs, class_weights, fold) {
+  clf_train(.lP$Output$Prepared,
+    .label_col = label_col, .model = model,
+    .text_col = "Text", .class_weights = class_weights,
+    .lr = lr, .max_len = max_len, .epochs = epochs,
+    .batch_size = 32L, .test_fold = fold,
+    .runs_root = .lP$Output$RunsDir
+  )
+})
+```
+
+## Sweep -- Amendment (Original vs Amended)
+
+Separate binary task off AmendType. NOTE: requires the one-line trainer change
+that drops rows with no label for the task (the 75 NA-AmendType docs). Mild
+imbalance (~3.7:1) and the signal is front-loaded ("AMENDED AND RESTATED..."), so
+a focused grid suffices; widen later if needed.
+  2 models x 2 max_len x 5 folds = 20 runs.
+
+```{r}
+grid_amend <- tidyr::expand_grid(
+  model   = c("roberta-base", "nlpaueb/legal-bert-base-uncased"),
+  max_len = c(256L, 512L),
+  fold    = 1:5
+)
+purrr::pwalk(grid_amend, function(model, max_len, fold) {
+  clf_train(.lP$Output$Prepared,
+    .label_col = "AmendType", .model = model,
+    .text_col = "Text", .class_weights = FALSE,
+    .lr = 2e-5, .max_len = max_len, .epochs = 6,
+    .batch_size = 32L, .test_fold = fold,
+    .runs_root = .lP$Output$RunsDir
+  )
+})
+```
+
+## Sweep -- Phase B (long-context probe, conditional)
+
+Only if Phase A shows 512 clearly beating 256. Longformer reaches 1024+ tokens;
+slow and patchier on MPS, so smoke one fold first. batch dropped to 16.
+
+```{r}
+clf_train(.lP$Output$Prepared,
+  .label_col = "ClassDetailed",
+  .model = "allenai/longformer-base-4096",
+  .max_len = 1024L, .batch_size = 16L,
+  .runs_root = .lP$Output$RunsDir, .smoke = TRUE
+)
+```
+
+```{r}
+grid_long <- tidyr::expand_grid(label_col = c("ClassDetailed", "ClassBroad"), fold = 1:5)
+purrr::pwalk(grid_long, function(label_col, fold) {
+  clf_train(.lP$Output$Prepared,
+    .label_col = label_col,
+    .model = "allenai/longformer-base-4096",
+    .text_col = "Text", .class_weights = FALSE,
+    .lr = 2e-5, .max_len = 1024L, .epochs = 6,
+    .batch_size = 16L, .test_fold = fold,
+    .runs_root = .lP$Output$RunsDir
+  )
+})
+```
+
+## Results -- Leaderboards and Axis Effects
+
+```{r}
+tab_overall <- clf_load_overall(.lP$Output$RunsDir)
+
+# Per task (tasks differ in difficulty, so view separately)
+clf_leaderboard_show(tab_overall, .label_col = "ClassDetailed", .n = 15L)
+clf_leaderboard_show(tab_overall, .label_col = "ClassBroad", .n = 15L)
+clf_leaderboard_show(tab_overall, .label_col = "AmendType", .n = 10L)
+```
+
+```{r}
+# Which lever mattered (within the detailed task)
+clf_effect(tab_overall, "Model", .label_col = "ClassDetailed")
+clf_effect(tab_overall, "MaxLen", .label_col = "ClassDetailed")
+clf_effect(tab_overall, "Epochs", .label_col = "ClassDetailed")
+clf_effect(tab_overall, "ClassWeights", .label_col = "ClassDetailed")
+clf_effect(tab_overall, "LR", .label_col = "ClassDetailed")
+```
+
+## Results -- Winning Detailed Config
+
+```{r}
+best_det_ <- clf_leaderboard(dplyr::filter(tab_overall, .data$LabelCol == "ClassDetailed")) |>
+  dplyr::slice(1) |>
+  dplyr::pull(.data$ConfigName)
+
+pred_det <- clf_pool_predictions(.lP$Output$RunsDir, .config_name = best_det_)
+
+clf_scores(pred_det)
+clf_perclass(pred_det)
+clf_confusion(pred_det)
+```
+
+## Results -- Dual-Class Strict vs Lenient
+
+Strict scores the primary only; lenient accepts either of a dual-class doc's two
+labels. The gap quantifies what the dual-class ambiguity costs -- concentrated on
+the rare classes that show up as second labels (R&D, Licenses).
+
+```{r}
+pred_det_dc <- pred_det |> clf_add_second_label(tab_prep)
+
+dplyr::bind_rows(
+  clf_scores(pred_det_dc, .lenient = FALSE),
+  clf_scores(pred_det_dc, .lenient = TRUE)
+)
+```
+
+```{r}
+# Per-class precision/recall shift (strict vs lenient)
+clf_perclass(pred_det_dc, .lenient = FALSE)
+clf_perclass(pred_det_dc, .lenient = TRUE)
+```
+
+## Results -- Detailed-Rolled-Up vs Broad-Direct
+
+Does predicting the fine 12 classes and aggregating to the 7 broad classes beat
+predicting the 7 broad classes directly? Both scored at the broad level.
+
+```{r}
+best_broad_ <- clf_leaderboard(dplyr::filter(tab_overall, .data$LabelCol == "ClassBroad")) |>
+  dplyr::slice(1) |>
+  dplyr::pull(.data$ConfigName)
+
+pred_broad <- clf_pool_predictions(.lP$Output$RunsDir, .config_name = best_broad_)
+rolled_ <- clf_rollup_to_broad(pred_det, tab_prep)
+
+dplyr::bind_rows(
+  clf_scores(rolled_) |> dplyr::mutate(Approach = "ClassDetailed -> rolled up", .before = 1),
+  clf_scores(pred_broad) |> dplyr::mutate(Approach = "ClassBroad direct", .before = 1)
+)
+```
+
+## Results -- Amendment
+
+```{r}
+best_amend_ <- clf_leaderboard(dplyr::filter(tab_overall, .data$LabelCol == "AmendType")) |>
+  dplyr::slice(1) |>
+  dplyr::pull(.data$ConfigName)
+
+pred_amend <- clf_pool_predictions(.lP$Output$RunsDir, .config_name = best_amend_)
+
+clf_scores(pred_amend)
+clf_perclass(pred_amend)
+clf_confusion(pred_amend)
+```
+
+## Results -- Optional Round-Sliced Robustness
+
+Headline detailed metrics on Round2 (gold) labels only vs all labels -- shows the
+result is not propped up by the automated Round1 labels. Off by default.
+
+```{r}
+pred_det_round2 <- pred_det |>
+  clf_add_labelround(tab_prep) |>
+  dplyr::filter(.data$LabelRound == "Round2")
+
+dplyr::bind_rows(
+  clf_scores(pred_det) |> dplyr::mutate(Labels = "All (Round1 + Round2)", .before = 1),
+  clf_scores(pred_det_round2) |> dplyr::mutate(Labels = "Round2 only (gold)", .before = 1)
+)
+```

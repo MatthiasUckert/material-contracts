@@ -1,0 +1,532 @@
+---
+title: "Contract Classification: Schema 1 to Schema 2"
+subtitle: "Definitive reconciliation and overview"
+author: "Matthias Uckert and Ann-Kristin"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    df-print: kable
+    embed-resources: true
+    theme: cosmo
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE, purl=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(root.dir = here::here())
+```
+
+
+```{r}
+#| label: setup
+#| include: false
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+# Keep _Classification.R in the same folder as this .qmd.
+source("1_code/00-Scripts/_Classification.R")
+
+fmt_ <- function(x) format(x, big.mark = ",")
+
+# Paths: add your own; the first that exists is used.
+.paths_parq <- c(
+  "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractData/Classification/ClassifyContracts/Classification/Classifications.parquet",
+  ""   # <- Ann-Kristin: your Classifications.parquet path here
+)
+.paths_db <- c(
+  "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MaterialContractClassification/DocumentClassification/01-Classification/classification_data.db",
+  ""   # <- Ann-Kristin: your classification_data.db path here
+)
+.path_parq <- cls_pick_path(.paths_parq, "Classifications.parquet")
+.path_db   <- cls_pick_path(.paths_db, "classification_data.db")
+```
+
+::: {.callout-tip title="How to read this document"}
+This is a **working document** that doubles as a draft for the paper. Sections 1
+and 2 (the classification logic and the old-to-new reconciliation) are written
+to be paper-ready. Section 3 (error diagnostics) is for our review only and
+would be dropped or condensed for the manuscript. Every number recomputes on
+render, so the prose stays in sync with the data on whichever machine runs it.
+:::
+
+# Classification logic
+
+We classify each material contract into a single primary contract category,
+with an optional secondary category for documents that genuinely span two
+types, plus a binary amendment flag (Original / Amended). Two classification
+schemes exist: the original **Schema 1** used in the first submission, and the
+revised **Schema 2** introduced for this revision. The final label set
+reconciles the two.
+
+## Old scheme (Schema 1) {#sec-old}
+
+Schema 1 was produced by manual annotation through the `rLabelDocs` interface
+(stored in `Classifications.parquet`) and follows the categorisation of
+Verrecchia and Weber (2006) as described in the manuscript: seven broad
+categories resolving into ten specific contract types, plus the binary
+amendment flag.
+
+```{r}
+#| label: tax-s1
+.s1_taxonomy <- tibble::tribble(
+  ~Level1,                 ~Level2,
+  "Employment",            "Compensation",
+  "Employment",            "Legal",
+  "Financial Instruments", "Debt",
+  "Financial Instruments", "Equity",
+  "Purchases Or Sales",    "Inventory or Services",
+  "Purchases Or Sales",    "Assets",
+  "Leases",                NA_character_,
+  "License",               NA_character_,
+  "M&A",                   NA_character_,
+  "Other",                 NA_character_
+)
+.s1_taxonomy
+```
+
+## New scheme (Schema 2) {#sec-new}
+
+In response to Reviewer 2, the scheme was revised to align with more recent
+literature (Boone et al. 2016; Bao et al. 2022, 2025, as cited in the project
+overview). Schema 2 sharpens category boundaries, splits two ambiguous
+categories, and adds previously missing types. It comprises twelve specific
+categories under seven Level-1 groups:
+
+```{r}
+#| label: tax-s2
+.s2_taxonomy <- tibble::tribble(
+  ~Level1,                  ~Level2,                 ~DocClass,
+  "Financial Instruments",  "Credit",                "Financial Instruments: Credit",
+  "Financial Instruments",  "Equity",                "Financial Instruments: Equity",
+  "Leases",                 NA_character_,           "Leases",
+  "Employment",             "Compensation",          "Employment: Compensation",
+  "Employment",             "Legal",                 "Employment: Legal",
+  "Purchases and Sales",    "Assets",                "Purchases and Sales: Assets",
+  "Purchases and Sales",    "R&D",                   "R&D",
+  "Purchases and Sales",    "Customer / Supplier",   "Customer / Supplier",
+  "Licenses",               NA_character_,           "Licenses",
+  "Other",                  NA_character_,           "Other",
+  "Business Structure",     "Peer Agreements",       "Business Structure: Peer Agreements",
+  "Business Structure",     "Investment and Merger", "Business Structure: Investment and Merger"
+)
+.s2_taxonomy
+```
+
+The substantive changes from Schema 1 are: the old **Debt** category is renamed
+**Credit**; the old **Inventory or Services** category is split into **R&D** and
+**Customer / Supplier**; the old **M&A** category is split into **Business
+Structure: Peer Agreements** and **Business Structure: Investment and Merger**;
+and the remaining categories are unchanged or renamed only.
+
+## Combination rule {#sec-rule}
+
+The two schemes are reconciled per document as follows (from the project
+overview, June 2026):
+
+1. If a Schema-2 label exists for a document, **use it**.
+2. Otherwise, if the document's Schema-1 label belongs to a *name-change* or
+   *unchanged* category, **map it forward** to its Schema-2 name.
+3. Otherwise the Schema-1 label belongs to a *split* category (Inventory or
+   Services, or M&A). These carry **no Schema-1 fallback** ("use S2 only"): the
+   document is marked `UNRESOLVED` and requires a Schema-2 label. It is never
+   carried forward under an outdated label.
+
+The amendment flag (Original / Amended) is taken from Schema 1 only.
+
+The forward map below is the operative version of this rule. Only name-change
+and unchanged rows are eligible for fallback; the split rows are listed for
+completeness but deliberately excluded from the map, which is what forces
+`UNRESOLVED`.
+
+```{r}
+#| label: map-overview
+.s1_s2_overview <- tibble::tribble(
+  ~Schema1,                                  ~Transition,  ~Schema2,                                       ~Rule,
+  "Fin. Instruments: Debt",                  "name change", "Financial Instruments: Credit",                "S2 if exists, else S1",
+  "Fin. Instruments: Equity",                "unchanged",   "Financial Instruments: Equity",                "S2 if exists, else S1",
+  "Empoyment: Compensation",                 "unchanged",   "Employment: Compensation",                     "S2 if exists, else S1",
+  "Empoyment: Legal",                        "unchanged",   "Employment: Legal",                            "S2 if exists, else S1",
+  "Leases: Leases Category",                 "name change", "Leases",                                       "S2 if exists, else S1",
+  "License: License Category",               "name change", "Licenses",                                     "S2 if exists, else S1",
+  "Other: Other Category",                   "name change", "Other",                                        "S2 if exists, else S1",
+  "Purchases/Sales: Assets",                 "name change", "Purchases and Sales: Assets",                  "S2 if exists, else S1",
+  "Purchases/Sales: Inventory or Services",  "split",       "R&D / Customer / Supplier",                    "S2 only -> UNRESOLVED if missing",
+  "MergerAcquisition: M&A Category",         "split",       "Business Structure: Peer / Investment",        "S2 only -> UNRESOLVED if missing"
+)
+.s1_s2_overview
+```
+
+Note the source typo "Empoyment" in the Schema-1 labels; it is preserved here
+because the map keys on the strings as they appear in the data.
+
+```{r}
+#| label: maps-operative
+# Forward map actually used by the pipeline (name-change + unchanged only).
+.s1_to_s2 <- tibble::tribble(
+  ~DocClassS1,                  ~DocClass,
+  "Purchases/Sales: Assets",    "Purchases and Sales: Assets",
+  "Other: Other Category",      "Other",
+  "License: License Category",  "Licenses",
+  "Leases: Leases Category",    "Leases",
+  "Fin. Instruments: Debt",     "Financial Instruments: Credit",
+  "Fin. Instruments: Equity",   "Financial Instruments: Equity",
+  "Empoyment: Compensation",    "Employment: Compensation",
+  "Empoyment: Legal",           "Employment: Legal"
+)
+
+# Raw S2 label -> canonical. Accumulator for case / spacing / redundancy drift
+# in what was typed in the labeling app; the validation check feeds this table.
+.s2_relabel <- tibble::tribble(
+  ~DocClassRaw,                                        ~DocClass,
+  "Purchases and Sales: Purchases and Sales-Assets",   "Purchases and Sales: Assets",
+  "Business structure: Investment and merger",         "Business Structure: Investment and Merger",
+  "Business structure: Peer Agreements",               "Business Structure: Peer Agreements"
+)
+.s2_relabel
+```
+
+# Reconciliation (old to new)
+
+```{r}
+#| label: pipeline
+log_      <- cls_read_log(.path_db)
+raw_s2_   <- cls_raw_s2_counts(log_)
+s2_       <- cls_build_s2(log_, .s2_relabel)
+s1_       <- cls_build_s1(.path_parq, .s1_to_s2)
+final_    <- cls_combine(s2_, s1_, .s2_taxonomy)
+checks_   <- cls_validate(final_, .s2_taxonomy, .s2_relabel, raw_s2_)
+recon_    <- cls_reconcile_s1(log_, s1_)
+selfdual_ <- cls_self_duals(log_)
+coverage_ <- cls_coverage(s2_, s1_, final_)
+
+kpi_ <- list(
+  n_final    = nrow(final_),
+  n_s2       = sum(final_$Provenance == "S2"),
+  n_fb       = sum(final_$Provenance == "S1_fallback"),
+  n_unres    = sum(final_$Provenance == "UNRESOLVED"),
+  n_dual     = sum(final_$DualClass == 1L),
+  n_orphan   = sum(is.na(final_$AmendType)),
+  n_selfdual = nrow(selfdual_),
+  n_disagree = sum(!recon_$Agree, na.rm = TRUE)
+)
+kpi_$pct_s2 <- round(100 * kpi_$n_s2 / kpi_$n_final, 1)
+kpi_$pct_fb <- round(100 * kpi_$n_fb / kpi_$n_final, 1)
+all_pass_   <- all(checks_$Status == "PASS")
+```
+
+```{r}
+#| label: banner
+#| output: asis
+#| code-fold: false
+if (all_pass_) {
+  cat("::: {.callout-note title='Validation: PASS'}\nAll structural checks passed (canonical label set, one row per document, no unmapped labels).\n:::\n")
+} else {
+  cat("::: {.callout-important title='Validation: FAIL'}\nA structural check failed -- see Section 3. A failure on the label-mapping check means a new raw label needs a row in `.s2_relabel`.\n:::\n")
+}
+```
+
+Of **`r fmt_(kpi_$n_final)`** documents, **`r fmt_(kpi_$n_s2)`** (`r kpi_$pct_s2`%)
+carry a new Schema-2 label and **`r fmt_(kpi_$n_fb)`** (`r kpi_$pct_fb`%) retain a
+Schema-1 label mapped forward; **`r kpi_$n_unres`** remain unresolved. The
+Schema-2 re-labeling was therefore *targeted* at the split and changed
+categories rather than applied wall-to-wall, which is exactly what the "retain
+S1 where only S1 exists" rule prescribes (see @fig-provenance).
+
+## Source coverage
+
+How the old (parquet) and new (log) document sets overlap. `n_s1_only` are
+documents that retain a mapped Schema-1 label; `n_s2_only` are documents present
+only in the new log (these have no amendment flag, see @sec-orphans).
+
+```{r}
+#| label: ovw-coverage
+#| code-fold: false
+coverage_
+```
+
+## Provenance
+
+Where each final label came from.
+
+```{r}
+#| label: ovw-prov
+#| code-fold: false
+final_ |> dplyr::count(Provenance)
+```
+
+## Forward map in action
+
+Which Schema-1 labels actually fell back (no Schema-2 label existed), and the
+canonical category each was mapped to. This is the operative reconciliation.
+
+```{r}
+#| label: ovw-fallback
+#| code-fold: false
+final_ |>
+  dplyr::filter(Provenance == "S1_fallback") |>
+  dplyr::count(DocClassS1, DocClassFinal1)
+```
+
+## S1 source reconciliation {#sec-recon}
+
+The pipeline takes Schema-1 from the parquet. This check confirms that choice is
+safe by comparing it against the log's own Schema-1 entries: `TRUE` where they
+agree, `FALSE` where they differ, `NA` where only one source has the document.
+
+```{r}
+#| label: ovw-recon
+#| code-fold: false
+recon_ |> dplyr::count(Agree)
+```
+
+Agreement is near-total; the `r kpi_$n_disagree` disagreements are detailed in
+@sec-disagree.
+
+# Potential errors and mismatches
+
+::: {.callout-warning title="Working-document section"}
+Each subsection below explains what the mismatch is, why it arises, whether it
+affects the final classification, and what (if anything) to do about it. These
+are diagnostics for our review and would not appear in the paper.
+:::
+
+## Unresolved documents {#sec-unresolved}
+
+These are documents whose only label is an old Schema-1 **split** category --
+`Inventory or Services` or `M&A` -- with no Schema-2 label
+(**`r kpi_$n_unres`** documents). They arise because the combination rule gives
+split categories no Schema-1 fallback: the old category maps to two or more new
+ones, so the correct destination cannot be inferred mechanically and has to be
+set by hand. Until that happens, each has no final label (`DocClassFinal1` is
+`NA`) and is excluded from every category count below -- so this is the one
+mismatch that genuinely blocks a complete dataset. Action: assign each a
+Schema-2 label. All `r kpi_$n_unres` here are old `Inventory or Services`
+contracts, so each belongs in R&D, Customer / Supplier, or Purchases and Sales:
+Assets depending on its content.
+
+```{r}
+#| label: err-unresolved
+#| code-fold: false
+final_ |>
+  dplyr::filter(Provenance == "UNRESOLVED") |>
+  dplyr::select(DocID, DocClassS1, AmendType)
+```
+
+## Documents missing from the old parquet {#sec-orphans}
+
+**`r kpi_$n_orphan`** documents carry a Schema-2 label but have no row in the
+old parquet, so they have no amendment flag (`AmendType` is `NA`, since the flag
+comes only from Schema 1). **Confirmed: these are documents we deliberately
+added during the revision**, not a join failure. Two things support that: they
+concentrate in the new and expanded categories (54 are Customer / Supplier, the
+rest sit in Business Structure, R&D, and Licenses), and 983 of the 1,058
+Schema-2 documents do match the parquet, so the DocID key itself is sound -- a
+format mismatch would have stranded far more than `r kpi_$n_orphan`. The only
+consequence is that the classification sample grows from 4,327 to
+**`r fmt_(kpi_$n_final)`**, and these documents have a full Schema-2
+classification but no Original/Amended flag. Action: either accept the `NA`, or
+backfill the flag by running the amendment classifier over these IDs.
+
+```{r}
+#| label: err-orphans
+#| code-fold: false
+final_ |>
+  dplyr::filter(is.na(AmendType)) |>
+  dplyr::count(DocClassFinal1)
+```
+
+## S1 source disagreements {#sec-disagree}
+
+These are documents where the old parquet and the new log hold **different**
+Schema-1 labels for the same document (`Agree == FALSE`), plus the one document
+that exists in only one source (`Agree == NA`). They occur because the parquet
+and the log were two separate labeling passes, and a few contracts -- usually
+genuinely ambiguous ones, such as a document the parquet calls M&A and the log
+calls Equity -- were labeled inconsistently between them. **None of them affect
+the final result.** Every one either carries a Schema-2 label (which overrides
+both old labels) or sits in a name-change category that resolves identically
+whichever source is used, and the pipeline takes Schema 1 from the parquet
+throughout. They are shown only as a transparency check on that source choice,
+and because they point to contracts whose type is genuinely contestable. Action:
+none required; optionally eyeball them to sanity-check the ambiguous cases.
+
+```{r}
+#| label: err-disagree
+#| code-fold: false
+recon_ |> dplyr::filter(!Agree | is.na(Agree))
+```
+
+## Dual-label hygiene {#sec-selfdual}
+
+These are documents that were dual-classified with the **same** category in
+both slots, i.e. primary equals secondary (**`r kpi_$n_selfdual`** document) --
+almost certainly a slip in the labeling interface where the category was picked
+twice. The pipeline collapses them back to a single label (it sets the secondary
+to `NA` in `cls_build_s2`), so they do **not** inflate the dual-classification
+counts or the multi-label population in Section 4. They are listed here only so
+they can be fixed at source if desired; no downstream action is required.
+
+```{r}
+#| label: err-selfdual
+#| code-fold: false
+selfdual_
+```
+
+## Label drift handled
+
+This lists every distinct raw Schema-2 label as it was typed in the labeling
+app, with how the pipeline handled it: `canonical` (already matches the
+taxonomy), `relabeled` (a case, spacing, or redundancy variant fixed via
+`.s2_relabel` -- for example the lowercase `Business structure: ...` or the
+redundant `Purchases and Sales: Purchases and Sales-Assets`), or `UNKNOWN` (an
+unrecognised label). Drift happens because the app accepts the label more or
+less as free text, so the same category can be entered in slightly different
+forms. Relabeled variants are folded into their canonical name before any
+counting, and an `UNKNOWN` would fail the structural check in Section 2,
+flagging a new variant to add to `.s2_relabel`. One thing to note when reading
+the table: the counts include secondary (dual) labels and come from the
+Schema-2 log only, so they deliberately do **not** match the final category
+totals, which also include Schema-1 fallback. Action: if any row reads
+`UNKNOWN`, add it to `.s2_relabel` and re-render.
+
+```{r}
+#| label: err-drift
+#| code-fold: false
+raw_s2_ |>
+  dplyr::mutate(
+    Disposition = dplyr::case_when(
+      Value %in% .s2_taxonomy$DocClass   ~ "canonical",
+      Value %in% .s2_relabel$DocClassRaw ~ "relabeled",
+      TRUE                               ~ "UNKNOWN"
+    )
+  ) |>
+  dplyr::arrange(Disposition, dplyr::desc(n_raw))
+```
+
+# Overviews
+
+## Distribution by hierarchy {#sec-dist}
+
+The headline distribution, ready for a Table-1 view. The `NA` row (if any) is
+the unresolved documents.
+
+```{r}
+#| label: ovw-dist
+#| code-fold: false
+final_ |> dplyr::count(Level1, Level2, DocClassFinal1)
+```
+
+```{r}
+#| label: fig-distribution
+#| fig-cap: "Distribution of contracts across the twelve Schema-2 categories, coloured by Level-1 group."
+#| fig-width: 8
+#| fig-height: 5
+cls_plot_distribution(final_)
+```
+
+## Amendment flag
+
+```{r}
+#| label: ovw-amend
+#| code-fold: false
+final_ |> dplyr::count(AmendType)
+```
+
+```{r}
+#| label: fig-amend
+#| fig-cap: "Share of amendments within each category, ordered from least to most amended."
+#| fig-width: 8
+#| fig-height: 5
+cls_plot_amend(final_)
+```
+
+## Dual classifications {#sec-dual}
+
+The **`r fmt_(kpi_$n_dual)`** documents with a genuine secondary category, and
+the primary / secondary pairs. This is the multi-label population relevant to
+Reviewer 2's multi-label point.
+
+```{r}
+#| label: ovw-dual
+#| code-fold: false
+final_ |>
+  dplyr::filter(DualClass == 1L) |>
+  dplyr::count(DocClassFinal1, DocClassFinal2)
+```
+
+```{r}
+#| label: fig-dual
+#| fig-cap: "Co-occurrence of primary (rows) and secondary (columns) categories among dual-classified contracts."
+#| fig-width: 8
+#| fig-height: 7
+cls_plot_dual(final_)
+```
+
+## Category by provenance
+
+A cross-tab of how much of each final category comes from new Schema-2 work
+versus mapped Schema-1 labels.
+
+```{r}
+#| label: ovw-prov-class
+#| code-fold: false
+final_ |>
+  dplyr::count(Level1, Provenance) |>
+  tidyr::pivot_wider(names_from = Provenance, values_from = n, values_fill = 0L)
+```
+
+```{r}
+#| label: fig-provenance
+#| fig-cap: "Provenance composition by category: new Schema-2 labels versus Schema-1 labels mapped forward. The Schema-2 re-labeling was targeted at the split and changed categories."
+#| fig-width: 8
+#| fig-height: 5
+cls_plot_provenance(final_)
+```
+
+## Validation detail
+
+```{r}
+#| label: ovw-checks
+#| code-fold: false
+checks_
+```
+
+# Open decisions and next steps
+
+1. **Schema-2 coverage is intentional.** Three-quarters of final labels are
+   mapped Schema-1, by design of the "retain S1" rule. Confirm the paper text
+   describes the sample's provenance accordingly.
+2. **Unresolved documents** (@sec-unresolved) need a per-document call.
+3. **Documents added during the revision** (@sec-orphans) -- confirmed as
+   deliberate additions, so the sample is now `r fmt_(kpi_$n_final)`. The only
+   open point is whether to backfill the amendment flag for these
+   `r kpi_$n_orphan` documents or accept `NA`.
+4. **Dual classifications** (@sec-dual) -- decide how `DocClassFinal2` enters the
+   analysis (multi-label, drop, or primary-only).
+5. **S1 source** is settled in favour of the parquet (@sec-recon); the
+   reconciliation section can be retired once we are both satisfied.
+6. **Schema 3.** The log contains a third `DocClass` schema that is unused here.
+   Confirm it is scratch.
+
+# Export
+
+Disabled by default. Enable once the open decisions are settled.
+
+```{r}
+#| label: export
+#| eval: false
+.path_out <- "0_data/Classification.parquet"
+arrow::write_parquet(final_, .path_out)
+```
+
+# Appendix: session info
+
+```{r}
+#| label: sessioninfo
+#| code-fold: true
+sessionInfo()
+```

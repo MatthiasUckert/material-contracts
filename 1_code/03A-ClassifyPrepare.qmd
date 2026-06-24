@@ -1,0 +1,466 @@
+---
+title: "Contract Classification -- Sample & Shared Tooling (03A)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r setup, include=FALSE, purl=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(root.dir = here::here(), message = FALSE, warning = FALSE)
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+```{r echo=FALSE}
+source("1_code/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Utils.R", encoding = "UTF-8")
+source("1_code/_Format.R", encoding = "UTF-8")
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(here::here(), .name_script))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(here::here(), .name_script))
+source(.path_fun)
+```
+
+# What 03A is
+
+03A is the **foundation** of the classification pipeline. It does two jobs and
+nothing else:
+
+1. **Build the one prepared sample.** It reads the labelled documents, deals a
+   frozen stratified k-fold split, and writes a single `prepared.parquet` that
+   *every* downstream method consumes. The folds are dealt here, once, so BERT
+   (03B) and keyword (03C) are scored on byte-for-byte identical splits.
+2. **Provide the shared "overall" tooling.** A single scoring / leaderboard /
+   plotting layer that every method reports through -- BERT, keyword, the 03D
+   router, and the 03E deployment. Because all methods emit the same
+   `predictions.parquet` schema on the same folds, scoring them head-to-head is
+   just a matter of pooling predictions and calling the same functions.
+
+The trainers do **not** live here. `bert_*` (the BERT wrapper) is 03B; `kw_*`
+(the keyword miner) is 03C; both `source()` this file for prep and scoring so the
+splits never drift.
+
+Two deliberate simplifications over the earlier two-track code:
+
+- **One prepared parquet, not two.** `clf_prepare_sample` now carries `DocDesc` /
+  `DocName`, so there is a single prepared table. BERT ignores the title column;
+  keyword mines it. (The old `kw_write_prepared` re-attach step is gone.)
+- **One scoring layer, not `clf_` + `kw_`.** `clf_perclass` / `clf_scores` take a
+  `.none` sentinel argument and are abstention-aware. With no abstention (BERT)
+  they reduce *exactly* to the previous behaviour; with abstention (keyword
+  `(none)`) they drop the sentinel and report `Coverage`.
+
+## Path Tree
+
+`prepared.parquet` is written into 03A's own output directory; 03B and 03C read
+it from there. The two runs roots are referenced only so the overview / plot
+helpers can be demonstrated once those sweeps have produced runs.
+
+```{r}
+.lP <- list(
+  Input = list(
+    ClassificationSample = "0_data/Classification.parquet",
+    MetaData = "../pMatDisc/2_output/01-GetEDGAR/Output/FullMetaData.parquet",
+    DirContracts = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/"
+  ),
+  Cache = list(
+    ContractFiles = utils_file_path(.dir_main, "Cache", "ContractFiles.parquet")
+  ),
+  Output = list(
+    Prepared = utils_file_path(.dir_main, "prepared.parquet")
+  ),
+  Runs = list(
+    Bert = here::here("2_output", "03B-ClassifyTrainBERT", "runs"),
+    Kw   = here::here("2_output", "03C-ClassifyTrainKeyword", "runs")
+  )
+)
+```
+
+## Load Sample
+
+Labels come from `Classification.parquet` (with `Provenance` for `LabelRound`,
+`DocClassFinal2` for the dual-class second label, and `AmendType` for the
+amendment task). `DocDesc` / `DocName` (the filer title and filename) join in from
+the metadata and now ride all the way into the prepared parquet for the keyword
+track. `Path` locates each document's parsed text.
+
+```{r}
+fils_contract <- utils_list_project_files(.lP$Input$DirContracts, .lP$Cache$ContractFiles, FALSE)
+fils_class_sample <- arrow::open_dataset(.lP$Input$ClassificationSample) |>
+  dplyr::select(DocID, AmendType, DocClassFinal1, DocClassFinal2, DualClass, Level1, Level2, Provenance) |>
+  dplyr::left_join(
+    y = arrow::open_dataset(.lP$Input$MetaData) |>
+      dplyr::select(DocID, DocDesc, DocName),
+    by = dplyr::join_by(DocID)
+  ) |>
+  dplyr::collect() |>
+  dplyr::left_join(fils_contract, by = dplyr::join_by(DocID))
+```
+
+## Prepare Sample
+
+The full combined sample (Round1 + Round2). Emits `ClassBroad` (7),
+`ClassDetailed` (12), `ClassDetailed2` (dual-class second label, NA for
+single-class docs), `AmendType`, `LabelRound`, `DocDesc`, `DocName`, and the
+frozen `Fold`. Training downstream is single-label on the primary; the second
+label is used only for lenient scoring.
+
+```{r}
+tab_prep <- clf_prepare_sample(
+  .tab_input   = fils_class_sample,
+  .path_labels = .lP$Input$ClassificationSample,
+  .k           = 5L,
+  .seed        = 42L
+)
+clf_write_prepared(tab_prep, .lP$Output$Prepared)
+```
+
+# The labelled sample
+
+This is the data-resource description -- the tables and figures that document what
+we are classifying. (Tables here use `knitr::kable`; pipe them through your
+`plot_htmltable()` from the shared plot utils for the Times-styled look.)
+
+## Composition
+
+```{r}
+clf_sample_composition(tab_prep) |>
+  fmt_table(.caption = "Labelled sample composition")
+```
+
+`Round2` are the manually-checked gold labels; `Round1` are the first-pass
+automated labels that bulk out the common classes. Four fine classes (R&D,
+Customer / Supplier, Investment and Merger, Peer Agreements) exist only in Round2,
+which automated Round1 cannot express -- a structural recall limit we watch rather
+than fix here.
+
+## Class distribution
+
+```{r}
+clf_class_distribution(tab_prep, "ClassBroad") |>
+  fmt_table(.caption = "Broad taxonomy (7 classes)", .pct = "Pct")
+```
+
+```{r}
+clf_class_distribution(tab_prep, "ClassDetailed") |>
+  fmt_table(.caption = "Detailed taxonomy (12 classes)", .pct = "Pct")
+```
+
+```{r}
+#| fig-cap: "Detailed-taxonomy class distribution."
+clf_plot_class_distribution(tab_prep, "ClassDetailed")
+```
+
+The imbalance is steep -- Employment classes and Credit dominate; R&D and Peer
+Agreements are in the tens. This is exactly why we report macro-F1 (which weights
+every class equally) alongside accuracy, and why per-class scoring matters.
+
+## Amended vs Original
+
+The amendment task is a **separate binary label** (`AmendType`: Original vs
+Amended), orthogonal to the contract-type taxonomy. It carries genuine NAs -- docs
+never labelled for amendment -- so the breakdown shows an explicit unlabeled row;
+the amendment classifier (03B with `--label-col AmendType`) simply drops those, and
+the labelled (non-NA) share is what bounds the task.
+
+```{r}
+clf_class_distribution(tab_prep, "AmendType", .include_na = TRUE) |>
+  dplyr::mutate(Pct = scales::percent(Pct, 0.1)) |>
+  knitr::kable(caption = "Amendment task (Original vs Amended, with unlabeled)",
+               format.args = list(big.mark = ","))
+```
+
+```{r}
+#| fig-cap: "Amendment task distribution."
+#| fig-height: 2.6
+clf_plot_class_distribution(tab_prep, "AmendType", .include_na = TRUE)
+```
+
+Where the unlabeled docs fall by round (does the NA subset concentrate in Round1 or
+Round2?):
+
+```{r}
+tab_prep |>
+  dplyr::mutate(AmendType = dplyr::coalesce(.data$AmendType, "(unlabeled)")) |>
+  dplyr::count(.data$LabelRound, .data$AmendType) |>
+  tidyr::pivot_wider(names_from = "AmendType", values_from = "n", values_fill = 0L) |>
+  knitr::kable(caption = "Amendment label by round")
+```
+
+Amendment is decisively a BERT task: "amended and restated" appears as a naming
+convention in genuine originals, so a keyword rule cannot separate the classes
+(keyword macro-F1 ~0.62 vs BERT ~0.86). That is settled; the point here is only to
+quantify how much of the corpus carries a usable amendment label.
+
+## Dual-class labels
+
+A small minority of docs carry a **second valid label** (`ClassDetailed2`).
+Ann-Kristin confirms the two labels are **co-equal, not ranked** -- so today's
+first-listed `ClassDetailed` is an arbitrary pick between two correct answers. We
+keep first-listed as the training target (the choice is immaterial -- both labels
+are valid) and do **not** train or predict multi-label. The second label is
+retained only for (i) this description and (ii) a lenient robustness check that
+confirms the ambiguity does not move the headline.
+
+```{r}
+clf_dual_class_overview(tab_prep) |>
+  dplyr::mutate(PctDual = scales::percent(PctDual, 0.1)) |>
+  knitr::kable(caption = "Dual-class docs: count, share, Round split",
+               format.args = list(big.mark = ","))
+```
+
+By construction dual labels should sit in **Round2** (automated Round1 emits a
+single label); the split above shows where they actually fall. If they are
+Round2-only, the entire strict-vs-lenient gap lives in the manually-checked subset.
+
+Which class *pairs* co-occur (unordered, since order is meaningless):
+
+```{r}
+clf_dual_class_pairs(tab_prep) |>
+  knitr::kable(caption = "Co-occurring class pairs among dual-class docs",
+               format.args = list(big.mark = ","))
+```
+
+These are taxonomically adjacent contract types -- the cases where a single
+document genuinely spans two categories. Because they are so few, scoring treats
+**strict** (first label) as the conservative headline and reports **lenient**
+(either label) only as a robustness number. Strict can only *undercount* on these
+docs, so it is a clean lower bound rather than a generous one. The per-class
+strict-vs-lenient plot in the scoring section then reads as a diagnostic of which
+classes carry this ambiguity, not as a separate scoring track.
+
+## Document length
+
+```{r}
+clf_length_summary(tab_prep) |>
+  knitr::kable(
+    caption = "Document length in words (~200w ~ 256 tokens, ~400w ~ 512 tokens)",
+    digits = c(0, 0, 0, 0, 3, 3), format.args = list(big.mark = ",")
+  )
+```
+
+Contracts are long: the median runs to thousands of words, and the large majority
+exceed both the 256- and 512-token windows. At 512 tokens a transformer sees only
+the opening pages, which motivates the 256-vs-512 axis in the BERT sweep and the
+(conditional) long-context probe. Contract *type*, though, is usually legible from
+the title and preamble -- which is the bet the whole pipeline rests on.
+
+## Fold balance
+
+The frozen folds, dealt once here. Stratified on `ClassDetailed` and reused for
+`ClassBroad` and `AmendType`, so all three tasks share splits.
+
+```{r}
+clf_fold_overview(tab_prep, "ClassDetailed") |>
+  knitr::kable(caption = "Per-fold counts -- detailed taxonomy")
+```
+
+```{r}
+clf_fold_overview(tab_prep, "AmendType") |>
+  knitr::kable(caption = "Per-fold counts -- amendment task")
+```
+
+## Missing data
+
+A full missingness audit across the prepared columns. Two kinds of NA appear, and
+telling them apart is the whole point.
+
+```{r}
+clf_na_overview(tab_prep) |>
+  fmt_table(.caption = "Missingness by column", .pct = "PctNA")
+```
+
+- **`ClassDetailed2`** is NA for every single-class doc -- the large majority. That
+  is the *definition* of a single-class doc, not missing data; it is exactly the
+  complement of the dual-class count above.
+- **`AmendType`** NAs are genuine: docs never labelled for amendment. They are
+  dropped when the amendment classifier trains, so the labelled subset shown
+  earlier is what bounds that task.
+- **`LabelRound`** NA, if any, flags a doc whose provenance was neither Round1 nor
+  Round2 -- worth a look, since every labelled doc should map to one.
+- **`DocDesc` / `DocName`** never go NA (prep coalesces them to `""`), but an empty
+  title surfaces as `nEmpty` -- those are the docs where the keyword docdesc model
+  abstains.
+- **`ClassBroad` / `ClassDetailed` / `Text` / `Fold`** are NA-free by construction.
+  A nonzero count in any of these would signal an upstream problem, not a labelling
+  gap.
+
+# Shared scoring tooling
+
+Every method -- BERT, keyword, the router -- writes the **same**
+`predictions.parquet`: `DocID, TrueLabel, PredLabel, Score, Fold`. Scoring is
+therefore method-agnostic. The one wrinkle is abstention: a keyword model can
+return `(none)` when no term fires, whereas BERT always predicts. The unified
+layer handles both through a single `.none` argument -- absent from BERT's labels,
+so the abstention logic is a no-op there.
+
+A small synthetic example makes the behaviour concrete (and lets this section
+render before any real runs exist). It includes two abstentions and one dual-class
+document whose "wrong-looking" prediction is in fact its valid second label.
+
+```{r}
+demo_pred <- tibble::tribble(
+  ~DocID, ~TrueLabel,  ~PredLabel,  ~Score, ~ClassDetailed2,
+  "d01",  "Leases",    "Leases",    0.95,   NA,
+  "d02",  "Leases",    "Leases",    0.88,   NA,
+  "d03",  "Leases",    "Licenses",  0.41,   "Licenses",
+  "d04",  "Licenses",  "Licenses",  0.79,   NA,
+  "d05",  "Licenses",  "(none)",    0.00,   NA,
+  "d06",  "Licenses",  "Licenses",  0.66,   NA,
+  "d07",  "R&D",       "R&D",       0.71,   NA,
+  "d08",  "R&D",       "(none)",    0.00,   NA,
+  "d09",  "Other",     "Other",     0.83,   NA,
+  "d10",  "Other",     "Leases",    0.52,   NA,
+  "d11",  "Other",     "Other",     0.77,   NA,
+  "d12",  "R&D",       "Other",     0.45,   NA
+)
+```
+
+**Headline scores, strict vs lenient.** Strict scores the primary label only;
+lenient also accepts a dual-class doc's second label. `Coverage` is the predicted
+share (here below 1 because of the two abstentions); a method that always predicts
+would show `Coverage = 1`.
+
+```{r}
+dplyr::bind_rows(
+  clf_scores(demo_pred, .lenient = FALSE),
+  clf_scores(demo_pred, .lenient = TRUE)
+) |>
+  knitr::kable(caption = "Headline scores (synthetic)", digits = 3)
+```
+
+**Per-class precision / recall / F1.** The `(none)` sentinel is excluded from the
+class set; an abstention costs the true class recall but never creates a false
+positive.
+
+```{r}
+clf_perclass(demo_pred, .lenient = FALSE) |>
+  knitr::kable(caption = "Per-class, strict (synthetic)", digits = 3)
+```
+
+**Confusion matrix.** A `(none)` column, when present, shows exactly which true
+classes the method abstained on.
+
+```{r}
+clf_confusion(demo_pred) |>
+  knitr::kable(caption = "Confusion matrix (synthetic)")
+```
+
+**Plots.** The same data through the publication plot helpers. These are the
+method-agnostic figures 03B / 03C / 03D / 03E reuse unchanged.
+
+```{r}
+#| fig-cap: "Per-class F1 (synthetic)."
+clf_plot_perclass(demo_pred)
+```
+
+```{r}
+#| fig-cap: "Confusion heatmap, row-normalised (synthetic)."
+#| fig-height: 4
+clf_plot_confusion(demo_pred, .normalize = TRUE)
+```
+
+```{r}
+#| fig-cap: "Strict vs lenient per-class F1; the gap is the dual-class cost (synthetic)."
+#| fig-height: 3.5
+clf_plot_strict_lenient(demo_pred)
+```
+
+# Overview across runs
+
+This is where 03B and 03C plug in. `clf_load_overall` binds the per-run metrics
+across one or more runs roots (BERT and keyword live in separate trees);
+`clf_leaderboard` / `clf_leaderboard_show` rank configurations head-to-head, keyed
+on `ConfigName` (which encodes every axis, so the same leaderboard handles both
+methods); `clf_effect` reads off the marginal effect of any single axis. Against
+real runs the load is one line:
+
+```r
+tab_overall <- clf_load_overall(c(.lP$Runs$Bert, .lP$Runs$Kw))
+```
+
+No sweeps have run yet, so to show what the final output looks like the block
+below **fabricates** a small but realistic `tab_overall` -- four BERT configs and
+one keyword config, five folds each. Everything downstream of it is the real code;
+only the inputs are synthetic. (Note the keyword config's `Coverage` below 1, where
+BERT sits at exactly 1.)
+
+```{r}
+# Synthetic stand-in for clf_load_overall() output -- illustrative only.
+set.seed(42)
+config_grid <- tibble::tribble(
+  ~ConfigName,                 ~Model,         ~TextCol,   ~Source,    ~MaxLen, ~Epochs, ~LR,    ~F1Base, ~CovBase,
+  "legalbert_ml512_e6_lr2e5",  "legal-bert",   "Text",     NA,         512L,    6L,      "2e-5", 0.852,   1.00,
+  "legalbert_ml256_e6_lr2e5",  "legal-bert",   "Text",     NA,         256L,    6L,      "2e-5", 0.849,   1.00,
+  "legalbert_ml512_e3_lr2e5",  "legal-bert",   "Text",     NA,         512L,    3L,      "2e-5", 0.831,   1.00,
+  "roberta_ml512_e6_lr2e5",    "roberta-base", "Text",     NA,         512L,    6L,      "2e-5", 0.808,   1.00,
+  "keyword_combined_none",     "keyword",      "combined", "combined", NA,      NA,      NA,     0.712,   0.93
+)
+
+tab_overall <- config_grid |>
+  tidyr::expand_grid(Fold = 1:5) |>
+  dplyr::mutate(
+    LabelCol    = "ClassDetailed",
+    Seed        = 42L,
+    Smoke       = FALSE,
+    F1_macro    = pmin(0.98, pmax(0.20, .data$F1Base + stats::rnorm(dplyr::n(), 0, 0.015))),
+    F1_weighted = pmin(0.99, .data$F1_macro + abs(stats::rnorm(dplyr::n(), 0.030, 0.006))),
+    Accuracy    = pmin(0.99, .data$F1_weighted + abs(stats::rnorm(dplyr::n(), 0.015, 0.005))),
+    Coverage    = dplyr::if_else(
+      .data$CovBase >= 1, 1.0,
+      pmin(1.0, pmax(0, .data$CovBase + stats::rnorm(dplyr::n(), 0, 0.010)))
+    )
+  ) |>
+  dplyr::select(-F1Base, -CovBase)
+```
+
+**Leaderboard.** One row per configuration, ranked by mean macro-F1, with Coverage
+and mean +/- sd across folds. legal-bert leads; the keyword config trails and
+abstains on a few percent of docs.
+
+```{r}
+clf_leaderboard_show(tab_overall, .label_col = "ClassDetailed", .n = 15L) |>
+  knitr::kable(caption = "Top configurations -- detailed taxonomy (synthetic)")
+```
+
+```{r}
+#| fig-cap: "Leaderboard: macro-F1 (mean +/- sd across folds) per configuration (synthetic)."
+clf_plot_leaderboard(tab_overall, .label_col = "ClassDetailed", .n = 15L)
+```
+
+**Marginal effect of one axis.** `clf_effect` averages over everything else; rows
+where the axis is NA (the keyword config has no `MaxLen`) drop out automatically,
+so it is safe to run on a pooled BERT + keyword table.
+
+```{r}
+clf_effect(tab_overall, "Model", .label_col = "ClassDetailed") |>
+  knitr::kable(caption = "Macro-F1 by model, averaged over other axes (synthetic)", digits = 3)
+```
+
+Against real runs, replace the synthetic block with the one-line `clf_load_overall`
+call above, then pool the winning config's out-of-fold predictions --
+`clf_pool_predictions(c(.lP$Runs$Bert, .lP$Runs$Kw), best_config)` -- to drive the
+per-class and confusion plots shown earlier in the scoring section.
+
+# Next
+
+03A defines the seam and the tooling; the trainers come next.
+
+- **03B-ClassifyTrainBERT** -- isolate the BERT wrapper (`bert_train` / `bert_cv`),
+  add the per-run log + master `train_log.parquet`, quiet the console to one
+  formatted line per run. Sources this file for prep and scoring.
+- **03C-ClassifyTrainKeyword** -- the keyword miner (`kw_*`), swapped from
+  `mclapply` to `mirai`, same logging contract as 03B, same `predictions.parquet`
+  schema so it scores through the helpers above.
+- **03D / 03E** -- routing (per-class precision + an optional Ollama pass on the
+  hard tail) and final deployment, both pure consumers of this layer.

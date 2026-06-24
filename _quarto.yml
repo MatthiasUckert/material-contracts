@@ -1,0 +1,59 @@
+# _quarto.yml
+project:
+  # Run every document's code from the PROJECT ROOT (not the .qmd's own folder),
+  # so repo-root-relative paths like source("1_code/_Initialize.R") and here::here()
+  # resolve the same way they do interactively in RStudio. Without this Quarto
+  # defaults to execute-dir: file (the .qmd's directory) and those paths break.
+  execute-dir: project
+
+  # Rendered HTML/PDF land here (mirroring the input path, e.g.
+  # 1_code/03A-ClassifyPrepare.qmd -> _rendered/1_code/03A-ClassifyPrepare.html).
+  # R-side artifacts (parquet, runs) are written directly by arrow/fs under
+  # 2_output/ and are NOT affected by this. Change "_rendered" to taste.
+  # Note: `quarto render` with no args now renders the WHOLE project; use
+  # `quarto render <file.qmd>` to render a single document.
+  output-dir: _rendered
+
+format:
+  html:
+    code-fold: true
+    toc-location: left
+    toc: true
+    toc-depth: 4
+    toc-expand: 3
+    page-layout: article
+    code-overflow: wrap
+    code-line-numbers: true
+    code-copy: true
+    self-contained: true
+    fig-align: center
+    fig-format: svg
+    fig-width: 16
+    fig-height: 7
+    out-width: "100%"
+    mainfont: "Times New Roman"
+    fontfamily: "serif"
+    css: _styles.css
+    theme:
+      - none
+
+  pdf:
+    # PDF prerequisites: `quarto install tinytex` (or a system TeX). xelatex is
+    # required for the Times New Roman system font. CSS does NOT apply to PDF --
+    # the fixed-left TOC and _styles1.css are HTML-only; PDF is styled here.
+    echo: false        # no code in the PDF -- results-only (HTML keeps folded code)
+    pdf-engine: xelatex
+    mainfont: "Times New Roman"
+    toc: true
+    toc-depth: 4
+    fig-align: center
+    fig-width: 8         # narrower than HTML's 16 so figures fit the page
+    fig-height: 4.5
+    fig-dpi: 300         # crisp raster (ragg_png) embedding
+    code-overflow: wrap
+    geometry: margin=1in
+    colorlinks: true
+
+knitr:
+  opts_chunk:
+    dev: "ragg_png"

@@ -19,3 +19,8 @@ __pycache__/
 2_output/
 0_sample/
 0_scratch/
+_rendered
+0_data
+
+/.quarto/
+**/*.quarto_ipynb

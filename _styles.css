@@ -1,0 +1,269 @@
+/* _styles.css -- house style for the material-contracts Quarto reports.
+   Used with `theme: none`, so this sheet carries the full look: Times
+   throughout, h1 bold / h2 italic, a fixed left TOC, academic tables, and
+   readable code. Organised in sections; the !important flags override the
+   bare (theme-less) defaults. */
+
+
+/* 1. Base ---------------------------------------------------------------- */
+
+body {
+  font-family: "Times New Roman", Times, serif !important;
+  line-height: 1.5;
+  color: #1a1a1a;
+}
+
+
+/* 2. Headers ------------------------------------------------------------- */
+/* h1 bold; h2 italic (not bold); h3-h6 plain Times. */
+
+body .quarto-title-block .quarto-title h1,
+body .quarto-title-block .title,
+body main h1,
+body article h1,
+body div.quarto-document h1,
+body h1 {
+  font-weight: bold !important;
+  font-family: "Times New Roman", Times, serif !important;
+}
+
+body main h2,
+body article h2,
+body div.quarto-document h2,
+body h2 {
+  font-weight: normal !important;
+  font-style: italic !important;
+  font-family: "Times New Roman", Times, serif !important;
+}
+
+body h3, body h4, body h5, body h6 {
+  font-family: "Times New Roman", Times, serif !important;
+}
+
+
+/* 3. Table of contents (fixed, left) ------------------------------------- */
+/* Multiple selectors cover different Quarto versions. */
+
+body #TOC,
+body nav.sidebar-navigation,
+body div.sidebar,
+body .sidebar-menu[role="doc-toc"] {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 280px;
+  height: 100%;
+  overflow-y: auto;
+  padding: 20px;
+  background-color: #fff;
+  border-right: 1px solid #e0e0e0;
+  z-index: 1000;
+  font-family: "Times New Roman", Times, serif !important;
+}
+
+/* Level 1 TOC items: bold */
+body #TOC .sidebar-item-container .sidebar-item-text a[data-bs-toggle="collapse"],
+body #TOC .sidebar-item-container .sidebar-item-text a[href*="#sec-"],
+body nav.sidebar-navigation > ul > li > a,
+body .sidebar nav[role="doc-toc"] > ul > li > a,
+body .sidebar-menu[role="doc-toc"] > ul > li > a {
+  font-weight: bold !important;
+  font-family: "Times New Roman", Times, serif !important;
+}
+
+/* Level 2 TOC items: italic, not bold */
+body nav.sidebar-navigation > ul > li > ul > li > a,
+body .sidebar-menu ul.collapse li .sidebar-item-text a,
+body .sidebar nav[role="doc-toc"] > ul > li > ul > li > a,
+body .sidebar-menu[role="doc-toc"] > ul > li > ul > li > a {
+  font-weight: normal !important;
+  font-style: italic !important;
+  font-family: "Times New Roman", Times, serif !important;
+}
+
+.sidebar a,
+#TOC a {
+  font-family: "Times New Roman", Times, serif !important;
+}
+
+.sidebar-item {
+  white-space: normal;
+  line-height: 1.3;
+  padding-right: 5px;
+}
+
+/* Level 3+ collapse behaviour */
+.sidebar-item-container .sidebar-item-toggle .bi {
+  transition: transform 0.3s ease;
+}
+.sidebar-item-container .sidebar-item ul.collapse:not(.show) {
+  display: none;
+}
+.sidebar-item-container .sidebar-item-toggle[aria-expanded="true"] .bi {
+  transform: rotate(90deg);
+}
+.sidebar-item-toggle:hover {
+  background-color: #f8f9fa;
+  border-radius: 3px;
+}
+
+
+/* 4. Main content positioning -------------------------------------------- */
+
+body main,
+body article,
+body div.quarto-document {
+  margin-left: 300px !important;
+  max-width: 64rem !important;   /* wide but capped (~1024px); raise/lower to taste */
+  width: auto !important;
+  padding-left: 40px;
+  padding-right: 24px;
+}
+
+
+/* 5. Tables (academic / booktabs) ---------------------------------------- */
+/* Horizontal rules only -- top rule, header rule, bottom rule, no verticals.
+   Scoped away from code-highlight tables via :not(.sourceCode). kable sets
+   per-column alignment inline, so we leave text-align to it. */
+
+main table:not(.sourceCode),
+article table:not(.sourceCode) {
+  border-collapse: collapse;
+  margin: 1em auto;
+  font-family: "Times New Roman", Times, serif;
+  font-size: 0.95em;
+}
+
+main table:not(.sourceCode) thead th,
+article table:not(.sourceCode) thead th {
+  border-top: 1.5px solid #000;
+  border-bottom: 1px solid #000;
+  padding: 5px 12px;
+  font-weight: bold;
+  vertical-align: bottom;
+}
+
+main table:not(.sourceCode) tbody td,
+article table:not(.sourceCode) tbody td {
+  padding: 4px 12px;
+  border: none;
+}
+
+main table:not(.sourceCode) tbody tr:last-child td,
+article table:not(.sourceCode) tbody tr:last-child td {
+  border-bottom: 1.5px solid #000;
+}
+
+/* subtle row emphasis on hover (HTML only; ignored in PDF) */
+main table:not(.sourceCode) tbody tr:hover td {
+  background-color: #f6f6f6;
+}
+
+/* Table captions: italic, left, above the table */
+caption,
+table > caption {
+  caption-side: top;
+  text-align: left;
+  font-style: italic;
+  font-size: 0.9em;
+  color: #333;
+  padding: 4px 0;
+}
+
+
+/* 6. Figure captions ----------------------------------------------------- */
+
+figcaption,
+.figure-caption,
+.quarto-figure figcaption {
+  font-style: italic;
+  font-size: 0.9em;
+  text-align: center;
+  color: #333;
+  margin-top: 0.5em;
+}
+
+
+/* 7. Code ---------------------------------------------------------------- */
+
+pre, code {
+  font-family: "Consolas", "Menlo", monospace !important;
+}
+
+/* inline code */
+code:not(pre code) {
+  font-size: 0.9em;
+  color: #24292e;
+}
+
+/* code blocks: bumped up from the old 0.7em for legibility */
+pre.sourceCode,
+div.sourceCode pre {
+  font-size: 0.82em;
+  line-height: 1.45;
+  border: 1px solid #e6e6e6;
+  border-radius: 4px;
+  padding: 0.6em 0.8em;
+  overflow-x: auto;
+}
+
+/* code-fold toggle: small and unobtrusive */
+details.code-fold > summary,
+details.code-fold > summary code {
+  font-family: "Consolas", "Menlo", monospace;
+  font-size: 0.8em;
+  color: #666;
+  cursor: pointer;
+}
+details.code-fold > summary:hover {
+  color: #1a1a1a;
+}
+
+
+/* 8. Links (content only; TOC links keep their own styling) -------------- */
+
+main a:not(.sidebar a),
+article a {
+  color: #1a4f8a;
+  text-decoration: none;
+}
+main a:not(.sidebar a):hover,
+article a:hover {
+  text-decoration: underline;
+}
+
+
+/* 9. Layout fixes (single-column flow under theme: none) ----------------- */
+
+.page-columns,
+.column-screen,
+.column-page {
+  display: block !important;
+}
+
+
+/* 10. Responsive (stack TOC above content on narrow screens) ------------- */
+
+@media (max-width: 991.98px) {
+  body #TOC,
+  body nav.sidebar-navigation,
+  body div.sidebar,
+  body .sidebar-menu[role="doc-toc"] {
+    display: block;
+    position: relative;
+    width: 100%;
+    height: auto;
+    border-right: none;
+    border-bottom: 1px solid #e0e0e0;
+    padding-bottom: 20px;
+    margin-bottom: 20px;
+  }
+
+  body main,
+  body article,
+  body div.quarto-document {
+    margin-left: 0 !important;
+    width: 100% !important;
+    padding-left: 0;
+  }
+}
