@@ -455,6 +455,85 @@ kw_load_lexicon <- function(.runs_root, .config_name, .min_folds = 1L, .top_per_
 # the rest. These read pooled predictions only (no re-mining, no engine change) and
 # reuse 03A's abstention-aware scoring. This is the keyword arm of 03D routing.
 
+#' Pool a keyword config's per-doc predictions under a chosen confidence
+#'
+#' Returns the keyword pooled predictions (one row per doc, on the shared folds)
+#' with $Score OVERWRITTEN by the requested confidence, so the gate / calibrate /
+#' precision-coverage functions below (and the 03D selective router) consume it
+#' unchanged. The argmax PredLabel is preserved exactly -- only the confidence used
+#' for gating changes -- and the original max-score is kept as ScoreMax.
+#'
+#' The engine writes win_score as the fold-normalised MAX class score: a
+#' between-document magnitude (how much class-exclusive vocabulary a doc carries
+#' versus the most-loaded doc in its fold), which is NOT a per-document separation.
+#' "margin" / "marginrel" instead read the per-class scores from
+#' probabilities.parquet and form a per-document top-1-minus-top-2 separation -- the
+#' sharper signal for selective classification. "marginrel" divides by Top1Prob,
+#' cancelling the per-fold normalisation, so it pools cleanly across folds.
+#'
+#' @param .runs_roots Character vector of runs roots (keyword root among them).
+#' @param .config_name Keyword ConfigName (from kw_leaderboard).
+#' @param .which "maxscore" (the as-shipped win_score), "margin", or "marginrel".
+#' @param .none Character. Abstention sentinel (default "(none)").
+#' @return Tibble: DocID, TrueLabel, PredLabel, Score (= chosen confidence), Fold,
+#'   ScoreMax, Top1Prob, Top2Prob, Margin, MarginRel.
+kw_load_confidence <- function(.runs_roots, .config_name,
+                               .which = c("maxscore", "margin", "marginrel"),
+                               .none = "(none)") {
+  if (FALSE) {
+    .runs_roots  <- c(.lP$Runs$Bert, .lP$Runs$Kw)
+    .config_name <- best_kw
+    .which       <- "marginrel"
+    .none        <- "(none)"
+  }
+  .which <- match.arg(.which)
+
+  # base predictions: DocID, TrueLabel, PredLabel, Score (= win_score), Fold
+  base_ <- clf_pool_predictions(.runs_roots, .config_name) |>
+    dplyr::mutate(ScoreMax = .data$Score)
+
+  # the per-class scores live in probabilities.parquet (long: ConfigName, DocID,
+  # Class, Prob). Pool across folds and keep this config's rows.
+  paths_ <- .runs_roots |>
+    purrr::map(\(r_) fs::dir_ls(r_, recurse = TRUE, glob = "*probabilities.parquet")) |>
+    purrr::list_c()
+  paths_ <- paths_[!grepl("_smoke", paths_)]
+  if (length(paths_) == 0L) cli::cli_abort("No probabilities.parquet under the runs roots")
+
+  probs_ <- paths_ |>
+    purrr::map(arrow::read_parquet) |>
+    purrr::list_rbind() |>
+    dplyr::filter(.data$ConfigName == .config_name)
+  if (nrow(probs_) == 0L) cli::cli_abort("No probability rows for config {(.config_name)}")
+
+  # per doc: rank the class scores, take the top two, derive the margins
+  top_ <- probs_ |>
+    dplyr::arrange(.data$DocID, dplyr::desc(.data$Prob)) |>
+    dplyr::mutate(Rank = dplyr::row_number(), .by = DocID) |>
+    dplyr::filter(.data$Rank <= 2L) |>
+    dplyr::select(DocID, Rank, Prob) |>
+    tidyr::pivot_wider(names_from = Rank, values_from = Prob, names_prefix = "Top") |>
+    dplyr::rename(Top1Prob = Top1, Top2Prob = Top2) |>
+    dplyr::mutate(
+      Top2Prob  = dplyr::coalesce(.data$Top2Prob, 0),
+      Margin    = .data$Top1Prob - .data$Top2Prob,
+      MarginRel = dplyr::if_else(.data$Top1Prob > 0, .data$Margin / .data$Top1Prob, 0)
+    )
+
+  # overwrite Score with the chosen confidence (abstentions -> 0 so they gate out);
+  # the existing selective stack reads $Score and needs no edit.
+  base_ |>
+    dplyr::left_join(top_, by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(
+      Score = dplyr::case_when(
+        .which == "maxscore"  ~ .data$ScoreMax,
+        .which == "margin"    ~ dplyr::coalesce(.data$Margin, 0),
+        .which == "marginrel" ~ dplyr::coalesce(.data$MarginRel, 0)
+      ),
+      Score = dplyr::if_else(.data$PredLabel == .none, 0, .data$Score)
+    )
+}
+
 #' Apply a confidence gate to pooled predictions (selective classification)
 #'
 #' Relabels low-confidence predictions to the abstention sentinel, so the shared
@@ -640,4 +719,102 @@ kw_plot_precision_coverage <- function(.curve) {
     ggplot2::labs(x = "Coverage (share of documents classified)",
                   y = "Selective accuracy (precision on classified)")
   clf_apply_theme(p_)
+}
+
+
+# Per-source comparison, margin diagnostics, selective profile ------------
+# Built for the desc/text/combined escalation question: surface each source's best
+# config side by side, the margin's right/wrong separation (the keyword twin of the
+# BERT margin stat), and a one-row high-precision profile per config so the three
+# sources line up in a single unified table.
+
+#' Best keyword config per source (the escalation arms)
+#'
+#' Collapses the leaderboard to one winning config per Source (docdesc / text /
+#' combined) by mean macro-F1, so the three escalation arms are easy to grab for the
+#' per-source comparisons. Each row is a deployable keyword classifier on its own
+#' field; docdesc is the low-N / high-clarity arm, text the body arm, combined the
+#' score fusion of the two.
+#'
+#' @param .tab_overall Output of clf_load_overall() (keyword rows carry Source).
+#' @param .label_col Task to restrict to (default "ClassDetailed").
+#' @return Tibble: Source, ConfigName, F1macro_mean, Acc_mean, Cov_mean (by macro-F1).
+kw_pick_source_configs <- function(.tab_overall, .label_col = "ClassDetailed") {
+  if (FALSE) {
+    .tab_overall <- tab_overall
+    .label_col   <- "ClassDetailed"
+  }
+  kw_leaderboard(dplyr::filter(.tab_overall, .data$LabelCol == .label_col)) |>
+    dplyr::slice_max(.data$F1macro_mean, n = 1L, by = Source, with_ties = FALSE) |>
+    dplyr::select(Source, ConfigName, F1macro_mean, Acc_mean, Cov_mean) |>
+    dplyr::arrange(dplyr::desc(.data$F1macro_mean))
+}
+
+#' Margin separation by correctness (the keyword twin of the BERT margin stat)
+#'
+#' Does the keyword confidence actually separate right from wrong answers? Splits the
+#' committed predictions (abstentions excluded) into correct vs incorrect and reports
+#' the mean top-1 score and both margins for each. A useful confidence is higher on
+#' the correct set; if the margins barely differ, the gate has little to grip. Feed it
+#' a kw_load_confidence() table (margin / marginrel are the informative .which values).
+#'
+#' @param .tab_conf Output of kw_load_confidence (carries Top1Prob, Margin, MarginRel).
+#' @param .none Character. Abstention sentinel (default "(none)").
+#' @return Tibble: Correct, N, Top1Mean, MarginMean, MarginRelMean (correct first).
+kw_margin_correctness <- function(.tab_conf, .none = "(none)") {
+  if (FALSE) {
+    .tab_conf <- kw_load_confidence(.lP$Output$RunsDir, best_kw, .which = "marginrel")
+    .none     <- "(none)"
+  }
+  .tab_conf |>
+    dplyr::filter(.data$PredLabel != .none) |>
+    dplyr::mutate(Correct = .data$PredLabel == .data$TrueLabel) |>
+    dplyr::summarise(
+      N             = dplyr::n(),
+      Top1Mean      = mean(.data$Top1Prob),
+      MarginMean    = mean(.data$Margin),
+      MarginRelMean = mean(.data$MarginRel),
+      .by = Correct
+    ) |>
+    dplyr::arrange(dplyr::desc(.data$Correct))
+}
+
+#' One-row high-precision profile for a config (strict + selective in one line)
+#'
+#' Runs the selective layer end to end for one config's pooled predictions --
+#' kw_calibrate to a per-class precision target, kw_gate, kw_selective_summary -- and
+#' returns a single row pairing the strict pooled scores with the gated high-precision
+#' operating point. Mapping this over kw_pick_source_configs() lines the three sources
+#' up in one table: full macro-F1 next to "how much can each source label at >= target
+#' precision, and how accurate is that slice" -- the high-performance-at-low-coverage
+#' view the docdesc arm is meant to win.
+#'
+#' @param .tab_pred Pooled predictions for one config (DocID, TrueLabel, PredLabel, Score).
+#' @param .target_precision Per-class precision target (default 0.95).
+#' @param .min_keep Minimum kept predictions per class to qualify (default 5).
+#' @param .none Character. Abstention sentinel (default "(none)").
+#' @return One-row tibble: StrictMacroF1, StrictAcc, StrictCoverage, SelCoverage,
+#'   SelAccuracy, TargetP.
+kw_selective_profile <- function(.tab_pred, .target_precision = 0.95,
+                                 .min_keep = 5L, .none = "(none)") {
+  if (FALSE) {
+    .tab_pred         <- pred_kw
+    .target_precision <- 0.95
+    .min_keep         <- 5L
+    .none             <- "(none)"
+  }
+  strict_ <- clf_scores(.tab_pred, .none = .none)
+  calib_  <- kw_calibrate(.tab_pred, .target_precision = .target_precision,
+                          .min_keep = .min_keep, .none = .none)
+  thr_    <- stats::setNames(calib_$Threshold, calib_$Label)
+  gated_  <- kw_gate(.tab_pred, thr_, .none = .none)
+  sel_    <- kw_selective_summary(gated_, .none = .none)
+  tibble::tibble(
+    StrictMacroF1  = strict_$F1_macro,
+    StrictAcc      = strict_$Accuracy,
+    StrictCoverage = strict_$Coverage,
+    SelCoverage    = sel_$Coverage,
+    SelAccuracy    = sel_$SelAccuracy,
+    TargetP        = .target_precision
+  )
 }

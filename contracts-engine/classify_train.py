@@ -200,10 +200,18 @@ def main():
     ap.add_argument("--no-save-probs", dest="save_probs", action="store_false")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("--fit-final", dest="fit_final", action="store_true", default=False,
+                    help="train on ALL rows (no held-out fold), skip evaluation, and "
+                         "force-save the model -- produces the deployable model.")
+    ap.add_argument("--verbose", action="store_true", default=False,
+                    help="stream training output (epoch logs, progress bar) to the "
+                         "console; default captures it into run.log only.")
     args = ap.parse_args()
 
     set_seed(args.seed)
     device = pick_device()
+    if args.fit_final:
+        args.save_model = True            # the whole point of this mode
 
     model_slug = args.model.replace("/", "-")
     wtag = 1 if args.class_weights else 0
@@ -214,13 +222,18 @@ def main():
     )
     run_name = f"{config_name}_F{args.test_fold}"
     run_token = f"bert:{model_slug}:{args.label_col}:T{args.text_col}:W{wtag}:F{args.test_fold}"
+    if args.fit_final:
+        run_name = f"{config_name}__FINAL"
+        run_token = f"bert:{model_slug}:{args.label_col}:T{args.text_col}:W{wtag}:FINAL"
 
     runs_root = Path(args.runs_root)
     if args.smoke:
         runs_root = runs_root / "_smoke"
     run_dir = runs_root / run_name
 
-    done_marker = run_dir / "metrics_overall.parquet"
+    # final mode is marked done by its config.json (written last); CV mode by its
+    # metrics_overall.parquet.
+    done_marker = run_dir / ("config.json" if args.fit_final else "metrics_overall.parquet")
     if done_marker.exists() and not args.overwrite and not args.smoke:
         print(f"[skip  ] run exists: {run_dir} (use --overwrite to redo)")
         return
@@ -236,31 +249,42 @@ def main():
     # class columns, which have no NA.
     df = df[df[args.label_col].notna()].copy()
 
-    train_df = df[df[args.fold_col] != args.test_fold].copy()
-    test_df = df[df[args.fold_col] == args.test_fold].copy()
+    if args.fit_final:
+        # train on everything; there is no held-out fold in this mode.
+        train_df = df.copy()
+        test_df = df.iloc[0:0].copy()
+    else:
+        train_df = df[df[args.fold_col] != args.test_fold].copy()
+        test_df = df[df[args.fold_col] == args.test_fold].copy()
     if args.smoke:
         train_df = smoke_subset(train_df, args.label_col, 8)
-        test_df = smoke_subset(test_df, args.label_col, 4)
+        if not args.fit_final:
+            test_df = smoke_subset(test_df, args.label_col, 4)
         args.epochs = 1.0
 
     labels_sorted = sorted(train_df[args.label_col].unique().tolist())
     lab2id = {lab: i for i, lab in enumerate(labels_sorted)}
     id2lab = {i: lab for lab, i in lab2id.items()}
-    test_df = test_df[test_df[args.label_col].isin(lab2id)].copy()
+    if not args.fit_final:
+        test_df = test_df[test_df[args.label_col].isin(lab2id)].copy()
 
+    fold_disp = "ALL" if args.fit_final else args.test_fold
     log.say(f"[run   ] {run_name}")
     log.log(f"[device] {device}")
     log.log(f"[label ] {args.label_col} | text={args.text_col} | classes={len(labels_sorted)} | "
-            f"weights={bool(args.class_weights)} | test_fold={args.test_fold}")
+            f"weights={bool(args.class_weights)} | fold={fold_disp}")
     log.log(f"[data  ] train={len(train_df)} test={len(test_df)}")
 
     started = time.time()
     started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    # Heavy compute: silence the console and capture everything (transformers
-    # epoch logs, library warnings, any progress output) into run.log at the fd
-    # level, so the R console sees only the start/done lines above and below.
-    with redirect_fds(log.file):
+    # Heavy compute. By default we silence the console and capture everything
+    # (transformers epoch logs, library warnings, progress output) into run.log at
+    # the fd level. In --verbose mode we skip the redirect so it streams live to the
+    # console instead (run.log then keeps only the structured lines; per-epoch
+    # metrics are always in train_log.parquet).
+    train_ctx = contextlib.nullcontext() if args.verbose else redirect_fds(log.file)
+    with train_ctx:
         tok = AutoTokenizer.from_pretrained(args.model)
 
         def encode(texts):
@@ -270,11 +294,12 @@ def main():
                        padding="max_length", return_tensors="pt")
 
         train_txt = train_df[args.text_col].fillna("").astype(str).tolist()
-        test_txt = test_df[args.text_col].fillna("").astype(str).tolist()
         train_enc = encode(train_txt)
-        test_enc = encode(test_txt)
         train_y = torch.tensor([lab2id[x] for x in train_df[args.label_col]])
-        test_y = torch.tensor([lab2id[x] for x in test_df[args.label_col]])
+        if not args.fit_final:
+            test_txt = test_df[args.text_col].fillna("").astype(str).tolist()
+            test_enc = encode(test_txt)
+            test_y = torch.tensor([lab2id[x] for x in test_df[args.label_col]])
 
         model = AutoModelForSequenceClassification.from_pretrained(
             args.model, num_labels=len(labels_sorted), id2label=id2lab, label2id=lab2id
@@ -289,7 +314,7 @@ def main():
             seed=args.seed,
             save_strategy="no",
             logging_strategy="epoch",
-            disable_tqdm=True,          # epoch logs only; keeps run.log readable
+            disable_tqdm=not args.verbose,   # show the live progress bar when verbose
             report_to="none",
             dataloader_pin_memory=False,
             fp16=False,
@@ -308,50 +333,53 @@ def main():
 
         trainer.train()
 
-        pred = trainer.predict(TextDataset(test_enc, test_y))
-        probs = torch.softmax(torch.tensor(pred.predictions), dim=-1).numpy()
-        pred_ids = probs.argmax(axis=-1)
-        scores = probs.max(axis=-1)
-        true_ids = test_y.numpy()
+        if not args.fit_final:
+            pred = trainer.predict(TextDataset(test_enc, test_y))
+            probs = torch.softmax(torch.tensor(pred.predictions), dim=-1).numpy()
+            pred_ids = probs.argmax(axis=-1)
+            scores = probs.max(axis=-1)
+            true_ids = test_y.numpy()
 
     ended_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
     duration = round(time.time() - started, 1)
+    acc = f1_macro = f1_weight = None
 
-    pd.DataFrame({
-        "ConfigName": config_name, "Run": run_token,
-        "DocID": test_df["DocID"].to_numpy(),
-        "TrueLabel": [id2lab[i] for i in true_ids],
-        "PredLabel": [id2lab[i] for i in pred_ids],
-        "Score": scores, "Fold": args.test_fold,
-    }).to_parquet(run_dir / "predictions.parquet", index=False)
+    if not args.fit_final:
+        pd.DataFrame({
+            "ConfigName": config_name, "Run": run_token,
+            "DocID": test_df["DocID"].to_numpy(),
+            "TrueLabel": [id2lab[i] for i in true_ids],
+            "PredLabel": [id2lab[i] for i in pred_ids],
+            "Score": scores, "Fold": args.test_fold,
+        }).to_parquet(run_dir / "predictions.parquet", index=False)
 
-    if args.save_probs:
-        wide = pd.DataFrame(probs, columns=labels_sorted)
-        wide.insert(0, "DocID", test_df["DocID"].to_numpy())
-        wide.insert(0, "ConfigName", config_name)
-        wide.melt(id_vars=["ConfigName", "DocID"], var_name="Class", value_name="Prob") \
-            .to_parquet(run_dir / "probabilities.parquet", index=False)
+        if args.save_probs:
+            wide = pd.DataFrame(probs, columns=labels_sorted)
+            wide.insert(0, "DocID", test_df["DocID"].to_numpy())
+            wide.insert(0, "ConfigName", config_name)
+            wide.melt(id_vars=["ConfigName", "DocID"], var_name="Class", value_name="Prob") \
+                .to_parquet(run_dir / "probabilities.parquet", index=False)
 
-    acc = float(accuracy_score(true_ids, pred_ids))
-    f1_macro = float(f1_score(true_ids, pred_ids, average="macro"))
-    f1_weight = float(f1_score(true_ids, pred_ids, average="weighted"))
-    pd.DataFrame([{
-        "ConfigName": config_name, "Run": run_token, "RunName": run_name, "Model": args.model,
-        "LabelCol": args.label_col, "TextCol": args.text_col, "ClassWeights": bool(args.class_weights),
-        "TestFold": args.test_fold, "MaxLen": args.max_len, "Epochs": args.epochs,
-        "BatchSize": args.batch_size, "LR": args.lr, "Seed": args.seed, "Device": device,
-        "nTrain": len(train_df), "nTest": len(test_df), "nClasses": len(labels_sorted),
-        "Accuracy": acc, "F1_macro": f1_macro, "F1_weighted": f1_weight,
-        "DurationSec": duration, "Smoke": bool(args.smoke),
-    }]).to_parquet(run_dir / "metrics_overall.parquet", index=False)
+        acc = float(accuracy_score(true_ids, pred_ids))
+        f1_macro = float(f1_score(true_ids, pred_ids, average="macro"))
+        f1_weight = float(f1_score(true_ids, pred_ids, average="weighted"))
+        pd.DataFrame([{
+            "ConfigName": config_name, "Run": run_token, "RunName": run_name, "Model": args.model,
+            "LabelCol": args.label_col, "TextCol": args.text_col, "ClassWeights": bool(args.class_weights),
+            "TestFold": args.test_fold, "MaxLen": args.max_len, "Epochs": args.epochs,
+            "BatchSize": args.batch_size, "LR": args.lr, "Seed": args.seed, "Device": device,
+            "nTrain": len(train_df), "nTest": len(test_df), "nClasses": len(labels_sorted),
+            "Accuracy": acc, "F1_macro": f1_macro, "F1_weighted": f1_weight,
+            "DurationSec": duration, "Smoke": bool(args.smoke),
+        }]).to_parquet(run_dir / "metrics_overall.parquet", index=False)
 
-    p, r, f, s = precision_recall_fscore_support(
-        true_ids, pred_ids, labels=list(range(len(labels_sorted))), zero_division=0
-    )
-    pd.DataFrame({
-        "ConfigName": config_name, "Run": run_token, "Label": labels_sorted,
-        "Precision": p, "Recall": r, "F1": f, "Support": s.astype(int),
-    }).to_parquet(run_dir / "metrics_perclass.parquet", index=False)
+        p, r, f, s = precision_recall_fscore_support(
+            true_ids, pred_ids, labels=list(range(len(labels_sorted))), zero_division=0
+        )
+        pd.DataFrame({
+            "ConfigName": config_name, "Run": run_token, "Label": labels_sorted,
+            "Precision": p, "Recall": r, "F1": f, "Support": s.astype(int),
+        }).to_parquet(run_dir / "metrics_perclass.parquet", index=False)
 
     try:
         pd.DataFrame(trainer.state.log_history).to_parquet(
@@ -366,9 +394,11 @@ def main():
 
     manifest = {
         "config_name": config_name, "run_name": run_name, "run_token": run_token,
+        "fit_final": bool(args.fit_final),
         "smoke": bool(args.smoke), "model": args.model, "label_col": args.label_col,
         "text_col": args.text_col, "class_weights": bool(args.class_weights),
-        "test_fold": args.test_fold, "max_len": args.max_len, "epochs": args.epochs,
+        "test_fold": (None if args.fit_final else args.test_fold),
+        "max_len": args.max_len, "epochs": args.epochs,
         "batch_size": args.batch_size, "lr": args.lr, "seed": args.seed, "device": device,
         "n_classes": len(labels_sorted), "labels": labels_sorted, "label2id": lab2id,
         "data_path": str(args.data), "n_train": len(train_df), "n_test": len(test_df),
@@ -382,7 +412,10 @@ def main():
     }
     (run_dir / "config.json").write_text(json.dumps(manifest, indent=2))
 
-    log.say(f"[done  ] acc={acc:.3f} f1_macro={f1_macro:.3f} f1_weighted={f1_weight:.3f} ({duration}s)")
+    if args.fit_final:
+        log.say(f"[final ] saved deployable model on {len(train_df)} docs to {run_dir / 'model'} ({duration}s)")
+    else:
+        log.say(f"[done  ] acc={acc:.3f} f1_macro={f1_macro:.3f} f1_weighted={f1_weight:.3f} ({duration}s)")
     log.log(f"[write ] {run_dir}")
     log.close()
 

@@ -79,6 +79,10 @@ writer). Runs are written under 03B's own `runs/` -- the same tree
   Runs = list(
     Bert = here::here("2_output", "03B-ClassifyTrainBERT", "runs")
   ),
+  Output = list(
+    Classification = utils_file_path(.dir_main, "classification"),
+    ModelFinal     = utils_file_path(.dir_main, "model_final")
+  ),
   Engine = list(
     Python = here::here("contracts-engine", ".venv", "bin", "python"),
     Script = here::here("contracts-engine", "classify_train.py")
@@ -130,6 +134,19 @@ bert_train(.lP$Input$Prepared,
 )
 ```
 
+By default a run prints a single cli line on completion (full detail in its
+`run.log`). To watch a fold train live -- per-epoch loss and the progress bar
+streaming to the console -- pass `.verbose = TRUE`. It works on `bert_train`,
+`bert_cv`, `bert_sweep`, and `bert_fit_final`.
+
+```{r}
+#| eval: false
+bert_train(.lP$Input$Prepared,
+  .label_col = "ClassDetailed", .test_fold = 1L,
+  .runs_root = .lP$Runs$Bert, .verbose = TRUE
+)
+```
+
 ## Sweep -- Phase A (contract-type taxonomy)
 
 The class sweep that produced the crowned config. Axes: model x level x LR x
@@ -137,6 +154,7 @@ max_len x class_weights x folds (epochs swept {3, 6}). 2x2x2x2x2x2x5 = 320 runs,
 ~35-40h on the M3 Ultra. Built once; left here as the as-run record.
 
 ```{r}
+#| eval: false
 grid_main <- tidyr::expand_grid(
   model         = c("roberta-base", "nlpaueb/legal-bert-base-uncased"),
   label_col     = c("ClassDetailed", "ClassBroad"),
@@ -156,6 +174,7 @@ The binary amendment task off `AmendType`, reusing the same harness
 front-loaded signal, so a focused grid: 2 models x 2 max_len x 5 folds = 20 runs.
 
 ```{r}
+#| eval: false
 grid_amend <- tidyr::expand_grid(
   model         = c("roberta-base", "nlpaueb/legal-bert-base-uncased"),
   label_col     = "AmendType",
@@ -192,19 +211,16 @@ Per task (tasks differ in difficulty, so view them separately). legal-bert leads
 
 ```{r}
 clf_leaderboard_show(tab_overall, .label_col = "ClassDetailed", .n = 15L) |>
-  dplyr::select(-ConfigName) |>
   fmt_table(.caption = "Top configurations -- detailed taxonomy (12 classes)")
 ```
 
 ```{r}
 clf_leaderboard_show(tab_overall, .label_col = "ClassBroad", .n = 15L) |>
-  dplyr::select(-ConfigName) |>
   fmt_table(.caption = "Top configurations -- broad taxonomy (7 classes)")
 ```
 
 ```{r}
 clf_leaderboard_show(tab_overall, .label_col = "AmendType", .n = 10L) |>
-  dplyr::select(-ConfigName) |>
   fmt_table(.caption = "Top configurations -- amendment task")
 ```
 
@@ -359,10 +375,140 @@ dplyr::bind_rows(
   fmt_table(.caption = "Round-sliced robustness (detailed taxonomy)")
 ```
 
+# Save the classification
+
+The crowned config's pooled **out-of-fold** predictions are the honest per-document
+classification: every doc labelled once, by a model blind to it, with its full
+softmax probability vector. We assemble that into one tidy table and persist it.
+The probabilities are the raw material for the calibration and confidence analyses
+below and for 03D routing.
+
+```{r}
+class_det <- clf_cache(
+  "bert_class_det",
+  bert_classification(.lP$Runs$Bert, best_det_, .tab_prep = tab_prep)
+)
+```
+
+```{r}
+class_det |>
+  dplyr::slice_head(n = 8) |>
+  dplyr::select(DocID, TrueLabel, PredLabel, Top1Prob, Top2Class, Top2Prob, Margin, Correct) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Per-document classification (head; full table adds one P_<Class> column per class)")
+```
+
+Persist it. Parquet is canonical; a CSV rides along for convenience. (For the Stata
+hand-off pass `.dta = TRUE` -- it rewrites the per-class probability columns to
+`P01..P12` with a codebook, since Stata forbids spaces in variable names.)
+
+```{r}
+bert_save_classification(class_det, .lP$Output$Classification, .csv = TRUE, .dta = FALSE)
+```
+
+# Confidence and calibration
+
+Three questions about how much to trust a BERT prediction, all answered from the
+table just built -- no retraining.
+
+## Calibration -- is an 80%-confident prediction right 80% of the time?
+
+This is **calibration**. The reliability table bins the top-1 probability and
+compares mean confidence to empirical accuracy in each bin; the summary reduces it
+to ECE (doc-weighted mean gap), MCE (worst bin), and a multiclass Brier score.
+Fine-tuned transformers are typically a little **over-confident** -- expect accuracy
+to sit just below confidence in the top bins.
+
+```{r}
+bert_calibration_metrics(class_det) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 4))) |>
+  fmt_table(.caption = "Calibration summary (ECE, MCE, multiclass Brier; lower is better)")
+```
+
+```{r}
+bert_calibration(class_det) |>
+  dplyr::mutate(dplyr::across(c(MeanConf, Accuracy, Gap), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Reliability table: confidence bin vs empirical accuracy")
+```
+
+```{r}
+#| fig-cap: "Reliability diagram: mean confidence vs empirical accuracy (dashed = perfect calibration; points sized by docs in bin)."
+bert_plot_reliability(class_det)
+```
+
+## Decision margin -- first guess vs second guess
+
+The **margin** is top-1 minus top-2 probability: large when BERT is decisive, small
+when it is torn between two classes. If correct predictions carry a clearly larger
+margin than incorrect ones, the margin is a usable confidence signal for routing or
+a reject option.
+
+```{r}
+bert_margin_summary(class_det) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Decision margin (top-1 minus top-2) by outcome")
+```
+
+```{r}
+#| fig-cap: "Margin distribution for correct vs incorrect predictions."
+#| fig-height: 3
+bert_plot_margin(class_det)
+```
+
+## Confidence vs accuracy -- the risk-coverage curve
+
+"At what confidence is BERT reliably right?" Keep only docs whose top-1 probability
+clears a rising floor and watch accuracy climb as coverage falls. This is the BERT
+twin of 03C's selective layer: it quantifies how accurately the model can label a
+confident fraction, and feeds the 03D routing decision.
+
+```{r}
+bert_confidence_accuracy(class_det) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  fmt_table(.caption = "Confidence floor -> coverage and accuracy on the kept subset")
+```
+
+```{r}
+#| fig-cap: "Risk-coverage: accuracy on the kept subset as a rising confidence floor shrinks coverage."
+bert_plot_risk_coverage(class_det)
+```
+
+# Deploy: the final all-data model
+
+The CV sweep has already certified the configuration; the deployable artifact is
+that same config fit **once on all labelled docs** (no folds, no hold-out -- the
+honest number is already paid for). `bert_crowned_config` reads the crowned recipe
+straight off the leaderboard, and `bert_fit_final` trains and saves it (weights,
+tokenizer, label map) under `model_final/`. This is what 03E / the full-corpus
+apply loads.
+
+```{r}
+cfg_det <- bert_crowned_config(tab_overall, "ClassDetailed")
+cfg_det
+```
+
+```{r}
+#| eval: false
+# ~12 min on the M3 Ultra; writes model_final/<config>__FINAL/model.
+bert_fit_final(.lP$Input$Prepared, cfg_det, .model_dir = .lP$Output$ModelFinal, .verbose = TRUE)
+```
+
+The amendment classifier deploys identically -- `bert_crowned_config(tab_overall,
+"AmendType")` then `bert_fit_final(...)` -- if a saved amendment model is wanted
+downstream too.
+
+```{r}
+#| eval: false
+cfg_amend <- bert_crowned_config(tab_overall, "AmendType")
+bert_fit_final(.lP$Input$Prepared, cfg_amend, .model_dir = .lP$Output$ModelFinal, .verbose = TRUE)
+```
+
 # Next
 
-03B reproduces the crowned numbers under the new layout, scored through 03A. From
-here the runs feed the consumers, both pure readers of this layer:
+03B reproduces the crowned numbers under the new layout, scored through 03A, and now
+also persists the per-document classification (with probabilities) and the
+deployable all-data model. From here the runs feed the consumers, both pure readers
+of this layer:
 
 - **03D-ClassifyOrchestrate** -- pool a BERT config and a keyword config from their
   separate roots (`clf_pool_predictions(c(.lP$Runs$Bert, .lP$Runs$Kw), ...)`) and

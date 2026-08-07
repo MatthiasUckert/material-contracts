@@ -1,0 +1,365 @@
+---
+title: "Contract Classification -- Orchestration & Routing (03D)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r setup, include=FALSE, purl=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(root.dir = here::here(), message = FALSE, warning = FALSE)
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+```{r echo=FALSE}
+source("1_code/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Utils.R", encoding = "UTF-8")
+source("1_code/_Format.R", encoding = "UTF-8")
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(here::here(), .name_script))
+
+# 03D consumes the whole stack: 03A (prep + scoring + plots), 03B (BERT per-doc
+# classification + crowned config), 03C (the keyword gate). Source all three, then
+# this file. None are re-run -- 03D reads the predictions they already wrote.
+for (.s in c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword")) {
+  cat(.s, "function file: ")
+  print(.p <- init_create_script_fun(here::here(), .s))
+  source(.p)
+}
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(here::here(), .name_script))
+source(.path_fun)
+```
+
+# What 03D is
+
+03D is the **orchestrator**. 03B and 03C each produced pooled out-of-fold
+predictions on the *identical* frozen folds; 03D takes both and asks the one
+question it exists to answer: **does routing between BERT and keyword (or an LLM
+tiebreak on the hard cases) beat just running BERT everywhere?**
+
+The honest prior is *no, or barely*. The head-to-head (03B vs 03C) showed BERT
+winning every class, so per-class accuracy routing has little to route toward. That
+makes 03D a **methods experiment, not an accuracy grab** -- and a clean null is the
+finding. This document is built to make that test legible: it states the incumbent
+(BERT), an unattainable ceiling (oracle), and what every *deployable* router
+actually scores against the incumbent.
+
+Nothing here retrains. Every number is read off the predictions on disk, scored
+through 03A's shared `clf_scores` / `clf_perclass` so it is directly comparable with
+03B and 03C. The single exception is the optional Ollama tiebreak (last section),
+which adjudicates only the disagreement residue.
+
+Three routers are deployable -- **BERT-everywhere** (baseline), **agreement +
+tiebreak**, and **selective keyword + BERT backfill** -- and one is a diagnostic
+**ceiling** (oracle per-class, which peeks at the true label to bound what routing
+could ever buy).
+
+## Paths
+
+`prepared.parquet` and both runs roots come from the upstream scripts' own
+directories (same path construction they wrote with, so they always match).
+`clf_load_overall(c(bert, kw))` binds both method families into one leaderboard.
+
+```{r}
+.dir_prep <- init_create_script_dir(here::here(), "03A-ClassifyPrepare")
+.dir_bert <- init_create_script_dir(here::here(), "03B-ClassifyTrainBERT")
+.dir_kw   <- init_create_script_dir(here::here(), "03C-ClassifyTrainKeyword")
+
+.lP <- list(
+  Input = list(
+    Prepared = utils_file_path(.dir_prep, "prepared.parquet")
+  ),
+  Runs = list(
+    Bert = utils_file_path(.dir_bert, "runs"),
+    Kw   = utils_file_path(.dir_kw,   "runs")
+  ),
+  Output = list(
+    OllamaCache = utils_file_path(.dir_main, "_ollama_cache")
+  )
+)
+```
+
+```{r}
+tab_prep    <- arrow::read_parquet(.lP$Input$Prepared)
+tab_overall <- clf_cache("orch_overall",
+  clf_load_overall(c(.lP$Runs$Bert, .lP$Runs$Kw)))
+```
+
+The two configs 03D routes between: the crowned BERT config (03B) and the best
+keyword config (03C), both for `ClassDetailed`.
+
+```{r}
+best_bert <- bert_crowned_config(tab_overall, "ClassDetailed")$config_name
+best_kw   <- kw_leaderboard(dplyr::filter(tab_overall, LabelCol == "ClassDetailed")) |>
+  dplyr::slice(1) |>
+  dplyr::pull(ConfigName)
+
+tibble::tibble(Method = c("BERT", "Keyword"), ConfigName = c(best_bert, best_kw)) |>
+  fmt_table(.caption = "Configs 03D routes between")
+```
+
+# Assemble the routing table
+
+One row per document, both methods side by side: BERT's argmax label with its
+confidence (`Top1Prob`, `Margin`), keyword's argmax label with its `Score`, and the
+`Agree` flag. Because both tracks ran identical folds, the join is one-to-one; a
+shortfall would warn rather than silently drop docs.
+
+```{r}
+tab_route <- clf_cache(
+  paste0("orch_route__", best_bert, "__", best_kw),
+  orch_assemble(c(.lP$Runs$Bert, .lP$Runs$Kw), best_bert, best_kw, tab_prep)
+)
+tab_route |> dplyr::slice_head(n = 8) |>
+  fmt_table(.caption = "Assembled routing table (head)", .digits = 3, .wide = TRUE)
+```
+
+# Per-class head-to-head
+
+The table 03D rests on. Per-class F1 for each method on identical folds, with the
+winner and the gap. If BERT wins every row (the expected case), accuracy routing
+cannot help and the deployable routers below are predicted to tie BERT. Keyword's
+strict F1 here counts an abstention as a miss -- its high-precision contribution is
+the *selective* story further down, not this aggregate.
+
+```{r}
+compare_pc <- clf_cache(
+  paste0("orch_perclass__", best_bert, "__", best_kw),
+  orch_perclass_compare(c(.lP$Runs$Bert, .lP$Runs$Kw), best_bert, best_kw)
+)
+compare_pc |> fmt_table(
+  .caption = "Per-class F1: BERT vs keyword (winner and gap)",
+  .digits = 3
+)
+```
+
+```{r}
+winners <- orch_winner_map(compare_pc)
+```
+
+# Agreement and the residue
+
+How often do the two methods agree, how accurate is each set, and -- on the docs
+they dispute -- who is right more often? If BERT is right far more often than
+keyword on the residue, the safe default (keep BERT) is already near-optimal there
+and a tiebreak has little headroom. This is the diagnostic that predicts, before any
+routing is scored, whether 03D can move the number.
+
+```{r}
+orch_agreement_summary(tab_route) |>
+  fmt_table(.caption = "Agreement vs residue: share, best-of-two accuracy, who is right",
+            .digits = 3, .pct = c("Share", "EitherAcc", "BertRight", "KwRight"))
+```
+
+The residue itself -- the only documents any tiebreak can change -- carried with
+both candidate labels and BERT's confidence:
+
+```{r}
+residue <- orch_disagreement_set(tab_route)
+cli::cli_alert_info("Residue: {nrow(residue)} of {nrow(tab_route)} docs")
+residue |> dplyr::slice_head(n = 10) |>
+  fmt_table(.caption = "Disagreement residue (head)", .digits = 3)
+```
+
+# The selective keyword layer (from 03C)
+
+Rebuild 03C's high-precision keyword gate so the selective router can use it:
+calibrate a per-class cutoff to 95% precision, then gate. Whatever this layer
+commits to, keyword owns; BERT backfills the rest.
+
+```{r}
+pred_kw <- clf_cache(
+  paste0("orch_kwpred__", best_kw),
+  clf_pool_predictions(c(.lP$Runs$Bert, .lP$Runs$Kw), best_kw)
+)
+calib   <- kw_calibrate(pred_kw, .target_precision = 0.95, .min_keep = 5L)
+thr_    <- calib |> dplyr::select(Label, Threshold) |> tibble::deframe()
+pred_hi <- kw_gate(pred_kw, thr_)
+
+kw_selective_summary(pred_hi) |>
+  fmt_table(.caption = "High-precision keyword layer (per-class gated)",
+            .pct = c("Coverage", "SelAccuracy"))
+```
+
+A high selective accuracy only matters relative to **what BERT scores on the very
+same documents the gate kept**. Because an easy, prototypical contract is easy for
+both methods, keyword's confident subset overlaps BERT's confident subset -- so the
+honest test is the head-to-head on the keyword-owned partition, not the gate's
+accuracy against BERT's *global* number. If BERT wins the Keyword-owned row, handing
+those docs to keyword strictly loses, which is exactly why the selective router
+cannot clear BERT-everywhere.
+
+```{r}
+orch_subset_compare(tab_route, pred_hi) |>
+  fmt_table(.caption = "BERT vs keyword on the gate's own subset (KwAcc NA where keyword abstained)",
+            .digits = 3, .pct = c("Share", "KwAcc", "BertAcc", "Gap"))
+```
+
+## Does a margin-based gate change the verdict?
+
+The `Score` the gate above thresholds on is the engine's fold-normalised MAX class
+score -- a *between-document* magnitude (how much class-exclusive vocabulary a doc
+carries), not a *within-document* separation. The sharper selective signal is the
+**margin**: top-1 minus top-2 class score, i.e. how decisively the winning class beats
+the runner-up for *this* document. `kw_load_confidence` rebuilds the keyword
+predictions with `Score` swapped for the scale-free relative margin, so the *same*
+`kw_calibrate` -> `kw_gate` -> `orch_subset_compare` runs on it unchanged. If even a
+margin-built gate cannot win its own covered subset, the null is robust to how keyword
+confidence is defined.
+
+```{r}
+pred_kw_mr <- clf_cache(
+  paste0("orch_kwpred_mr__", best_kw),
+  kw_load_confidence(c(.lP$Runs$Bert, .lP$Runs$Kw), best_kw, .which = "marginrel")
+)
+calib_mr   <- kw_calibrate(pred_kw_mr, .target_precision = 0.95, .min_keep = 5L)
+thr_mr     <- calib_mr |> dplyr::select(Label, Threshold) |> tibble::deframe()
+pred_hi_mr <- kw_gate(pred_kw_mr, thr_mr)
+
+kw_selective_summary(pred_hi_mr) |>
+  fmt_table(.caption = "High-precision keyword layer, margin-gated",
+            .pct = c("Coverage", "SelAccuracy"))
+```
+
+```{r}
+orch_subset_compare(tab_route, pred_hi_mr) |>
+  fmt_table(.caption = "Margin gate -- BERT vs keyword on the gate's own subset",
+            .digits = 3, .pct = c("Share", "KwAcc", "BertAcc", "Gap"))
+```
+
+Read the `Gap` column (BertAcc - KwAcc on the keyword-owned partition) against the
+max-score gate's table just above. If both stay positive, BERT wins the covered subset
+no matter how keyword confidence is defined, and the selective router cannot clear
+BERT-everywhere -- the null holds. A `Gap` that flips negative under the margin gate is
+the one result worth chasing: it would mean the keyword arm finally isolates a subset
+it wins, at which point the per-class calibration should be nested inside the folds
+(calibrate on the training folds' out-of-fold predictions, apply to the held-out one)
+before the gain is reported.
+
+# Per-source escalation: can desc or text win a subset?
+
+The tests above route BERT against the *overall* best keyword config. The escalation
+idea is different: hand each **source arm** its own high-precision gate and ask whether
+the clean, low-N `docdesc` arm -- or the body `text` arm -- owns a subset on which it
+beats BERT. `kw_pick_source_configs` (03C) gives the best config per source; each is
+gated at marginrel + 95% per-class precision and overlaid on the same routing spine
+(`orch_subset_compare` reads only BERT's side from `tab_route`, so a different source's
+gate is a valid overlay).
+
+Read the `Gap` column -- BertAcc minus KwAcc on each arm's keyword-owned subset.
+`Gap > 0` on every arm means no source, however clean, carves a subset it wins: the
+desc -> text -> BERT cascade is dead on arrival and a single transformer suffices. A
+`Gap < 0` on the desc arm is the one result that would justify building the 3-tier
+router -- and then the per-class calibration should be nested inside the folds before
+the gain is reported.
+
+```{r}
+src_cfgs <- kw_pick_source_configs(tab_overall, "ClassDetailed")
+
+escalation <- src_cfgs |>
+  dplyr::mutate(
+    Owned = purrr::map(.data$ConfigName, function(cfg_) {
+      clf_cache(paste0("orch_esc__", cfg_), {
+        pred_  <- kw_load_confidence(c(.lP$Runs$Bert, .lP$Runs$Kw), cfg_, .which = "marginrel")
+        calib_ <- kw_calibrate(pred_, .target_precision = 0.95, .min_keep = 5L)
+        thr_   <- stats::setNames(calib_$Threshold, calib_$Label)
+        gated_ <- kw_gate(pred_, thr_)
+        orch_subset_compare(tab_route, gated_) |>
+          dplyr::filter(.data$Owner == "Keyword-owned") |>
+          dplyr::select(NDocs, Share, KwAcc, BertAcc, Gap)
+      })
+    })
+  ) |>
+  dplyr::select(Source, ConfigName, Owned) |>
+  tidyr::unnest(Owned)
+
+escalation |>
+  fmt_table(
+    .caption = "Per-source escalation: BERT vs each source arm on the arm's own gated subset",
+    .digits = 3, .pct = c("Share", "KwAcc", "BertAcc", "Gap")
+  )
+```
+
+# Router comparison (the headline)
+
+Every router scored through the shared layer, with its deployability flag and the
+delta against BERT-everywhere. A near-zero or negative delta on every *deployable*
+router is the clean null the head-to-head predicts; the oracle ceiling shows the
+most any per-class routing could have bought.
+
+```{r}
+compare_routers <- orch_compare(
+  tab_route,
+  .winners  = winners,
+  .kw_gated = pred_hi
+)
+compare_routers |> fmt_table(
+  .caption = "Routers vs BERT-everywhere (DeltaMacroF1 against the incumbent)",
+  .digits = 3, .pct = c("Accuracy", "MacroF1", "Coverage")
+)
+```
+
+```{r}
+#| fig-cap: "Macro-F1 per router. Dashed line = BERT-everywhere; hollow = oracle ceiling (not deployable)."
+orch_plot_compare(compare_routers)
+```
+
+# Optional: Ollama tiebreak on the residue
+
+The last lever. Only the disagreement residue can change, so qwen3:32b is asked to
+adjudicate *only those docs* -- shown the contract header (signal is front-loaded,
+so the opening pages are enough and far cheaper than the full text) and the two
+candidate labels, constrained to a JSON answer that must be one of the two, at
+temperature 0. Every answer is hash-cached, so an interrupted pass resumes for free.
+
+This is the one expensive chunk in 03D (a process spawn per disputed doc). It is
+written to run as-is once a local Ollama is up; until then, leave it for the
+dedicated pass. The result feeds `orch_route_agreement(.tiebreak = "ollama")`, and
+re-running `orch_compare` with `.ollama_pred` adds the "Agreement + Ollama" row.
+
+```{r}
+#| eval: false
+ollama_pred <- orch_ollama_tiebreak(
+  residue, tab_prep,
+  .cache_dir = .lP$Output$OllamaCache,
+  .model = "qwen3:32b",
+  .header_chars = 4000L
+)
+
+compare_all <- orch_compare(
+  tab_route,
+  .winners     = winners,
+  .kw_gated    = pred_hi,
+  .ollama_pred = ollama_pred
+)
+compare_all |> fmt_table(
+  .caption = "Routers incl. the Ollama tiebreak",
+  .digits = 3, .pct = c("Accuracy", "MacroF1", "Coverage")
+)
+```
+
+# Next
+
+03D's verdict is the router comparison table: most likely a null on the deployable
+routers, with the oracle ceiling quantifying the unrealised headroom. Whatever the
+outcome, it is a clean methods result -- routing was tested, not assumed.
+
+- **Read the verdict into the paper.** If deployable routers tie BERT, the finding
+  is "a single fine-tuned transformer is sufficient; routing and an LLM tiebreak add
+  nothing measurable" -- a genuine contribution, since it rules out a plausible-
+  sounding architecture.
+- **03E -- apply.** The deployable model is BERT's `--fit-final` artifact from 03B
+  (the router did not displace it). 03E loads it and labels the full corpus.
+- **Lenient / round-sliced robustness.** `orch_compare(.lenient = TRUE)` and a
+  LabelRound split would confirm the verdict holds on the gold (Round2) slice.
+```
