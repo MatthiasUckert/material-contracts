@@ -627,9 +627,12 @@ kw_decide <- function(.hits, .mine,
 #' @param .min_precision,.min_reach,.max_terms Selection axes.
 #' @param .tau Power threshold.
 #' @param .seed Stamped for parity.
+#' @param .terms_tag Optional short tag identifying a supplied term list. Mined runs pass NULL and
+#'   keep their existing names; only runs scored from a written list are distinguished by it.
 #' @return Character scalar.
 kw_config_name <- function(.label_col, .source, .nwords, .ngram_max, .stopwords,
-                           .min_precision, .min_reach, .max_terms, .tau, .seed = 42L) {
+                           .min_precision, .min_reach, .max_terms, .tau, .seed = 42L,
+                           .terms_tag = NULL) {
   if (FALSE) {
     .label_col     <- "ClassDetailed"
     .source        <- "text"
@@ -641,6 +644,7 @@ kw_config_name <- function(.label_col, .source, .nwords, .ngram_max, .stopwords,
     .max_terms     <- 25L
     .tau           <- 0.70
     .seed          <- 42L
+    .terms_tag     <- NULL
   }
   window_ <- if (.nwords == 0L) "full" else as.character(.nwords)
   sw_     <- c(none = "none", english = "en", domain = "dom", english_domain = "endom")[[.stopwords]]
@@ -651,6 +655,7 @@ kw_config_name <- function(.label_col, .source, .nwords, .ngram_max, .stopwords,
     "_R", sprintf("%03d", round(.min_reach * 1000)),
     "_M", .max_terms,
     "_T", sprintf("%02d", round(.tau * 100)),
+    if (is.null(.terms_tag)) "" else paste0("_X", .terms_tag),
     "_S", .seed
   )
 }
@@ -739,7 +744,15 @@ kw_evaluate <- function(.mine,
     .min_reach     = .min_reach,
     .max_terms     = .max_terms,
     .tau           = .tau,
-    .seed          = .seed
+    .seed          = .seed,
+    # A supplied list is identified by its content, not by its shape. Two lists scored for the same
+    # task, source, window and floors differ in nothing kw_config_name otherwise sees, so without
+    # this the generated and union arms collide and whichever is written second wins the folder.
+    .terms_tag     = if (identical(man_$mode, "manual")) {
+      stringi::stri_sub(man_$terms_hash %||% "nohash", 1L, 6L)
+    } else {
+      NULL
+    }
   )
   run_  <- paste0(cfg_, "_F", man_$test_fold)
   sc_   <- clf_scores(pred_, .none = KW_NONE)
@@ -779,6 +792,9 @@ kw_evaluate <- function(.mine,
     MinReach     = .min_reach,
     MaxTerms     = as.integer(.max_terms),
     Tau          = .tau,
+    Origin       = if (identical(man_$mode, "manual")) "supplied" else "mined",
+    TermsFile    = as.character(man_$terms_file %||% NA_character_),
+    TermsHash    = as.character(man_$terms_hash %||% NA_character_),
     nTerms       = nrow(lex_tau_),
     nClassesHit  = dplyr::n_distinct(pred_$PredLabel[hit_]),
     Coverage     = sc_$Coverage,
@@ -1307,29 +1323,62 @@ kw_summarise_selection <- function(.tab, .label_col = "ClassDetailed") {
 
 #' Choose a configuration by precision, breaking ties on coverage
 #'
-#' Precision differences inside the tolerance are indistinguishable from fold-to-fold noise, so
-#' selecting the maximum among them buys spurious precision at real cost in coverage and compute.
-#' Among configurations that are equivalent on the promise, the widest one is preferred.
+#' Precision is the promise, so it decides; coverage breaks ties inside a band the sample cannot
+#' measure. `.prefer` names axes chosen on grounds no column reports -- readability of the terms --
+#' and is applied only among rows already tied on the promise.
 #'
-#' Where an axis is chosen for a reason a metric does not carry, .prefer states it. The stopword
-#' regime is the case in point: both regimes are judged on the readability of the terms they produce,
-#' which no column reports, so leaving the choice to a coverage tiebreak would silently decide it on
-#' a criterion the document explicitly rejects.
+#' The coverage floor is a PUBLICATION criterion: a table labelling less than a quarter of the corpus
+#' is not a usable artifact. It is not a criterion for a routing arm, where a source that commits
+#' rarely and is nearly always right is exactly what a cascade wants and the transformer backfills
+#' the rest. Applying one threshold to both purposes silently deletes the second: a source clearing
+#' no configuration at the publication bar used to return zero rows into a bind, and every downstream
+#' step -- mine selection, run writing, the router's arm inventory -- inherited the absence without
+#' an error anywhere.
 #'
-#' @param .tab Summary from kw_summarise_mines or kw_summarise_selection.
+#' So the floor is now advisory. Where nothing clears it, the best configuration is returned anyway,
+#' flagged `Publishable = FALSE` and announced. The published table filters on that flag; 03D does
+#' not, and judges an arm by the coverage the inventory reports.
+#'
+#' @param .tab Summarised sweep (kw_summarise_mines or kw_summarise_selection).
 #' @param .tolerance Precision band treated as a tie.
-#' @param .min_coverage Configurations below this coverage are not eligible.
-#' @param .prefer Named list of column-value pairs preferred among tied rows, or NULL.
-#' @return One-row tibble.
-kw_choose_config <- function(.tab, .tolerance = 0.01, .min_coverage = 0.25, .prefer = NULL) {
+#' @param .min_coverage Coverage a configuration needs to be publishable.
+#' @param .prefer Named list of preferred axis levels, applied only among tied rows.
+#' @param .fallback Logical. Return the best configuration even where none clears .min_coverage.
+#' @return One row, carrying a Publishable flag. Zero rows only where .tab was empty.
+kw_choose_config <- function(.tab, .tolerance = 0.01, .min_coverage = 0.25, .prefer = NULL,
+                             .fallback = TRUE) {
   if (FALSE) {
     .tab          <- kw_summarise_mines(.tab = perf_mines)
     .tolerance    <- 0.01
     .min_coverage <- 0.25
     .prefer       <- list(Stopwords = "english_domain")
+    .fallback     <- TRUE
   }
-  tied_ <- .tab |>
-    dplyr::filter(.data$mCoverage >= .min_coverage) |>
+  if (nrow(.tab) == 0L) {
+    cli::cli_alert_warning("kw_choose_config received no rows; nothing to choose from.")
+    return(.tab |> dplyr::mutate(Publishable = logical()))
+  }
+
+  ok_    <- .tab |> dplyr::filter(.data$mCoverage >= .min_coverage)
+  pub_   <- nrow(ok_) > 0L
+  cand_  <- if (pub_) ok_ else .tab
+
+  if (!pub_) {
+    if (!.fallback) {
+      cli::cli_alert_warning(
+        "No configuration reaches {clf_pct(.min_coverage)} coverage and .fallback is FALSE; \\
+         returning nothing."
+      )
+      return(.tab[0, ] |> dplyr::mutate(Publishable = logical()))
+    }
+    cli::cli_alert_warning(
+      "No configuration reaches {clf_pct(.min_coverage)} coverage (best is \\
+       {clf_pct(max(.tab$mCoverage))}). Returning the best anyway, flagged not publishable -- it is \\
+       still a usable routing arm."
+    )
+  }
+
+  tied_ <- cand_ |>
     dplyr::filter(.data$mPrecision >= max(.data$mPrecision, na.rm = TRUE) - .tolerance)
 
   if (!is.null(.prefer)) {
@@ -1342,7 +1391,8 @@ kw_choose_config <- function(.tab, .tolerance = 0.01, .min_coverage = 0.25, .pre
 
   tied_ |>
     dplyr::arrange(dplyr::desc(.data$mCoverage), dplyr::desc(.data$mPrecision)) |>
-    dplyr::slice_head(n = 1L)
+    dplyr::slice_head(n = 1L) |>
+    dplyr::mutate(Publishable = pub_)
 }
 
 #' Survival of proposed terms through the precision and evidence gates

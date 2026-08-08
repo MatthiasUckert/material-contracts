@@ -306,6 +306,16 @@ the ground this document rejects. Removing stopwords costs a little coverage and
 phrases in place of fragments carrying function words, so `english_domain` is preferred wherever the
 two regimes are indistinguishable on the promise.
 
+The coverage floor is advisory rather than binding, and the distinction matters because two documents
+consume this choice. A table labelling less than a quarter of the corpus is not a usable artifact, so
+the floor is the right bar for what this stage publishes. It is the wrong bar for what 03D consumes:
+a source that commits rarely and is nearly always right is exactly what a cascade wants, since the
+transformer backfills everything it declines. Enforcing one threshold for both purposes deleted the
+second silently -- a source clearing nothing at the publication bar returned no rows, and mine
+selection, run writing and the router's arm inventory all inherited the absence without an error
+anywhere. Where nothing clears the floor the best configuration is now returned regardless, flagged
+and announced. The published table filters on that flag; the router does not.
+
 ```{r}
 cfg_mine <- purrr::map(
   .x = c("ClassDetailed", "ClassBroad", "AmendType"),
@@ -315,8 +325,9 @@ cfg_mine <- purrr::map(
         dplyr::filter(Source == .src) |>
         kw_choose_config(
           .tolerance    = 0.01, # precision band treated as a tie
-          .min_coverage = 0.25, # below this a configuration is unusable
-          .prefer       = list(Stopwords = "english_domain") # readability, judged outside the table
+          .min_coverage = 0.25, # below this a configuration is not publishable
+          .prefer       = list(Stopwords = "english_domain"), # readability, judged outside the table
+          .fallback     = TRUE # keep the best configuration even where none clears the floor
         ) |>
         dplyr::mutate(LabelCol = .task, .before = 1L)
     }) |>
@@ -334,10 +345,13 @@ cfg_mine |>
   ) |>
   dplyr::select(LabelCol, Source, Stopwords, Window, NgramMax,
     Classes = mClasses, Coverage,
-    Precision, MacroF1
+    Precision, MacroF1, Publishable
   ) |>
   clf_say_table(.title = "Mining configuration carried forward")
 ```
+
+A row marked not publishable is still evaluated, still written as a run, and still available to 03D.
+It is excluded only from the table this stage ships.
 
 The selection floors are then swept over the winning mining configurations only.
 
@@ -370,8 +384,9 @@ kw_report_selection(.tab = perf_sel, .label_col = "ClassDetailed", .n = 12L)
 sel_best <- kw_summarise_selection(.tab = perf_sel, .label_col = "ClassDetailed") |>
   kw_choose_config(
     .tolerance    = 0.01, # precision band treated as a tie
-    .min_coverage = 0.25, # below this a configuration is unusable
-    .prefer       = NULL # no axis here is chosen on grounds the table does not report
+    .min_coverage = 0.25, # below this a configuration is not publishable
+    .prefer       = NULL, # no axis here is chosen on grounds the table does not report
+    .fallback     = TRUE  # these floors are swept over an already-publishable mine
   )
 
 sel_best |>

@@ -1,12 +1,28 @@
 ---
-title: "Contract Classification -- Orchestration & Routing (03D)"
+title: "Contract Classification -- Routing Between the Arms (03D)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
 
-```{r setup, include=FALSE, purl=FALSE}
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
 knitr::opts_knit$set(root.dir = here::here())
-knitr::opts_chunk$set(root.dir = here::here(), message = FALSE, warning = FALSE)
+
+knitr::opts_chunk$set(
+  root.dir  = here::here(),
+  message   = TRUE,       # mandatory: cli writes through the message stream under knitr, so
+                          # message = FALSE would discard this document's entire output
+  warning   = FALSE,
+  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
+  fig.width = 7.5,        # fixed for every figure; only height varies, and only with row count
+  fig.align = "center",
+  dpi       = 200,
+  out.width = "100%"
+)
+
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -18,348 +34,724 @@ knitr::opts_chunk$set(root.dir = here::here(), message = FALSE, warning = FALSE)
 library <- function(...) suppressPackageStartupMessages(base::library(...))
 ```
 
-```{r echo=FALSE}
-source("1_code/_Initialize.R", encoding = "UTF-8")
-source("1_code/_Utils.R", encoding = "UTF-8")
-source("1_code/_Format.R", encoding = "UTF-8")
+```{r}
+#| label: load-libraries
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+
+# This document consumes the whole stack. 03A owns the folds and the shared scoring layer, 03B the
+# transformer predictions and the per-document probability vectors, 03C the keyword runs. Sourcing
+# all three means every number below is produced by the same scoring code that produced theirs;
+# nothing here is re-estimated.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword"),
+  .f = function(.s) {
+    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+           encoding = "UTF-8")
+  }
+)
 
 cat("Main Directory: ")
-(.dir_main <- init_create_script_dir(here::here(), .name_script))
-
-# 03D consumes the whole stack: 03A (prep + scoring + plots), 03B (BERT per-doc
-# classification + crowned config), 03C (the keyword gate). Source all three, then
-# this file. None are re-run -- 03D reads the predictions they already wrote.
-for (.s in c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword")) {
-  cat(.s, "function file: ")
-  print(.p <- init_create_script_fun(here::here(), .s))
-  source(.p)
-}
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
+))
 
 cat("Function File: ")
-(.path_fun <- init_create_script_fun(here::here(), .name_script))
-source(.path_fun)
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/03D-ClassifyOrchestrate.R
+))
+source(file = .path_fun, encoding = "UTF-8")
 ```
 
-# What 03D is
+# Purpose
 
-03D is the **orchestrator**. 03B and 03C each produced pooled out-of-fold
-predictions on the *identical* frozen folds; 03D takes both and asks the one
-question it exists to answer: **does routing between BERT and keyword (or an LLM
-tiebreak on the hard cases) beat just running BERT everywhere?**
+Two classifiers have been estimated on the same documents and the same folds. The transformer labels
+every document; the keyword table labels only those carrying a term it trusts, and declines the rest.
+An obvious question follows, and it is the one this document answers for each of the three tasks:
+does a rule sending each document to whichever arm handles it best beat simply using the transformer
+everywhere?
 
-The honest prior is *no, or barely*. The head-to-head (03B vs 03C) showed BERT
-winning every class, so per-class accuracy routing has little to route toward. That
-makes 03D a **methods experiment, not an accuracy grab** -- and a clean null is the
-finding. This document is built to make that test legible: it states the incumbent
-(BERT), an unattainable ceiling (oracle), and what every *deployable* router
-actually scores against the incumbent.
+The question is easy to ask and easy to answer badly. There are a few dozen plausible routing rules,
+they are separated by a fraction of a percentage point, and the sample holds 4,400 documents.
+Enumerating the rules on those documents and reporting the winner would produce a number that is part
+routing and part search, with no way to tell which.
 
-Nothing here retrains. Every number is read off the predictions on disk, scored
-through 03A's shared `clf_scores` / `clf_perclass` so it is directly comparable with
-03B and 03C. The single exception is the optional Ollama tiebreak (last section),
-which adjudicates only the disagreement residue.
+So the rule is chosen the way every other decision in this pipeline is made -- inside the folds. For
+each fold in turn, every rule is ranked on the other four and the winner is applied to the fifth. No
+document contributes to choosing the rule that labels it. What the results report is the performance
+of the **procedure**: what a reader who ran this selection would obtain.
 
-Three routers are deployable -- **BERT-everywhere** (baseline), **agreement +
-tiebreak**, and **selective keyword + BERT backfill** -- and one is a diagnostic
-**ceiling** (oracle per-class, which peeks at the true label to bound what routing
-could ever buy).
+## What counts as an arm
 
-## Paths
+An **arm** is one source of per-document predictions scored on the shared folds. Arms differ in one
+respect that governs everything else: whether they can decline. The transformer always commits. A
+keyword arm commits only where a term clears its evidence threshold. Only an always-committing arm
+can end a cascade, because every document must leave with a label.
 
-`prepared.parquet` and both runs roots come from the upstream scripts' own
-directories (same path construction they wrote with, so they always match).
-`clf_load_overall(c(bert, kw))` binds both method families into one leaderboard.
+A **policy** is an ordered list of abstaining arms, a floor applied within each, and a terminal arm
+that catches the rest. Two families are searched. The **cascade** family honours every commitment
+clearing the floor. The **per-class** family honours a commitment only for categories where that arm
+beat the terminal on the training folds -- the deployable counterpart of an oracle, since the
+decision uses training labels only.
+
+## Ties are resolved toward doing nothing
+
+A strict ranking crowns whichever rule leads in the fourth decimal, which on this sample is a
+rounding artifact. Left alone it makes the fold-level winner change for no reason and writes a
+deployment artifact that contradicts the document's own conclusion. So every ranking here resolves
+through a tolerance: among rules within `Tolerance` macro-F1 of the best, the one **routing the
+fewest documents** is taken. The incumbent routes none and therefore wins every tie by construction,
+and routing has to earn its place by a margin the sample can measure. 03C applies the same principle
+to precision when it chooses a keyword configuration.
+
+## Amendment needs a decision, not a workaround
+
+For `AmendType` the keyword engine mines the positive class only and assigns `Original` wherever no
+amendment term fired. That label is the absence of evidence wearing the name of a class: coverage
+reads as complete, the arm looks like a terminal, and the cascade space collapses to "pick one
+method". 03C states the asymmetry in its own bundle script -- *Original is defined by the absence of
+amendment language*.
+
+Naming the labels that count as commitments repairs it. The keyword arm commits to `Amended` and
+abstains otherwise, and the routing question becomes the real one: if an amendment term fires, call
+it amended, otherwise ask the transformer. 03B predicts this fails, because *amended and restated*
+titles many genuine originals. It is now testable rather than assumed.
+
+## Which arms may enter the search
+
+Not all of them. The mined keyword arms were estimated on all five folds; arms scored from a written
+term list were not, because the reading session that produced the list read folds one to four **with
+their labels**. An arm existing on one fold cannot enter a five-fold nested search without
+contaminating four of the five rankings. Those arms are held back and evaluated in Robustness, on the
+fold they are entitled to.
+
+# Configuration
 
 ```{r}
-.dir_prep <- init_create_script_dir(here::here(), "03A-ClassifyPrepare")
-.dir_bert <- init_create_script_dir(here::here(), "03B-ClassifyTrainBERT")
-.dir_kw   <- init_create_script_dir(here::here(), "03C-ClassifyTrainKeyword")
+#| label: configure-paths
+.dir_prep <- init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare")
+.dir_bert <- init_create_script_dir(.dir_here = here::here(), .name_script = "03B-ClassifyTrainBERT")
+.dir_kw   <- init_create_script_dir(.dir_here = here::here(), .name_script = "03C-ClassifyTrainKeyword")
 
 .lP <- list(
   Input = list(
+    # Paths are rebuilt through the same helper the upstream scripts wrote with, so they cannot drift
+    # from where the files actually landed.
     Prepared = utils_file_path(.dir_prep, "prepared.parquet")
   ),
   Runs = list(
-    Bert = utils_file_path(.dir_bert, "runs"),
-    Kw   = utils_file_path(.dir_kw,   "runs")
+    Bert = utils_file_path(.dir_bert, "runs"), # written by 03B
+    Kw   = utils_file_path(.dir_kw,   "runs")  # written by 03C
   ),
   Output = list(
-    OllamaCache = utils_file_path(.dir_main, "_ollama_cache")
+    Policy = utils_file_path(.dir_main, "policy") # the deployment decisions 03E reads
+  ),
+  Param = list(
+    Floors    = c(0, 0.70, 0.80, 0.90), # score floors crossed into the policy grid
+    MaxDepth  = 2L,                     # longest cascade of abstaining arms
+    Families  = c("cascade", "perclass"), # gating families searched
+    Folds     = 5L,                     # folds an arm must cover to enter the nested search
+    Holdout   = 5L,                     # the fold a written term list never read
+    Tolerance = 0.005                   # macro-F1 band treated as indistinguishable
   )
 )
 ```
 
+The tolerance is set below half the fold-level spread 03B reports for the leading transformer
+configurations. It is a claim about measurement, not a preference: differences smaller than this are
+inside the noise of a 4,400-document five-fold estimate, so resolving them by argmax reports the
+resolution of the arithmetic rather than anything about the classifiers.
+
+Nothing in this document is cached. Every step is a join over a few thousand rows and the whole
+search completes in seconds, so a cache would buy no time while introducing the one failure this
+pipeline has already been bitten by: a key naming a computation rather than fingerprinting its input.
+
 ```{r}
-tab_prep    <- arrow::read_parquet(.lP$Input$Prepared)
-tab_overall <- clf_cache("orch_overall",
-  clf_load_overall(c(.lP$Runs$Bert, .lP$Runs$Kw)))
+#| label: load-prepared-sample
+if (!fs::file_exists(.lP$Input$Prepared)) cli::cli_abort("Run 03A before this document")
+tab_prep <- arrow::read_parquet(file = .lP$Input$Prepared)
 ```
 
-The two configs 03D routes between: the crowned BERT config (03B) and the best
-keyword config (03C), both for `ClassDetailed`.
+# The hierarchy
+
+The broad taxonomy is a strict roll-up of the detailed one, so each level could in principle
+constrain the other. 03B already guarantees a *consistent* published hierarchy by deriving the broad
+label from the detailed prediction, so what is at stake here is accuracy, not consistency.
+
+One number bounds what a broad-level constraint could buy, and it is worth stating the expectation
+before reading it. 03B reports that detailed errors concentrate in substantively adjacent category
+pairs. If those pairs share a broad parent, the broad prediction was already right on the documents
+the detailed model got wrong and constraining the detailed decision cannot reach them.
 
 ```{r}
-best_bert <- bert_crowned_config(tab_overall, "ClassDetailed")$config_name
-best_kw   <- kw_leaderboard(dplyr::filter(tab_overall, LabelCol == "ClassDetailed")) |>
-  dplyr::slice(1) |>
-  dplyr::pull(ConfigName)
+#| label: hierarchy-errors
+tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
 
-tibble::tibble(Method = c("BERT", "Keyword"), ConfigName = c(best_bert, best_kw)) |>
-  fmt_table(.caption = "Configs 03D routes between")
-```
-
-# Assemble the routing table
-
-One row per document, both methods side by side: BERT's argmax label with its
-confidence (`Top1Prob`, `Margin`), keyword's argmax label with its `Score`, and the
-`Agree` flag. Because both tracks ran identical folds, the join is one-to-one; a
-shortfall would warn rather than silently drop docs.
-
-```{r}
-tab_route <- clf_cache(
-  paste0("orch_route__", best_bert, "__", best_kw),
-  orch_assemble(c(.lP$Runs$Bert, .lP$Runs$Kw), best_bert, best_kw, tab_prep)
+pred_det <- bert_best_predictions(
+  .tab_overall = tab_overall,    # bound per-fold metrics
+  .runs_roots  = .lP$Runs$Bert,  # run folders to pool from
+  .label_col   = "ClassDetailed" # task
 )
-tab_route |> dplyr::slice_head(n = 8) |>
-  fmt_table(.caption = "Assembled routing table (head)", .digits = 3, .wide = TRUE)
-```
 
-# Per-class head-to-head
-
-The table 03D rests on. Per-class F1 for each method on identical folds, with the
-winner and the gap. If BERT wins every row (the expected case), accuracy routing
-cannot help and the deployable routers below are predicted to tie BERT. Keyword's
-strict F1 here counts an abstention as a miss -- its high-precision contribution is
-the *selective* story further down, not this aggregate.
-
-```{r}
-compare_pc <- clf_cache(
-  paste0("orch_perclass__", best_bert, "__", best_kw),
-  orch_perclass_compare(c(.lP$Runs$Bert, .lP$Runs$Kw), best_bert, best_kw)
+pred_broad <- bert_best_predictions(
+  .tab_overall = tab_overall,   # bound per-fold metrics
+  .runs_roots  = .lP$Runs$Bert, # run folders to pool from
+  .label_col   = "ClassBroad"   # task
 )
-compare_pc |> fmt_table(
-  .caption = "Per-class F1: BERT vs keyword (winner and gap)",
-  .digits = 3
+
+orch_report_hierarchy(
+  .tab = orch_hierarchy_errors(
+    .tab_pred = pred_det, # pooled out-of-fold detailed predictions
+    .tab_prep = tab_prep  # supplies the detailed-to-broad mapping
+  )
 )
 ```
 
-```{r}
-winners <- orch_winner_map(compare_pc)
-```
-
-# Agreement and the residue
-
-How often do the two methods agree, how accurate is each set, and -- on the docs
-they dispute -- who is right more often? If BERT is right far more often than
-keyword on the residue, the safe default (keep BERT) is already near-optimal there
-and a tiebreak has little headroom. This is the diagnostic that predicts, before any
-routing is scored, whether 03D can move the number.
+Reachable headroom is not the same as realisable headroom, and the two are separated by the broad
+model's own error rate: every document where the constraint is imposed on a wrong parent is a
+document the constraint breaks. Both directions are therefore built as arms and made to compete
+rather than argued about. The detailed task gets `bert-hier`, whose detailed choice is restricted to
+the predicted parent's children. The broad task gets `bert-rollup`, the detailed prediction's parent,
+which is the route 03B actually deploys and so the strongest thing in the broad search to beat.
 
 ```{r}
-orch_agreement_summary(tab_route) |>
-  fmt_table(.caption = "Agreement vs residue: share, best-of-two accuracy, who is right",
-            .digits = 3, .pct = c("Share", "EitherAcc", "BertRight", "KwRight"))
-```
-
-The residue itself -- the only documents any tiebreak can change -- carried with
-both candidate labels and BERT's confidence:
-
-```{r}
-residue <- orch_disagreement_set(tab_route)
-cli::cli_alert_info("Residue: {nrow(residue)} of {nrow(tab_route)} docs")
-residue |> dplyr::slice_head(n = 10) |>
-  fmt_table(.caption = "Disagreement residue (head)", .digits = 3)
-```
-
-# The selective keyword layer (from 03C)
-
-Rebuild 03C's high-precision keyword gate so the selective router can use it:
-calibrate a per-class cutoff to 95% precision, then gate. Whatever this layer
-commits to, keyword owns; BERT backfills the rest.
-
-```{r}
-pred_kw <- clf_cache(
-  paste0("orch_kwpred__", best_kw),
-  clf_pool_predictions(c(.lP$Runs$Bert, .lP$Runs$Kw), best_kw)
+#| label: build-derived-arms
+class_det <- bert_classification(
+  .runs_roots  = .lP$Runs$Bert,                                                    # run folders
+  .config_name = bert_best_config(.tab_overall = tab_overall, .label_col = "ClassDetailed"),
+  .tab_prep    = tab_prep                                                          # document metadata
 )
-calib   <- kw_calibrate(pred_kw, .target_precision = 0.95, .min_keep = 5L)
-thr_    <- calib |> dplyr::select(Label, Threshold) |> tibble::deframe()
-pred_hi <- kw_gate(pred_kw, thr_)
 
-kw_selective_summary(pred_hi) |>
-  fmt_table(.caption = "High-precision keyword layer (per-class gated)",
-            .pct = c("Coverage", "SelAccuracy"))
-```
-
-A high selective accuracy only matters relative to **what BERT scores on the very
-same documents the gate kept**. Because an easy, prototypical contract is easy for
-both methods, keyword's confident subset overlaps BERT's confident subset -- so the
-honest test is the head-to-head on the keyword-owned partition, not the gate's
-accuracy against BERT's *global* number. If BERT wins the Keyword-owned row, handing
-those docs to keyword strictly loses, which is exactly why the selective router
-cannot clear BERT-everywhere.
-
-```{r}
-orch_subset_compare(tab_route, pred_hi) |>
-  fmt_table(.caption = "BERT vs keyword on the gate's own subset (KwAcc NA where keyword abstained)",
-            .digits = 3, .pct = c("Share", "KwAcc", "BertAcc", "Gap"))
-```
-
-## Does a margin-based gate change the verdict?
-
-The `Score` the gate above thresholds on is the engine's fold-normalised MAX class
-score -- a *between-document* magnitude (how much class-exclusive vocabulary a doc
-carries), not a *within-document* separation. The sharper selective signal is the
-**margin**: top-1 minus top-2 class score, i.e. how decisively the winning class beats
-the runner-up for *this* document. `kw_load_confidence` rebuilds the keyword
-predictions with `Score` swapped for the scale-free relative margin, so the *same*
-`kw_calibrate` -> `kw_gate` -> `orch_subset_compare` runs on it unchanged. If even a
-margin-built gate cannot win its own covered subset, the null is robust to how keyword
-confidence is defined.
-
-```{r}
-pred_kw_mr <- clf_cache(
-  paste0("orch_kwpred_mr__", best_kw),
-  kw_load_confidence(c(.lP$Runs$Bert, .lP$Runs$Kw), best_kw, .which = "marginrel")
+arm_hier <- orch_arm_hierarchical(
+  .class_detailed = class_det,  # carries the P_<Class> probability vector
+  .pred_broad     = pred_broad, # the constraint
+  .tab_prep       = tab_prep,   # supplies the mapping
+  .arm            = "bert-hier" # name it carries through the search
 )
-calib_mr   <- kw_calibrate(pred_kw_mr, .target_precision = 0.95, .min_keep = 5L)
-thr_mr     <- calib_mr |> dplyr::select(Label, Threshold) |> tibble::deframe()
-pred_hi_mr <- kw_gate(pred_kw_mr, thr_mr)
 
-kw_selective_summary(pred_hi_mr) |>
-  fmt_table(.caption = "High-precision keyword layer, margin-gated",
-            .pct = c("Coverage", "SelAccuracy"))
+arm_rollup <- orch_arm_rollup(
+  .pred_detailed = pred_det,      # pooled detailed predictions
+  .tab_prep      = tab_prep,      # supplies the mapping
+  .arm           = "bert-rollup"  # name it carries through the search
+)
+```
+
+# Selection
+
+Each task is run end to end by the same call. The rules a reader would want to check are named
+arguments rather than constants inside the function: how many folds an arm must cover, which labels
+count as commitments, how wide the search is, and what counts as a tie.
+
+## Detailed taxonomy
+
+```{r}
+#| label: run-detailed
+res_det <- orch_run_task(
+  .runs_roots  = c(.lP$Runs$Bert, .lP$Runs$Kw), # both trees; the run schema is shared
+  .label_col   = "ClassDetailed",               # task
+  .tab_prep    = tab_prep,                      # prepared sample
+  .extra_arms  = arm_hier,                      # the broad-constrained transformer
+  .floors      = .lP$Param$Floors,              # score floors to cross in
+  .max_depth   = .lP$Param$MaxDepth,            # longest cascade
+  .families    = .lP$Param$Families,            # gating families
+  .commit_only = NULL,                          # every label is a commitment on a categorical task
+  .n_folds     = .lP$Param$Folds,               # folds required to enter the nested search
+  .tolerance   = .lP$Param$Tolerance,           # macro-F1 band treated as a tie
+  .lenient     = FALSE,                         # strict scoring; leniency is a robustness slice
+  .carry       = c("ClassDetailed2", "LabelRound") # columns the robustness slices need
+)
 ```
 
 ```{r}
-orch_subset_compare(tab_route, pred_hi_mr) |>
-  fmt_table(.caption = "Margin gate -- BERT vs keyword on the gate's own subset",
-            .digits = 3, .pct = c("Share", "KwAcc", "BertAcc", "Gap"))
+#| label: report-detailed-arms
+orch_report_arms(
+  .tab       = res_det$Arms,      # the inventory
+  .n_folds   = .lP$Param$Folds,   # folds required to enter the nested search
+  .label_col = res_det$LabelCol   # task, for the heading
+)
 ```
 
-Read the `Gap` column (BertAcc - KwAcc on the keyword-owned partition) against the
-max-score gate's table just above. If both stay positive, BERT wins the covered subset
-no matter how keyword confidence is defined, and the selective router cannot clear
-BERT-everywhere -- the null holds. A `Gap` that flips negative under the margin gate is
-the one result worth chasing: it would mean the keyword arm finally isolates a subset
-it wins, at which point the per-class calibration should be nested inside the folds
-(calibrate on the training folds' out-of-fold predictions, apply to the held-out one)
-before the gain is reported.
-
-# Per-source escalation: can desc or text win a subset?
-
-The tests above route BERT against the *overall* best keyword config. The escalation
-idea is different: hand each **source arm** its own high-precision gate and ask whether
-the clean, low-N `docdesc` arm -- or the body `text` arm -- owns a subset on which it
-beats BERT. `kw_pick_source_configs` (03C) gives the best config per source; each is
-gated at marginrel + 95% per-class precision and overlaid on the same routing spine
-(`orch_subset_compare` reads only BERT's side from `tab_route`, so a different source's
-gate is a valid overlay).
-
-Read the `Gap` column -- BertAcc minus KwAcc on each arm's keyword-owned subset.
-`Gap > 0` on every arm means no source, however clean, carves a subset it wins: the
-desc -> text -> BERT cascade is dead on arrival and a single transformer suffices. A
-`Gap < 0` on the desc arm is the one result that would justify building the 3-tier
-router -- and then the per-class calibration should be nested inside the folds before
-the gain is reported.
+```{r}
+#| label: report-detailed-spine
+orch_report_spine(.spine = res_det$Spine)
+```
 
 ```{r}
-src_cfgs <- kw_pick_source_configs(tab_overall, "ClassDetailed")
+#| label: report-detailed-stability
+orch_report_stability(.tab_nested = res_det$Nested)
+```
 
-escalation <- src_cfgs |>
-  dplyr::mutate(
-    Owned = purrr::map(.data$ConfigName, function(cfg_) {
-      clf_cache(paste0("orch_esc__", cfg_), {
-        pred_  <- kw_load_confidence(c(.lP$Runs$Bert, .lP$Runs$Kw), cfg_, .which = "marginrel")
-        calib_ <- kw_calibrate(pred_, .target_precision = 0.95, .min_keep = 5L)
-        thr_   <- stats::setNames(calib_$Threshold, calib_$Label)
-        gated_ <- kw_gate(pred_, thr_)
-        orch_subset_compare(tab_route, gated_) |>
-          dplyr::filter(.data$Owner == "Keyword-owned") |>
-          dplyr::select(NDocs, Share, KwAcc, BertAcc, Gap)
-      })
-    })
+## Broad taxonomy
+
+```{r}
+#| label: run-broad
+res_broad <- orch_run_task(
+  .runs_roots  = c(.lP$Runs$Bert, .lP$Runs$Kw), # both trees
+  .label_col   = "ClassBroad",                  # task
+  .tab_prep    = tab_prep,                      # prepared sample
+  .extra_arms  = arm_rollup,                    # the rolled-up detailed prediction
+  .floors      = .lP$Param$Floors,              # unchanged
+  .max_depth   = .lP$Param$MaxDepth,            # unchanged
+  .families    = .lP$Param$Families,            # unchanged
+  .commit_only = NULL,                          # categorical task
+  .n_folds     = .lP$Param$Folds,               # unchanged
+  .tolerance   = .lP$Param$Tolerance,           # unchanged
+  .lenient     = FALSE,                         # strict scoring
+  .carry       = "LabelRound"                   # ClassDetailed2 is a detailed label; useless here
+)
+```
+
+```{r}
+#| label: report-broad-arms
+orch_report_arms(
+  .tab       = res_broad$Arms,    # the inventory
+  .n_folds   = .lP$Param$Folds,   # folds required to enter the nested search
+  .label_col = res_broad$LabelCol # task, for the heading
+)
+```
+
+```{r}
+#| label: report-broad-stability
+orch_report_stability(.tab_nested = res_broad$Nested)
+```
+
+## Amendment
+
+`.commit_only` is the whole difference. Without it the keyword arm reports complete coverage, is
+classed as a terminal, and no cascade exists to search over.
+
+```{r}
+#| label: run-amendment
+res_amend <- orch_run_task(
+  .runs_roots  = c(.lP$Runs$Bert, .lP$Runs$Kw), # both trees
+  .label_col   = "AmendType",                   # task
+  .tab_prep    = tab_prep,                      # prepared sample
+  .extra_arms  = NULL,                          # no hierarchy to exploit on a binary task
+  .floors      = .lP$Param$Floors,              # unchanged
+  .max_depth   = .lP$Param$MaxDepth,            # unchanged
+  .families    = .lP$Param$Families,            # unchanged
+  .commit_only = "Amended",                     # "Original" is the absence of evidence, not a label
+  .n_folds     = .lP$Param$Folds,               # unchanged
+  .tolerance   = .lP$Param$Tolerance,           # unchanged
+  .lenient     = FALSE,                         # strict scoring
+  .carry       = "LabelRound"                   # dual labels do not apply to a binary task
+)
+```
+
+```{r}
+#| label: report-amendment-arms
+orch_report_arms(
+  .tab       = res_amend$Arms,    # the inventory
+  .n_folds   = .lP$Param$Folds,   # folds required to enter the nested search
+  .label_col = res_amend$LabelCol # task, for the heading
+)
+```
+
+```{r}
+#| label: report-amendment-stability
+orch_report_stability(.tab_nested = res_amend$Nested)
+```
+
+The coverage the keyword arm reports here is the share of documents in which an amendment term fired
+at all. Read it against 03B's finding: if that share is large and its selective precision is modest,
+the arm is firing on originals, which is exactly the failure that made a transformer necessary.
+
+# Results
+
+```{r}
+#| label: results-verdicts
+verdicts <- orch_verdicts(.results = list(res_det, res_broad, res_amend))
+orch_report_verdicts(.tab = verdicts)
+```
+
+The `Moved` column is the one to read first. A procedure that moved no documents did not fail to find
+a gain; it declined to route, on every fold, and the tolerance is what let it. A procedure that moved
+many documents for a delta near zero found real structure and traded it away, which reads differently
+in the text and is visible only in the movement table below.
+
+## Detailed taxonomy
+
+```{r}
+#| label: results-detailed-compare
+orch_report_compare(.tab = res_det$Compare, .title = "ClassDetailed")
+```
+
+```{r}
+#| label: results-detailed-movement
+orch_report_movement(.tab = res_det$Movement)
+```
+
+```{r}
+#| label: results-detailed-perclass
+clf_report_perclass(
+  .tab_pred = res_det$Nested,                          # routed, held-out predictions
+  .title    = "Routed procedure -- per category"       # heading
+)
+```
+
+Per-category scores are where a null aggregate becomes informative or stays inert. Routing that
+leaves macro-F1 unchanged while lifting one thin category and depressing another has found structure
+and traded it away; routing that leaves every category where it was has found nothing.
+
+## Broad taxonomy
+
+```{r}
+#| label: results-broad-compare
+orch_report_compare(.tab = res_broad$Compare, .title = "ClassBroad")
+```
+
+```{r}
+#| label: results-broad-movement
+orch_report_movement(.tab = res_broad$Movement)
+```
+
+## Amendment
+
+```{r}
+#| label: results-amendment-compare
+orch_report_compare(.tab = res_amend$Compare, .title = "AmendType")
+```
+
+```{r}
+#| label: results-amendment-movement
+orch_report_movement(.tab = res_amend$Movement)
+```
+
+```{r}
+#| label: results-amendment-confusion
+clf_say_table(
+  .tab   = clf_confusion(.tab_pred = res_amend$Nested), # routed labels against the truth
+  .title = "Amendment -- confusion after routing"       # heading
+)
+```
+
+# Validation
+
+The routed labels must not contradict each other across taxonomy levels in a released dataset. Rolling
+the routed detailed prediction up to its parent and scoring it at the broad level says whether routing
+broke the property 03B established, and whether the routed detailed labels remain at least as good a
+route to the broad taxonomy as the broad task's own output.
+
+```{r}
+#| label: validation-hierarchy
+dplyr::bind_rows(
+  clf_scores(
+    .tab_pred = clf_rollup_to_broad(
+      .tab_pred = res_det$Nested, # routed detailed predictions
+      .tab_prep = tab_prep        # supplies the detailed-to-broad mapping
+    )
   ) |>
-  dplyr::select(Source, ConfigName, Owned) |>
-  tidyr::unnest(Owned)
+    dplyr::mutate(Route = "Routed detailed, rolled up", .before = 1),
+  clf_scores(
+    .tab_pred = clf_rollup_to_broad(.tab_pred = pred_det, .tab_prep = tab_prep)
+  ) |>
+    dplyr::mutate(Route = "Transformer detailed, rolled up", .before = 1),
+  clf_scores(.tab_pred = res_broad$Nested) |>
+    dplyr::mutate(Route = "Routed broad, direct", .before = 1),
+  clf_scores(.tab_pred = pred_broad) |>
+    dplyr::mutate(Route = "Transformer broad, direct", .before = 1)
+) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  clf_say_table(.title = "Four routes to the broad taxonomy, all scored at the broad level")
+```
 
-escalation |>
-  fmt_table(
-    .caption = "Per-source escalation: BERT vs each source arm on the arm's own gated subset",
-    .digits = 3, .pct = c("Share", "KwAcc", "BertAcc", "Gap")
+Four routes converging within noise is the substantive finding, not a null: it says the two taxonomy
+levels carry the same information and neither improves the other. That turns 03B's decision to derive
+the published broad label by roll-up from a consistency argument into a measured one.
+
+# Robustness
+
+## The curated arms, on the fold they are entitled to
+
+Arms scored from a written term list read folds one to four with their labels, so the fifth fold is
+their only honest test. The check is paired: the same selection runs on the same fold-five documents
+with and without those arms available, so the two cascades are compared on identical rows.
+
+The comparison is deliberately bounded. One fold holds roughly a fifth of the sample and the keyword
+arms abstain on much of it, so only a large difference would be visible. A null here says the curated
+terms did not change the ordering on the documents available to test them, and no more than that.
+
+```{r}
+#| label: robustness-curated-arms
+# Start from the spine the headline used, restricted to the holdout fold, so the derived arm is
+# present here too and the two cascades differ only in the curated arms.
+spine_hold <- res_det$Spine |>
+  dplyr::filter(Fold == .lP$Param$Holdout)
+
+if (nrow(res_det$ArmsHeld) > 0L) {
+  spine_hold <- dplyr::bind_rows(
+    spine_hold,
+    orch_spine(
+      .runs_roots = c(.lP$Runs$Bert, .lP$Runs$Kw), # both trees
+      .arms       = res_det$ArmsHeld,              # the fold-restricted arms
+      .tab_prep   = tab_prep                       # document-level columns
+    ) |>
+      dplyr::filter(Fold == .lP$Param$Holdout)
   )
+}
+
+# Only arms actually committing on this fold can be gated; one absent from these rows would
+# contribute nothing and make the comparison look like a null it did not earn.
+roles_hold <- orch_roles(.spine = spine_hold)
+
+policies_hold <- orch_policy_grid(
+  .arms_gated = roles_hold$Arm[roles_hold$Role == "gated"],    # curated arms included
+  .terminals  = roles_hold$Arm[roles_hold$Role == "terminal"], # unchanged
+  .floors     = .lP$Param$Floors,                              # unchanged
+  .max_depth  = .lP$Param$MaxDepth,                            # unchanged
+  .families   = .lP$Param$Families                             # unchanged
+)
+
+dplyr::bind_rows(
+  orch_score_policies(.spine = spine_hold, .policies = res_det$Policies) |>
+    orch_pick_policy(.tolerance = .lP$Param$Tolerance) |>
+    dplyr::mutate(Arms = "Mined arms only", .before = 1),
+  orch_score_policies(.spine = spine_hold, .policies = policies_hold) |>
+    orch_pick_policy(.tolerance = .lP$Param$Tolerance) |>
+    dplyr::mutate(Arms = "Mined plus curated", .before = 1)
+) |>
+  dplyr::mutate(Accuracy = clf_pct(Accuracy), MacroF1 = sprintf("%.3f", MacroF1)) |>
+  dplyr::select(Arms, Label, Accuracy, MacroF1, nRouted) |>
+  clf_say_table(.title = "Holdout fold: does hand curation change the best cascade?")
 ```
 
-# Router comparison (the headline)
+With no fold-restricted arms on disk, the two rows are identical by construction and the check is
+inert rather than wrong. It becomes informative as soon as a curated term list exists.
 
-Every router scored through the shared layer, with its deployability flag and the
-delta against BERT-everywhere. A near-zero or negative delta on every *deployable*
-router is the clean null the head-to-head predicts; the oracle ceiling shows the
-most any per-class routing could have bought.
+## Lenient scoring
+
+A minority of documents carry a second valid category. Scoring the routed detailed labels leniently
+asks whether predictions counted as wrong were in fact the document's other valid answer -- a rule
+that appears to break labels may only be choosing the second valid one. The check applies to the
+detailed task alone, since `ClassDetailed2` is a detailed label.
 
 ```{r}
-compare_routers <- orch_compare(
-  tab_route,
-  .winners  = winners,
-  .kw_gated = pred_hi
-)
-compare_routers |> fmt_table(
-  .caption = "Routers vs BERT-everywhere (DeltaMacroF1 against the incumbent)",
-  .digits = 3, .pct = c("Accuracy", "MacroF1", "Coverage")
-)
+#| label: robustness-lenient
+dplyr::bind_rows(
+  clf_scores(.tab_pred = res_det$Nested, .lenient = FALSE) |>
+    dplyr::mutate(Scoring = "Strict", .before = 1),
+  clf_scores(.tab_pred = res_det$Nested, .lenient = TRUE) |>
+    dplyr::mutate(Scoring = "Lenient", .before = 1)
+) |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  clf_say_table(.title = "Routed detailed procedure under strict and lenient scoring")
+```
+
+## Label provenance
+
+The second labelling round is the harder subset rather than a random sample, so a rule helping only
+on the first round would be exploiting the easier documents.
+
+```{r}
+#| label: robustness-label-round
+purrr::map(
+  .x = list(res_det, res_broad, res_amend),
+  .f = function(.r) {
+    dplyr::bind_rows(
+      clf_scores(.tab_pred = .r$Nested) |>
+        dplyr::mutate(Labels = "Both rounds", .before = 1),
+      clf_scores(.tab_pred = dplyr::filter(.r$Nested, LabelRound == "Round2")) |>
+        dplyr::mutate(Labels = "Round 2 only", .before = 1)
+    ) |>
+      dplyr::mutate(LabelCol = .r$LabelCol, .before = 1)
+  }
+) |>
+  purrr::list_rbind() |>
+  dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+  dplyr::select(LabelCol, Labels, Accuracy, F1_macro, N) |>
+  clf_say_table(.title = "Routed procedures by label provenance")
+```
+
+# Deployment
+
+The folds paid for the estimate; the full sample produces the artifact. The policy deployed is the one
+the same selection crowns with every fold available, under the same tolerance, so the artifact cannot
+contradict the document's own conclusion by preferring a fourth-decimal winner.
+
+```{r}
+#| label: deploy-leaderboards
+purrr::map(
+  .x = list(res_det, res_broad, res_amend),
+  .f = function(.r) {
+    .r$Final$Rank |>
+      head(5) |>
+      dplyr::mutate(LabelCol = .r$LabelCol, .before = 1)
+  }
+) |>
+  purrr::list_rbind() |>
+  dplyr::mutate(Accuracy = clf_pct(Accuracy), MacroF1 = sprintf("%.3f", MacroF1)) |>
+  dplyr::select(LabelCol, Label, Accuracy, MacroF1, nRouted) |>
+  clf_say_table(.title = "All-fold leaderboards, top five per task")
 ```
 
 ```{r}
-#| fig-cap: "Macro-F1 per router. Dashed line = BERT-everywhere; hollow = oracle ceiling (not deployable)."
-orch_plot_compare(compare_routers)
+#| label: deploy-save-policies
+purrr::walk2(
+  .x = list(res_det, res_broad, res_amend),
+  .y = list(NULL, NULL, "Amended"), # what each task let a keyword arm commit to
+  .f = function(.r, .commit) {
+    orch_save_policy(
+      .final       = .r$Final,        # chosen policy plus its per-class gate
+      .arms        = .r$Arms,         # records the ConfigName behind each arm name
+      .label_col   = .r$LabelCol,     # the task this policy applies to
+      .dir         = .lP$Output$Policy, # destination 03E reads
+      .commit_only = .commit,         # recorded so 03E reproduces the same abstention rule
+      .stem        = "routing_policy" # file stem
+    )
+  }
+)
 ```
 
-# Optional: Ollama tiebreak on the residue
+03E reads these files and applies them. It makes no routing decision of its own: an apply script that
+re-derived a policy would be free to re-derive it differently, and the released labels would then
+depend on which script last ran.
 
-The last lever. Only the disagreement residue can change, so qwen3:32b is asked to
-adjudicate *only those docs* -- shown the contract header (signal is front-loaded,
-so the opening pages are enough and far cheaper than the full text) and the two
-candidate labels, constrained to a JSON answer that must be one of the two, at
-temperature 0. Every answer is hash-cached, so an interrupted pass resumes for free.
+# Overview
 
-This is the one expensive chunk in 03D (a process spawn per disputed doc). It is
-written to run as-is once a local Ollama is up; until then, leave it for the
-dedicated pass. The result feeds `orch_route_agreement(.tiebreak = "ollama")`, and
-re-running `orch_compare` with `.ollama_pred` adds the "Agreement + Ollama" row.
+Everything above in one place, per task, followed by the figures. Nothing here is new.
 
 ```{r}
-#| eval: false
-ollama_pred <- orch_ollama_tiebreak(
-  residue, tab_prep,
-  .cache_dir = .lP$Output$OllamaCache,
-  .model = "qwen3:32b",
-  .header_chars = 4000L
-)
-
-compare_all <- orch_compare(
-  tab_route,
-  .winners     = winners,
-  .kw_gated    = pred_hi,
-  .ollama_pred = ollama_pred
-)
-compare_all |> fmt_table(
-  .caption = "Routers incl. the Ollama tiebreak",
-  .digits = 3, .pct = c("Accuracy", "MacroF1", "Coverage")
-)
+#| label: overview-verdicts
+orch_report_verdicts(.tab = verdicts)
 ```
+
+::: {.panel-tabset}
+
+## Detailed
+
+```{r}
+#| label: overview-report-detailed
+orch_report_all(.res = res_det, .n_folds = .lP$Param$Folds)
+```
+
+## Broad
+
+```{r}
+#| label: overview-report-broad
+orch_report_all(.res = res_broad, .n_folds = .lP$Param$Folds)
+```
+
+## Amendment
+
+```{r}
+#| label: overview-report-amendment
+orch_report_all(.res = res_amend, .n_folds = .lP$Param$Folds)
+```
+
+:::
+
+## Strategies compared
+
+::: {.panel-tabset}
+
+### Detailed
+
+```{r}
+#| label: fig-compare-detailed
+#| fig-height: 3.4
+#| fig-cap: "Macro-F1 by strategy, detailed taxonomy. The dashed line is the incumbent; the hollow
+#|   bar was selected and scored on the same documents and is not obtainable by running the procedure."
+orch_plot_compare(.compare = res_det$Compare)
+```
+
+### Broad
+
+```{r}
+#| label: fig-compare-broad
+#| fig-height: 3.4
+#| fig-cap: "Macro-F1 by strategy, broad taxonomy."
+orch_plot_compare(.compare = res_broad$Compare)
+```
+
+### Amendment
+
+```{r}
+#| label: fig-compare-amendment
+#| fig-height: 2.4
+#| fig-cap: "Macro-F1 by strategy, amendment task."
+orch_plot_compare(.compare = res_amend$Compare)
+```
+
+:::
+
+## How much each fold actually routed
+
+::: {.panel-tabset}
+
+### Detailed
+
+```{r}
+#| label: fig-stability-detailed
+#| fig-height: 2.4
+#| fig-cap: "Documents the crowned policy moved away from the terminal, per held-out fold. A fold at
+#|   zero ran the incumbent whatever its winning policy was called."
+orch_plot_stability(.tab_nested = res_det$Nested)
+```
+
+### Broad
+
+```{r}
+#| label: fig-stability-broad
+#| fig-height: 2.4
+#| fig-cap: "Documents routed per held-out fold, broad taxonomy."
+orch_plot_stability(.tab_nested = res_broad$Nested)
+```
+
+### Amendment
+
+```{r}
+#| label: fig-stability-amendment
+#| fig-height: 2.4
+#| fig-cap: "Documents routed per held-out fold, amendment task."
+orch_plot_stability(.tab_nested = res_amend$Nested)
+```
+
+:::
+
+## Per-category performance after routing
+
+::: {.panel-tabset}
+
+### Detailed
+
+```{r}
+#| label: fig-perclass-detailed
+#| fig-height: 4.6
+#| fig-cap: "Per-category F1 for the routed procedure, detailed taxonomy."
+clf_plot_perclass(.tab_pred = res_det$Nested)
+```
+
+### Broad
+
+```{r}
+#| label: fig-perclass-broad
+#| fig-height: 3.4
+#| fig-cap: "Per-category F1 for the routed procedure, broad taxonomy."
+clf_plot_perclass(.tab_pred = res_broad$Nested)
+```
+
+### Amendment
+
+```{r}
+#| label: fig-perclass-amendment
+#| fig-height: 2.4
+#| fig-cap: "Per-category F1 for the routed procedure, amendment task."
+clf_plot_perclass(.tab_pred = res_amend$Nested)
+```
+
+:::
 
 # Next
 
-03D's verdict is the router comparison table: most likely a null on the deployable
-routers, with the oracle ceiling quantifying the unrealised headroom. Whatever the
-outcome, it is a clean methods result -- routing was tested, not assumed.
+`03E` applies the deployed models to the full corpus, reading the routing policies written here rather
+than deciding its own. The keyword table remains an independent artifact of 03C: it ships alongside
+the archived dataset and does not enter the labelling path, whatever this document concludes about
+routing.
 
-- **Read the verdict into the paper.** If deployable routers tie BERT, the finding
-  is "a single fine-tuned transformer is sufficient; routing and an LLM tiebreak add
-  nothing measurable" -- a genuine contribution, since it rules out a plausible-
-  sounding architecture.
-- **03E -- apply.** The deployable model is BERT's `--fit-final` artifact from 03B
-  (the router did not displace it). 03E loads it and labels the full corpus.
-- **Lenient / round-sliced robustness.** `orch_compare(.lenient = TRUE)` and a
-  LabelRound split would confirm the verdict holds on the gold (Round2) slice.
-```
+One extension needs no change here. Regenerating the curated term lists once per fold would promote
+the written-list arms out of Robustness into the nested search proper, at which point the `nFolds`
+filter admits them automatically and the mined and curated arms compete on equal terms across all five
+folds.
