@@ -1,12 +1,13 @@
 ---
-title: "Contract Classification -- Keyword Sweep (03C)"
+title: "Contract Classification: The Keyword Table (03C)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
 
 ```{r setup, include=FALSE, purl=FALSE}
 knitr::opts_knit$set(root.dir = here::here())
-knitr::opts_chunk$set(root.dir = here::here(), message = FALSE, warning = FALSE)
+knitr::opts_chunk$set(root.dir = here::here(), message = TRUE, warning = FALSE, comment = "")
+options(cli.num_colors = 1, cli.width = 120)
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -19,358 +20,769 @@ library <- function(...) suppressPackageStartupMessages(base::library(...))
 ```
 
 ```{r echo=FALSE}
-source("1_code/_Initialize.R", encoding = "UTF-8")
-source("1_code/_Utils.R", encoding = "UTF-8")
-source("1_code/_Format.R", encoding = "UTF-8")
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+
+# 03A owns sample preparation and the shared scoring, leaderboard and reporting layer. Sourcing it
+# here is what makes the keyword and transformer arms comparable: both are scored by the same code
+# on the same folds rather than by two similar implementations that disagree at the third decimal.
+source(init_create_script_fun(here::here(), "03A-ClassifyPrepare"), encoding = "UTF-8")
 
 cat("Main Directory: ")
-(.dir_main <- init_create_script_dir(here::here(), .name_script))
-
-# 03A owns the common layer (prep + scoring + plots); source it, then this file.
-cat("03A function file: ")
-(.path_fun_prep <- init_create_script_fun(here::here(), "03A-ClassifyPrepare"))
-source(.path_fun_prep)
+(.dir_main <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script))
 
 cat("Function File: ")
-(.path_fun <- init_create_script_fun(here::here(), .name_script))
+(.path_fun <- init_create_script_fun(.dir_here = here::here(), .name_script = .name_script))
 source(.path_fun)
 ```
 
-# What 03C is
+# Purpose
 
-03C is the **keyword classifier**: a transparent, lexical counterpart to BERT (03B)
-on the *identical* frozen folds. For each contract type it mines a per-class lexicon
-(the discriminative terms and n-grams) on the training folds and predicts the
-held-out fold by which class's lexicon fires hardest, abstaining (`(none)`) when
-nothing fires. It exists for the head-to-head: where keyword matches BERT, the
-cheaper, fully-interpretable method wins; where it lags, that gap motivates routing
-(03D).
+The transformer classifier trained in 03B is the deployed model. This stage produces something it
+cannot: a short, ranked, human-readable table of terms per contract type, applicable to EDGAR with a
+text editor and no GPU, carrying a stated precision and a stated coverage.
 
-Two things make this clean rather than a parallel re-implementation:
+That is an artifact rather than a model, and it needs a different objective. A keyword classifier
+tuned for accuracy maximises an aggregate score and will accept any term that helps it, including
+terms no reader could act on. A keyword table tuned for publication accepts only terms that mean what
+they appear to mean, and reports honestly how much of the corpus it therefore declines to label.
 
-- **It reuses 03A's prepared parquet and scoring layer.** The single
-  `prepared.parquet` already carries `DocDesc`, so there is no keyword-specific prep
-  -- the engine points `--data` at 03A's output. Scoring goes through `clf_scores` /
-  `clf_perclass` / `clf_confusion`, abstention-aware by default (`.none = "(none)"`).
-- **The engine writes the same run-folder schema as the BERT trainer**
-  (`predictions` / `probabilities` / `metrics_overall` / `metrics_perclass` /
-  `config.json`) plus `lexicon.parquet`. So `clf_load_overall` binds keyword and BERT
-  runs together, and 03D consumes both with no special-casing.
+## How a term earns its place
 
-The method adds three concepts: **Source** (`text` body, `docdesc` filer title, or
-`combined`), **Coverage** (the share of docs it predicts, i.e. 1 - abstention rate),
-and the `(none)` abstention sentinel.
+**Power** is the Wilson 95 percent lower bound on a term's training precision. It is bounded in
+`[0, 1]` and monotone in both precision and evidence:
 
-Two design points this version foregrounds, because they drive the escalation idea
-(03D) and the high-precision-at-low-N goal:
+| Occurrences | Raw precision | Power |
+|:--|--:|--:|
+| 2 of 2 | 1.000 | 0.342 |
+| 10 of 10 | 1.000 | 0.722 |
+| 45 of 50 | 0.900 | 0.786 |
+| 190 of 200 | 0.950 | 0.910 |
 
-- **The desc and text lexicons are mined independently.** Even a `combined` run mines
-  a separate per-class lexicon for each field (the engine stamps a `Zone`) and fuses
-  only the *scores* (`alpha * docdesc + text`), never the lists. So an independent
-  Desc list and Text list already exist for every run -- surfaced below.
-- **Keyword regex is cheap**, so this version sweeps wider: `source` x `stopwords` x
-  `topk` x `ngram_max`. The `topk` lift (25 -> 50) is the main lever for rare-class
-  recall, and the per-class selective layer turns the result into a high-precision
-  subset even where a class is small.
+Raw precision cannot distinguish a coincidence from a pattern; it ranks two-of-two above
+one-hundred-and-ninety-of-two-hundred. Power ranks them the other way and reads directly as "a hit
+means this category at least this often, with 95 percent confidence". It is the sort key of the
+published table and the evidence gate at scoring time.
 
-Scope note: amendment classification is settled to BERT (lexical separation is
-intractable -- "amended and restated" is a naming convention in genuine originals,
-keyword ~0.62 vs BERT ~0.86 macro-F1), so this sweep targets `ClassDetailed`.
+Power is deliberately **not** the precision gate. Setting precision to one in the Wilson formula
+leaves `Power_max(n) = n / (n + 3.84)`, so Power carries a support-dependent ceiling: a perfect term
+needs 44 occurrences to reach 0.92 at all. The thinnest category in this sample holds 71 documents, so
+no term within it can clear a high global Power threshold however clean it is. A single threshold on
+Power therefore selects for category size rather than term quality and empties every small category by
+arithmetic. Precision has no ceiling, so precision is the promise and Power is the evidence.
 
-This document renders end to end. The engine steps shell out to Python, but the sweep
-is idempotent (a finished cell is skipped), so re-rendering is cheap once the grid is
-on disk. Everything downstream is wrapped in `clf_cache()`; after a fresh sweep, set
-`options(clf.cache.overwrite = TRUE)` once to rebuild.
+Three further rules follow from the artifact goal. A **directional guard** admits a term only where
+its precision exceeds the category's base rate. **Greedy marginal reach** accepts a term only where it
+catches documents no accepted term caught, which removes nested n-grams, near-synonyms and boilerplate
+variants under one rule that works on document overlap rather than surface form. The **maximum-Power
+decision** scores a document by the single best term that fired rather than by a weighted sum, so
+every label traces to one printable term; a sum is not inspectable, and the two rules agree at the
+operating point anyway, because most documents fire either no term or one.
 
-## Paths
+## Two independent arms
 
-`prepared.parquet` is read from 03A's output directory (same path construction 03A
-wrote it with). Keyword runs live under 03C's own runs root;
-`clf_load_overall(c(bert_runs, kw_runs))` binds both for 03D.
+Mining can only surface terms frequent enough to clear a document-frequency floor and distinctive
+enough to win a greedy slot. Reading contracts is not subject to either constraint, and can propose
+terminology that is rare, that lost to a longer n-gram containing it, or that a lawyer would name and
+a frequency table would never isolate. This document evaluates both arms and their union on identical
+folds under identical rules, so the only thing differing between them is where the terms came from.
+
+## Where the work happens
+
+The mining engine emits statistics; every decision is taken in R. Mining is expensive and selection is
+cheap, so binding the floors into the engine would force a re-mine for every floor combination.
+Splitting them keeps the mining grid at a few hundred cells and leaves the selection sweep
+interactive. It also makes the engine task-agnostic: the amendment decision rule is a decision, so it
+lives here.
+
+# Configuration
 
 ```{r}
-.dir_prep <- init_create_script_dir(here::here(), "03A-ClassifyPrepare")
+.dir_prep <- init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare")
+
+# The generated term lists are produced outside the repository, by 03C-CoWorkKeywords.R and
+# 03C-CoWorkCompile.R, and are read from the shared project folder rather than rebuilt here.
+.dir_cowork <- fs::path(
+  "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractData",
+  "KeyWordsClaude"
+)
 
 .lP <- list(
   Input = list(
-    Prepared = utils_file_path(.dir_prep, "prepared.parquet")
+    Prepared      = utils_file_path(.dir_prep, "prepared.parquet"),
+    TermsDetailed = fs::path(.dir_cowork, "detailed", "cowork_terms_detailed.parquet"),
+    TermsBroad    = fs::path(.dir_cowork, "broad", "cowork_terms_broad.parquet"),
+    TermsAmend    = fs::path(.dir_cowork, "amendment", "cowork_terms_amendment.parquet")
   ),
   Output = list(
-    RunsDir = utils_file_path(.dir_main, "runs")
+    Mines = utils_file_path(.dir_main, "mines"),
+    Runs  = utils_file_path(.dir_main, "runs"),
+    Table = utils_file_path(.dir_main, "table"),
+    Union = utils_file_path(.dir_main, "table", "union_terms_detailed.parquet")
   ),
   Engine = list(
     Python = here::here("contracts-engine", ".venv", "bin", "python"),
     Script = here::here("contracts-engine", "keyword_train.py")
+  ),
+  Param = list(
+    TargetPrecision = 0.95, # the promise the categorical tables make
+    TargetAmend     = 0.85, # amendment promises less; see the Robustness section for why
+    Tolerance       = 0.01, # precision band treated as indistinguishable; roughly two SEs here
+    MinClasses      = 9L, # categories the table must label before a threshold is acceptable
+    MinFolds        = 3L, # fold agreement required of a published term
+    HoldoutFold     = 5L, # the fold the generated arm never read
+    Seed            = 42L # fixed upstream in 03A and reused unchanged
   )
 )
 ```
 
+A mine is named after its hyperparameters and carries no fingerprint of the data it consumed. Change
+the sample without emptying `mines/`, and every cell will be reported as already complete while
+serving results computed from folds that no longer exist. Superseded mines should be renamed rather
+than deleted, since discovery globs a known directory and a renamed sibling is invisible to the code
+while remaining available as a record.
+
+# The sample
+
 ```{r}
+if (!fs::file_exists(.lP$Input$Prepared)) cli::cli_abort("Run 03A before this document")
 tab_prep <- arrow::read_parquet(.lP$Input$Prepared)
 ```
 
-# Step 0 diagnostics
-
-Two checks on the data before modelling -- both keyword-specific validity questions
-the BERT track does not care about, and both directly relevant to the desc-vs-text
-escalation.
-
-## DocDesc coverage
-
-How much of the sample carries a non-empty filer title. Where it is empty, a
-`docdesc` model has nothing to mine and must abstain -- which `Coverage` then reports
-honestly. This is the N the desc arm has to work with, per class.
+The filer title is mined as a separate arm, so the share of documents carrying one bounds what that
+arm can reach. The prediction, before looking: title coverage is high and roughly even across
+categories, because a missing title reflects a filing-format accident rather than anything about the
+contract.
 
 ```{r}
-kw_diag_desc_coverage(tab_prep) |>
-  fmt_table(.caption = "DocDesc coverage (overall and per class)", .pct = "Coverage")
-```
-
-## Header leakage
-
-Does the body restate the title verbatim near the top? If so, mining `text` partly
-relearns `docdesc`, and the two are not independent feature sources. High leakage
-means `combined` is closer to `text` than its name suggests, and -- important for 03D
--- it means the desc signal is mostly already inside what BERT reads (BERT sees
-`Text`). The small non-leaked remainder is the only place desc can carry signal BERT
-lacks.
-
-```{r}
-kw_diag_header_leak(tab_prep, .n_chars = 300L) |>
-  fmt_table(.caption = "Body restates the title verbatim in the first 300 chars?",
-            .pct = "LeakShare")
-```
-
-# The sweep grid
-
-Wider than before, since regex is cheap. The three source fields, crossed with two
-stopword regimes (confirming the "none wins" finding rather than assuming it), two
-`topk` levels (25 vs 50 -- the rare-class recall lever), and two `ngram_max` (2 vs 3),
-five folds each. Optional grid columns override `kw_command` defaults per row;
-anything omitted falls back to the default.
-
-```{r}
-grid_main <- tidyr::expand_grid(
-  label_col = "ClassDetailed",
-  source    = c("text", "docdesc", "combined"),
-  stopwords = c("none", "english_domain"),
-  topk      = c(25L, 50L),
-  ngram_max = c(2L, 3L),
-  fold      = 1:5
-)
-grid_main |>
-  dplyr::distinct(source, stopwords, topk, ngram_max) |>
-  fmt_table(.caption = "Keyword sweep configs (x 5 folds each)")
-cli::cli_alert_info("Total cells: {nrow(grid_main)}")
-```
-
-Note on `min_df`: the engine does not encode `min_df` in its config name, so sweeping
-it would collide on disk with the existing runs. The `topk` lift covers the same
-rare-class-recall ground safely; a dedicated `min_df = 1` starvation probe is a
-one-line engine change (add `min_df` to `config_name`) left for a separate pass.
-
-# Run the sweep
-
-A quick seam check first -- one tiny cell on a 40/10 subset, end to end, to confirm
-the R -> Python -> parquet path before committing the full grid:
-
-```{r}
-kw_train(.lP$Input$Prepared,
-  .label_col = "ClassDetailed", .source = "combined",
-  .test_fold = 1L, .runs_root = .lP$Output$RunsDir, .smoke = TRUE
-)
-```
-
-Then the grid. Each cell is an independent, CPU-bound shell-out; `kw_sweep` dispatches
-them across mirai daemons (spun up for the sweep, torn down on exit), discards the
-console, and tees each run's narrative to its `run.log`. It prints a compact
-performance table for the freshly-run cells and returns it.
-
-```{r}
-perf <- kw_sweep(grid_main, .lP$Input$Prepared, .runs_root = .lP$Output$RunsDir)
-```
-
-# Score the sweep
-
-All scoring goes through 03A's shared layer, so these numbers are directly comparable
-with BERT's. `clf_load_overall` binds the per-run `metrics_overall` rows -- that bound
-table *is* the master log. Disk reads are wrapped in `clf_cache()`; after a fresh
-sweep set `options(clf.cache.overwrite = TRUE)` once.
-
-```{r}
-tab_overall <- clf_cache("kw_overall", clf_load_overall(.lP$Output$RunsDir))
-kw_leaderboard_show(tab_overall, .label_col = "ClassDetailed", .n = 24L) |>
-  fmt_table(.caption = "Keyword configurations -- detailed taxonomy", .wide = TRUE)
-```
-
-Marginal effects of the swept axes (each averaged over everything else), so the
-winner is read off main effects rather than one lucky cell:
-
-```{r}
-clf_effect(tab_overall, "Source", .label_col = "ClassDetailed") |>
-  fmt_table(.caption = "Macro-F1 by source field")
-clf_effect(tab_overall, "TopK", .label_col = "ClassDetailed") |>
-  fmt_table(.caption = "Macro-F1 by topk")
-clf_effect(tab_overall, "Stopwords", .label_col = "ClassDetailed") |>
-  fmt_table(.caption = "Macro-F1 by stopword regime")
-```
-
-# The three sources, side by side
-
-The escalation arms -- the best config for each source -- lined up on identical folds.
-`docdesc` is the low-N / high-clarity arm; `text` the body arm; `combined` the score
-fusion. This is the unified view the shared schema makes possible: one row per source,
-same columns, directly comparable (and directly comparable with BERT in 03D).
-
-```{r}
-src_cfgs <- kw_pick_source_configs(tab_overall, "ClassDetailed")
-src_cfgs |>
-  fmt_table(.caption = "Best config per source (by pooled macro-F1)",
-            .digits = 3, .pct = "Cov_mean", .wide = TRUE)
-```
-
-Per-class F1 by source, so the structural pattern is visible: where does the clean
-`docdesc` title help, and where does the body `text` carry classes the title cannot
-(the heterogeneous / rare classes)?
-
-```{r}
-perclass_src <- src_cfgs |>
-  dplyr::mutate(
-    PC = purrr::map(.data$ConfigName, function(cfg_) {
-      pred_ <- clf_cache(paste0("kw_pred__", cfg_),
-                         clf_pool_predictions(.lP$Output$RunsDir, cfg_))
-      clf_perclass(pred_) |> dplyr::select(Label, F1)
-    })
+tab_prep |>
+  dplyr::summarise(
+    N = dplyr::n(),
+    nHasDesc = sum(!is.na(DocDesc) & trimws(DocDesc) != ""),
+    ShareHas = mean(!is.na(DocDesc) & trimws(DocDesc) != ""),
+    .by = ClassDetailed
   ) |>
-  dplyr::select(Source, PC) |>
-  tidyr::unnest(PC) |>
-  tidyr::pivot_wider(names_from = Source, values_from = F1)
-perclass_src |>
-  fmt_table(.caption = "Per-class F1 by source (pooled out-of-fold)", .digits = 3)
+  dplyr::arrange(ShareHas) |>
+  dplyr::mutate(ShareHas = clf_pct(ShareHas)) |>
+  clf_say_table(.title = "Documents carrying a filer title")
 ```
 
-# Independent mined lexicons: Desc vs Text
+The title also appears verbatim in the opening characters of the body in almost every document. As a
+feature source that makes the title arm redundant, since any model reading the body already reads it.
+As a mining ground for a published table it is the better field, because it is short: a term mined
+from a filer's own title is close to a contract-type name by construction, where a term mined from the
+body is a fragment of operative language. The consequence to expect is a measurable convergence
+between the two arms at narrow truncation windows, widening as the window grows.
 
-The interpretable payoff, surfaced for each field separately. The `docdesc` list is
-short and clean -- contract-type names ("credit agreement", "lease dated"). The `text`
-list is the boilerplate verbal fingerprints ("the consultant shall", "the borrower")
-that the stopwords-hurt finding predicted. Read together they show *why* the two
-sources behave differently.
+# Mining the candidate terms
 
-```{r}
-desc_cfg <- src_cfgs |> dplyr::filter(.data$Source == "docdesc") |> dplyr::pull(ConfigName)
-text_cfg <- src_cfgs |> dplyr::filter(.data$Source == "text")    |> dplyr::pull(ConfigName)
-
-clf_cache(paste0("kw_lex__", desc_cfg),
-  kw_load_lexicon(.lP$Output$RunsDir, desc_cfg, .min_folds = 3L, .top_per_class = 6L)) |>
-  fmt_table(.caption = "Desc lexicon: stable terms, top per class", .digits = 3, .wide = TRUE)
-```
+The engine is checked end to end on a tiny subsample before the grid is committed, so a broken seam
+surfaces in seconds rather than after the sweep.
 
 ```{r}
-clf_cache(paste0("kw_lex__", text_cfg),
-  kw_load_lexicon(.lP$Output$RunsDir, text_cfg, .min_folds = 3L, .top_per_class = 6L)) |>
-  fmt_table(.caption = "Text lexicon: stable terms, top per class", .digits = 3, .wide = TRUE)
-```
-
-# Confidence: does the margin separate right from wrong?
-
-The keyword twin of the BERT margin stat. The engine's `Score` is a fold-normalised
-max; the sharper per-document signal is the **margin** (top-1 minus top-2 class
-score), reconstructed by `kw_load_confidence` from the saved probabilities. If the
-margin is reliably larger on the correct predictions than the incorrect ones, the gate
-has something to grip -- if not, no threshold will carve a clean subset. (There is no
-reliability-diagram / ECE here: the keyword score is a normalised weight-sum, not a
-calibrated probability, so an ECE would mislead rather than inform.)
-
-```{r}
-best_kw <- src_cfgs |> dplyr::slice(1) |> dplyr::pull(ConfigName)
-conf_mr <- clf_cache(paste0("kw_conf_mr__", best_kw),
-  kw_load_confidence(.lP$Output$RunsDir, best_kw, .which = "marginrel"))
-kw_margin_correctness(conf_mr) |>
-  fmt_table(.caption = "Relative margin by correctness (committed predictions)",
-            .digits = 3)
-```
-
-# Selective classification: a high-precision subset, per source
-
-The per-class numbers show high precision but low recall on the hard classes: the
-lexicon is usually right when it commits, and pays mostly for being forced to guess on
-ambiguous documents. Gating on confidence makes that a deliberate choice -- classify
-only what the lexicon is sure about, defer the rest. This is the keyword arm of 03D
-routing, and the high-performance-at-low-N goal for `docdesc` lives exactly here.
-
-The unified high-precision profile: for each source, the strict pooled macro-F1 next
-to the gated operating point -- how much it can label at >= 95% per-class precision
-(`SelCoverage`) and how accurate that slice is (`SelAccuracy`). The docdesc arm is the
-one to watch: small coverage, but is it precise?
-
-```{r}
-src_profile <- src_cfgs |>
-  dplyr::mutate(
-    Profile = purrr::map(.data$ConfigName, function(cfg_) {
-      pred_ <- clf_cache(paste0("kw_pred__", cfg_),
-                         clf_pool_predictions(.lP$Output$RunsDir, cfg_))
-      kw_selective_profile(pred_, .target_precision = 0.95, .min_keep = 5L)
-    })
-  ) |>
-  dplyr::select(Source, ConfigName, Profile) |>
-  tidyr::unnest(Profile)
-src_profile |>
-  fmt_table(.caption = "Strict vs high-precision (>=95%) profile, per source",
-            .digits = 3,
-            .pct = c("StrictCoverage", "SelCoverage", "SelAccuracy", "TargetP"))
-```
-
-The precision-coverage tradeoff for the best config, swept over a single global cutoff
--- selective accuracy (precision on the classified subset) against coverage:
-
-```{r}
-pred_best <- clf_cache(paste0("kw_pred__", best_kw),
-                       clf_pool_predictions(.lP$Output$RunsDir, best_kw))
-pc_curve <- kw_precision_coverage(pred_best)
-pc_curve |> fmt_table(.caption = "Precision-coverage tradeoff (global Score cutoff)")
-```
-
-```{r}
-#| fig-cap: "Selective accuracy against coverage: the precision bought by abstaining."
-kw_plot_precision_coverage(pc_curve)
-```
-
-A single global cutoff is blunt, since `Score` is only loosely comparable across
-classes. Calibrating a cutoff *per class* to a target precision is the real operating
-point -- each class contributes the slice it can label at >= 95% precision, and
-`Recall` reports how much of that class we still recover there:
-
-```{r}
-calib <- kw_calibrate(pred_best, .target_precision = 0.95, .min_keep = 5L)
-calib |> fmt_table(
-  .caption = "Per-class operating points at 95% target precision",
-  .digits = 3, .wide = TRUE
+kw_mine(
+  .path_data  = .lP$Input$Prepared, # sample written by 03A
+  .label_col  = "ClassDetailed", # any task will do for a seam check
+  .source     = "docdesc", # the cheapest field to mine
+  .test_fold  = 1L, # an arbitrary held-out fold
+  .mines_root = .lP$Output$Mines, # smoke mines land in a _smoke subfolder
+  .python     = .lP$Engine$Python,
+  .script     = .lP$Engine$Script,
+  .smoke      = TRUE # tiny subsample; checks the seam, not the result
 )
 ```
 
-Applying those per-class cutoffs gives the high-precision keyword layer. Its coverage
-and selective accuracy -- not `clf_scores` accuracy, which would count every deferral
-as wrong -- are the headline for routing:
+The grid crosses three tasks, two source fields, five truncation windows, two n-gram lengths and two
+stopword regimes, over five folds plus an all-data mine.
+
+Two of those axes deserve a stated expectation. **The truncation window** runs well past the 512
+tokens the transformer reads: 256 and 512 words are the like-for-like comparison, and 1024, 2048 and
+the whole document are windows no transformer in this study can see. If performance keeps rising past
+512 words there is signal deeper in these contracts than the deployed model reads, which would matter
+beyond this stage. If it flattens, that independently corroborates the assumption the pipeline already
+rests on, from a method that had every opportunity to find something further in and did not.
+
+**The stopword regime** is swept rather than fixed because its answer depends on the objective. Under
+an accuracy objective, function-word collocations are discriminative and removing them costs
+performance. Under a readability objective they are unusable, whatever they score. The two regimes are
+therefore judged on the terms they produce, not on the accuracy column.
 
 ```{r}
-thr_ <- calib |> dplyr::select(Label, Threshold) |> tibble::deframe()
-pred_hi <- kw_gate(pred_best, thr_)
-kw_selective_summary(pred_hi) |>
-  fmt_table(.caption = "High-precision keyword layer (per-class gated)",
-            .pct = c("Coverage", "SelAccuracy"))
+grid_mine <- kw_mine_grid(
+  .label_cols   = c("ClassDetailed", "ClassBroad", "AmendType"), # every task, mined directly
+  .nwords_text  = c(256L, 512L, 1024L, 2048L, 0L), # 0 keeps the whole document
+  .ngram_max    = c(2L, 3L), # longest n-gram mined
+  .stopwords    = c("none", "english_domain"), # judged on readability, not accuracy
+  .folds        = 1:5, # folds dealt once, in 03A
+  .with_alldata = TRUE # fold 0 produces the published table
+)
+
+grid_mine |>
+  dplyr::count(Source, Stopwords, NWords, name = "Cells") |>
+  dplyr::mutate(Window = dplyr::if_else(NWords == 0L, "full", as.character(NWords))) |>
+  dplyr::select(Source, Stopwords, Window, Cells) |>
+  clf_say_table(.title = paste0("Mining grid: ", nrow(grid_mine), " cells"))
+```
+
+Categories are mined directly at both levels rather than rolling one up into the other. Mining is
+one-against-the-rest at whatever level it runs, so a term shared evenly by three detailed categories
+belonging to one broad parent scores about one third precision against each of them and is discarded,
+despite marking the parent cleanly. Those terms are reachable only by working at the broad level.
+
+The sweep is idempotent: the engine skips any cell already on disk, so this chunk runs on every render
+and costs seconds after the first.
+
+```{r}
+kw_mine_sweep(
+  .grid       = grid_mine, # what to mine
+  .path_data  = .lP$Input$Prepared, # sample written by 03A
+  .mines_root = .lP$Output$Mines, # destination; existing cells are skipped
+  .python     = .lP$Engine$Python,
+  .script     = .lP$Engine$Script,
+  .workers    = 24L, # measured: the full grid completes in minutes
+  .overwrite  = FALSE # FALSE skips work already present on disk
+)
+
+idx_mine <- kw_mine_index(.mines_root = .lP$Output$Mines)
+```
+
+```{r}
+idx_mine |>
+  dplyr::filter(Fold > 0L, Mode == "mine") |>
+  dplyr::summarise(
+    nCells = dplyr::n(),
+    mVocab = round(mean(nVocab)),
+    mCand = round(mean(nCand)),
+    mSeconds = round(mean(MineSec), 1),
+    .by = c(LabelCol, Source, NWords)
+  ) |>
+  dplyr::mutate(Window = dplyr::if_else(NWords == 0L, "full", as.character(NWords))) |>
+  dplyr::select(LabelCol, Source, Window, nCells, mVocab, mCand, mSeconds) |>
+  clf_say_table(.title = "What was mined")
+```
+
+# Choosing the configuration
+
+The mining axes are resolved first, under one fixed selection. Crossing mining and selection at once
+searches a far wider space than the transformer sweep did on the same 4,400 documents, and the winner
+of a wide search on a small sample is partly a winner by luck.
+
+```{r}
+perf_mines <- kw_sweep_mines(
+  .mine_index      = idx_mine, # every fold mine
+  .min_precision   = 0.95, # the promise; held fixed while mining axes vary
+  .min_hits        = 5L, # minimum positive-class training hits
+  .min_tot         = 5L, # minimum total training hits
+  .min_reach       = 0.01, # greedy acceptance bar, as a share of the category
+  .max_terms       = 25L, # per-category cap
+  .min_filers      = 5L, # minimum distinct registrants
+  .min_filer_ratio = 0.5, # registrants per hit; catches one firm's own template
+  .drop_repeats    = TRUE, # discard n-grams with a repeated token
+  .tau             = 0.70, # evidence floor
+  .runs_root       = NULL # NULL evaluates without writing run folders
+)
+```
+
+```{r}
+kw_report_mines(.tab = perf_mines, .label_col = "ClassDetailed")
+```
+
+```{r}
+kw_report_mines(.tab = perf_mines, .label_col = "ClassBroad")
+```
+
+```{r}
+kw_report_mines(.tab = perf_mines, .label_col = "AmendType")
+```
+
+The configuration carried forward is chosen by precision with ties broken on coverage. A precision
+difference inside one percentage point is indistinguishable from the fold-to-fold spread, so taking
+the maximum among such rows buys nothing measurable while discarding real coverage and, where the
+winner is a wide truncation window, twenty times the mining time.
+
+The stopword regime is stated rather than inferred. Its criterion is the readability of the terms
+produced, and no column reports that, so a tiebreak on coverage would decide the axis on precisely
+the ground this document rejects. Removing stopwords costs a little coverage and returns content-word
+phrases in place of fragments carrying function words, so `english_domain` is preferred wherever the
+two regimes are indistinguishable on the promise.
+
+```{r}
+cfg_mine <- purrr::map(
+  .x = c("ClassDetailed", "ClassBroad", "AmendType"),
+  .f = function(.task) {
+    purrr::map(c("text", "docdesc"), function(.src) {
+      kw_summarise_mines(.tab = perf_mines, .label_col = .task) |>
+        dplyr::filter(Source == .src) |>
+        kw_choose_config(
+          .tolerance    = 0.01, # precision band treated as a tie
+          .min_coverage = 0.25, # below this a configuration is unusable
+          .prefer       = list(Stopwords = "english_domain") # readability, judged outside the table
+        ) |>
+        dplyr::mutate(LabelCol = .task, .before = 1L)
+    }) |>
+      purrr::list_rbind()
+  }
+) |>
+  purrr::list_rbind()
+
+cfg_mine |>
+  dplyr::mutate(
+    Window    = dplyr::if_else(NWords == 0L, "full", as.character(NWords)),
+    Coverage  = clf_pct(mCoverage),
+    Precision = clf_pct(mPrecision),
+    MacroF1   = sprintf("%.3f", mMacroF1)
+  ) |>
+  dplyr::select(LabelCol, Source, Stopwords, Window, NgramMax,
+    Classes = mClasses, Coverage,
+    Precision, MacroF1
+  ) |>
+  clf_say_table(.title = "Mining configuration carried forward")
+```
+
+The selection floors are then swept over the winning mining configurations only.
+
+```{r}
+grid_sel <- kw_select_grid(
+  .min_precision = 0.95, # the promise, fixed
+  .min_hits      = 5L, # evidence floor, fixed: Power already encodes it
+  .min_tot       = 5L, # evidence floor, fixed
+  .min_reach     = c(0.005, 0.01, 0.02, 0.05), # the greedy bar; the axis that shortens the list
+  .max_terms     = c(15L, 25L, 40L) # per-category cap
+)
+
+idx_sel <- idx_mine |>
+  dplyr::semi_join(cfg_mine, by = dplyr::join_by(LabelCol, Source, NWords, NgramMax, Stopwords)) |>
+  dplyr::filter(Fold > 0L)
+
+perf_sel <- kw_sweep_selection(
+  .mine_index = idx_sel, # winning mining configurations only
+  .grid_sel   = grid_sel, # floors to cross
+  .tau        = 0.70, # evidence floor, held fixed while floors vary
+  .runs_root  = NULL # NULL evaluates without writing run folders
+)
+```
+
+```{r}
+kw_report_selection(.tab = perf_sel, .label_col = "ClassDetailed", .n = 12L)
+```
+
+```{r}
+sel_best <- kw_summarise_selection(.tab = perf_sel, .label_col = "ClassDetailed") |>
+  kw_choose_config(
+    .tolerance    = 0.01, # precision band treated as a tie
+    .min_coverage = 0.25, # below this a configuration is unusable
+    .prefer       = NULL # no axis here is chosen on grounds the table does not report
+  )
+
+sel_best |>
+  dplyr::mutate(Coverage = clf_pct(mCoverage), Precision = clf_pct(mPrecision)) |>
+  dplyr::select(MinReach, MaxTerms, Terms = mTerms, Classes = mClasses, Coverage, Precision) |>
+  clf_say_table(.title = "Selection floors carried forward")
+```
+
+# Results
+
+The threshold filters a fixed lexicon at scoring time, so a whole curve costs one join per fold. This
+curve is the instrument the stage produces: a reader consults it to choose an operating point, and the
+paper reports it as a sensitivity surface rather than a single tuned number.
+
+```{r}
+dirs_detailed <- idx_sel |>
+  dplyr::filter(LabelCol == "ClassDetailed", Source == "text") |>
+  dplyr::pull(MineDir)
+
+curve_detailed <- kw_tau_curve(
+  .mine_dirs     = dirs_detailed, # fold mines of the chosen configuration
+  .taus          = seq(0.40, 0.96, by = 0.02), # evidence floors to trace
+  .min_precision = 0.95, # the promise, fixed across the curve
+  .min_hits      = sel_best$MinHits,
+  .min_tot       = sel_best$MinTot,
+  .min_reach     = sel_best$MinReach,
+  .max_terms     = sel_best$MaxTerms
+)
+```
+
+Two constraints govern the choice, not one. Realised precision must reach the target, and the
+resulting table must still label a required number of categories. The second constraint exists because
+of the Power ceiling argued in the Purpose: without it the rule returns a very precise table that has
+quietly dropped every small category, not because their terms were poor but because those categories
+are too small for any term to clear a high threshold.
+
+The target carries a tolerance for the same reason the configuration choice does. Around two thousand
+documents are classified here, so the standard error of a proportion near the target is close to half
+a percentage point. Comparing hard against the target would treat differences the sample cannot
+measure as decisive, and because raising the threshold removes small categories first, the cost of
+that false precision is paid in breadth. Among thresholds reaching the target within tolerance, the
+one labelling most categories is preferred.
+
+```{r}
+op_detailed <- kw_report_tau(
+  .curve            = curve_detailed,
+  .target_precision = .lP$Param$TargetPrecision, # the promise
+  .tolerance        = .lP$Param$Tolerance, # differences this small are not measurable here
+  .min_classes      = .lP$Param$MinClasses, # categories the table must label
+  .every            = 2L # the curve is dense; print every other row
+)
+```
+
+The runs at the chosen operating point are written to disk, in the schema the transformer trainer
+uses, so a single leaderboard ranks both arms of the study.
+
+```{r}
+perf_final <- kw_sweep_selection(
+  .mine_index = idx_sel,
+  .grid_sel = sel_best |>
+    dplyr::select(MinPrecision, MinHits, MinTot, MinReach, MaxTerms) |>
+    dplyr::mutate(SelName = "final"),
+  .tau = op_detailed$Tau, # the chosen operating point
+  .runs_root = .lP$Output$Runs # these are the runs the paper cites
+)
+
+pred_final <- perf_final |>
+  dplyr::filter(LabelCol == "ClassDetailed", Source == "text") |>
+  dplyr::pull(Pred) |>
+  purrr::list_rbind()
+```
+
+```{r}
+clf_report_scores(pred_final, .title = "Keyword table at the operating point")
+```
+
+```{r}
+clf_report_perclass(pred_final, .title = "Per category")
+```
+
+Per-category recall is the cost the table pays for its promise. A category with high precision and low
+recall is one the table labels rarely and reliably, which is the intended behaviour; a category with
+no rows at all is one the table declines entirely, and that is a finding about the category rather
+than a gap to be closed by lowering the bar.
+
+```{r}
+clf_confusion(pred_final) |> clf_say_table(.title = "Confusion, rows are true labels")
+```
+
+Every committed label traces to one term, so the reason for it can be printed rather than asserted.
+
+```{r}
+kw_report_audit(.tab_pred = pred_final, .per_class = 2L, .wrong = FALSE)
+```
+
+```{r}
+kw_report_audit(.tab_pred = pred_final, .per_class = 2L, .wrong = TRUE)
+```
+
+# The generated arm
+
+`03C-CoWorkKeywords.R` wrote contrastive document bundles, pairing documents of a category with
+documents drawn from the rest so that a term appearing in both can be recognised as worthless. A
+reading session proposed terms from those bundles, and `03C-CoWorkCompile.R` folded the responses into
+one term list per task.
+
+The bundles were drawn from folds one to four, so the session read those documents together with their
+labels. Only the held-out fold is absent from every bundle, and it is therefore the only honest
+estimate for this arm. Power is still computed on the folds the session read, which makes the Power
+values optimistic for both arms alike; the precision and coverage reported below are not.
+
+```{r}
+purrr::walk(
+  .x = c(.lP$Input$TermsDetailed, .lP$Input$TermsBroad, .lP$Input$TermsAmend),
+  .f = function(.p) {
+    if (!fs::file_exists(.p)) cli::cli_abort("Missing term list {(.p)}; run 03C-CoWorkCompile.R")
+  }
+)
+
+cfg_detailed <- cfg_mine |> dplyr::filter(LabelCol == "ClassDetailed", Source == "text")
+
+perf_generated <- kw_terms_evaluate(
+  .path_data     = .lP$Input$Prepared,
+  .terms_file    = .lP$Input$TermsDetailed, # written by 03C-CoWorkCompile.R
+  .label_col     = "ClassDetailed",
+  .source        = "text",
+  .nwords        = cfg_detailed$NWords, # same window as the mined arm
+  .stopwords     = cfg_detailed$Stopwords, # same regime; a mismatch makes mined terms unmatchable
+  .folds         = .lP$Param$HoldoutFold, # the only fold the session never read
+  .tau           = op_detailed$Tau, # same evidence floor as the mined arm
+  .min_precision = 0.95, # same promise; both arms clear the same gate
+  .mines_root    = .lP$Output$Mines,
+  .runs_root     = .lP$Output$Runs,
+  .python        = .lP$Engine$Python,
+  .script        = .lP$Engine$Script
+)
+```
+
+The session was instructed to propose generously, on the reasoning that a term which fails is discarded
+at no cost while a term never proposed cannot be recovered. Survival is therefore expected to be low,
+and a low rate is not itself a problem; what matters is whether the survivors reach categories the
+mined arm could not.
+
+```{r}
+terms_generated <- arrow::read_parquet(.lP$Input$TermsDetailed)
+
+kw_survival(.proposed = terms_generated, .lexicon = perf_generated$Lexicon[[1]]) |>
+  dplyr::mutate(ShareSurvive = clf_pct(ShareSurvive)) |>
+  clf_say_table(.title = "Proposed terms surviving the precision and evidence gates")
+```
+
+# Validation
+
+The union combines the two arms. Its mined half is taken from the fold mine trained on exactly the
+folds the session read, not from the all-data mine, so that neither half has seen the evaluation fold.
+
+Both halves are scored under the mined arm's stopword regime. Where a regime is in force the miner
+forms n-grams after removal, so a mined term names two words that need not be adjacent in the raw
+text; scoring it without the regime returns zero hits for every such term, and a union assembled that
+way silently reduces to the list whose terms happened to survive. Supplied terms are folded to the
+same tokenised form on the way in, so a phrase written in full English and a phrase mined after
+removal describe the same pattern.
+
+```{r}
+lex_mined_holdout <- kw_select(
+  .mine = kw_load_mine(
+    .mine_dir = idx_sel |>
+      dplyr::filter(
+        LabelCol == "ClassDetailed", Source == "text",
+        Fold == .lP$Param$HoldoutFold
+      ) |>
+      dplyr::pull(MineDir)
+  ),
+  .min_precision = 0.95,
+  .min_hits = sel_best$MinHits,
+  .min_tot = sel_best$MinTot,
+  .min_reach = sel_best$MinReach,
+  .max_terms = sel_best$MaxTerms
+) |>
+  dplyr::filter(Power >= op_detailed$Tau)
+
+kw_terms_union(
+  .lexicon    = lex_mined_holdout, # mined on folds 1-4 only
+  .terms_file = .lP$Input$TermsDetailed, # generated from folds 1-4 only
+  .path_out   = .lP$Output$Union
+)
+
+perf_union <- kw_terms_evaluate(
+  .path_data     = .lP$Input$Prepared,
+  .terms_file    = .lP$Output$Union,
+  .label_col     = "ClassDetailed",
+  .source        = "text",
+  .nwords        = cfg_detailed$NWords,
+  .stopwords     = cfg_detailed$Stopwords,
+  .folds         = .lP$Param$HoldoutFold,
+  .tau           = op_detailed$Tau,
+  .min_precision = 0.95,
+  .mines_root    = .lP$Output$Mines,
+  .runs_root     = .lP$Output$Runs,
+  .python        = .lP$Engine$Python,
+  .script        = .lP$Engine$Script
+)
+```
+
+```{r}
+kw_report_arms(
+  .tabs = list(
+    mined = perf_final |>
+      dplyr::filter(
+        LabelCol == "ClassDetailed", Source == "text",
+        TestFold == .lP$Param$HoldoutFold
+      ),
+    generated = perf_generated,
+    union = perf_union
+  )
+)
+```
+
+The number to read first is the count of categories labelled. A union matching both arms on precision
+while labelling more categories establishes that mining and reading recover different vocabulary and
+that neither substitutes for the other. A union matching the mined arm on every column establishes the
+opposite, that the generated terms add nothing the statistics had not already found, which is a
+weaker but equally reportable result.
+
+A union can also label **fewer** categories than one of its parts, and that is a property of the
+decision rule rather than a fault in the assembly. A document is assigned to the category whose
+best-firing term carries the highest Power, so a thin category reachable only through a low-Power term
+loses its documents as soon as a higher-Power term from another category is added. Adding terms raises
+coverage monotonically; it does not raise the number of categories monotonically. Where the union
+trails a parent on category count, that parent is labelling those documents only because the competing
+evidence was absent from its list.
+
+# Robustness
+
+The remaining tasks are scored the same way, from the same folds, with the same gates.
+
+```{r}
+perf_generated_broad <- kw_terms_evaluate(
+  .path_data = .lP$Input$Prepared,
+  .terms_file = .lP$Input$TermsBroad,
+  .label_col = "ClassBroad",
+  .source = "text",
+  .nwords = cfg_mine |> dplyr::filter(LabelCol == "ClassBroad", Source == "text") |>
+    dplyr::pull(NWords),
+  .stopwords = cfg_mine |> dplyr::filter(LabelCol == "ClassBroad", Source == "text") |>
+    dplyr::pull(Stopwords),
+  .folds = .lP$Param$HoldoutFold,
+  .tau = op_detailed$Tau,
+  .min_precision = 0.95,
+  .mines_root = .lP$Output$Mines,
+  .runs_root = .lP$Output$Runs,
+  .python = .lP$Engine$Python,
+  .script = .lP$Engine$Script
+)
+
+perf_generated_amend <- kw_terms_evaluate(
+  .path_data = .lP$Input$Prepared,
+  .terms_file = .lP$Input$TermsAmend,
+  .label_col = "AmendType",
+  .source = "text",
+  .nwords = cfg_mine |> dplyr::filter(LabelCol == "AmendType", Source == "text") |>
+    dplyr::pull(NWords),
+  .stopwords = cfg_mine |> dplyr::filter(LabelCol == "AmendType", Source == "text") |>
+    dplyr::pull(Stopwords),
+  .folds = .lP$Param$HoldoutFold,
+  .tau = op_detailed$Tau,
+  .min_precision = .lP$Param$TargetAmend, # amendment promises less; see below
+  .mines_root = .lP$Output$Mines,
+  .runs_root = .lP$Output$Runs,
+  .python = .lP$Engine$Python,
+  .script = .lP$Engine$Script
+)
+```
+
+Amendment is held to a lower promise than the categorical tasks, and the reason is structural rather
+than a concession. The categorical tables abstain, so their precision is a promise about the subset
+they choose to label and can be set as high as the terms allow. Amendment does not abstain: it assigns
+one of two labels to every document, so its precision is a property of the whole corpus and is bounded
+by how separable the two classes are. Demanding the categorical target of it leaves a handful of terms
+and a worse classifier, which is not a stricter table but a broken one.
+
+The stopword regime is not neutral between the two arms, and the union forces them to share one. The
+miner forms n-grams after removal, so under a regime its terms name words that need not be adjacent,
+and the regime is what makes them fire at all. A written list is folded through the same tokeniser on
+the way in, which is what makes it comparable, but folding also collapses phrases the session wrote as
+distinct: an article-led phrase and its bare form become the same entry, and the surviving unigram is
+less precise than either. Scoring the generated list under both regimes measures that cost directly.
+
+```{r}
+perf_generated_none <- kw_terms_evaluate(
+  .path_data     = .lP$Input$Prepared,
+  .terms_file    = .lP$Input$TermsDetailed,
+  .label_col     = "ClassDetailed",
+  .source        = "text",
+  .nwords        = cfg_detailed$NWords, # window held at the mined arm's choice
+  .stopwords     = "none", # the only axis varied
+  .folds         = .lP$Param$HoldoutFold,
+  .tau           = op_detailed$Tau,
+  .min_precision = 0.95,
+  .mines_root    = .lP$Output$Mines,
+  .runs_root     = .lP$Output$Runs,
+  .python        = .lP$Engine$Python,
+  .script        = .lP$Engine$Script
+)
+```
+
+```{r}
+kw_report_arms(
+  .tabs = list(
+    `generated, shared regime` = perf_generated,
+    `generated, own regime`    = perf_generated_none
+  )
+)
+```
+
+A written list scoring better under its own regime than under the shared one bounds what the union
+costs: the comparison in the previous section understates the generated arm by that difference, and
+the difference is the price of expressing both arms in one vocabulary. Amendment, which runs without
+removal, shows the same arm unfolded and is the cleanest read on what reading contributes.
+
+```{r}
+kw_report_arms(
+  .tabs = list(
+    `broad, mined` = perf_final |>
+      dplyr::filter(LabelCol == "ClassBroad", TestFold == .lP$Param$HoldoutFold),
+    `broad, generated` = perf_generated_broad,
+    `amendment, mined` = perf_final |>
+      dplyr::filter(LabelCol == "AmendType", TestFold == .lP$Param$HoldoutFold),
+    `amendment, generated` = perf_generated_amend
+  )
+)
+```
+
+Amendment is the sharpest test of the two arms, because the phrase that most obviously marks an
+amendment is a title convention appearing on many genuine originals. A statistical miner cannot know
+that; it can only observe that the phrase is imprecise and discard it. A reader can recognise the
+convention and look instead for the structural markers of modification, which is what the session was
+asked to do.
+
+# Deployment
+
+The folds pay for the estimate; the all-data mine produces the artifact. A published term must also
+have been chosen independently by at least the required number of fold mines, a filter applied here
+and nowhere else: mine `k` trains on every fold but `k`, so filtering a fold lexicon on agreement
+across all mines would let the held-out fold influence selection. An all-data mine holds nothing out,
+so the filter is legitimate against it. The reported precision and coverage therefore describe the
+unfiltered procedure, while the published table carries one further filter that can only remove terms.
+
+```{r}
+tab_keywords <- kw_lexicon_final(
+  .mine_dir_all = idx_mine |>
+    dplyr::semi_join(cfg_detailed, by = dplyr::join_by(LabelCol, Source, NWords, NgramMax, Stopwords)) |>
+    dplyr::filter(Fold == 0L) |>
+    dplyr::pull(MineDir),
+  .mine_dirs_folds = dirs_detailed,
+  .tau = op_detailed$Tau, # the chosen operating point
+  .min_folds = .lP$Param$MinFolds, # fold agreement required of a published term
+  .min_precision = 0.95,
+  .min_hits = sel_best$MinHits,
+  .min_tot = sel_best$MinTot,
+  .min_reach = sel_best$MinReach,
+  .max_terms = sel_best$MaxTerms
+)
+```
+
+```{r}
+kw_report_lexicon(.tab = tab_keywords, .top = 8L)
+```
+
+```{r}
+kw_save_lexicon(
+  .tab  = tab_keywords,
+  .dir  = .lP$Output$Table,
+  .stem = "keyword_table_detailed"
+)
+```
+
+# Overview
+
+```{r}
+kw_report_all(
+  .perf_mines       = perf_mines,
+  .perf_sel         = perf_sel,
+  .curve            = curve_detailed,
+  .tab_pred         = pred_final,
+  .tab_lexicon      = tab_keywords,
+  .label_col        = "ClassDetailed",
+  .target_precision = .lP$Param$TargetPrecision,
+  .min_classes      = .lP$Param$MinClasses
+)
+```
+
+```{r}
+#| fig-cap: "Performance against the truncation window. The reference line marks the transformer's
+#|   reading window; anything right of it is signal no model in this study sees."
+kw_plot_window(.tab = perf_mines, .label_col = "ClassDetailed", .window_ref = 512L)
+```
+
+```{r}
+#| fig-cap: "Precision bought by declining to label. Point size is the number of categories the table still reaches."
+kw_plot_tau(.curve = curve_detailed, .target_precision = .lP$Param$TargetPrecision)
+```
+
+```{r}
+#| fig-cap: "Share of each category reached by successive terms. A curve flattening early marks
+#|   the point at which a list stops earning its length."
+kw_plot_reach(.tab = tab_keywords)
 ```
 
 # Next
 
-03C produces the keyword runs in their own root; 03A's overview tooling reads them,
-and 03D compares methods and tests the desc -> text -> BERT escalation.
-
-- **03D escalation.** `kw_load_confidence` works on any source config, so 03D can run
-  `orch_subset_compare` on the docdesc and text configs separately -- the test of
-  whether either carves a subset it wins before any cascade is built. The shared folds
-  make every source row directly comparable with BERT.
-- **Optional min_df starvation probe.** A `min_df = 1` sweep for the rare classes
-  needs `min_df` added to the engine `config_name` first (so variants do not collide
-  on disk); a small, isolated change if the topk lift proves insufficient on R&D /
-  Peer.
+03D compares the keyword and transformer arms on the shared leaderboard, using the run folders written
+here. 03E applies the deployed transformer to the full corpus; the keyword table is an independent
+artifact that does not enter that path and ships alongside the archived dataset.

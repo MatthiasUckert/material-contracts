@@ -1,820 +1,1714 @@
-# 03C-ClassifyTrainKeyword: keyword sweep (parallel) + mined lexicon ----
-# The keyword classifier: a transparent, lexical counterpart to BERT (03B) on the
-# IDENTICAL frozen folds. R builds per-(config x fold) commands; Python
-# (contracts-engine/keyword_train.py) mines a per-class lexicon on the TRAIN folds
-# and scores the held-out fold, writing the SAME run-folder schema as the BERT
-# engine (predictions / metrics_overall / metrics_perclass / config.json) plus
-# lexicon.parquet. R scores keyword head-to-head with BERT through the shared
-# 03A layer, on byte-for-byte the same splits.
+# 03C-ClassifyTrainKeyword.R -- library for the keyword table
 #
-# Sources 03A (source it alongside this file) for everything common:
-#   clf_prepare_sample / clf_write_prepared -- the single prepared.parquet (which
-#       already carries DocDesc, so there is NO keyword-specific prep step here)
-#   clf_perclass / clf_scores / clf_confusion -- the unified abstention-aware
-#       scoring layer (.none = "(none)" by default); keyword was the reason it is
-#       abstention-aware, so the old kw_perclass / kw_scores / kw_confusion are gone
-#   clf_load_overall / clf_pool_predictions / clf_effect / clf_add_second_label
+# The deliverable of this stage is an artifact rather than a model: a short, ranked, human-readable
+# table of terms per contract type that can be applied to EDGAR without a GPU, with a stated
+# precision and a stated coverage. Every design decision below follows from that goal, and where a
+# choice would differ had the goal been accuracy, the roxygen says so.
 #
-# Keyword-specific (this file): diagnostics, the trainer command + runners, the
-# axis-broken-out leaderboard, and the lexicon inspector. The method adds:
-#   Source   = which field(s): "text" (body), "docdesc" (filer title),
-#              "combined" (alpha * docdesc + text).
-#   Coverage = share of docs the method predicts (1 - abstention rate).
-#   "(none)" = sentinel PredLabel for an abstention (no term fired).
+# THE SEAM
+# Mining is expensive, selection is cheap. contracts-engine/keyword_train.py tokenises the sample and
+# writes per-(term, class) statistics plus incidence; every floor, the greedy rule, the decision rule
+# and the thresholds live here. That split keeps the mining grid at a few hundred cells while leaving
+# the selection sweep interactive, and it makes the engine task-agnostic: the amendment decision rule
+# is a decision, so it lives in R.
 #
-# Parallelism: the sweep dispatches independent, CPU-bound shell-outs across mirai
-# daemons (scoped to the sweep, torn down on exit). Logging: each run tees its
-# narrative to run_dir/run.log; the console stays quiet and shows only formatted
-# performance + run stats; the master structured log is clf_load_overall() binding
-# the per-run metrics_overall rows -- no shared file the parallel workers race on.
+# POWER
+# Wilson 95% lower bound on training precision. Bounded in [0, 1], monotone in both precision and
+# evidence: a term seen 2 times in 2 documents scores 0.342, one seen 190 times in 200 scores 0.910,
+# where raw precision ranks the first ahead of the second. Power is the sort key of the published
+# table and the evidence gate at scoring time. It is NOT the precision gate -- see kw_select.
 #
-# House style: native pipe; explicit package::function; dot-prefixed args;
-# underscore-suffixed locals; .data$ for existing columns, bare CamelCase for new;
-# if (FALSE) dev blocks; cli/fs/here; pure ASCII; {(.arg)} parens in cli.
+# Sources 03A for the shared layer (clf_scores, clf_perclass, clf_confusion, clf_leaderboard,
+# clf_say_table, clf_pct, clf_apply_theme). Run folders are written in the same schema the BERT
+# trainer uses, so those functions consume keyword runs without special-casing.
 
-if (FALSE) {
-  .path_data <- .lP$Input$Prepared
-  .runs_root <- .lP$Output$RunsDir
-  .grid      <- tidyr::expand_grid(label_col = "ClassDetailed", source = c("text", "docdesc", "combined"),
-                                   stopwords = "none", fold = 1:5)
-}
+KW_NONE <- "(none)"
+
+`%||%` <- function(.x, .y) if (is.null(.x)) .y else .x
 
 
-# Step 0 diagnostics ------------------------------------------------------
+# 1. Engine seam: mining commands, the sweep, and the index --------------------------------------
 
-#' DocDesc coverage (run before modelling)
+#' Build the argument vector for one mining cell
 #'
-#' How much of the sample carries a non-empty filer title. If below 100%, a
-#' docdesc-only model must abstain on the gaps, which Coverage will then report.
+#' Pure: validates and returns the command, with no side effects, so the sequential and parallel
+#' paths construct byte-identical calls and a failed cell can be reproduced by printing it.
 #'
-#' @param .tab Prepared sample (must contain DocDesc, ClassDetailed).
-#' @return Tibble: overall and per-ClassDetailed non-empty-DocDesc share.
-kw_diag_desc_coverage <- function(.tab) {
+#' Test fold 0 mines every labelled row and holds nothing out. Its lexicon becomes the published
+#' table, mirroring the convention used for the transformer: the folds pay for the honest estimate,
+#' an all-data fit produces the deployed artifact.
+#'
+#' @param .path_data Prepared parquet written by 03A.
+#' @param .label_col Label column to mine.
+#' @param .source Field to mine: document body or filer title.
+#' @param .test_fold Held-out fold; 0 mines all labelled rows.
+#' @param .nwords Truncate the body to the first N whitespace words; 0 keeps the whole document.
+#' @param .ngram_max Longest n-gram mined.
+#' @param .stopwords Stopword regime. Under an accuracy objective "none" wins, because function-word
+#'   collocations are discriminative. Under a readability objective it loses, because "borrower any
+#'   its" cannot be published. Both are swept and judged on the terms produced.
+#' @param .min_df,.max_df Vocabulary pruning bounds; max_df removes corpus-wide boilerplate.
+#' @param .min_token_len Shortest alphabetic token kept.
+#' @param .power_floor Permissive engine-side pre-filter; the binding floors are applied in R.
+#' @param .max_candidates Candidate cap per class. Bounds artifact size only.
+#' @param .terms_file Optional (Class, Term) file; supplying it scores that list instead of mining.
+#' @param .seed Stamped for parity across methods; mining itself is deterministic.
+#' @param .mines_root Directory under which mine folders are written.
+#' @param .python,.script Interpreter and miner paths.
+#' @param .overwrite Re-mine cells already present on disk.
+#' @param .smoke Tiny subsample, for checking the seam rather than producing results.
+#' @return List with elements `python` and `args`.
+kw_mine_command <- function(.path_data,
+                            .label_col      = c("ClassDetailed", "ClassBroad", "AmendType"),
+                            .source         = c("text", "docdesc"),
+                            .test_fold      = 1L,
+                            .nwords         = 0L,
+                            .ngram_max      = 3L,
+                            .stopwords      = c("none", "english_domain", "english", "domain"),
+                            .min_df         = 3L,
+                            .max_df         = 0.5,
+                            .min_token_len  = 3L,
+                            .power_floor    = 0.30,
+                            .max_candidates = 300L,
+                            .terms_file     = NULL,
+                            .seed           = 42L,
+                            .mines_root     = NULL,
+                            .python         = NULL,
+                            .script         = NULL,
+                            .overwrite      = FALSE,
+                            .smoke          = FALSE) {
   if (FALSE) {
-    .tab <- arrow::read_parquet(.lP$Input$Prepared)
+    .path_data  <- .lP$Input$Prepared
+    .label_col  <- "ClassDetailed"
+    .source     <- "text"
+    .test_fold  <- 1L
+    .nwords     <- 256L
+    .mines_root <- .lP$Output$Mines
+    .python     <- .lP$Engine$Python
+    .script     <- .lP$Engine$Script
   }
-  has_desc_ <- function(.x) !is.na(.x) & trimws(.x) != ""
-
-  overall_ <- .tab |>
-    dplyr::summarise(
-      Level    = "ALL",
-      N        = dplyr::n(),
-      HasDesc  = sum(has_desc_(.data$DocDesc)),
-      Coverage = mean(has_desc_(.data$DocDesc))
-    )
-
-  by_class_ <- .tab |>
-    dplyr::summarise(
-      N        = dplyr::n(),
-      HasDesc  = sum(has_desc_(.data$DocDesc)),
-      Coverage = mean(has_desc_(.data$DocDesc)),
-      .by      = ClassDetailed
-    ) |>
-    dplyr::rename(Level = ClassDetailed) |>
-    dplyr::arrange(.data$Coverage)
-
-  cli::cli_alert_info("DocDesc non-empty: {scales::percent(overall_$Coverage, 0.1)} of {overall_$N} docs")
-  dplyr::bind_rows(overall_, by_class_)
-}
-
-#' Header-leakage probe: does the body restate the title verbatim?
-#'
-#' If DocDesc (or DocName) appears verbatim near the top of Text, then mining
-#' Text partly relearns DocDesc and the docdesc-vs-text contrast is muddied. High
-#' leakage argues for stripping a header zone before mining the body.
-#'
-#' stri_sub (not base substr) is used for the head slice: base substr indexes
-#' bytes, stri_sub indexes code points, so multibyte titles slice correctly.
-#'
-#' @param .tab Prepared sample (DocID, Text, DocDesc; DocName optional).
-#' @param .n_chars Head window of Text to test, in characters.
-#' @return Tibble: leak share for DocDesc and (if present) DocName.
-kw_diag_header_leak <- function(.tab, .n_chars = 300L) {
-  if (FALSE) {
-    .tab     <- arrow::read_parquet(.lP$Input$Prepared)
-    .n_chars <- 300L
-  }
-  head_ <- stringi::stri_sub(.tab$Text, 1L, .n_chars) |> stringi::stri_trans_tolower()
-
-  leak_share_ <- function(.field) {
-    field_ <- stringi::stri_trans_tolower(.field)
-    ok_    <- !is.na(field_) & trimws(field_) != "" & !is.na(head_)
-    if (!any(ok_)) return(NA_real_)
-    mean(stringi::stri_detect_fixed(head_[ok_], field_[ok_]))
-  }
-
-  out_ <- tibble::tibble(
-    Field     = "DocDesc",
-    NChars    = .n_chars,
-    LeakShare = leak_share_(.tab$DocDesc)
-  )
-  if ("DocName" %in% names(.tab)) {
-    out_ <- dplyr::bind_rows(out_, tibble::tibble(
-      Field = "DocName", NChars = .n_chars, LeakShare = leak_share_(.tab$DocName)
-    ))
-  }
-  cli::cli_alert_info("Head-{(.n_chars)}-char verbatim title match: DocDesc {scales::percent(out_$LeakShare[[1]], 0.1)}")
-  out_
-}
-
-
-# Training command + single run -------------------------------------------
-
-#' Build the keyword-trainer command for one (config x fold)
-#'
-#' Pure: validates args and returns the python + argument vector, with NO side
-#' effects. Both kw_train (sequential) and kw_sweep (parallel) call this so they
-#' construct identical commands; the parallel path needs a side-effect-free builder
-#' it can run inside daemons.
-#'
-#' The .stopwords default is "none": legal boilerplate function-word n-grams
-#' ("the consultant shall") are discriminative verbal fingerprints, not noise, so
-#' removing them does not help (and "none" won the sweep over "english_domain").
-#'
-#' @param .path_data Prepared parquet path (carries DocDesc).
-#' @param .label_col "ClassDetailed", "ClassBroad", or "AmendType".
-#' @param .source "text", "docdesc", or "combined".
-#' @param .test_fold Integer. Fold held out for testing.
-#' @param .text_col,.desc_col Body and title column names.
-#' @param .positive_class Character or NULL. Binary asymmetric mode (mine only this
-#'   class, predict it if its lexicon fires else the other label). NULL gives
-#'   multi-class argmax with abstain-on-no-match.
-#' @param .alpha Title weight for .source = "combined".
-#' @param .topk,.ngram_max,.min_df,.max_df Mining hyperparameters.
-#' @param .stopwords "none" (default), "english", "domain", or "english_domain".
-#' @param .min_token_len Shortest alpha token kept.
-#' @param .seed Stamped for parity (mining is deterministic).
-#' @param .runs_root Directory under which run folders are written.
-#' @param .python,.script Paths to the venv python and the keyword trainer.
-#' @param .save_probs,.overwrite,.smoke Flags.
-#' @return List(python = <path>, args = <character vector>).
-kw_command <- function(.path_data,
-                       .label_col = c("ClassDetailed", "ClassBroad", "AmendType"),
-                       .source = c("text", "docdesc", "combined"),
-                       .test_fold = 1L,
-                       .text_col = "Text",
-                       .desc_col = "DocDesc",
-                       .positive_class = NULL,
-                       .alpha = 2.0,
-                       .topk = 25L,
-                       .ngram_max = 3L,
-                       .min_df = 2L,
-                       .max_df = 0.5,
-                       .stopwords = c("none", "english_domain", "english", "domain"),
-                       .min_token_len = 3L,
-                       .seed = 42L,
-                       .runs_root = here::here("2_output", "03C-ClassifyTrainKeyword", "runs"),
-                       .python = here::here("contracts-engine", ".venv", "bin", "python"),
-                       .script = here::here("contracts-engine", "keyword_train.py"),
-                       .save_probs = TRUE,
-                       .overwrite = FALSE,
-                       .smoke = FALSE) {
-
   .label_col <- match.arg(.label_col)
   .source    <- match.arg(.source)
   .stopwords <- match.arg(.stopwords)
 
   args_ <- c(
     .script,
-    "--data", .path_data,
-    "--label-col", .label_col,
-    "--source", .source,
-    "--text-col", .text_col,
-    "--desc-col", .desc_col,
-    "--test-fold", as.character(.test_fold),
-    "--alpha", as.character(.alpha),
-    "--topk", as.character(.topk),
-    "--ngram-max", as.character(.ngram_max),
-    "--min-df", as.character(.min_df),
-    "--max-df", as.character(.max_df),
-    "--stopwords", .stopwords,
-    "--min-token-len", as.character(.min_token_len),
-    "--seed", as.character(.seed),
-    "--runs-root", .runs_root
+    "--data",            .path_data,
+    "--label-col",       .label_col,
+    "--source",          .source,
+    "--test-fold",       as.character(.test_fold),
+    "--nwords",          as.character(.nwords),
+    "--ngram-max",       as.character(.ngram_max),
+    "--stopwords",       .stopwords,
+    "--min-df",          as.character(.min_df),
+    "--max-df",          as.character(.max_df),
+    "--min-token-len",   as.character(.min_token_len),
+    "--power-floor",     as.character(.power_floor),
+    "--max-candidates",  as.character(.max_candidates),
+    "--seed",            as.character(.seed),
+    "--runs-root",       .mines_root
   )
-  if (!is.null(.positive_class)) args_ <- c(args_, "--positive-class", .positive_class)
-  if (!.save_probs)             args_ <- c(args_, "--no-save-probs")
-  if (.overwrite)              args_ <- c(args_, "--overwrite")
-  if (.smoke)                  args_ <- c(args_, "--smoke")
+  if (!is.null(.terms_file)) args_ <- c(args_, "--terms-file", .terms_file)
+  if (.overwrite)            args_ <- c(args_, "--overwrite")
+  if (.smoke)                args_ <- c(args_, "--smoke")
 
   list(python = .python, args = args_)
 }
 
-#' Mine + score one fold by invoking the contracts-engine keyword trainer
+#' Run one mining cell in the foreground
 #'
-#' Sequential single-run wrapper for manual checks (smoke, one real fold). For
-#' sweeping a grid in parallel use kw_sweep. One invocation = one (config x fold);
-#' skip-if-exists is handled engine-side. The Python narrative is shown on the
-#' console (one run, so no spam) and is also captured to run_dir/run.log.
+#' For smoke checks and for scoring a supplied term list, where the parallel path adds nothing.
 #'
-#' @inheritParams kw_command
-#' @return Invisible exit status.
-kw_train <- function(.path_data, ...,
-                     .python = here::here("contracts-engine", ".venv", "bin", "python"),
-                     .script = here::here("contracts-engine", "keyword_train.py")) {
+#' @param .path_data Prepared parquet.
+#' @param ... Passed to kw_mine_command.
+#' @param .python,.script Interpreter and miner paths.
+#' @return Exit status, invisibly.
+kw_mine <- function(.path_data, ..., .python = NULL, .script = NULL) {
+  if (FALSE) {
+    .path_data <- .lP$Input$Prepared
+    .python    <- .lP$Engine$Python
+    .script    <- .lP$Engine$Script
+  }
   if (!fs::file_exists(.python)) cli::cli_abort("Python not found at {(.python)}")
-  if (!fs::file_exists(.script)) cli::cli_abort("Trainer not found at {(.script)}")
+  if (!fs::file_exists(.script)) cli::cli_abort("Miner not found at {(.script)}")
 
-  cmd_ <- kw_command(.path_data, ..., .python = .python, .script = .script)
+  cmd_    <- kw_mine_command(.path_data, ..., .python = .python, .script = .script)
   status_ <- system2(cmd_$python, args = cmd_$args, stdout = "", stderr = "")
-  if (!identical(status_, 0L)) cli::cli_abort("Python keyword trainer failed (exit {status_})")
+  if (!identical(status_, 0L)) cli::cli_abort("Keyword miner failed (exit {status_})")
   invisible(status_)
 }
 
-#' Run k-fold CV for one keyword configuration (sequential; manual checks)
+#' Build the mining grid
 #'
-#' For sweeping a grid, prefer kw_sweep (parallel). This loops kw_train over folds.
+#' The filer title is a single short field, so the truncation axis does not apply to it and the
+#' docdesc arm gets one row per (task, n-gram, fold) rather than one per window.
 #'
-#' @param .path_data Prepared parquet path.
-#' @param .label_col "ClassDetailed", "ClassBroad", or "AmendType".
-#' @param .source "text", "docdesc", or "combined".
-#' @param .folds Integer vector of fold ids to hold out.
-#' @param ... Passed through to kw_train (.stopwords, .topk, .runs_root, ...).
-kw_cv <- function(.path_data, .label_col = "ClassDetailed", .source = "text",
-                  .folds = 1:5, ...) {
-  purrr::walk(.folds, function(f_) {
-    kw_train(.path_data, .label_col = .label_col, .source = .source,
-             .test_fold = f_, ...)
-  })
-  invisible(NULL)
+#' @param .label_cols Tasks to mine.
+#' @param .nwords_text Word windows for the body arm; 0 is the whole document.
+#' @param .ngram_max Longest n-gram(s) to try.
+#' @param .stopwords Stopword regimes to cross.
+#' @param .folds Held-out folds.
+#' @param .with_alldata Append the fold-0 all-data mine that produces the published table.
+#' @return Tibble with columns LabelCol, Source, NWords, NgramMax, Stopwords, Fold.
+kw_mine_grid <- function(.label_cols   = c("ClassDetailed", "ClassBroad", "AmendType"),
+                         .nwords_text  = c(256L, 512L, 1024L, 2048L, 0L),
+                         .ngram_max    = c(2L, 3L),
+                         .stopwords    = c("none", "english_domain"),
+                         .folds        = 1:5,
+                         .with_alldata = TRUE) {
+  if (FALSE) {
+    .label_cols   <- "ClassDetailed"
+    .nwords_text  <- c(256L, 512L)
+    .ngram_max    <- 3L
+    .stopwords    <- "none"
+    .folds        <- 1:5
+    .with_alldata <- TRUE
+  }
+  folds_ <- if (.with_alldata) c(.folds, 0L) else .folds
+
+  dplyr::bind_rows(
+    tidyr::expand_grid(
+      LabelCol = .label_cols, Source = "text", NWords = .nwords_text,
+      NgramMax = .ngram_max, Stopwords = .stopwords, Fold = folds_
+    ),
+    tidyr::expand_grid(
+      LabelCol = .label_cols, Source = "docdesc", NWords = 0L,
+      NgramMax = .ngram_max, Stopwords = .stopwords, Fold = folds_
+    )
+  )
 }
 
-
-# Parallel sweep (mirai) --------------------------------------------------
-
-#' Run a grid of keyword (config x fold) cells in parallel via mirai
+#' Run the mining grid in parallel
 #'
-#' The cells are independent and CPU-bound (each shells out to its own Python
-#' process), so they parallelise trivially. mirai daemons are spun up for the
-#' sweep and torn down on exit, so workers are not left pinned and will not
-#' contend with a GPU/MPS-bound BERT run. Each daemon only runs system2 on a
-#' command pre-built in the main process (absolute paths throughout), so no
-#' per-daemon state or sourcing is needed. A failed cell is captured (not fatal);
-#' the summary reports it and re-running is cheap (the engine skips finished cells).
+#' Idempotent: the engine skips any cell whose termstats file already exists, so re-running the
+#' document costs seconds and reproduces identical output. That is what makes it affordable to run
+#' this chunk on every render rather than guarding it.
 #'
-#' For many sweeps back-to-back in one session, hoist mirai::daemons() to the
-#' caller and delete the on.exit teardown so daemons are reused.
+#' Because the mine name encodes hyperparameters and not a hash of the data, changing the sample
+#' without clearing the mines directory would serve stale results silently. The document states this
+#' in its Configuration section.
 #'
-#' The grid must have columns label_col, source, fold; optional columns
-#' positive_class, stopwords, min_token_len, topk, ngram_max, alpha override the
-#' defaults per row (missing columns fall back to the kw_command defaults).
-#'
-#' @param .grid Tibble of cells (see above).
-#' @param .path_data Prepared parquet path.
-#' @param .runs_root Runs directory (default the 03C runs root).
-#' @param .python,.script Paths to the venv python and the keyword trainer.
-#' @param .workers Concurrent daemons. Default leaves 2 cores free.
-#' @param .overwrite Re-run cells already on disk.
-#' @return Invisible tibble of performance for the freshly-run cells (by macro-F1).
-kw_sweep <- function(.grid, .path_data,
-                     .runs_root = here::here("2_output", "03C-ClassifyTrainKeyword", "runs"),
-                     .python = here::here("contracts-engine", ".venv", "bin", "python"),
-                     .script = here::here("contracts-engine", "keyword_train.py"),
-                     .workers = max(1L, parallel::detectCores() - 2L),
-                     .overwrite = FALSE) {
+#' @param .grid Grid from kw_mine_grid.
+#' @param .path_data Prepared parquet.
+#' @param .mines_root Mines directory.
+#' @param .python,.script Interpreter and miner paths.
+#' @param .workers Daemons to run; NULL uses all cores but two.
+#' @param .overwrite Re-mine cells already on disk.
+#' @param ... Passed to kw_mine_command.
+#' @return Mine index for the whole directory, invisibly.
+kw_mine_sweep <- function(.grid, .path_data, .mines_root, .python, .script,
+                          .workers = NULL, .overwrite = FALSE, ...) {
   if (FALSE) {
-    .grid      <- tidyr::expand_grid(label_col = "ClassDetailed", source = "text",
-                                     stopwords = "none", fold = 1:5)
-    .path_data <- .lP$Input$Prepared
-    .runs_root <- .lP$Output$RunsDir
-    .workers   <- 8L
-    .overwrite <- FALSE
+    .grid       <- kw_mine_grid(.label_cols = "ClassDetailed", .nwords_text = 512L)
+    .path_data  <- .lP$Input$Prepared
+    .mines_root <- .lP$Output$Mines
+    .python     <- .lP$Engine$Python
+    .script     <- .lP$Engine$Script
+    .workers    <- 24L
+    .overwrite  <- FALSE
   }
   if (!fs::file_exists(.python)) cli::cli_abort("Python not found at {(.python)}")
-  if (!fs::file_exists(.script)) cli::cli_abort("Trainer not found at {(.script)}")
+  if (!fs::file_exists(.script)) cli::cli_abort("Miner not found at {(.script)}")
 
-  need_ <- c("label_col", "source", "fold")
+  need_ <- c("LabelCol", "Source", "NWords", "NgramMax", "Stopwords", "Fold")
   miss_ <- setdiff(need_, names(.grid))
   if (length(miss_) > 0L) cli::cli_abort("Grid missing columns: {miss_}")
 
-  has_ <- function(.col) .col %in% names(.grid)
-  cmds_ <- purrr::map(seq_len(nrow(.grid)), function(i_) {
-    kw_command(
-      .path_data      = .path_data,
-      .label_col      = .grid$label_col[[i_]],
-      .source         = .grid$source[[i_]],
-      .test_fold      = .grid$fold[[i_]],
-      .positive_class = if (has_("positive_class")) .grid$positive_class[[i_]] else NULL,
-      .stopwords      = if (has_("stopwords"))      .grid$stopwords[[i_]]      else "none",
-      .min_token_len  = if (has_("min_token_len"))  .grid$min_token_len[[i_]]  else 3L,
-      .topk           = if (has_("topk"))           .grid$topk[[i_]]           else 25L,
-      .ngram_max      = if (has_("ngram_max"))      .grid$ngram_max[[i_]]      else 3L,
-      .alpha          = if (has_("alpha"))          .grid$alpha[[i_]]          else 2.0,
-      .runs_root      = .runs_root,
-      .python         = .python,
-      .script         = .script,
-      .overwrite      = .overwrite
+  if (is.null(.workers)) .workers <- as.integer(max(1L, parallel::detectCores() - 2L))
+
+  cmds_ <- purrr::map(seq_len(nrow(.grid)), function(.i) {
+    kw_mine_command(
+      .path_data  = .path_data,
+      .label_col  = .grid$LabelCol[[.i]],
+      .source     = .grid$Source[[.i]],
+      .test_fold  = .grid$Fold[[.i]],
+      .nwords     = .grid$NWords[[.i]],
+      .ngram_max  = .grid$NgramMax[[.i]],
+      .stopwords  = .grid$Stopwords[[.i]],
+      .mines_root = .mines_root,
+      .python     = .python,
+      .script     = .script,
+      .overwrite  = .overwrite,
+      ...
     )
   })
 
-  cli::cli_alert_info("Dispatching {length(cmds_)} keyword cells across {(.workers)} mirai daemons ...")
+  cli::cli_alert_info("Dispatching {length(cmds_)} mine cells across {(.workers)} daemons")
   t0_ <- Sys.time()
 
   mirai::daemons(.workers)
   on.exit(mirai::daemons(0L), add = TRUE)
 
-  # mirai_map dispatches one task per command; system2 is base (available on the
-  # daemon), cmd is the mapped element. ms_[.progress] collects with a progress
-  # bar (use ms_[] if an older mirai lacks the .progress signal).
-  ms_  <- mirai::mirai_map(cmds_, \(cmd) system2(cmd$python, cmd$args, stdout = FALSE, stderr = FALSE))
-  res_ <- ms_[.progress]
-
+  res_  <- mirai::mirai_map(cmds_, \(cmd) system2(cmd$python, cmd$args, stdout = FALSE, stderr = FALSE))[.progress]
+  ok_   <- purrr::map_lgl(res_, \(s_) !inherits(s_, "miraiError") && identical(as.integer(s_), 0L))
   mins_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "mins")), 1)
-  ok_   <- purrr::map_lgl(res_, function(s_) {
-    !inherits(s_, "miraiError") && identical(as.integer(s_), 0L)
-  })
+
   if (any(!ok_)) {
-    cli::cli_alert_warning("{sum(!ok_)} of {length(cmds_)} cells failed -- see each run.log; re-run is cheap (engine skips finished cells)")
+    cli::cli_alert_warning("{sum(!ok_)} of {length(cmds_)} cells failed; each cell's run.log holds the reason")
   }
-  cli::cli_alert_success("Sweep done: {sum(ok_)}/{length(cmds_)} OK in {mins_} min")
+  cli::cli_alert_success("Mining complete: {sum(ok_)}/{length(cmds_)} cells in {mins_} min")
 
-  # Tidy performance for the freshly written cells. The mtime gate drops cells
-  # that were skipped (their metrics predate this sweep); those results are still
-  # on disk and reachable via clf_load_overall().
-  paths_ <- fs::dir_ls(.runs_root, recurse = TRUE, glob = "*metrics_overall.parquet")
-  paths_ <- paths_[!grepl("_smoke", paths_)]
-  fresh_ <- paths_[file.mtime(paths_) >= t0_]
-  perf_  <- if (length(fresh_) > 0L) {
-    purrr::map(fresh_, arrow::read_parquet) |>
-      purrr::list_rbind() |>
-      dplyr::select(RunName, Source, Stopwords, TopK, Accuracy, F1_macro, Coverage, DurationSec) |>
-      dplyr::arrange(dplyr::desc(.data$F1_macro))
-  } else {
-    tibble::tibble()
+  invisible(kw_mine_index(.mines_root = .mines_root))
+}
+
+#' Index every mine on disk
+#'
+#' Reads manifests rather than parsing directory names, so a change to the naming scheme cannot
+#' silently mislabel a run.
+#'
+#' @param .mines_root Mines directory.
+#' @return Tibble, one row per mine, ordered by task then configuration.
+kw_mine_index <- function(.mines_root) {
+  if (FALSE) .mines_root <- .lP$Output$Mines
+
+  paths_ <- fs::dir_ls(.mines_root, recurse = TRUE, glob = "*mine.json")
+  paths_ <- paths_[!grepl("_smoke", paths_, fixed = TRUE)]
+  if (length(paths_) == 0L) cli::cli_abort("No mine.json found under {(.mines_root)}")
+
+  purrr::map(paths_, function(.p) {
+    m_ <- jsonlite::read_json(.p, simplifyVector = TRUE)
+    tibble::tibble(
+      MineDir   = as.character(fs::path_dir(.p)),
+      MineName  = m_$mine_name,
+      Mode      = m_$mode,
+      LabelCol  = m_$label_col,
+      Source    = m_$source,
+      NWords    = as.integer(m_$nwords),
+      NgramMax  = as.integer(m_$ngram_range[[2]]),
+      Stopwords = m_$stopwords %||% "none",
+      TermsFile = m_$terms_file %||% NA_character_,
+      TermsHash = m_$terms_hash %||% NA_character_,
+      Fold      = as.integer(m_$test_fold),
+      nTrain    = as.integer(m_$n_train),
+      nTest     = as.integer(m_$n_test),
+      nVocab    = as.integer(m_$n_vocab),
+      nCand     = as.integer(m_$n_candidates),
+      MineSec   = as.numeric(m_$duration_sec)
+    )
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::arrange(.data$LabelCol, .data$Source, .data$Stopwords, .data$NWords, .data$NgramMax,
+                   .data$Fold)
+}
+
+#' Load one mine's artifacts
+#'
+#' @param .mine_dir Directory of a single mine.
+#' @return List with TermStats, IncTrain, IncTest, DocsTrain, DocsTest, Manifest. The test elements
+#'   are NULL for an all-data mine, which has no held-out fold.
+kw_load_mine <- function(.mine_dir) {
+  if (FALSE) .mine_dir <- idx_mine$MineDir[[1]]
+
+  opt_ <- function(.f) {
+    p_ <- fs::path(.mine_dir, .f)
+    if (fs::file_exists(p_)) arrow::read_parquet(p_) else NULL
   }
-  if (nrow(perf_) > 0L) {
-    cli::cli_h3("Fresh cells (by macro-F1)")
-    print(perf_, n = nrow(perf_))
-  }
-  invisible(perf_)
+  list(
+    TermStats = arrow::read_parquet(fs::path(.mine_dir, "termstats.parquet")),
+    IncTrain  = arrow::read_parquet(fs::path(.mine_dir, "incidence_train.parquet")),
+    IncTest   = opt_("incidence_test.parquet"),
+    DocsTrain = arrow::read_parquet(fs::path(.mine_dir, "docs_train.parquet")),
+    DocsTest  = opt_("docs_test.parquet"),
+    Manifest  = jsonlite::read_json(fs::path(.mine_dir, "mine.json"), simplifyVector = TRUE)
+  )
 }
 
 
-# Overview: keyword leaderboard (surfaces Source + Coverage) --------------
+# 2. Selection: from candidate statistics to a lexicon -------------------------------------------
 
-#' Leaderboard over keyword configs: mean / sd across folds (numeric)
+#' Select a minimal non-redundant lexicon from one mine
 #'
-#' Filters clf_load_overall() output to keyword rows (those carrying a Source), so
-#' BERT runs in a combined load are excluded. One row per configuration, with the
-#' keyword axes broken out as columns (Source, Stopwords, TopK, ...) -- the
-#' analyst's view, complementary to clf_leaderboard (ConfigName-keyed, cross-method)
-#' and clf_effect (marginal effect of one axis).
+#' Four gates and one greedy pass, each answering a different question.
 #'
-#' @param .tab_overall Output of clf_load_overall().
-#' @return One row per keyword configuration, descending by mean macro-F1.
-kw_leaderboard <- function(.tab_overall) {
-  .tab_overall |>
-    dplyr::filter(!is.na(.data$Source), !.data$Smoke) |>
-    dplyr::summarise(
-      nFolds        = dplyr::n(),
-      Acc_mean      = mean(.data$Accuracy),    Acc_sd      = sd(.data$Accuracy),
-      F1macro_mean  = mean(.data$F1_macro),    F1macro_sd  = sd(.data$F1_macro),
-      F1weight_mean = mean(.data$F1_weighted), F1weight_sd = sd(.data$F1_weighted),
-      Cov_mean      = mean(.data$Coverage),
-      .by = c(ConfigName, Model, LabelCol, Source, TopK, NgramMax, Alpha,
-              Stopwords, MinTokenLen, PositiveClass, Seed)
-    ) |>
-    dplyr::arrange(dplyr::desc(.data$F1macro_mean))
+#' PRECISION is the promise the table makes, and it is deliberately separate from the Power floor.
+#' Setting precision to 1 in the Wilson formula leaves Power_max(n) = n / (n + 3.84), so Power carries
+#' a support-dependent ceiling: a perfect term needs 44 hits to reach 0.92 at all. A category holding
+#' 71 documents therefore has no term that can clear a high global Power threshold, however clean.
+#' Thresholding on Power alone selects for class size rather than quality and empties every thin
+#' category by arithmetic. Precision has no such ceiling; Power stays on as the evidence gate.
+#'
+#' FILER DIVERSITY catches a term concentrated in one registrant's own template language. It does not
+#' catch a counterparty name, which is spread across the many suppliers that contract with that
+#' counterparty; nothing available here does, because the text is lowercased before mining and the
+#' one signal identifying a proper noun is gone before any statistic sees the term.
+#'
+#' REPEATED TOKENS arise when stopword removal collides across the gap: "employment agreement (this
+#' Agreement)" mines as "employment agreement agreement". Accurate, and unreadable.
+#'
+#' GREEDY MARGINAL REACH accepts a term only where it catches class documents no accepted term
+#' caught. One rule subsumes nested n-grams, near-synonyms and boilerplate variants, and because it
+#' works on document overlap rather than surface form it also removes redundancy no string rule sees.
+#'
+#' @param .mine Loaded mine from kw_load_mine.
+#' @param .min_precision Minimum training precision; the promise the table makes.
+#' @param .min_hits Minimum positive-class training hits.
+#' @param .min_tot Minimum total training hits.
+#' @param .min_reach Minimum marginal reach for acceptance, as a share of the class.
+#' @param .max_terms Cap on accepted terms per class. Readability, not accuracy.
+#' @param .min_filers Minimum distinct registrants a term must span; 0 disables.
+#' @param .min_filer_ratio Minimum NFilers / HitsPos. Scale-free, and the sharper of the two.
+#' @param .drop_repeats Drop n-grams containing a repeated token.
+#' @param .filer_pattern Regex extracting the registrant identifier from DocID.
+#' @return Tibble of accepted terms, one row per (class, term), ordered by class then Power.
+kw_select <- function(.mine,
+                      .min_precision   = 0.95,
+                      .min_hits        = 5L,
+                      .min_tot         = 5L,
+                      .min_reach       = 0.01,
+                      .max_terms       = 25L,
+                      .min_filers      = 5L,
+                      .min_filer_ratio = 0.5,
+                      .drop_repeats    = TRUE,
+                      .filer_pattern   = "^[0-9]{10}") {
+  if (FALSE) {
+    .mine            <- kw_load_mine(.mine_dir = idx_mine$MineDir[[1]])
+    .min_precision   <- 0.95
+    .min_hits        <- 5L
+    .min_tot         <- 5L
+    .min_reach       <- 0.01
+    .max_terms       <- 25L
+    .min_filers      <- 5L
+    .min_filer_ratio <- 0.5
+    .drop_repeats    <- TRUE
+    .filer_pattern   <- "^[0-9]{10}"
+  }
+  empty_ <- tibble::tibble(
+    Class = character(), Term = character(), Rank = integer(), Power = numeric(),
+    Precision = numeric(), HitsPos = integer(), HitsTot = integer(), NFilers = integer(),
+    FilerRatio = numeric(), Reach = numeric(), MarginalReach = numeric(), CumReach = numeric(),
+    NClass = integer()
+  )
+
+  stats_ <- .mine$TermStats |>
+    dplyr::filter(
+      .data$Precision >= .min_precision,
+      .data$HitsPos   >= .min_hits,
+      .data$HitsTot   >= .min_tot
+    )
+  if (nrow(stats_) == 0L) return(empty_)
+
+  if (.drop_repeats) {
+    distinct_ <- stats_$Term |>
+      stringi::stri_split_fixed(pattern = " ") |>
+      purrr::map_lgl(\(.t) length(unique(.t)) == length(.t))
+    stats_ <- stats_[distinct_, ]
+    if (nrow(stats_) == 0L) return(empty_)
+  }
+
+  stats_ <- stats_ |>
+    dplyr::arrange(.data$Class, dplyr::desc(.data$Power), dplyr::desc(.data$HitsPos), .data$Term)
+
+  n_train_ <- nrow(.mine$DocsTrain)
+  inc_     <- .mine$IncTrain |> dplyr::semi_join(stats_, by = dplyr::join_by(Class, Term))
+
+  filers_ <- inc_ |>
+    dplyr::left_join(.mine$DocsTrain |> dplyr::select(DocIdx, DocID), by = dplyr::join_by(DocIdx)) |>
+    dplyr::mutate(Filer = stringi::stri_extract_first_regex(.data$DocID, pattern = .filer_pattern)) |>
+    dplyr::summarise(NFilers = dplyr::n_distinct(.data$Filer), .by = c(Class, Term))
+
+  stats_ <- stats_ |>
+    dplyr::left_join(filers_, by = dplyr::join_by(Class, Term)) |>
+    dplyr::mutate(FilerRatio = .data$NFilers / pmax(.data$HitsPos, 1L)) |>
+    dplyr::filter(
+      !is.na(.data$NFilers),
+      .data$NFilers    >= .min_filers,
+      .data$FilerRatio >= .min_filer_ratio
+    )
+  if (nrow(stats_) == 0L) return(empty_)
+  inc_ <- inc_ |> dplyr::semi_join(stats_, by = dplyr::join_by(Class, Term))
+
+  purrr::map(unique(stats_$Class), function(.c) {
+    cand_    <- stats_ |> dplyr::filter(.data$Class == .c)
+    n_class_ <- cand_$NClass[[1]]
+    if (n_class_ == 0L) return(empty_)
+
+    hits_ <- inc_ |>
+      dplyr::filter(.data$Class == .c) |>
+      (\(.d) split(.d$DocIdx, .d$Term))()
+
+    covered_ <- logical(n_train_)
+    keep_    <- logical(nrow(cand_))
+    marg_    <- numeric(nrow(cand_))
+    cum_     <- numeric(nrow(cand_))
+    n_kept_  <- 0L
+
+    for (.i in seq_len(nrow(cand_))) {
+      docs_ <- hits_[[cand_$Term[[.i]]]]
+      if (is.null(docs_)) next
+      idx_  <- docs_ + 1L                                   # DocIdx is written 0-based by the engine
+      gain_ <- sum(!covered_[idx_]) / n_class_
+      if (gain_ >= .min_reach) {
+        covered_[idx_] <- TRUE
+        keep_[.i]      <- TRUE
+        marg_[.i]      <- gain_
+        cum_[.i]       <- sum(covered_) / n_class_
+        n_kept_        <- n_kept_ + 1L
+        if (n_kept_ >= .max_terms) break
+      }
+    }
+
+    cand_[keep_, ] |>
+      dplyr::mutate(
+        Rank          = dplyr::row_number(),
+        MarginalReach = marg_[keep_],
+        CumReach      = cum_[keep_]
+      ) |>
+      dplyr::select(Class, Term, Rank, Power, Precision, HitsPos, HitsTot, NFilers, FilerRatio,
+                    Reach, MarginalReach, CumReach, NClass)
+  }) |>
+    purrr::list_rbind()
 }
 
-#' Keyword leaderboard, formatted for reading (top .n configs)
+#' Build the selection sweep grid
 #'
-#' @param .tab_overall Output of clf_load_overall().
-#' @param .label_col Optional character. Restrict to one task (e.g. "ClassDetailed").
-#' @param .n Integer. Rows to show.
-#' @return Formatted tibble.
-kw_leaderboard_show <- function(.tab_overall, .label_col = NULL, .n = 20L) {
-  tab_ <- if (is.null(.label_col)) .tab_overall else dplyr::filter(.tab_overall, .data$LabelCol == .label_col)
-  kw_leaderboard(tab_) |>
+#' The evidence floors are single-valued rather than swept. Power already encodes evidence, so by the
+#' time the greedy pass accepts a term its support runs to dozens or hundreds and a floor of twenty
+#' never binds; crossing those axes returns identical results at four times the cost. Marginal reach
+#' and the per-class cap are the axes that change the answer.
+#'
+#' @param .min_precision Precision gate, held fixed across the sweep.
+#' @param .min_hits,.min_tot Evidence floors, held fixed.
+#' @param .min_reach Marginal-reach levels to cross.
+#' @param .max_terms Per-class caps to cross.
+#' @return Tibble grid with a SelName key per row.
+kw_select_grid <- function(.min_precision = 0.95,
+                           .min_hits      = 5L,
+                           .min_tot       = 5L,
+                           .min_reach     = c(0.005, 0.01, 0.02, 0.05),
+                           .max_terms     = c(15L, 25L, 40L)) {
+  if (FALSE) {
+    .min_precision <- 0.95
+    .min_hits      <- 5L
+    .min_tot       <- 5L
+    .min_reach     <- c(0.005, 0.01, 0.02, 0.05)
+    .max_terms     <- c(15L, 25L, 40L)
+  }
+  tidyr::expand_grid(
+    MinPrecision = .min_precision,
+    MinHits      = .min_hits,
+    MinTot       = .min_tot,
+    MinReach     = .min_reach,
+    MaxTerms     = .max_terms
+  ) |>
     dplyr::mutate(
-      Rank        = dplyr::row_number(),
-      Coverage    = sprintf("%.3f", .data$Cov_mean),
-      Accuracy    = sprintf("%.3f +/- %.3f", .data$Acc_mean, .data$Acc_sd),
-      F1_macro    = sprintf("%.3f +/- %.3f", .data$F1macro_mean, .data$F1macro_sd),
-      F1_weighted = sprintf("%.3f +/- %.3f", .data$F1weight_mean, .data$F1weight_sd)
-    ) |>
-    dplyr::select(Rank, LabelCol, Source, Stopwords, MinTokenLen, TopK, NgramMax, Alpha,
-                  nFolds, Coverage, Accuracy, F1_macro, F1_weighted) |>
-    head(.n)
+      SelName = sprintf("P%02d_H%d_C%d_R%03d_M%d", round(.data$MinPrecision * 100), .data$MinHits,
+                        .data$MinTot, round(.data$MinReach * 1000), .data$MaxTerms)
+    )
 }
 
 
-# Inspect a config's mined lexicon (the interpretable payoff) -------------
+# 3. Decision: turning a lexicon into labels -----------------------------------------------------
 
-#' Pool and summarise the mined lexicon for one keyword configuration
+#' Term hits on the held-out fold, independent of the threshold
 #'
-#' Binds lexicon.parquet across the config's folds and reports, per (Zone, Class,
-#' Term), the mean training precision weight and the number of folds the term was
-#' mined in (its stability). High-weight, all-fold terms are the trustworthy
-#' signals -- and the natural seed list for an optional human-prune pass.
+#' Computed once per lexicon so that an entire threshold curve costs one join. A term can belong to
+#' more than one class lexicon, hence the many-to-many relationship.
+#'
+#' @param .lexicon Output of kw_select.
+#' @param .mine Loaded mine carrying a held-out fold.
+#' @return Tibble with DocIdx, Class, Term, Power.
+kw_hits <- function(.lexicon, .mine) {
+  if (FALSE) {
+    .mine    <- kw_load_mine(.mine_dir = idx_mine$MineDir[[1]])
+    .lexicon <- kw_select(.mine = .mine)
+  }
+  if (is.null(.mine$IncTest)) cli::cli_abort("This mine holds nothing out; there is no fold to score")
+
+  .mine$IncTest |>
+    dplyr::inner_join(
+      .lexicon |> dplyr::select(Class, Term, Power),
+      by           = dplyr::join_by(Term),
+      relationship = "many-to-many"
+    )
+}
+
+#' Assign labels from term hits at one threshold
+#'
+#' A document's score for a class is the single highest-Power term of that class firing at or above
+#' the threshold, not a sum over firing terms. The maximum keeps every prediction traceable to one
+#' printable term, which is the point of shipping a table rather than a model; a weighted sum is not
+#' inspectable, and at the operating point the two rules agree anyway because most documents fire
+#' either no term or one.
+#'
+#' Amendment is asymmetric: an original is defined by the absence of amendment language, so the
+#' argument-maximum rule does not apply. The positive class is predicted where any of its terms
+#' clears the threshold and the other label otherwise, with no abstention.
+#'
+#' @param .hits Output of kw_hits.
+#' @param .mine Loaded mine; its held-out documents supply the universe and the truth.
+#' @param .tau Power threshold, acting as the evidence gate.
+#' @param .mode Decision rule to apply.
+#' @param .positive_class Class predicted on any hit, required in binary mode.
+#' @param .none Abstention sentinel.
+#' @return List with Pred (one row per document) and Prob (one row per document and class).
+kw_decide <- function(.hits, .mine,
+                      .tau            = 0.70,
+                      .mode           = c("multiclass", "binary"),
+                      .positive_class = NULL,
+                      .none           = KW_NONE) {
+  if (FALSE) {
+    .mine           <- kw_load_mine(.mine_dir = idx_mine$MineDir[[1]])
+    .hits           <- kw_hits(.lexicon = kw_select(.mine = .mine), .mine = .mine)
+    .tau            <- 0.70
+    .mode           <- "multiclass"
+    .positive_class <- NULL
+    .none           <- KW_NONE
+  }
+  .mode    <- match.arg(.mode)
+  docs_    <- .mine$DocsTest
+  classes_ <- sort(unique(.mine$DocsTrain$Label))
+
+  best_ <- .hits |>
+    dplyr::filter(.data$Power >= .tau) |>
+    dplyr::arrange(.data$DocIdx, .data$Class, dplyr::desc(.data$Power), .data$Term) |>
+    dplyr::distinct(DocIdx, Class, .keep_all = TRUE)
+
+  prob_ <- tidyr::expand_grid(DocIdx = docs_$DocIdx, Class = classes_) |>
+    dplyr::left_join(best_ |> dplyr::select(DocIdx, Class, Power), by = dplyr::join_by(DocIdx, Class)) |>
+    dplyr::mutate(Prob = dplyr::coalesce(.data$Power, 0)) |>
+    dplyr::left_join(docs_ |> dplyr::select(DocIdx, DocID), by = dplyr::join_by(DocIdx)) |>
+    dplyr::select(DocID, Class, Prob)
+
+  if (.mode == "binary") {
+    if (is.null(.positive_class)) cli::cli_abort("Binary mode requires .positive_class")
+    other_ <- setdiff(classes_, .positive_class)
+    if (length(other_) != 1L) cli::cli_abort("Binary mode expects exactly two classes")
+
+    pred_ <- docs_ |>
+      dplyr::left_join(
+        best_ |> dplyr::filter(.data$Class == .positive_class) |>
+          dplyr::select(DocIdx, PosPower = Power, PosTerm = Term),
+        by = dplyr::join_by(DocIdx)
+      ) |>
+      dplyr::mutate(
+        PredLabel = dplyr::if_else(!is.na(.data$PosPower), .positive_class, other_),
+        Score     = dplyr::coalesce(.data$PosPower, 0),
+        TopTerm   = .data$PosTerm
+      ) |>
+      dplyr::select(DocID, TrueLabel = Label, PredLabel, Score, TopTerm)
+
+    return(list(Pred = pred_, Prob = prob_))
+  }
+
+  top_ <- best_ |>
+    dplyr::mutate(
+      MaxPower = max(.data$Power),
+      nTied    = sum(.data$Power == max(.data$Power)),
+      .by = DocIdx
+    ) |>
+    dplyr::arrange(.data$DocIdx, dplyr::desc(.data$Power), .data$Class) |>
+    dplyr::distinct(DocIdx, .keep_all = TRUE)
+
+  pred_ <- docs_ |>
+    dplyr::left_join(
+      top_ |> dplyr::select(DocIdx, WinClass = Class, WinTerm = Term, MaxPower, nTied),
+      by = dplyr::join_by(DocIdx)
+    ) |>
+    dplyr::mutate(
+      Committed = !is.na(.data$MaxPower) & .data$nTied == 1L,
+      PredLabel = dplyr::if_else(.data$Committed, .data$WinClass, .none),
+      Score     = dplyr::if_else(.data$Committed, .data$MaxPower, 0),
+      TopTerm   = dplyr::if_else(.data$Committed, .data$WinTerm, NA_character_)
+    ) |>
+    dplyr::select(DocID, TrueLabel = Label, PredLabel, Score, TopTerm)
+
+  list(Pred = pred_, Prob = prob_)
+}
+
+
+# 4. Evaluation: one cell, and the sweeps over cells ---------------------------------------------
+
+#' Canonical configuration name
+#'
+#' Encodes every axis that varied, so the shared leaderboard -- which keys on this string -- ranks
+#' keyword and transformer configurations side by side without knowing their axes differ.
+#'
+#' @param .label_col,.source,.nwords,.ngram_max,.stopwords Mining axes.
+#' @param .min_precision,.min_reach,.max_terms Selection axes.
+#' @param .tau Power threshold.
+#' @param .seed Stamped for parity.
+#' @return Character scalar.
+kw_config_name <- function(.label_col, .source, .nwords, .ngram_max, .stopwords,
+                           .min_precision, .min_reach, .max_terms, .tau, .seed = 42L) {
+  if (FALSE) {
+    .label_col     <- "ClassDetailed"
+    .source        <- "text"
+    .nwords        <- 256L
+    .ngram_max     <- 3L
+    .stopwords     <- "none"
+    .min_precision <- 0.95
+    .min_reach     <- 0.01
+    .max_terms     <- 25L
+    .tau           <- 0.70
+    .seed          <- 42L
+  }
+  window_ <- if (.nwords == 0L) "full" else as.character(.nwords)
+  sw_     <- c(none = "none", english = "en", domain = "dom", english_domain = "endom")[[.stopwords]]
+  paste0(
+    .label_col, "__keyword-", .source, "__",
+    "W", window_, "_N", .ngram_max, "_SW", sw_,
+    "_P", sprintf("%02d", round(.min_precision * 100)),
+    "_R", sprintf("%03d", round(.min_reach * 1000)),
+    "_M", .max_terms,
+    "_T", sprintf("%02d", round(.tau * 100)),
+    "_S", .seed
+  )
+}
+
+#' Evaluate one mine under one selection at one threshold
+#'
+#' Writes a run folder in the schema the transformer trainer uses, so the shared loading and
+#' leaderboard functions consume these runs unchanged even though R rather than Python authored them.
+#'
+#' @param .mine Loaded mine carrying a held-out fold.
+#' @param .min_precision,.min_hits,.min_tot,.min_reach,.max_terms Selection parameters.
+#' @param .min_filers,.min_filer_ratio,.drop_repeats Selection parameters.
+#' @param .tau Power threshold.
+#' @param .runs_root Runs directory, or NULL to evaluate without writing.
+#' @param .seed Stamped for parity.
+#' @return One-row tibble of metrics, carrying the predictions and lexicon in list columns.
+kw_evaluate <- function(.mine,
+                        .min_precision   = 0.95,
+                        .min_hits        = 5L,
+                        .min_tot         = 5L,
+                        .min_reach       = 0.01,
+                        .max_terms       = 25L,
+                        .min_filers      = 5L,
+                        .min_filer_ratio = 0.5,
+                        .drop_repeats    = TRUE,
+                        .tau             = 0.70,
+                        .runs_root       = NULL,
+                        .seed            = 42L) {
+  if (FALSE) {
+    .mine          <- kw_load_mine(.mine_dir = idx_mine$MineDir[[1]])
+    .min_precision <- 0.95
+    .min_reach     <- 0.01
+    .max_terms     <- 25L
+    .tau           <- 0.70
+    .runs_root     <- NULL
+    .seed          <- 42L
+  }
+  man_ <- .mine$Manifest
+  if (is.null(.mine$IncTest)) cli::cli_abort("An all-data mine holds nothing out and cannot be scored")
+
+  binary_ <- identical(man_$label_col, "AmendType")
+  pos_    <- if (binary_) "Amended" else NULL
+  t0_     <- Sys.time()
+
+  lex_ <- kw_select(
+    .mine            = .mine,
+    .min_precision   = .min_precision,
+    .min_hits        = .min_hits,
+    .min_tot         = .min_tot,
+    .min_reach       = .min_reach,
+    .max_terms       = .max_terms,
+    .min_filers      = .min_filers,
+    .min_filer_ratio = .min_filer_ratio,
+    .drop_repeats    = .drop_repeats
+  )
+  lex_tau_ <- lex_ |> dplyr::filter(.data$Power >= .tau)
+
+  if (nrow(lex_tau_) == 0L) {
+    pred_ <- .mine$DocsTest |>
+      dplyr::transmute(
+        DocID, TrueLabel = Label,
+        PredLabel = if (binary_) "Original" else KW_NONE,
+        Score     = 0,
+        TopTerm   = NA_character_
+      )
+    prob_ <- tibble::tibble(DocID = character(), Class = character(), Prob = numeric())
+  } else {
+    dec_  <- kw_decide(
+      .hits           = kw_hits(.lexicon = lex_, .mine = .mine),
+      .mine           = .mine,
+      .tau            = .tau,
+      .mode           = if (binary_) "binary" else "multiclass",
+      .positive_class = pos_
+    )
+    pred_ <- dec_$Pred
+    prob_ <- dec_$Prob
+  }
+
+  cfg_ <- kw_config_name(
+    .label_col     = man_$label_col,
+    .source        = man_$source,
+    .nwords        = man_$nwords,
+    .ngram_max     = man_$ngram_range[[2]],
+    .stopwords     = man_$stopwords %||% "none",
+    .min_precision = .min_precision,
+    .min_reach     = .min_reach,
+    .max_terms     = .max_terms,
+    .tau           = .tau,
+    .seed          = .seed
+  )
+  run_  <- paste0(cfg_, "_F", man_$test_fold)
+  sc_   <- clf_scores(pred_, .none = KW_NONE)
+  pc_   <- clf_perclass(pred_, .none = KW_NONE)
+  hit_  <- pred_$PredLabel != KW_NONE
+
+  overall_ <- tibble::tibble(
+    ConfigName   = cfg_,
+    Run          = run_,
+    RunName      = run_,
+    Model        = paste0("keyword-", man_$source),
+    LabelCol     = man_$label_col,
+    TextCol      = man_$source,
+    ClassWeights = FALSE,
+    TestFold     = as.integer(man_$test_fold),
+    MaxLen       = NA_real_,
+    Epochs       = NA_real_,
+    BatchSize    = NA_real_,
+    LR           = NA_real_,
+    Seed         = as.integer(.seed),
+    Device       = "cpu",
+    nTrain       = as.integer(man_$n_train),
+    nTest        = as.integer(man_$n_test),
+    nClasses     = as.integer(man_$n_classes),
+    Accuracy     = sc_$Accuracy,
+    F1_macro     = sc_$F1_macro,
+    F1_weighted  = sc_$F1_weighted,
+    DurationSec  = round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 2),
+    Smoke        = FALSE,
+    Source       = man_$source,
+    NWords       = as.integer(man_$nwords),
+    NgramMax     = as.integer(man_$ngram_range[[2]]),
+    Stopwords    = man_$stopwords %||% "none",
+    MinPrecision = .min_precision,
+    MinHits      = as.integer(.min_hits),
+    MinTot       = as.integer(.min_tot),
+    MinReach     = .min_reach,
+    MaxTerms     = as.integer(.max_terms),
+    Tau          = .tau,
+    nTerms       = nrow(lex_tau_),
+    nClassesHit  = dplyr::n_distinct(pred_$PredLabel[hit_]),
+    Coverage     = sc_$Coverage,
+    SelPrecision = if (any(hit_)) mean(pred_$PredLabel[hit_] == pred_$TrueLabel[hit_]) else NA_real_
+  )
+
+  if (!is.null(.runs_root)) {
+    kw_write_run(
+      .runs_root   = .runs_root,
+      .run_name    = run_,
+      .config_name = cfg_,
+      .pred        = pred_,
+      .prob        = prob_,
+      .overall     = overall_,
+      .perclass    = pc_,
+      .lexicon     = lex_tau_,
+      .manifest    = man_
+    )
+  }
+
+  overall_ |> dplyr::mutate(Pred = list(pred_), Lexicon = list(lex_tau_))
+}
+
+#' Write one keyword run in the shared run-folder schema
 #'
 #' @param .runs_root Runs directory.
-#' @param .config_name ConfigName string (from kw_leaderboard).
-#' @param .min_folds Integer. Keep only terms mined in at least this many folds.
-#' @param .top_per_class Integer or NULL. Keep only the top terms per class by weight.
-#' @return Tibble: Zone, Class, Term, Folds, WeightMean, Measure, HitsPosMean.
-kw_load_lexicon <- function(.runs_root, .config_name, .min_folds = 1L, .top_per_class = NULL) {
+#' @param .run_name,.config_name Identifiers.
+#' @param .pred,.prob,.overall,.perclass,.lexicon Artifacts to write.
+#' @param .manifest Mine manifest, carried into config.json as provenance.
+#' @return Run directory path, invisibly.
+kw_write_run <- function(.runs_root, .run_name, .config_name, .pred, .prob, .overall, .perclass,
+                         .lexicon, .manifest) {
   if (FALSE) {
-    .runs_root     <- .lP$Output$RunsDir
-    .config_name   <- best_kw_det_
-    .min_folds     <- 3L
-    .top_per_class <- 15L
+    .runs_root   <- .lP$Output$Runs
+    .run_name    <- "run"
+    .config_name <- "cfg"
+    .pred        <- perf_final$Pred[[1]]
+    .prob        <- tibble::tibble()
+    .overall     <- perf_final[1, ]
+    .perclass    <- clf_perclass(.pred, .none = KW_NONE)
+    .lexicon     <- perf_final$Lexicon[[1]]
+    .manifest    <- kw_load_mine(.mine_dir = idx_mine$MineDir[[1]])$Manifest
   }
-  paths_ <- fs::dir_ls(.runs_root, recurse = TRUE, glob = "*lexicon.parquet")
-  paths_ <- paths_[!grepl("_smoke", paths_)]
-  if (length(paths_) == 0L) cli::cli_abort("No lexicon.parquet under {(.runs_root)}")
+  dir_ <- fs::path(.runs_root, .run_name)
+  fs::dir_create(dir_)
 
-  lex_ <- purrr::map(paths_, arrow::read_parquet) |>
-    purrr::list_rbind() |>
-    dplyr::filter(.data$ConfigName == .config_name)
-  if (nrow(lex_) == 0L) cli::cli_abort("No lexicon rows for config {(.config_name)}")
+  .pred |>
+    dplyr::mutate(ConfigName = .config_name, Run = .run_name, Fold = as.integer(.manifest$test_fold)) |>
+    dplyr::select(ConfigName, Run, DocID, TrueLabel, PredLabel, Score, TopTerm, Fold) |>
+    arrow::write_parquet(fs::path(dir_, "predictions.parquet"))
 
-  out_ <- lex_ |>
-    dplyr::summarise(
-      Folds       = dplyr::n_distinct(.data$Run),
-      WeightMean  = mean(.data$Weight),
-      Measure     = paste(sort(unique(.data$Measure)), collapse = "/"),
-      HitsPosMean = mean(.data$HitsPosTrain),
-      .by = c(Zone, Class, Term)
-    ) |>
-    dplyr::filter(.data$Folds >= .min_folds) |>
-    dplyr::arrange(.data$Zone, .data$Class, dplyr::desc(.data$WeightMean))
+  .prob |>
+    dplyr::mutate(ConfigName = .config_name) |>
+    dplyr::select(ConfigName, DocID, Class, Prob) |>
+    arrow::write_parquet(fs::path(dir_, "probabilities.parquet"))
 
-  if (!is.null(.top_per_class)) {
-    out_ <- out_ |>
-      dplyr::slice_max(.data$WeightMean, n = .top_per_class, by = c(Zone, Class), with_ties = FALSE)
-  }
-  out_
+  arrow::write_parquet(.overall, fs::path(dir_, "metrics_overall.parquet"))
+
+  .perclass |>
+    dplyr::mutate(ConfigName = .config_name, Run = .run_name) |>
+    arrow::write_parquet(fs::path(dir_, "metrics_perclass.parquet"))
+
+  .lexicon |>
+    dplyr::mutate(ConfigName = .config_name, Run = .run_name) |>
+    arrow::write_parquet(fs::path(dir_, "lexicon.parquet"))
+
+  jsonlite::write_json(
+    list(config_name = .config_name, run_name = .run_name, authored_by = "03C kw_evaluate",
+         mine = .manifest, overall = as.list(.overall)),
+    fs::path(dir_, "config.json"), auto_unbox = TRUE, pretty = TRUE
+  )
+  invisible(dir_)
 }
 
-# Selective classification: high-precision subset ------------------------
-# The per-class numbers showed high precision but low recall on the hard classes:
-# the lexicon is usually right when it commits, and pays mostly for being forced to
-# guess (argmax) on ambiguous documents. Gating on the confidence Score turns that
-# into a deliberate choice -- classify only what the lexicon is sure about, defer
-# the rest. These read pooled predictions only (no re-mining, no engine change) and
-# reuse 03A's abstention-aware scoring. This is the keyword arm of 03D routing.
-
-#' Pool a keyword config's per-doc predictions under a chosen confidence
+#' Score every mine under one selection
 #'
-#' Returns the keyword pooled predictions (one row per doc, on the shared folds)
-#' with $Score OVERWRITTEN by the requested confidence, so the gate / calibrate /
-#' precision-coverage functions below (and the 03D selective router) consume it
-#' unchanged. The argmax PredLabel is preserved exactly -- only the confidence used
-#' for gating changes -- and the original max-score is kept as ScoreMax.
+#' Isolates the mining axes from the selection axes. Crossing both at once searches a far larger space
+#' than the transformer sweep does on the same documents, and the winner of a large search on a small
+#' sample is partly a winner by luck.
 #'
-#' The engine writes win_score as the fold-normalised MAX class score: a
-#' between-document magnitude (how much class-exclusive vocabulary a doc carries
-#' versus the most-loaded doc in its fold), which is NOT a per-document separation.
-#' "margin" / "marginrel" instead read the per-class scores from
-#' probabilities.parquet and form a per-document top-1-minus-top-2 separation -- the
-#' sharper signal for selective classification. "marginrel" divides by Top1Prob,
-#' cancelling the per-fold normalisation, so it pools cleanly across folds.
-#'
-#' @param .runs_roots Character vector of runs roots (keyword root among them).
-#' @param .config_name Keyword ConfigName (from kw_leaderboard).
-#' @param .which "maxscore" (the as-shipped win_score), "margin", or "marginrel".
-#' @param .none Character. Abstention sentinel (default "(none)").
-#' @return Tibble: DocID, TrueLabel, PredLabel, Score (= chosen confidence), Fold,
-#'   ScoreMax, Top1Prob, Top2Prob, Margin, MarginRel.
-kw_load_confidence <- function(.runs_roots, .config_name,
-                               .which = c("maxscore", "margin", "marginrel"),
-                               .none = "(none)") {
+#' @param .mine_index Mine index; all-data and manual mines are skipped.
+#' @param .runs_root Runs directory, or NULL.
+#' @param ... Selection parameters passed to kw_evaluate.
+#' @return Tibble of per-(mine, fold) metrics.
+kw_sweep_mines <- function(.mine_index, .runs_root = NULL, ...) {
   if (FALSE) {
-    .runs_roots  <- c(.lP$Runs$Bert, .lP$Runs$Kw)
-    .config_name <- best_kw
-    .which       <- "marginrel"
-    .none        <- "(none)"
+    .mine_index <- idx_mine
+    .runs_root  <- NULL
   }
-  .which <- match.arg(.which)
+  idx_ <- .mine_index |> dplyr::filter(.data$Fold > 0L, .data$Mode == "mine")
+  cli::cli_alert_info("Scoring {nrow(idx_)} mine-folds")
 
-  # base predictions: DocID, TrueLabel, PredLabel, Score (= win_score), Fold
-  base_ <- clf_pool_predictions(.runs_roots, .config_name) |>
-    dplyr::mutate(ScoreMax = .data$Score)
+  purrr::map(idx_$MineDir, function(.d) {
+    kw_evaluate(.mine = kw_load_mine(.mine_dir = .d), .runs_root = .runs_root, ...)
+  }, .progress = "mine-folds") |>
+    purrr::list_rbind()
+}
 
-  # the per-class scores live in probabilities.parquet (long: ConfigName, DocID,
-  # Class, Prob). Pool across folds and keep this config's rows.
-  paths_ <- .runs_roots |>
-    purrr::map(\(r_) fs::dir_ls(r_, recurse = TRUE, glob = "*probabilities.parquet")) |>
-    purrr::list_c()
-  paths_ <- paths_[!grepl("_smoke", paths_)]
-  if (length(paths_) == 0L) cli::cli_abort("No probabilities.parquet under the runs roots")
+#' Sweep the selection grid over chosen mines
+#'
+#' Mines are loaded once and reused across every selection configuration, which is what makes this
+#' sweep interactive rather than a second mining run.
+#'
+#' @param .mine_index Mine index restricted to the configurations to explore.
+#' @param .grid_sel Grid from kw_select_grid.
+#' @param .tau Power threshold.
+#' @param .runs_root Runs directory, or NULL.
+#' @param ... Further selection parameters passed to kw_evaluate.
+#' @return Tibble of per-(mine, fold, selection) metrics.
+kw_sweep_selection <- function(.mine_index, .grid_sel, .tau = 0.70, .runs_root = NULL, ...) {
+  if (FALSE) {
+    .mine_index <- idx_sel
+    .grid_sel   <- kw_select_grid()
+    .tau        <- 0.70
+    .runs_root  <- NULL
+  }
+  idx_ <- .mine_index |> dplyr::filter(.data$Fold > 0L, .data$Mode == "mine")
+  cli::cli_alert_info("Scoring {nrow(idx_)} mine-folds under {nrow(.grid_sel)} selection configs")
 
-  probs_ <- paths_ |>
-    purrr::map(arrow::read_parquet) |>
-    purrr::list_rbind() |>
-    dplyr::filter(.data$ConfigName == .config_name)
-  if (nrow(probs_) == 0L) cli::cli_abort("No probability rows for config {(.config_name)}")
+  purrr::map(idx_$MineDir, function(.d) {
+    mine_ <- kw_load_mine(.mine_dir = .d)
+    purrr::map(seq_len(nrow(.grid_sel)), function(.j) {
+      kw_evaluate(
+        .mine          = mine_,
+        .min_precision = .grid_sel$MinPrecision[[.j]],
+        .min_hits      = .grid_sel$MinHits[[.j]],
+        .min_tot       = .grid_sel$MinTot[[.j]],
+        .min_reach     = .grid_sel$MinReach[[.j]],
+        .max_terms     = .grid_sel$MaxTerms[[.j]],
+        .tau           = .tau,
+        .runs_root     = .runs_root,
+        ...
+      )
+    }) |>
+      purrr::list_rbind()
+  }, .progress = "selection sweep") |>
+    purrr::list_rbind()
+}
 
-  # per doc: rank the class scores, take the top two, derive the margins
-  top_ <- probs_ |>
-    dplyr::arrange(.data$DocID, dplyr::desc(.data$Prob)) |>
-    dplyr::mutate(Rank = dplyr::row_number(), .by = DocID) |>
-    dplyr::filter(.data$Rank <= 2L) |>
-    dplyr::select(DocID, Rank, Prob) |>
-    tidyr::pivot_wider(names_from = Rank, values_from = Prob, names_prefix = "Top") |>
-    dplyr::rename(Top1Prob = Top1, Top2Prob = Top2) |>
-    dplyr::mutate(
-      Top2Prob  = dplyr::coalesce(.data$Top2Prob, 0),
-      Margin    = .data$Top1Prob - .data$Top2Prob,
-      MarginRel = dplyr::if_else(.data$Top1Prob > 0, .data$Margin / .data$Top1Prob, 0)
+
+# 5. Operating point -----------------------------------------------------------------------------
+
+#' Precision and coverage across the threshold
+#'
+#' The threshold filters a fixed lexicon at scoring time, so the whole curve costs one hit join per
+#' fold. nClassesHit is reported alongside precision because a global Power floor removes thin
+#' categories by arithmetic: a curve can look excellent on precision while describing a table that
+#' labels five categories out of twelve.
+#'
+#' @param .mine_dirs Fold mine directories for one task and source.
+#' @param .taus Thresholds to evaluate.
+#' @param ... Selection parameters passed to kw_select.
+#' @return Tibble with one row per threshold.
+kw_tau_curve <- function(.mine_dirs, .taus = seq(0.40, 0.96, by = 0.02), ...) {
+  if (FALSE) {
+    .mine_dirs <- idx_sel$MineDir
+    .taus      <- seq(0.40, 0.96, by = 0.02)
+  }
+  prepped_ <- purrr::map(.mine_dirs, function(.d) {
+    mine_ <- kw_load_mine(.mine_dir = .d)
+    lex_  <- kw_select(.mine = mine_, ...)
+    list(
+      Mine   = mine_,
+      Lex    = lex_,
+      Hits   = kw_hits(.lexicon = lex_, .mine = mine_),
+      Binary = identical(mine_$Manifest$label_col, "AmendType")
     )
+  })
 
-  # overwrite Score with the chosen confidence (abstentions -> 0 so they gate out);
-  # the existing selective stack reads $Score and needs no edit.
-  base_ |>
-    dplyr::left_join(top_, by = dplyr::join_by(DocID)) |>
-    dplyr::mutate(
-      Score = dplyr::case_when(
-        .which == "maxscore"  ~ .data$ScoreMax,
-        .which == "margin"    ~ dplyr::coalesce(.data$Margin, 0),
-        .which == "marginrel" ~ dplyr::coalesce(.data$MarginRel, 0)
-      ),
-      Score = dplyr::if_else(.data$PredLabel == .none, 0, .data$Score)
-    )
-}
+  purrr::map(.taus, function(.t) {
+    pred_ <- purrr::map(prepped_, function(.p) {
+      kw_decide(
+        .hits           = .p$Hits,
+        .mine           = .p$Mine,
+        .tau            = .t,
+        .mode           = if (.p$Binary) "binary" else "multiclass",
+        .positive_class = if (.p$Binary) "Amended" else NULL
+      )$Pred
+    }) |>
+      purrr::list_rbind()
 
-#' Apply a confidence gate to pooled predictions (selective classification)
-#'
-#' Relabels low-confidence predictions to the abstention sentinel, so the shared
-#' scoring layer treats them as deferred. .threshold is either a single cutoff for
-#' every prediction, or a NAMED vector of per-class cutoffs (names = predicted
-#' labels, as kw_calibrate returns). A prediction is kept when its Score is at least
-#' the cutoff for its predicted class; otherwise it abstains. A class whose cutoff
-#' is NA (target precision unreachable) abstains entirely.
-#'
-#' @param .tab_pred Pooled predictions (DocID, TrueLabel, PredLabel, Score).
-#' @param .threshold Numeric scalar, or named numeric vector keyed by predicted label.
-#' @param .none Character. Abstention sentinel (default "(none)").
-#' @return .tab_pred with low-confidence PredLabel set to .none (other columns intact).
-kw_gate <- function(.tab_pred, .threshold, .none = "(none)") {
-  if (FALSE) {
-    .tab_pred  <- pred_kw
-    .threshold <- 0.5
-    .none      <- "(none)"
-  }
-  has_names_ <- !is.null(names(.threshold))
-  cut_ <- if (has_names_) {
-    thr_ <- .threshold[.tab_pred$PredLabel]    # per-class lookup by predicted label
-    thr_[is.na(thr_)] <- Inf                   # unreachable class -> always abstain
-    unname(thr_)
-  } else {
-    rep(.threshold[1], nrow(.tab_pred))
-  }
-  keep_ <- .tab_pred$PredLabel != .none & .tab_pred$Score >= cut_
-  .tab_pred |>
-    dplyr::mutate(PredLabel = dplyr::if_else(keep_, .data$PredLabel, .none))
-}
-
-#' Precision-coverage curve for a keyword config (global confidence gate)
-#'
-#' Sweeps a single Score cutoff over .grid; at each cutoff the gated predictions are
-#' scored on the COVERED subset. SelAccuracy is micro-accuracy among predicted docs
-#' (the selective classifier's precision) and rises as the cutoff tightens; Coverage
-#' is the predicted share and falls; MacroF1 is the abstention-aware mean per-class
-#' F1 (eventually falls as recall is sacrificed). The accuracy-rejection tradeoff in
-#' one table.
-#'
-#' @param .tab_pred Pooled predictions (DocID, TrueLabel, PredLabel, Score).
-#' @param .grid Numeric vector of Score cutoffs to sweep.
-#' @param .none Character. Abstention sentinel (default "(none)").
-#' @return Tibble: Threshold, NPred, Coverage, SelAccuracy, MacroF1 (one row per cutoff).
-kw_precision_coverage <- function(.tab_pred,
-                                  .grid = seq(0, 0.9, by = 0.05),
-                                  .none = "(none)") {
-  if (FALSE) {
-    .tab_pred <- pred_kw
-    .grid     <- seq(0, 0.9, by = 0.05)
-    .none     <- "(none)"
-  }
-  n_ <- nrow(.tab_pred)
-  purrr::map(.grid, function(t_) {
-    g_       <- kw_gate(.tab_pred, t_, .none = .none)
-    covered_ <- g_$PredLabel != .none
-    n_pred_  <- sum(covered_)
-    sel_acc_ <- if (n_pred_ == 0L) NA_real_ else
-      mean(g_$PredLabel[covered_] == g_$TrueLabel[covered_])
-    macro_   <- if (n_pred_ == 0L) NA_real_ else mean(clf_perclass(g_, .none = .none)$F1)
+    sc_  <- clf_scores(pred_, .none = KW_NONE)
+    hit_ <- pred_$PredLabel != KW_NONE
     tibble::tibble(
-      Threshold   = t_,
-      NPred       = n_pred_,
-      Coverage    = n_pred_ / n_,
-      SelAccuracy = sel_acc_,
-      MacroF1     = macro_
+      Tau          = .t,
+      nTerms       = sum(purrr::map_int(prepped_, \(.p) sum(.p$Lex$Power >= .t))),
+      nClassesHit  = dplyr::n_distinct(pred_$PredLabel[hit_]),
+      Coverage     = sc_$Coverage,
+      SelPrecision = if (any(hit_)) mean(pred_$PredLabel[hit_] == pred_$TrueLabel[hit_]) else NA_real_,
+      Accuracy     = sc_$Accuracy,
+      F1_macro     = sc_$F1_macro,
+      N            = nrow(pred_)
     )
   }) |>
     purrr::list_rbind()
 }
 
-#' Per-class confidence thresholds for a target precision
+#' Choose the operating point from the curve
 #'
-#' For each predicted class, finds the LOWEST Score cutoff (the most permissive,
-#' keeping the most documents) at which precision among the kept predictions reaches
-#' .target_precision, requiring at least .min_keep kept. This is the per-class
-#' operating point for a high-precision selective classifier; the returned Threshold
-#' column feeds kw_gate via a named vector. Precision is strict (predicted == primary
-#' true label). Classes that cannot reach the target get Threshold NA (kw_gate then
-#' abstains on them entirely). Realised Precision / Recall are reported at the chosen
-#' cutoff, so ties at the boundary show honestly rather than being assumed exact.
+#' Among thresholds whose realised precision reaches the target within tolerance, prefer the one
+#' labelling most categories, then the widest coverage, then the lowest threshold.
 #'
-#' @param .tab_pred Pooled predictions (DocID, TrueLabel, PredLabel, Score).
-#' @param .target_precision Numeric in (0, 1]. Precision to clear per class (default 0.95).
-#' @param .min_keep Integer. Minimum kept predictions for a class to qualify (default 5).
-#' @param .none Character. Abstention sentinel to exclude (default "(none)").
-#' @return Tibble per predicted class: Label, Threshold, Precision, Recall, NKeep,
-#'   NPredBase, KeepShare, Support (descending by Support).
-kw_calibrate <- function(.tab_pred, .target_precision = 0.95,
-                         .min_keep = 5L, .none = "(none)") {
+#' The tolerance is not slack, it is arithmetic. With roughly two thousand documents classified, the
+#' standard error of a proportion near 0.95 is about half a percentage point, so a hard comparison
+#' against the target treats differences it cannot measure as decisive. Applied to a curve sitting
+#' just under the target, a hard rule raises the threshold, and because Power carries a
+#' support-dependent ceiling the categories it drops first are the small ones. Paying two categories
+#' for half a percentage point of unmeasurable precision is the wrong trade for an artifact whose
+#' value is breadth at a stated precision.
+#'
+#' @param .curve Output of kw_tau_curve.
+#' @param .target_precision Precision the published table must clear.
+#' @param .tolerance Precision band treated as indistinguishable from the target.
+#' @param .min_classes Categories the table must label.
+#' @return One-row tibble.
+kw_operating_point <- function(.curve, .target_precision = 0.95, .tolerance = 0.01,
+                               .min_classes = 1L) {
   if (FALSE) {
-    .tab_pred         <- pred_kw
+    .curve            <- curve_detailed
     .target_precision <- 0.95
-    .min_keep         <- 5L
-    .none             <- "(none)"
+    .tolerance        <- 0.01
+    .min_classes      <- 9L
   }
-  classes_ <- setdiff(sort(unique(.tab_pred$PredLabel)), .none)
-  supp_    <- .tab_pred |> dplyr::count(.data$TrueLabel, name = "Support")
+  feasible_ <- .curve |>
+    dplyr::filter(!is.na(.data$SelPrecision), .data$Coverage > 0,
+                  .data$SelPrecision >= .target_precision - .tolerance)
 
-  purrr::map(classes_, function(c_) {
-    pc_ <- .tab_pred |>
-      dplyr::filter(.data$PredLabel == c_) |>
-      dplyr::mutate(Correct = .data$TrueLabel == c_) |>
-      dplyr::arrange(dplyr::desc(.data$Score))
-    n_base_  <- nrow(pc_)
-    support_ <- supp_$Support[supp_$TrueLabel == c_]
-    support_ <- if (length(support_) == 0L) 0L else support_
+  ok_ <- feasible_ |> dplyr::filter(.data$nClassesHit >= .min_classes)
+  if (nrow(ok_) > 0L) {
+    return(ok_ |>
+             dplyr::arrange(dplyr::desc(.data$nClassesHit), dplyr::desc(.data$Coverage), .data$Tau) |>
+             dplyr::slice_head(n = 1L))
+  }
 
-    # cumulative precision reading from the highest-score prediction downward;
-    # the deepest cut (max index) still on target maximises coverage
-    cum_prec_ <- cumsum(pc_$Correct) / seq_len(n_base_)
-    ok_       <- which(cum_prec_ >= .target_precision & seq_len(n_base_) >= .min_keep)
-    k_        <- if (length(ok_) == 0L) NA_integer_ else max(ok_)
+  if (nrow(feasible_) > 0L) {
+    cli::cli_alert_warning(
+      "Precision {(.target_precision)} is reachable but never with {(.min_classes)} categories \\
+       labelled; the widest is {max(feasible_$nClassesHit)}. Returning that point."
+    )
+    return(feasible_ |>
+             dplyr::arrange(dplyr::desc(.data$nClassesHit), dplyr::desc(.data$Coverage), .data$Tau) |>
+             dplyr::slice_head(n = 1L))
+  }
 
-    if (is.na(k_)) {
-      tibble::tibble(Label = c_, Threshold = NA_real_, Precision = NA_real_,
-                     Recall = 0, NKeep = 0L, NPredBase = n_base_,
-                     KeepShare = 0, Support = support_)
-    } else {
-      thr_    <- pc_$Score[k_]
-      kept_   <- pc_$Score >= thr_                 # realise the cut (ties included)
-      n_keep_ <- sum(kept_)
-      tibble::tibble(
-        Label     = c_,
-        Threshold = thr_,
-        Precision = mean(pc_$Correct[kept_]),
-        Recall    = if (support_ == 0L) NA_real_ else sum(pc_$Correct[kept_]) / support_,
-        NKeep     = n_keep_,
-        NPredBase = n_base_,
-        KeepShare = n_keep_ / n_base_,
-        Support   = support_
-      )
-    }
+  cli::cli_alert_warning("Precision {(.target_precision)} is unreachable; returning the most precise point")
+  .curve |>
+    dplyr::filter(!is.na(.data$SelPrecision), .data$Coverage > 0) |>
+    dplyr::slice_max(.data$SelPrecision, n = 1L, with_ties = FALSE)
+}
+
+
+# 6. The published table -------------------------------------------------------------------------
+
+#' Fold stability of a selection
+#'
+#' Counts how many of the independent fold mines chose each term. A term chosen by every fold is
+#' stable; one chosen by a single fold is an artifact of that split.
+#'
+#' @param .mine_dirs Fold mine directories for one configuration.
+#' @param ... Selection parameters passed to kw_select.
+#' @return Tibble with Class, Term, Folds, PowerMean, PowerMin.
+kw_lexicon_stability <- function(.mine_dirs, ...) {
+  if (FALSE) {
+    .mine_dirs <- dirs_detailed
+  }
+  purrr::map(.mine_dirs, function(.d) {
+    kw_select(.mine = kw_load_mine(.mine_dir = .d), ...) |> dplyr::select(Class, Term, Power)
   }) |>
     purrr::list_rbind() |>
-    dplyr::arrange(dplyr::desc(.data$Support))
+    dplyr::summarise(
+      Folds     = dplyr::n(),
+      PowerMean = mean(.data$Power),
+      PowerMin  = min(.data$Power),
+      .by = c(Class, Term)
+    )
 }
 
-#' One-line summary of a gated (selective) prediction set
+#' Assemble the publishable table
 #'
-#' What a high-precision layer actually delivers: how much of the corpus it
-#' classifies (Coverage) and how accurate it is on that covered subset
-#' (SelAccuracy). Unlike clf_scores -- which counts an abstention as incorrect --
-#' these describe the classified slice on its own terms.
+#' The folds pay for the honest estimate; the all-data mine produces the artifact. The stability
+#' filter is applied here and nowhere else: mine k trains on every fold but k, so filtering a fold-k
+#' lexicon on agreement across all mines would let the held-out fold influence selection. An all-data
+#' mine holds nothing out, so the filter is legitimate. The consequence is that the reported precision
+#' and coverage describe the unfiltered procedure while the published table carries one further filter
+#' that only removes terms.
 #'
-#' @param .tab_pred Gated pooled predictions (from kw_gate).
-#' @param .none Character. Abstention sentinel (default "(none)").
-#' @return One-row tibble: Coverage, SelAccuracy, NClassified, NTotal.
-kw_selective_summary <- function(.tab_pred, .none = "(none)") {
+#' @param .mine_dir_all Directory of the all-data mine.
+#' @param .mine_dirs_folds Fold mine directories for the same configuration.
+#' @param .tau Power floor for inclusion.
+#' @param .min_folds Fold agreement required.
+#' @param ... Selection parameters passed to kw_select.
+#' @return Tibble ordered by class then Power, ranked within class.
+kw_lexicon_final <- function(.mine_dir_all, .mine_dirs_folds, .tau = 0.70, .min_folds = 3L, ...) {
   if (FALSE) {
-    .tab_pred <- kw_gate(pred_kw, 0.5)
-    .none     <- "(none)"
+    .mine_dir_all    <- idx_mine$MineDir[[1]]
+    .mine_dirs_folds <- dirs_detailed
+    .tau             <- 0.70
+    .min_folds       <- 3L
   }
-  covered_ <- .tab_pred$PredLabel != .none
-  tibble::tibble(
-    Coverage    = mean(covered_),
-    SelAccuracy = if (any(covered_)) mean(.tab_pred$PredLabel[covered_] == .tab_pred$TrueLabel[covered_]) else NA_real_,
-    NClassified = sum(covered_),
-    NTotal      = length(covered_)
+  lex_ <- kw_select(.mine = kw_load_mine(.mine_dir = .mine_dir_all), ...) |>
+    dplyr::filter(.data$Power >= .tau)
+
+  stab_ <- kw_lexicon_stability(.mine_dirs = .mine_dirs_folds, ...) |>
+    dplyr::select(Class, Term, Folds)
+
+  joined_ <- lex_ |>
+    dplyr::left_join(stab_, by = dplyr::join_by(Class, Term)) |>
+    dplyr::mutate(Folds = tidyr::replace_na(.data$Folds, 0L))
+
+  n_before_ <- nrow(joined_)
+  out_      <- joined_ |> dplyr::filter(.data$Folds >= .min_folds)
+  cli::cli_alert_info("Fold agreement >= {(.min_folds)}/5 keeps {nrow(out_)} of {n_before_} terms")
+
+  out_ |>
+    dplyr::arrange(.data$Class, dplyr::desc(.data$Power)) |>
+    dplyr::mutate(Rank = dplyr::row_number(), .by = Class) |>
+    dplyr::select(Class, Rank, Term, Power, Precision, HitsPos, HitsTot, NFilers, FilerRatio,
+                  MarginalReach, CumReach, Folds)
+}
+
+#' Write the published table
+#'
+#' Parquet for downstream use and CSV because the artifact is meant to be opened by readers who will
+#' not have an R session.
+#'
+#' @param .tab Output of kw_lexicon_final.
+#' @param .dir Output directory.
+#' @param .stem File stem.
+#' @return Written paths, invisibly.
+kw_save_lexicon <- function(.tab, .dir, .stem = "keyword_table") {
+  if (FALSE) {
+    .tab  <- tab_keywords
+    .dir  <- .lP$Output$Table
+    .stem <- "keyword_table_detailed"
+  }
+  fs::dir_create(.dir)
+  paths_ <- c(fs::path(.dir, paste0(.stem, ".parquet")), fs::path(.dir, paste0(.stem, ".csv")))
+  arrow::write_parquet(.tab, paths_[[1]])
+  readr::write_csv(.tab, paths_[[2]])
+  cli::cli_alert_success("Wrote {nrow(.tab)} terms across {dplyr::n_distinct(.tab$Class)} categories")
+  invisible(paths_)
+}
+
+
+# 7. The generated arm ---------------------------------------------------------------------------
+
+#' Score a supplied term list on named folds
+#'
+#' The engine's term-file mode computes statistics and incidence for exactly the pairs supplied and
+#' mines nothing, so a supplied list is measured on the same folds by the same rule as a mined one.
+#' Terms absent from the corpus, or unable to survive tokenisation, are reported by the engine as
+#' unmatchable rather than dropped without notice.
+#'
+#' The evidence and reach floors are opened here so that a supplied list is measured rather than
+#' re-pruned, but the precision gate is not: it is the promise the table makes, and both arms must
+#' clear the same one or the comparison is meaningless.
+#'
+#' @param .path_data Prepared parquet.
+#' @param .terms_file Parquet of (Class, Term) pairs.
+#' @param .label_col Task the list addresses.
+#' @param .source Field to score against.
+#' @param .nwords Truncation, matching the mined arm.
+#' @param .stopwords Stopword regime, matching the mined arm. This is not cosmetic. Under a regime
+#'   the miner forms n-grams after removal, so a mined term such as "corporation borrower" describes
+#'   two words that are not adjacent in the raw text and cannot fire unless the same regime is applied
+#'   here. Scoring a mined list under a different regime silently returns zero hits for every term.
+#' @param .folds Folds to score. Where the list was written after reading documents, this must name
+#'   only folds those documents did not come from.
+#' @param .tau Power threshold.
+#' @param .min_precision Precision gate, matching the mined arm.
+#' @param .mines_root,.runs_root Output directories.
+#' @param .python,.script Interpreter and miner paths.
+#' @return Tibble of per-fold metrics.
+kw_terms_evaluate <- function(.path_data, .terms_file, .label_col, .source, .nwords, .stopwords,
+                              .folds, .tau, .min_precision, .mines_root, .runs_root, .python,
+                              .script) {
+  if (FALSE) {
+    .path_data     <- .lP$Input$Prepared
+    .terms_file    <- .lP$Input$TermsDetailed
+    .label_col     <- "ClassDetailed"
+    .source        <- "text"
+    .nwords        <- 256L
+    .stopwords     <- "english_domain"
+    .folds         <- 5L
+    .tau           <- 0.70
+    .min_precision <- 0.95
+    .mines_root    <- .lP$Output$Mines
+    .runs_root     <- .lP$Output$Runs
+  }
+  if (!fs::file_exists(.terms_file)) cli::cli_abort("No term list at {(.terms_file)}")
+
+  purrr::walk(.folds, function(.f) {
+    kw_mine(
+      .path_data  = .path_data,
+      .label_col  = .label_col,
+      .source     = .source,
+      .test_fold  = .f,
+      .nwords     = .nwords,
+      .stopwords  = .stopwords,
+      .terms_file = .terms_file,
+      .mines_root = .mines_root,
+      .python     = .python,
+      .script     = .script
+    )
+  })
+
+  # Selecting on task, source and fold alone would also match every OTHER list scored for the same
+  # task, and the results would be silently averaged across them. The manifest records the list each
+  # mine consumed, so the mine is identified by its input rather than by its shape.
+  want_ <- as.character(fs::path_abs(.terms_file))
+  idx_  <- kw_mine_index(.mines_root = .mines_root) |>
+    dplyr::filter(
+      .data$Mode      == "manual",
+      .data$LabelCol  == .label_col,
+      .data$Source    == .source,
+      .data$NWords    == .nwords,
+      .data$Stopwords == .stopwords,
+      .data$TermsFile == want_,
+      .data$Fold %in% .folds
+    )
+  if (nrow(idx_) != length(.folds)) {
+    cli::cli_abort(c(
+      "Expected {length(.folds)} mine{?s} for {(want_)}, found {nrow(idx_)}.",
+      "i" = "More than expected usually means mines written under an earlier naming scheme are still \
+             present; remove the kwmanual folders under the mines directory and re-run."
+    ))
+  }
+
+  purrr::map(idx_$MineDir, function(.d) {
+    kw_evaluate(
+      .mine            = kw_load_mine(.mine_dir = .d),
+      .min_precision   = .min_precision,
+      .min_hits        = 1L,
+      .min_tot         = 1L,
+      .min_reach       = 0,
+      .max_terms       = 1000L,
+      .min_filers      = 0L,
+      .min_filer_ratio = 0,
+      .drop_repeats    = FALSE,
+      .tau             = .tau,
+      .runs_root       = .runs_root
+    )
+  }) |>
+    purrr::list_rbind()
+}
+
+#' Combine a mined lexicon and a supplied list into one term file
+#'
+#' The mined half must come from a fold mine trained on exactly the folds the supplied list was
+#' written from. Taking it from the all-data mine instead would give the union a half that has seen
+#' the evaluation fold while the other half has not.
+#'
+#' @param .lexicon Mined lexicon from the appropriate fold mine.
+#' @param .terms_file Supplied term list.
+#' @param .path_out Destination parquet.
+#' @return Combined tibble, invisibly.
+kw_terms_union <- function(.lexicon, .terms_file, .path_out) {
+  if (FALSE) {
+    .lexicon    <- lex_mined_holdout
+    .terms_file <- .lP$Input$TermsDetailed
+    .path_out   <- .lP$Output$Union
+  }
+  out_ <- dplyr::bind_rows(
+    .lexicon |> dplyr::select(Class, Term) |> dplyr::mutate(Origin = "mined"),
+    arrow::read_parquet(.terms_file) |> dplyr::select(Class, Term) |> dplyr::mutate(Origin = "generated")
+  ) |>
+    dplyr::distinct(Class, Term, .keep_all = TRUE) |>
+    dplyr::arrange(.data$Class, .data$Term)
+
+  fs::dir_create(fs::path_dir(.path_out))
+  arrow::write_parquet(out_, .path_out)
+  invisible(out_)
+}
+
+
+# 8. Compute: summaries for reporting ------------------------------------------------------------
+
+#' Summarise performance across the mining axes
+#'
+#' @param .tab Output of kw_sweep_mines.
+#' @param .label_col Task to summarise.
+#' @return Tibble, one row per mining configuration.
+kw_summarise_mines <- function(.tab, .label_col = "ClassDetailed") {
+  if (FALSE) {
+    .tab       <- perf_mines
+    .label_col <- "ClassDetailed"
+  }
+  .tab |>
+    dplyr::filter(.data$LabelCol == .label_col) |>
+    dplyr::summarise(
+      nFolds     = dplyr::n(),
+      mTerms     = round(mean(.data$nTerms)),
+      mClasses   = round(mean(.data$nClassesHit)),
+      mCoverage  = mean(.data$Coverage),
+      mPrecision = mean(.data$SelPrecision, na.rm = TRUE),
+      mMacroF1   = mean(.data$F1_macro),
+      sMacroF1   = stats::sd(.data$F1_macro),
+      .by = c(Source, Stopwords, NWords, NgramMax)
+    ) |>
+    dplyr::arrange(.data$Source, .data$Stopwords, .data$NWords, .data$NgramMax)
+}
+
+#' Summarise performance across the selection axes
+#'
+#' @param .tab Output of kw_sweep_selection.
+#' @param .label_col Task to summarise.
+#' @return Tibble, one row per selection configuration.
+kw_summarise_selection <- function(.tab, .label_col = "ClassDetailed") {
+  if (FALSE) {
+    .tab       <- perf_sel
+    .label_col <- "ClassDetailed"
+  }
+  .tab |>
+    dplyr::filter(.data$LabelCol == .label_col) |>
+    dplyr::summarise(
+      nFolds     = dplyr::n(),
+      mTerms     = round(mean(.data$nTerms)),
+      mClasses   = round(mean(.data$nClassesHit)),
+      mCoverage  = mean(.data$Coverage),
+      mPrecision = mean(.data$SelPrecision, na.rm = TRUE),
+      mMacroF1   = mean(.data$F1_macro),
+      .by = c(MinPrecision, MinHits, MinTot, MinReach, MaxTerms)
+    ) |>
+    dplyr::arrange(dplyr::desc(.data$mPrecision), dplyr::desc(.data$mCoverage))
+}
+
+#' Choose a configuration by precision, breaking ties on coverage
+#'
+#' Precision differences inside the tolerance are indistinguishable from fold-to-fold noise, so
+#' selecting the maximum among them buys spurious precision at real cost in coverage and compute.
+#' Among configurations that are equivalent on the promise, the widest one is preferred.
+#'
+#' Where an axis is chosen for a reason a metric does not carry, .prefer states it. The stopword
+#' regime is the case in point: both regimes are judged on the readability of the terms they produce,
+#' which no column reports, so leaving the choice to a coverage tiebreak would silently decide it on
+#' a criterion the document explicitly rejects.
+#'
+#' @param .tab Summary from kw_summarise_mines or kw_summarise_selection.
+#' @param .tolerance Precision band treated as a tie.
+#' @param .min_coverage Configurations below this coverage are not eligible.
+#' @param .prefer Named list of column-value pairs preferred among tied rows, or NULL.
+#' @return One-row tibble.
+kw_choose_config <- function(.tab, .tolerance = 0.01, .min_coverage = 0.25, .prefer = NULL) {
+  if (FALSE) {
+    .tab          <- kw_summarise_mines(.tab = perf_mines)
+    .tolerance    <- 0.01
+    .min_coverage <- 0.25
+    .prefer       <- list(Stopwords = "english_domain")
+  }
+  tied_ <- .tab |>
+    dplyr::filter(.data$mCoverage >= .min_coverage) |>
+    dplyr::filter(.data$mPrecision >= max(.data$mPrecision, na.rm = TRUE) - .tolerance)
+
+  if (!is.null(.prefer)) {
+    wanted_ <- purrr::reduce(names(.prefer), function(.acc, .col) {
+      if (!.col %in% names(tied_)) return(.acc)
+      .acc & tied_[[.col]] %in% .prefer[[.col]]
+    }, .init = rep(TRUE, nrow(tied_)))
+    if (any(wanted_)) tied_ <- tied_[wanted_, ]
+  }
+
+  tied_ |>
+    dplyr::arrange(dplyr::desc(.data$mCoverage), dplyr::desc(.data$mPrecision)) |>
+    dplyr::slice_head(n = 1L)
+}
+
+#' Survival of proposed terms through the precision and evidence gates
+#'
+#' @param .proposed Tibble of proposed (Class, Term) pairs.
+#' @param .lexicon Surviving lexicon from kw_evaluate.
+#' @return Tibble, one row per class.
+kw_survival <- function(.proposed, .lexicon) {
+  if (FALSE) {
+    .proposed <- arrow::read_parquet(.lP$Input$TermsDetailed)
+    .lexicon  <- perf_generated$Lexicon[[1]]
+  }
+  .proposed |>
+    dplyr::count(.data$Class, name = "nProposed") |>
+    dplyr::left_join(.lexicon |> dplyr::count(.data$Class, name = "nSurvived"),
+                     by = dplyr::join_by(Class)) |>
+    dplyr::mutate(
+      nSurvived    = tidyr::replace_na(.data$nSurvived, 0L),
+      ShareSurvive = .data$nSurvived / .data$nProposed
+    ) |>
+    dplyr::arrange(.data$nSurvived)
+}
+
+#' Compare term lists on identical folds
+#'
+#' @param .tabs Named list of kw_evaluate outputs, names becoming the List column.
+#' @return Tibble, one row per list.
+kw_summarise_arms <- function(.tabs) {
+  if (FALSE) {
+    .tabs <- list(mined = perf_final, generated = perf_generated)
+  }
+  purrr::imap(.tabs, \(.t, .n) .t |> dplyr::mutate(List = .n)) |>
+    purrr::list_rbind() |>
+    dplyr::summarise(
+      nTerms       = round(mean(.data$nTerms)),
+      nClassesHit  = round(mean(.data$nClassesHit)),
+      Coverage     = mean(.data$Coverage),
+      SelPrecision = mean(.data$SelPrecision, na.rm = TRUE),
+      F1_macro     = mean(.data$F1_macro),
+      .by = List
+    )
+}
+
+
+# 9. Report --------------------------------------------------------------------------------------
+
+#' Report the mining axes
+#'
+#' @param .tab Output of kw_sweep_mines.
+#' @param .label_col Task to report.
+#' @return The compact tibble, invisibly.
+kw_report_mines <- function(.tab, .label_col = "ClassDetailed") {
+  if (FALSE) {
+    .tab       <- perf_mines
+    .label_col <- "ClassDetailed"
+  }
+  out_ <- kw_summarise_mines(.tab = .tab, .label_col = .label_col)
+
+  cli::cli_h2("Mining axes: {(.label_col)}")
+  out_ |>
+    dplyr::mutate(
+      Window    = dplyr::if_else(.data$NWords == 0L, "full", as.character(.data$NWords)),
+      Coverage  = clf_pct(.data$mCoverage),
+      Precision = clf_pct(.data$mPrecision),
+      MacroF1   = sprintf("%.3f +/- %.3f", .data$mMacroF1, .data$sMacroF1)
+    ) |>
+    dplyr::select(Source, Stopwords, Window, NgramMax, nFolds, Terms = mTerms,
+                  Classes = mClasses, Coverage, Precision, MacroF1) |>
+    clf_say_table()
+  cli::cli_alert_info(
+    "Precision is measured on the classified subset and is the number the table promises. \\
+     A Classes count well below the number of categories means the threshold is removing thin \\
+     categories by arithmetic, not judging their terms."
   )
+  invisible(out_)
 }
 
-#' Plot the precision-coverage (accuracy-rejection) curve
+#' Report the selection axes
 #'
-#' Selective accuracy against coverage, one point per swept cutoff. Reading
-#' right-to-left shows the precision bought by abstaining on more documents. House
-#' theme via clf_apply_theme.
-#'
-#' @param .curve Output of kw_precision_coverage.
-#' @return A ggplot.
-kw_plot_precision_coverage <- function(.curve) {
+#' @param .tab Output of kw_sweep_selection.
+#' @param .label_col Task to report.
+#' @param .n Rows to show.
+#' @return The compact tibble, invisibly.
+kw_report_selection <- function(.tab, .label_col = "ClassDetailed", .n = 12L) {
   if (FALSE) {
-    .curve <- kw_precision_coverage(pred_kw)
+    .tab       <- perf_sel
+    .label_col <- "ClassDetailed"
+    .n         <- 12L
   }
-  p_ <- .curve |>
-    dplyr::filter(!is.na(.data$SelAccuracy)) |>
-    ggplot2::ggplot(ggplot2::aes(x = Coverage, y = SelAccuracy)) +
-    ggplot2::geom_line(linewidth = 0.4, color = "grey30") +
-    ggplot2::geom_point(size = 1.6, color = "grey20") +
-    ggplot2::scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+  out_ <- kw_summarise_selection(.tab = .tab, .label_col = .label_col)
+
+  cli::cli_h2("Selection floors: {(.label_col)}")
+  out_ |>
+    utils::head(n = .n) |>
+    dplyr::mutate(
+      Coverage  = clf_pct(.data$mCoverage),
+      Precision = clf_pct(.data$mPrecision),
+      MacroF1   = sprintf("%.3f", .data$mMacroF1)
+    ) |>
+    dplyr::select(MinReach, MaxTerms, nFolds, Terms = mTerms, Classes = mClasses, Coverage,
+                  Precision, MacroF1) |>
+    clf_say_table()
+  cli::cli_alert_info(
+    "Marginal reach is the greedy acceptance bar: raising it shortens the list. Rows differing \\
+     only in MaxTerms and returning identical numbers mean the cap is not binding."
+  )
+  invisible(out_)
+}
+
+#' Report the threshold curve and the chosen operating point
+#'
+#' @param .curve Output of kw_tau_curve.
+#' @param .target_precision Precision the table must clear.
+#' @param .min_classes Categories the table must label.
+#' @param .every Print every Nth row; the curve is dense.
+#' @return The operating point, invisibly.
+kw_report_tau <- function(.curve, .target_precision = 0.95, .tolerance = 0.01, .min_classes = 1L,
+                          .every = 2L) {
+  if (FALSE) {
+    .curve            <- curve_detailed
+    .target_precision <- 0.95
+    .tolerance        <- 0.01
+    .min_classes      <- 9L
+    .every            <- 2L
+  }
+  cli::cli_h2("Precision and coverage across the threshold")
+  .curve |>
+    dplyr::filter(dplyr::row_number() %% .every == 1L) |>
+    dplyr::mutate(
+      Tau          = sprintf("%.2f", .data$Tau),
+      Coverage     = clf_pct(.data$Coverage),
+      SelPrecision = clf_pct(.data$SelPrecision),
+      Accuracy     = sprintf("%.3f", .data$Accuracy),
+      F1_macro     = sprintf("%.3f", .data$F1_macro)
+    ) |>
+    dplyr::select(Tau, Terms = nTerms, Classes = nClassesHit, Coverage, SelPrecision, Accuracy,
+                  F1_macro) |>
+    clf_say_table()
+
+  op_ <- kw_operating_point(.curve = .curve, .target_precision = .target_precision,
+                            .tolerance = .tolerance, .min_classes = .min_classes)
+  cli::cli_alert_success(
+    "Operating point tau = {sprintf('%.2f', op_$Tau)}: {op_$nTerms} terms across \\
+     {op_$nClassesHit} categories label {clf_pct(op_$Coverage)} of documents at \\
+     {clf_pct(op_$SelPrecision)} precision"
+  )
+  cli::cli_alert_info(
+    "The threshold is a floor on Power, not on precision, so quote the realised precision above \\
+     and never the threshold. Precision rising while Classes falls means coverage is being bought \\
+     by dropping categories."
+  )
+  invisible(op_)
+}
+
+#' Report the published table, category by category
+#'
+#' @param .tab Output of kw_lexicon_final.
+#' @param .top Terms shown per category.
+#' @return .tab, invisibly.
+kw_report_lexicon <- function(.tab, .top = 8L) {
+  if (FALSE) {
+    .tab <- tab_keywords
+    .top <- 8L
+  }
+  cli::cli_h2("Keyword table, sorted by Power within category")
+  purrr::walk(sort(unique(.tab$Class)), function(.c) {
+    .tab |>
+      dplyr::filter(.data$Class == .c) |>
+      utils::head(n = .top) |>
+      dplyr::mutate(
+        Power     = sprintf("%.3f", .data$Power),
+        Precision = sprintf("%.3f", .data$Precision),
+        Filers    = sprintf("%d (%.2f)", .data$NFilers, .data$FilerRatio),
+        MargReach = clf_pct(.data$MarginalReach),
+        CumReach  = clf_pct(.data$CumReach),
+        Stability = paste0(.data$Folds, "/5")
+      ) |>
+      dplyr::select(Rank, Term, Power, Precision, HitsPos, Filers, MargReach, CumReach, Stability) |>
+      clf_say_table(.title = .c)
+  })
+  cli::cli_alert_info(
+    "Marginal reach is the share of the category a term adds beyond its predecessors; a filer ratio \\
+     far below one marks a term concentrated in a single registrant's own template."
+  )
+  invisible(.tab)
+}
+
+#' Report why documents received the labels they did
+#'
+#' Sampled per predicted category rather than by score, because every document a term fires in
+#' carries that term's Power identically and a global sort returns one term repeatedly.
+#'
+#' @param .tab_pred Pooled predictions carrying TopTerm.
+#' @param .per_class Rows per predicted category.
+#' @param .wrong Show misclassifications rather than correct labels.
+#' @return The shown tibble, invisibly.
+kw_report_audit <- function(.tab_pred, .per_class = 2L, .wrong = FALSE) {
+  if (FALSE) {
+    .tab_pred  <- pred_final
+    .per_class <- 2L
+    .wrong     <- FALSE
+  }
+  out_ <- .tab_pred |>
+    dplyr::filter(.data$PredLabel != KW_NONE) |>
+    dplyr::mutate(Correct = .data$PredLabel == .data$TrueLabel) |>
+    dplyr::filter(.data$Correct != .wrong) |>
+    dplyr::slice_max(.data$Score, n = .per_class, by = PredLabel, with_ties = FALSE) |>
+    dplyr::arrange(.data$PredLabel, dplyr::desc(.data$Score))
+
+  cli::cli_h2("Term responsible for each label: {if (.wrong) 'errors' else 'correct'}")
+  out_ |>
+    dplyr::mutate(Power = sprintf("%.3f", .data$Score)) |>
+    dplyr::select(DocID, TrueLabel, PredLabel, Power, TopTerm) |>
+    clf_say_table()
+  cli::cli_alert_info(
+    "A term appearing repeatedly in the error block is a candidate for removal; a term appearing \\
+     in both blocks is ambiguous rather than wrong."
+  )
+  invisible(out_)
+}
+
+#' Report the term lists side by side
+#'
+#' @param .tabs Named list of kw_evaluate outputs.
+#' @return The comparison tibble, invisibly.
+kw_report_arms <- function(.tabs) {
+  if (FALSE) {
+    .tabs <- list(mined = perf_final, generated = perf_generated, union = perf_union)
+  }
+  out_ <- kw_summarise_arms(.tabs = .tabs)
+
+  cli::cli_h2("Where the terms came from")
+  out_ |>
+    dplyr::mutate(
+      Coverage     = clf_pct(.data$Coverage),
+      SelPrecision = clf_pct(.data$SelPrecision),
+      F1_macro     = sprintf("%.3f", .data$F1_macro)
+    ) |>
+    dplyr::select(List, Terms = nTerms, Classes = nClassesHit, Coverage, SelPrecision, F1_macro) |>
+    clf_say_table()
+  cli::cli_alert_info(
+    "Read Classes first. A union matching the arms on precision while labelling more categories \\
+     means the two arms recover different vocabulary; matching on all columns means one arm is \\
+     redundant."
+  )
+  invisible(out_)
+}
+
+#' Every report in order
+#'
+#' The block to copy out when something needs checking.
+#'
+#' @param .perf_mines,.perf_sel Sweep outputs.
+#' @param .curve Threshold curve.
+#' @param .tab_pred Pooled predictions at the operating point.
+#' @param .tab_lexicon Published table.
+#' @param .label_col Task to report.
+#' @param .target_precision,.min_classes Operating-point constraints.
+#' @return NULL, invisibly.
+kw_report_all <- function(.perf_mines, .perf_sel, .curve, .tab_pred, .tab_lexicon,
+                          .label_col = "ClassDetailed", .target_precision = 0.95,
+                          .min_classes = 1L) {
+  if (FALSE) {
+    .perf_mines       <- perf_mines
+    .perf_sel         <- perf_sel
+    .curve            <- curve_detailed
+    .tab_pred         <- pred_final
+    .tab_lexicon      <- tab_keywords
+    .label_col        <- "ClassDetailed"
+    .target_precision <- 0.95
+    .min_classes      <- 9L
+  }
+  kw_report_mines(.tab = .perf_mines, .label_col = .label_col)
+  kw_report_selection(.tab = .perf_sel, .label_col = .label_col)
+  kw_report_tau(.curve = .curve, .target_precision = .target_precision, .min_classes = .min_classes)
+  clf_report_scores(.tab_pred, .title = "At the operating point")
+  clf_report_perclass(.tab_pred, .title = "Per category")
+  kw_report_audit(.tab_pred = .tab_pred, .per_class = 2L, .wrong = TRUE)
+  kw_report_lexicon(.tab = .tab_lexicon, .top = 8L)
+  invisible(NULL)
+}
+
+
+# 10. Figures ------------------------------------------------------------------------------------
+
+#' Performance against the truncation window
+#'
+#' The reference line marks the window the transformer reads. Anything to its right is signal no
+#' transformer in this study can see, so a curve still rising there would locate information the
+#' whole pipeline currently discards.
+#'
+#' @param .tab Output of kw_sweep_mines.
+#' @param .label_col Task to plot.
+#' @param .window_ref Reference window in words.
+#' @return A ggplot.
+kw_plot_window <- function(.tab, .label_col = "ClassDetailed", .window_ref = 512L) {
+  if (FALSE) {
+    .tab        <- perf_mines
+    .label_col  <- "ClassDetailed"
+    .window_ref <- 512L
+  }
+  dat_ <- .tab |>
+    dplyr::filter(.data$LabelCol == .label_col, .data$Source == "text") |>
+    dplyr::summarise(
+      MacroF1   = mean(.data$F1_macro),
+      Precision = mean(.data$SelPrecision, na.rm = TRUE),
+      Coverage  = mean(.data$Coverage),
+      .by = c(NWords, NgramMax, Stopwords)
+    ) |>
+    dplyr::mutate(Window = dplyr::if_else(.data$NWords == 0L, 4096L, .data$NWords)) |>
+    tidyr::pivot_longer(cols = c(MacroF1, Precision, Coverage), names_to = "Metric",
+                        values_to = "Value")
+
+  p_ <- dat_ |>
+    ggplot2::ggplot(ggplot2::aes(x = Window, y = Value, colour = Stopwords,
+                                 linetype = factor(NgramMax))) +
+    ggplot2::geom_vline(xintercept = .window_ref, linewidth = 0.3, colour = "grey60") +
+    ggplot2::geom_line(linewidth = 0.5) +
+    ggplot2::geom_point(size = 1.5) +
+    ggplot2::facet_wrap(ggplot2::vars(Metric), nrow = 1L) +
+    ggplot2::scale_x_continuous(transform = "log2", breaks = c(256, 512, 1024, 2048, 4096),
+                                labels = c("256", "512", "1024", "2048", "full")) +
     ggplot2::scale_y_continuous(labels = scales::percent) +
-    ggplot2::labs(x = "Coverage (share of documents classified)",
-                  y = "Selective accuracy (precision on classified)")
+    ggplot2::labs(x = "Word window", y = NULL, colour = "Stopwords", linetype = "n-gram max")
   clf_apply_theme(p_)
 }
 
-
-# Per-source comparison, margin diagnostics, selective profile ------------
-# Built for the desc/text/combined escalation question: surface each source's best
-# config side by side, the margin's right/wrong separation (the keyword twin of the
-# BERT margin stat), and a one-row high-precision profile per config so the three
-# sources line up in a single unified table.
-
-#' Best keyword config per source (the escalation arms)
+#' Precision against coverage across the threshold
 #'
-#' Collapses the leaderboard to one winning config per Source (docdesc / text /
-#' combined) by mean macro-F1, so the three escalation arms are easy to grab for the
-#' per-source comparisons. Each row is a deployable keyword classifier on its own
-#' field; docdesc is the low-N / high-clarity arm, text the body arm, combined the
-#' score fusion of the two.
-#'
-#' @param .tab_overall Output of clf_load_overall() (keyword rows carry Source).
-#' @param .label_col Task to restrict to (default "ClassDetailed").
-#' @return Tibble: Source, ConfigName, F1macro_mean, Acc_mean, Cov_mean (by macro-F1).
-kw_pick_source_configs <- function(.tab_overall, .label_col = "ClassDetailed") {
+#' @param .curve Output of kw_tau_curve.
+#' @param .target_precision Reference line.
+#' @return A ggplot.
+kw_plot_tau <- function(.curve, .target_precision = 0.95) {
   if (FALSE) {
-    .tab_overall <- tab_overall
-    .label_col   <- "ClassDetailed"
-  }
-  kw_leaderboard(dplyr::filter(.tab_overall, .data$LabelCol == .label_col)) |>
-    dplyr::slice_max(.data$F1macro_mean, n = 1L, by = Source, with_ties = FALSE) |>
-    dplyr::select(Source, ConfigName, F1macro_mean, Acc_mean, Cov_mean) |>
-    dplyr::arrange(dplyr::desc(.data$F1macro_mean))
-}
-
-#' Margin separation by correctness (the keyword twin of the BERT margin stat)
-#'
-#' Does the keyword confidence actually separate right from wrong answers? Splits the
-#' committed predictions (abstentions excluded) into correct vs incorrect and reports
-#' the mean top-1 score and both margins for each. A useful confidence is higher on
-#' the correct set; if the margins barely differ, the gate has little to grip. Feed it
-#' a kw_load_confidence() table (margin / marginrel are the informative .which values).
-#'
-#' @param .tab_conf Output of kw_load_confidence (carries Top1Prob, Margin, MarginRel).
-#' @param .none Character. Abstention sentinel (default "(none)").
-#' @return Tibble: Correct, N, Top1Mean, MarginMean, MarginRelMean (correct first).
-kw_margin_correctness <- function(.tab_conf, .none = "(none)") {
-  if (FALSE) {
-    .tab_conf <- kw_load_confidence(.lP$Output$RunsDir, best_kw, .which = "marginrel")
-    .none     <- "(none)"
-  }
-  .tab_conf |>
-    dplyr::filter(.data$PredLabel != .none) |>
-    dplyr::mutate(Correct = .data$PredLabel == .data$TrueLabel) |>
-    dplyr::summarise(
-      N             = dplyr::n(),
-      Top1Mean      = mean(.data$Top1Prob),
-      MarginMean    = mean(.data$Margin),
-      MarginRelMean = mean(.data$MarginRel),
-      .by = Correct
-    ) |>
-    dplyr::arrange(dplyr::desc(.data$Correct))
-}
-
-#' One-row high-precision profile for a config (strict + selective in one line)
-#'
-#' Runs the selective layer end to end for one config's pooled predictions --
-#' kw_calibrate to a per-class precision target, kw_gate, kw_selective_summary -- and
-#' returns a single row pairing the strict pooled scores with the gated high-precision
-#' operating point. Mapping this over kw_pick_source_configs() lines the three sources
-#' up in one table: full macro-F1 next to "how much can each source label at >= target
-#' precision, and how accurate is that slice" -- the high-performance-at-low-coverage
-#' view the docdesc arm is meant to win.
-#'
-#' @param .tab_pred Pooled predictions for one config (DocID, TrueLabel, PredLabel, Score).
-#' @param .target_precision Per-class precision target (default 0.95).
-#' @param .min_keep Minimum kept predictions per class to qualify (default 5).
-#' @param .none Character. Abstention sentinel (default "(none)").
-#' @return One-row tibble: StrictMacroF1, StrictAcc, StrictCoverage, SelCoverage,
-#'   SelAccuracy, TargetP.
-kw_selective_profile <- function(.tab_pred, .target_precision = 0.95,
-                                 .min_keep = 5L, .none = "(none)") {
-  if (FALSE) {
-    .tab_pred         <- pred_kw
+    .curve            <- curve_detailed
     .target_precision <- 0.95
-    .min_keep         <- 5L
-    .none             <- "(none)"
   }
-  strict_ <- clf_scores(.tab_pred, .none = .none)
-  calib_  <- kw_calibrate(.tab_pred, .target_precision = .target_precision,
-                          .min_keep = .min_keep, .none = .none)
-  thr_    <- stats::setNames(calib_$Threshold, calib_$Label)
-  gated_  <- kw_gate(.tab_pred, thr_, .none = .none)
-  sel_    <- kw_selective_summary(gated_, .none = .none)
-  tibble::tibble(
-    StrictMacroF1  = strict_$F1_macro,
-    StrictAcc      = strict_$Accuracy,
-    StrictCoverage = strict_$Coverage,
-    SelCoverage    = sel_$Coverage,
-    SelAccuracy    = sel_$SelAccuracy,
-    TargetP        = .target_precision
-  )
+  p_ <- .curve |>
+    dplyr::filter(!is.na(.data$SelPrecision), .data$Coverage > 0) |>
+    ggplot2::ggplot(ggplot2::aes(x = Coverage, y = SelPrecision)) +
+    ggplot2::geom_hline(yintercept = .target_precision, linewidth = 0.3, linetype = "dashed",
+                        colour = "grey50") +
+    ggplot2::geom_line(linewidth = 0.4, colour = "grey30") +
+    ggplot2::geom_point(ggplot2::aes(size = nClassesHit), colour = "grey20", alpha = 0.7) +
+    ggplot2::scale_x_continuous(labels = scales::percent) +
+    ggplot2::scale_y_continuous(labels = scales::percent) +
+    ggplot2::labs(x = "Coverage", y = "Precision on the classified subset", size = "Categories")
+  clf_apply_theme(p_)
+}
+
+#' Reach accumulated by successive terms within each category
+#'
+#' Shows how quickly a category is covered and where a list stops earning its length.
+#'
+#' @param .tab Output of kw_lexicon_final.
+#' @return A ggplot.
+kw_plot_reach <- function(.tab) {
+  if (FALSE) {
+    .tab <- tab_keywords
+  }
+  p_ <- .tab |>
+    ggplot2::ggplot(ggplot2::aes(x = Rank, y = CumReach, group = Class)) +
+    ggplot2::geom_step(linewidth = 0.4, colour = "grey30") +
+    ggplot2::geom_point(size = 1.2, colour = "grey20") +
+    ggplot2::facet_wrap(ggplot2::vars(Class), ncol = 4L, labeller = ggplot2::label_wrap_gen(24)) +
+    ggplot2::scale_y_continuous(labels = scales::percent) +
+    ggplot2::labs(x = "Term rank within category", y = "Cumulative share of category reached")
+  clf_apply_theme(p_)
 }

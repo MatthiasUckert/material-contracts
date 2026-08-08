@@ -307,31 +307,59 @@ bert_sweep <- function(.path_data, .grid,
   n_todo_ <- n_all_ - n_done_
 
   # Pre-flight: what is already done, what still needs to run.
+  # Note nDone / nToRun are deliberately NOT named Done: dplyr evaluates
+  # summarise() expressions sequentially, so a column named Done would shadow the
+  # logical Done column for every later expression in the same call.
   cli::cli_h2("BERT sweep -- {n_all_} run(s), serial{if (.overwrite) ' (overwrite)' else ''}")
   cli::cli_alert_info("Already done: {n_done_}  |  To run: {n_todo_}")
   grid_ |>
-    dplyr::summarise(All = dplyr::n(), Done = sum(.data$Done), ToRun = sum(!.data$Done),
+    dplyr::summarise(All = dplyr::n(), nDone = sum(.data$Done), nToRun = sum(!.data$Done),
                      .by = label_col) |>
     dplyr::arrange(.data$label_col) |>
-    purrr::pwalk(\(label_col, All, Done, ToRun)
-      cli::cli_alert_info("{label_col}: {Done}/{All} done, {ToRun} to run"))
+    purrr::pwalk(\(label_col, All, nDone, nToRun)
+      cli::cli_alert_info("{label_col}: {nDone}/{All} done, {nToRun} to run"))
 
   if (n_todo_ == 0L) {
     cli::cli_alert_success("Nothing to do -- all {n_all_} run(s) already on disk.")
     return(invisible(grid_))
   }
 
-  # Train only the missing rows, behind a progress bar. A for-loop (not pwalk)
-  # keeps the progress bar in the same frame as its updates -- the reliable cli
-  # idiom; the Python training dwarfs any loop overhead.
+  # Train only the missing rows. No cli progress bar here: each run takes several
+  # minutes, so a bar would tick once per fold and its ETA would be undefined for
+  # the whole of the first run. An explicit status line before each fit is more
+  # useful -- it names what is training now and, once one fit has completed,
+  # projects a wall-clock finish time from the running mean.
   todo_ <- grid_ |> dplyr::filter(!.data$Done) |> dplyr::select(dplyr::all_of(need_))
-  cli::cli_progress_bar(
-    format = paste0("{cli::pb_spin} Training {cli::pb_current}/{cli::pb_total} ",
-                    "{cli::pb_bar} {cli::pb_percent} | elapsed {cli::pb_elapsed} | ETA {cli::pb_eta}"),
-    total = n_todo_, clear = FALSE
-  )
+  started_ <- Sys.time()
+
+  fmt_dur_ <- function(.sec) {
+    if (!is.finite(.sec) || .sec < 0) return("--")
+    h_ <- floor(.sec / 3600)
+    m_ <- floor((.sec %% 3600) / 60)
+    if (h_ > 0) sprintf("%dh%02dm", h_, m_) else sprintf("%dm", m_)
+  }
+
   for (i_ in seq_len(n_todo_)) {
     row_ <- todo_[i_, ]
+
+    elapsed_ <- as.numeric(difftime(Sys.time(), started_, units = "secs"))
+    eta_ <- if (i_ == 1L) {
+      "ETA --"
+    } else {
+      per_ <- elapsed_ / (i_ - 1L)
+      rem_ <- per_ * (n_todo_ - i_ + 1L)
+      paste0("ETA ", fmt_dur_(rem_), ", done ~", format(Sys.time() + rem_, "%H:%M"))
+    }
+    tag_ <- sprintf("%s L%d E%s LR%s W%d fold %d",
+                    row_$label_col, as.integer(row_$max_len),
+                    formatC(row_$epochs, format = "g"),
+                    formatC(row_$lr, format = "g"),
+                    as.integer(as.logical(row_$class_weights)),
+                    as.integer(row_$fold))
+    cli::cli_alert_info(
+      "[{i_}/{n_todo_}] {tag_} | elapsed {fmt_dur_(elapsed_)} | {eta_}"
+    )
+
     bert_train(
       .path_data     = .path_data,
       .label_col     = row_$label_col,
@@ -349,11 +377,12 @@ bert_sweep <- function(.path_data, .grid,
       .verbose       = .verbose,
       ...
     )
-    cli::cli_progress_update()
   }
-  cli::cli_progress_done()
 
-  cli::cli_alert_success("Sweep complete -- {n_todo_} trained, {n_done_} already cached.")
+  total_ <- as.numeric(difftime(Sys.time(), started_, units = "secs"))
+  cli::cli_alert_success(
+    "Sweep complete -- {n_todo_} trained, {n_done_} already cached. Total {fmt_dur_(total_)}."
+  )
   invisible(grid_)
 }
 
@@ -369,17 +398,26 @@ bert_sweep <- function(.path_data, .grid,
 #'
 #' @param .tab_overall Output of clf_load_overall().
 #' @param .label_col Task to crown ("ClassDetailed", "ClassBroad", "AmendType").
+#' @param .max_len Integer or NULL. Restrict the search to runs at this context length, so a
+#'   configuration can be selected under a deployment constraint rather than absolutely. NULL ranks
+#'   across every context length.
 #' @return Named list: config_name, label_col, model, text_col, max_len, epochs,
 #'   lr, class_weights, seed.
-bert_crowned_config <- function(.tab_overall, .label_col = "ClassDetailed") {
+bert_crowned_config <- function(.tab_overall, .label_col = "ClassDetailed", .max_len = NULL) {
   if (FALSE) {
-    .tab_overall <- clf_load_overall(.lP$Runs$Bert)
+    .tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
     .label_col   <- "ClassDetailed"
+    .max_len     <- NULL
   }
-  best_ <- clf_leaderboard(dplyr::filter(.tab_overall, .data$LabelCol == .label_col)) |>
-    dplyr::slice(1) |>
-    dplyr::pull(.data$ConfigName)
-  row_ <- .tab_overall |> dplyr::filter(.data$ConfigName == best_) |> dplyr::slice(1)
+  cand_ <- .tab_overall |> dplyr::filter(.data$LabelCol == .label_col)
+  if (!is.null(.max_len)) {
+    cand_ <- cand_ |> dplyr::filter(as.integer(.data$MaxLen) == as.integer(.max_len))
+    if (nrow(cand_) == 0L) {
+      cli::cli_abort("No {(.label_col)} runs at max_len {(.max_len)}.")
+    }
+  }
+  best_ <- clf_leaderboard(cand_) |> dplyr::slice(1) |> dplyr::pull(.data$ConfigName)
+  row_  <- .tab_overall |> dplyr::filter(.data$ConfigName == best_) |> dplyr::slice(1)
   list(
     config_name   = best_,
     label_col     = row_$LabelCol,
@@ -742,4 +780,417 @@ bert_plot_risk_coverage <- function(.tab_class, .thresholds = seq(0, 0.95, by = 
     ggplot2::scale_x_continuous(limits = c(0, 1)) +
     ggplot2::labs(x = "Coverage (share of docs kept)", y = "Accuracy on kept", color = "Min conf")
   clf_apply_theme(p_)
+}
+
+
+# Grid construction ---------------------------------------------------------
+
+#' Summarise a sweep grid, and project how long it will take
+#'
+#' Prints the shape of a sweep -- configurations, folds and runs per arm -- before any GPU time is
+#' spent on it. Where completed runs are supplied, it also projects the wall-clock cost of the runs
+#' still outstanding, which is the number that actually decides whether a sweep is worth starting.
+#'
+#' The projection fits run duration on the product of epochs and context length, which is what
+#' compute scales with, plus a fixed per-run overhead for tokenisation, model loading and evaluation.
+#' Both terms are estimated from runs already on disk, so the estimate is this machine's throughput
+#' rather than a generic figure.
+#'
+#' @param .grid Sweep grid as assembled in the runbook.
+#' @param .by Character vector of grid columns to group the summary by. Defaults to task and context
+#'   length, which are what drive both the interest and the cost of a sweep.
+#' @param .tab_overall Bound per-fold metrics from clf_load_overall(), or NULL. Supplying it enables
+#'   the runtime projection.
+#' @param .runs_root Directory holding the run folders; used to decide which rows are already done.
+#' @param .text_col,.batch_size,.seed The constants that enter a run key. These must match the values
+#'   passed to bert_sweep(), or the report will describe a different sweep from the one that runs.
+#' @return Invisibly a per-arm summary tibble.
+bert_report_grid <- function(.grid, .tab_overall = NULL,
+                             .by         = c("label_col", "max_len"),
+                             .runs_root  = here::here("2_output", "03B-ClassifyTrainBERT", "runs"),
+                             .text_col   = "Text",
+                             .batch_size = 32L,
+                             .seed       = 42L) {
+  if (FALSE) {
+    .grid        <- grid_all
+    .tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
+    .by          <- c("label_col", "max_len")
+    .runs_root   <- .lP$Runs$Bert
+    .text_col    <- "Text"
+    .batch_size  <- 32L
+    .seed        <- 42L
+  }
+  fmt_dur_ <- function(.sec) {
+    if (!is.finite(.sec) || .sec <= 0) return("--")
+    d_ <- floor(.sec / 86400)
+    h_ <- floor((.sec %% 86400) / 3600)
+    m_ <- floor((.sec %% 3600) / 60)
+    if (d_ > 0) sprintf("%dd %02dh", d_, h_) else if (h_ > 0) sprintf("%dh %02dm", h_, m_) else sprintf("%dm", m_)
+  }
+
+  grid_ <- .grid |>
+    dplyr::mutate(Units = .data$epochs * .data$max_len)   # compute scales with this product
+
+  # Mark rows already on disk. This reuses bert_run_key() and bert_done_keys(), the same matching
+  # bert_sweep() itself performs, rather than reconstructing it with a join: a second, independent
+  # rule would eventually disagree with the first, and the report would then describe a sweep other
+  # than the one about to run. It also sidesteps joining on floating-point learning rates.
+  done_keys_ <- bert_done_keys(.runs_root)   # one scan of the runs tree, not one per row
+
+  grid_ <- grid_ |>
+    dplyr::mutate(
+      RowKey = bert_run_key(
+        .label_col = .data$label_col, .model = .data$model, .text_col = .text_col,
+        .max_len = .data$max_len, .epochs = .data$epochs, .batch_size = .batch_size,
+        .lr = .data$lr, .class_weights = .data$class_weights, .seed = .seed, .fold = .data$fold
+      ),
+      # The same key with the fold zeroed identifies a configuration rather than a run. Counting
+      # distinct configurations this way avoids pick(), which cannot select grouping columns and so
+      # breaks whenever .by names one of the hyperparameters.
+      ConfigKey = bert_run_key(
+        .label_col = .data$label_col, .model = .data$model, .text_col = .text_col,
+        .max_len = .data$max_len, .epochs = .data$epochs, .batch_size = .batch_size,
+        .lr = .data$lr, .class_weights = .data$class_weights, .seed = .seed, .fold = 0L
+      ),
+      Done = .data$RowKey %in% done_keys_
+    )
+
+  out_ <- grid_ |>
+    dplyr::summarise(
+      Configs = dplyr::n_distinct(.data$ConfigKey),
+      Folds   = dplyr::n_distinct(.data$fold),
+      Runs    = dplyr::n(),
+      nDone   = sum(.data$Done),
+      nToRun  = sum(!.data$Done),
+      Units   = sum(.data$Units[!.data$Done]),
+      .by = dplyr::all_of(.by)
+    ) |>
+    dplyr::arrange(dplyr::desc(.data$nToRun))
+
+  # Fit duration on observed runs: intercept is fixed overhead, slope is seconds per unit of
+  # epochs x tokens. Needs at least two distinct workloads to separate the two terms.
+  fit_ <- NULL
+  if (!is.null(.tab_overall) && "DurationSec" %in% names(.tab_overall)) {
+    obs_ <- .tab_overall |>
+      dplyr::filter(!.data$Smoke, !is.na(.data$DurationSec)) |>
+      dplyr::transmute(Sec = .data$DurationSec, Units = .data$Epochs * as.integer(.data$MaxLen))
+    if (nrow(obs_) >= 3L && dplyr::n_distinct(obs_$Units) >= 2L) {
+      fit_ <- stats::lm(Sec ~ Units, data = obs_)
+    }
+  }
+
+  cli::cli_h2("Sweep grid")
+  show_ <- out_ |> dplyr::select(dplyr::all_of(.by), Configs, Folds, Runs, nDone, nToRun)
+  if (!is.null(fit_)) {
+    show_ <- show_ |>
+      dplyr::mutate(
+        Est = purrr::map2_chr(out_$nToRun, out_$Units, \(.n, .u) {
+          if (.n == 0L) "--" else fmt_dur_(.n * stats::coef(fit_)[[1]] + .u * stats::coef(fit_)[[2]])
+        })
+      )
+  }
+  clf_say_table(.tab = show_)
+  cli::cli_text("")
+
+  cli::cli_alert_info(
+    "{sum(out_$Runs)} run{?s} defined, {sum(out_$nDone)} already on disk, {sum(out_$nToRun)} outstanding."
+  )
+  if (!is.null(fit_)) {
+    total_ <- sum(out_$nToRun) * stats::coef(fit_)[[1]] + sum(out_$Units) * stats::coef(fit_)[[2]]
+    cli::cli_alert_info(
+      "Projected remaining time {.strong {fmt_dur_(total_)}}, from {stats::nobs(fit_)} completed run{?s}: \
+       {round(stats::coef(fit_)[[1]])}s fixed overhead plus \
+       {signif(stats::coef(fit_)[[2]], 3)}s per epoch-token unit."
+    )
+  } else {
+    cli::cli_alert_info("Supply .tab_overall to project the remaining wall-clock time.")
+  }
+  invisible(out_)
+}
+
+# Configuration selection ---------------------------------------------------
+
+#' Name of the best-scoring configuration for one task
+#'
+#' Thin wrapper over clf_leaderboard() that returns only the winning ConfigName. Exists so the
+#' runbook does not have to repeat a filter / rank / extract pipeline once per task.
+#'
+#' @param .tab_overall Bound per-fold metrics, from clf_load_overall().
+#' @param .label_col Task to rank: "ClassDetailed", "ClassBroad" or "AmendType".
+#' @return Character scalar: the ConfigName ranked first by mean macro-F1.
+bert_best_config <- function(.tab_overall, .label_col = "ClassDetailed") {
+  if (FALSE) {
+    .tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
+    .label_col   <- "ClassDetailed"
+  }
+  .tab_overall |>
+    dplyr::filter(.data$LabelCol == .label_col) |>
+    clf_leaderboard() |>
+    dplyr::slice(1) |>
+    dplyr::pull(.data$ConfigName)
+}
+
+#' Out-of-fold predictions for the best configuration of one task
+#'
+#' Combines configuration selection and prediction pooling, which are always performed together.
+#' Each document is predicted exactly once, by the fold model that did not see it in training.
+#'
+#' @param .tab_overall Bound per-fold metrics, from clf_load_overall().
+#' @param .runs_roots Directory (or directories) holding the run folders.
+#' @param .label_col Task to pool: "ClassDetailed", "ClassBroad" or "AmendType".
+#' @return Tibble of pooled out-of-fold predictions: DocID, TrueLabel, PredLabel, ConfigName, Fold.
+bert_best_predictions <- function(.tab_overall, .runs_roots, .label_col = "ClassDetailed") {
+  clf_pool_predictions(
+    .runs_roots  = .runs_roots,
+    .config_name = bert_best_config(.tab_overall = .tab_overall, .label_col = .label_col)
+  )
+}
+
+
+# Taxonomy consistency ------------------------------------------------------
+
+#' Agreement between the two contract-type models across taxonomy levels
+#'
+#' The broad taxonomy is a strict roll-up of the detailed one: every detailed category has exactly
+#' one broad parent. Two independently trained models therefore make a checkable joint claim. Where
+#' the detailed model's prediction maps to a different broad category than the broad model predicts
+#' directly, at least one of them is wrong, and a released dataset carrying both would contain an
+#' internal contradiction.
+#'
+#' This is a property of the models, not of the labels: the labels are consistent by construction.
+#'
+#' @param .tab_pred_detailed Pooled out-of-fold predictions from the detailed model.
+#' @param .tab_pred_broad Pooled out-of-fold predictions from the broad model.
+#' @param .tab_prep Prepared sample, supplying the detailed-to-broad mapping.
+#' @return Tibble, one row per document: DocID, TrueBroad, PredDetailed, PredDetailedRolled,
+#'   PredBroad, Agree, RolledCorrect, BroadCorrect.
+bert_hierarchy_agreement <- function(.tab_pred_detailed, .tab_pred_broad, .tab_prep) {
+  if (FALSE) {
+    .tab_pred_detailed <- pred_det
+    .tab_pred_broad    <- pred_broad
+    .tab_prep          <- tab_prep
+  }
+  map_ <- .tab_prep |> dplyr::distinct(ClassDetailed, ClassBroad)
+
+  .tab_pred_detailed |>
+    dplyr::select(DocID, PredDetailed = PredLabel) |>
+    dplyr::left_join(
+      y  = map_ |> dplyr::rename(PredDetailed = ClassDetailed, PredDetailedRolled = ClassBroad),
+      by = dplyr::join_by(PredDetailed)
+    ) |>
+    dplyr::inner_join(
+      y  = .tab_pred_broad |> dplyr::select(DocID, TrueBroad = TrueLabel, PredBroad = PredLabel),
+      by = dplyr::join_by(DocID)
+    ) |>
+    dplyr::mutate(
+      Agree         = .data$PredDetailedRolled == .data$PredBroad,
+      RolledCorrect = .data$PredDetailedRolled == .data$TrueBroad,
+      BroadCorrect  = .data$PredBroad == .data$TrueBroad
+    )
+}
+
+#' Report cross-level agreement and adjudicate the disagreements
+#'
+#' @param .tab_agree Output of bert_hierarchy_agreement().
+#' @param .n Integer. Number of disagreeing category pairs to list.
+#' @return Invisibly the disagreement pair table.
+bert_report_hierarchy <- function(.tab_agree, .n = 10L) {
+  n_    <- nrow(.tab_agree)
+  dis_  <- .tab_agree |> dplyr::filter(!.data$Agree)
+
+  cli::cli_h2("Taxonomy consistency -- detailed rolled up vs broad direct")
+  clf_say_table(
+    .tab = tibble::tibble(
+      Outcome = c("Agree", "Disagree"),
+      Docs    = c(n_ - nrow(dis_), nrow(dis_)),
+      Share   = clf_pct(c((n_ - nrow(dis_)) / n_, nrow(dis_) / n_))
+    )
+  )
+
+  if (nrow(dis_) == 0L) {
+    cli::cli_alert_success("The two models never contradict each other.")
+    return(invisible(NULL))
+  }
+
+  # Where they disagree, which one was right? This decides which to publish.
+  cli::cli_text("")
+  clf_say_table(
+    .tab = tibble::tibble(
+      Verdict = c("Rolled-up detailed correct", "Broad direct correct", "Both wrong"),
+      Docs    = c(
+        sum(dis_$RolledCorrect),
+        sum(dis_$BroadCorrect),
+        sum(!dis_$RolledCorrect & !dis_$BroadCorrect)
+      )
+    ) |>
+      dplyr::mutate(Share = clf_pct(.data$Docs / nrow(dis_))),
+    .title = "Adjudicating the disagreements"
+  )
+
+  pairs_ <- dis_ |>
+    dplyr::count(RolledUpTo = .data$PredDetailedRolled, BroadSaid = .data$PredBroad, name = "Docs") |>
+    dplyr::arrange(dplyr::desc(.data$Docs))
+
+  cli::cli_text("")
+  clf_say_table(
+    .tab   = utils::head(pairs_, .n),
+    .title = paste0("Where they part company (top ", min(.n, nrow(pairs_)), " of ", nrow(pairs_), ")")
+  )
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Publishing both columns from separate models would put these documents in two categories at \\
+     once. Deriving the broad label by roll-up makes that impossible by construction."
+  )
+  invisible(pairs_)
+}
+
+
+# Cross-task overview -------------------------------------------------------
+
+#' Headline result for all three tasks, side by side
+#'
+#' Collects the winning configuration and its cross-validated scores for each task into one table.
+#' This is the summary a reader needs; the per-task sections above supply the detail behind it.
+#'
+#' @param .tab_overall Bound per-fold metrics, from clf_load_overall().
+#' @param .runs_roots Directory (or directories) holding the run folders.
+#' @param .label_cols Character vector of tasks to include.
+#' @return Invisibly the summary tibble.
+bert_report_summary <- function(.tab_overall, .runs_roots,
+                                .label_cols = c("ClassDetailed", "ClassBroad", "AmendType")) {
+  if (FALSE) {
+    .tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
+    .runs_roots  <- .lP$Runs$Bert
+    .label_cols  <- c("ClassDetailed", "ClassBroad", "AmendType")
+  }
+  out_ <- purrr::map(.label_cols, \(.task) {
+    cfg_  <- bert_crowned_config(.tab_overall = .tab_overall, .label_col = .task)
+    pred_ <- clf_pool_predictions(.runs_roots = .runs_roots, .config_name = cfg_$config_name)
+    per_  <- clf_perclass(.tab_pred = pred_)
+    sco_  <- clf_scores(.tab_pred = pred_)
+    tibble::tibble(
+      Task         = .task,
+      Classes      = nrow(per_),
+      Docs         = sco_$N,
+      Encoder      = sub("^.*/", "", cfg_$model),
+      MaxLen       = as.integer(cfg_$max_len),
+      Epochs       = as.integer(cfg_$epochs),
+      LR           = formatC(cfg_$lr, format = "g"),
+      Weights      = as.integer(isTRUE(cfg_$class_weights)),
+      Accuracy     = round(sco_$Accuracy, 3),
+      MacroF1      = round(sco_$F1_macro, 3),
+      WeakestClass = paste0(per_$Label[[which.min(per_$F1)]], " (", round(min(per_$F1), 3), ")")
+    )
+  }) |>
+    purrr::list_rbind()
+
+  cli::cli_h2("Headline results")
+  clf_say_table(.tab = out_)
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "All figures are pooled out-of-fold: every document is scored by a model that did not train on it."
+  )
+  invisible(out_)
+}
+
+#' Per-class scores for all three tasks in one table
+#'
+#' @param .tab_overall Bound per-fold metrics, from clf_load_overall().
+#' @param .runs_roots Directory (or directories) holding the run folders.
+#' @param .label_cols Character vector of tasks to include.
+#' @return Invisibly the stacked per-class tibble.
+bert_report_perclass_all <- function(.tab_overall, .runs_roots,
+                                     .label_cols = c("ClassDetailed", "ClassBroad", "AmendType")) {
+  out_ <- purrr::map(.label_cols, \(.task) {
+    clf_pool_predictions(
+      .runs_roots  = .runs_roots,
+      .config_name = bert_best_config(.tab_overall = .tab_overall, .label_col = .task)
+    ) |>
+      clf_perclass() |>
+      dplyr::mutate(Task = .task, .before = 1)
+  }) |>
+    purrr::list_rbind()
+
+  cli::cli_h2("Per-class scores, all tasks")
+  out_ |>
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+    clf_say_table()
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Macro-F1 is the unweighted mean of the F1 column within each task, so the smallest categories \\
+     carry the same weight as the largest."
+  )
+  invisible(out_)
+}
+
+
+# Deploy: fit every task at every context length ----------------------------
+
+#' Refit the best configuration of each task at each context length
+#'
+#' Deployment is not a single choice. Context length trades accuracy against inference cost, and on a
+#' corpus of any size that trade-off is decided by whoever runs the classifier, not by whoever trained
+#' it. Fitting the best configuration at each length -- rather than only at the length that won
+#' overall -- means the decision can be made later, with the cost figures in hand, without retraining.
+#'
+#' Within each task and length, the configuration is the one cross-validation selected under that
+#' constraint; every other hyperparameter is still chosen on the evidence.
+#'
+#' @param .path_data Prepared sample written by the sample-construction script.
+#' @param .tab_overall Bound per-fold metrics, from clf_load_overall().
+#' @param .model_dir Destination directory for deployable models.
+#' @param .label_cols Character vector of tasks to fit.
+#' @param .max_lens Integer vector of context lengths to fit at.
+#' @param .batch_size Integer. Training batch size.
+#' @param .overwrite Logical. Refit even where a model for that configuration already exists.
+#' @param .verbose Logical. Stream per-epoch training loss to the console.
+#' @return Invisibly a tibble of the configurations fitted: Task, MaxLen, ConfigName, MacroF1.
+bert_fit_final_all <- function(.path_data, .tab_overall, .model_dir,
+                               .label_cols = c("ClassDetailed", "ClassBroad", "AmendType"),
+                               .max_lens   = c(256L, 512L),
+                               .batch_size = 32L, .overwrite = FALSE, .verbose = TRUE) {
+  if (FALSE) {
+    .path_data   <- .lP$Input$Prepared
+    .tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
+    .model_dir   <- .lP$Output$ModelFinal
+    .label_cols  <- c("ClassDetailed", "ClassBroad", "AmendType")
+    .max_lens    <- c(256L, 512L)
+  }
+  plan_ <- tidyr::expand_grid(Task = .label_cols, MaxLen = as.integer(.max_lens))
+
+  cli::cli_h2("Deploying {nrow(plan_)} model{?s}: {length(.label_cols)} task{?s} x {length(.max_lens)} context length{?s}")
+
+  out_ <- purrr::pmap(plan_, \(Task, MaxLen) {
+    cfg_ <- bert_crowned_config(.tab_overall = .tab_overall, .label_col = Task, .max_len = MaxLen)
+    board_ <- .tab_overall |>
+      dplyr::filter(.data$LabelCol == Task) |>
+      clf_leaderboard() |>
+      dplyr::filter(.data$ConfigName == cfg_$config_name)
+
+    bert_fit_final(
+      .path_data  = .path_data,
+      .config     = cfg_,
+      .model_dir  = .model_dir,
+      .batch_size = .batch_size,
+      .overwrite  = .overwrite,
+      .verbose    = .verbose
+    )
+
+    tibble::tibble(
+      Task    = Task,
+      MaxLen  = MaxLen,
+      Config  = clf_config_label(.config_name = cfg_$config_name),
+      MacroF1 = round(board_$F1macro_mean[[1]], 3)
+    )
+  }) |>
+    purrr::list_rbind()
+
+  cli::cli_text("")
+  clf_say_table(.tab = out_, .title = "Deployed models")
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "MacroF1 is the cross-validated score of that configuration, so the accuracy cost of the shorter \\
+     context length is readable directly from this table."
+  )
+  invisible(out_)
 }

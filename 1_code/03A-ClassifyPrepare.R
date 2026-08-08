@@ -1,66 +1,180 @@
-# 03A-ClassifyPrepare: dataset creation + shared "overall" tooling ----
-# The common foundation for the whole classification pipeline. Everything in this
-# file is METHOD-AGNOSTIC: it builds the one prepared sample (with frozen folds)
-# that BERT (03B) and keyword (03C) both consume, and it provides the single
-# scoring / leaderboard / plotting layer that every method (BERT, keyword, the
-# 03D router, the 03E deployment) reports through. No training wrappers live here:
-#   - bert_* (the BERT trainer wrapper) lives in 03B-ClassifyTrainBERT.R
-#   - kw_*   (the keyword miner wrapper) lives in 03C-ClassifyTrainKeyword.R
-# Those source THIS file for prep + scoring, so the splits never drift.
+# 03A-ClassifyPrepare: build the training sample + shared tooling ----
 #
-# Two consolidations vs the old 03-Classification.R / 03b-KeywordClass.R pair:
-#   1. ONE prepared parquet. clf_prepare_sample now carries DocDesc / DocName, so
-#      there is a single prepared.parquet for both tracks (BERT ignores the title
-#      column; keyword mines it). The old kw_write_prepared re-attach is gone.
-#   2. ONE scoring layer. clf_perclass / clf_scores are abstention-aware via a
-#      .none sentinel argument: with no abstention (BERT) they reduce EXACTLY to
-#      the old behaviour; with abstention (keyword "(none)") they drop the
-#      sentinel from the class set and report Coverage. The old kw_perclass /
-#      kw_scores duplicates are folded in here.
+# WHAT THIS FILE DOES, IN ONE PARAGRAPH
+# We have ~4.4k contracts that a human has labelled. 03A turns that label list
+# into ONE table -- prepared.parquet -- that every downstream method reads. That
+# table holds, per document: the text, the labels for all three tasks, and a fold
+# number. Nothing here trains anything. The whole job is (a) decide which
+# documents are eligible, (b) attach their text, (c) deal the folds once so every
+# method is scored on identical splits.
 #
-# Terminology (settled -- see the state document):
-#   ClassBroad     = 7-class broad taxonomy (source column Level1)
-#   ClassDetailed  = 12-class detailed taxonomy (source column DocClassFinal1)
-#   ClassDetailed2 = dual-class second label (DocClassFinal2, NA for single-class
-#                    docs); LENIENT scoring only, training stays single-label
-#   AmendType      = amendment task label: Original vs Amended (NA for some docs)
-#   LabelRound     = label source: Round1 = automated, Round2 = manual / gold
-#   DocDesc        = filer title; DocName = filename. Keyword-track inputs.
+# THE THREE TASKS (all predicted from the same Text column)
+#   ClassDetailed  12-class contract taxonomy   <- the headline task
+#   ClassBroad      7-class roll-up of the above
+#   AmendType       2 classes: Original vs Amended
+# All three share the SAME folds, dealt stratified on ClassDetailed. That is why
+# fold assignment lives here and not in the trainers: if each task dealt its own
+# folds, cross-task comparisons would be meaningless.
+#
+# SINGLE-LABEL, ALWAYS
+# A minority of documents carry a second valid category (ClassDetailed2). We
+# train on the primary only. The second label is never a training target; it is
+# used solely for lenient scoring, which asks "would this prediction have been
+# accepted as the other valid answer?".
+#
+# WHAT IS *NOT* HERE
+# The trainers: bert_* is 03B, kw_* is 03C, the router is 03D. They source this
+# file so the folds and the scoring functions never drift.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args;
 # underscore-suffixed locals; .data$ for existing columns in dplyr verbs, bare
 # CamelCase for new columns; if (FALSE) dev blocks; cli/fs/here; pure ASCII;
-# stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
+# {(.arg)} parens in cli interpolation.
 
 if (FALSE) {
-  .tab_input   <- fils_class_sample
-  .path_labels <- .lP$Input$ClassificationSample
-  .path_data   <- .lP$Output$Prepared
-  .runs_roots  <- c(.lP$Runs$Bert, .lP$Runs$Kw)
+  .tab_input  <- fils_class_sample
+  .path_data  <- .lP$Output$Prepared
+  .runs_roots <- c(.lP$Runs$Bert, .lP$Runs$Kw)
 }
 
 
-# Disk cache --------------------------------------------------------------
-# Lightweight disk memoisation for the report docs. Replaces per-chunk eval
-# guards: a chunk always runs, but the costly read / scoring behind it happens
-# once. clf_cache() returns the stored value when present and only evaluates its
-# expression on a miss (or when overwriting), so a warm cache is free. Flip
-# everything at once with options(clf.cache.overwrite = TRUE) -- e.g. after a fresh
-# sweep -- or force a single key with .overwrite = TRUE.
+# 1. Console reporting helpers --------------------------------------------
+# Everything 03A reports goes through these, so the console output is one
+# consistent, fixed-width, copy-pasteable block rather than a scatter of tables.
+
+#' Render a tibble as aligned fixed-width character lines
+#'
+#' Numeric columns are right-aligned and comma-grouped; character columns are
+#' left-aligned and NA renders as "-". Anything needing custom formatting
+#' (percentages, ratios) should be pre-formatted to character by the caller.
+#'
+#' @param .tab Tibble to render.
+#' @param .indent Integer. Leading spaces.
+#' @return Character vector, one element per line (header first).
+clf_fmt_table <- function(.tab, .indent = 2L) {
+  if (FALSE) {
+    .tab    <- tibble::tibble(Class = c("Leases", "R&D"), N = c(303L, 83L))
+    .indent <- 2L
+  }
+  pad_ <- strrep(" ", .indent)
+  if (nrow(.tab) == 0L) return(paste0(pad_, "(none)"))
+
+  is_num_ <- purrr::map_lgl(.tab, is.numeric)
+  cells_ <- purrr::map2(.tab, is_num_, \(.col, .num) {
+    if (!.num) return(tidyr::replace_na(as.character(.col), "-"))
+    if (is.integer(.col)) {
+      format(.col, big.mark = ",", trim = TRUE, scientific = FALSE)
+    } else {
+      formatC(.col, format = "f", digits = 3)
+    }
+  })
+
+  head_ <- names(.tab)
+  wid_  <- purrr::map2_int(cells_, head_, \(.c, .h) max(nchar(.c), nchar(.h)))
+  side_ <- dplyr::if_else(is_num_, "left", "right")
+
+  row_ <- function(.vals) {
+    paste0(pad_, paste(
+      purrr::pmap_chr(list(.vals, wid_, side_),
+                      \(.v, .w, .s) stringr::str_pad(.v, .w, side = .s)),
+      collapse = "  "
+    ))
+  }
+
+  body_ <- purrr::map_chr(seq_len(nrow(.tab)),
+                          \(.i) row_(purrr::map_chr(cells_, \(.c) .c[[.i]])))
+  c(row_(head_), body_)
+}
+
+#' Print a tibble to the console as an aligned block
+#'
+#' @param .tab Tibble to print.
+#' @param .title Optional heading printed above the block.
+#' @return Invisibly .tab, so this can sit mid-pipe.
+clf_say_table <- function(.tab, .title = NULL) {
+  if (!is.null(.title)) cli::cli_h3(.title)
+  cli::cli_verbatim(clf_fmt_table(.tab))
+  invisible(.tab)
+}
+
+#' Format a proportion as a percentage string
+#' @param .x Numeric vector in [0, 1].
+#' @param .digits Integer. Decimal places.
+#' @return Character vector.
+clf_pct <- function(.x, .digits = 1L) {
+  paste0(formatC(100 * .x, format = "f", digits = .digits), "%")
+}
+
+
+# 1a. Naming: short labels for models and configurations ---------------------
+# Run identifiers are built to be unique and machine-parseable, which makes them roughly eighty
+# characters long. That is fine on disk and unusable on a figure axis or in a console table, where a
+# long identifier pushes every number that matters off the visible width. These two functions
+# compress an identifier to the parts that actually vary within a study.
+
+#' Short display name for a pre-trained model
+#'
+#' Drops the organisation prefix and the size/casing suffix that every checkpoint in a family shares.
+#' Accepts either the hub form ("nlpaueb/legal-bert-base-uncased") or the slugged form used inside run
+#' identifiers ("nlpaueb-legal-bert-base-uncased").
+#'
+#' @param .model Character vector of model identifiers.
+#' @return Character vector of short names, e.g. "legal-bert", "roberta", "longformer".
+clf_model_short <- function(.model) {
+  if (FALSE) .model <- c("nlpaueb/legal-bert-base-uncased", "roberta-base")
+  out_ <- sub("^.*/", "", .model)                                   # hub form: drop the organisation
+  out_ <- sub("^(nlpaueb|allenai|google|facebook|microsoft)-", "", out_)   # slugged form: same job
+  out_ <- sub("-base-uncased$|-base-cased$|-base-4096$|-base$", "", out_)  # shared family suffixes
+  out_
+}
+
+#' Short display label for a run configuration
+#'
+#' Compresses a run identifier to the axes a sweep actually varies: model, context length, epochs,
+#' learning rate and class weighting. Batch size, text column and seed are held constant across the
+#' study and carry no information, so they are dropped. The task is dropped by default because
+#' figures and tables are already produced per task.
+#'
+#' @param .config_name Character vector of run identifiers.
+#' @param .keep_task Logical. Prefix the label with the task name.
+#' @return Character vector, e.g. "legal-bert L256 E6 LR2e-05 W1".
+clf_config_label <- function(.config_name, .keep_task = FALSE) {
+  if (FALSE) {
+    .config_name <- "ClassDetailed__nlpaueb-legal-bert-base-uncased__TText_L256_E6_B32_LR2e-05_W1_S42"
+    .keep_task   <- FALSE
+  }
+  parts_ <- stringr::str_split_fixed(.config_name, stringr::fixed("__"), 3)
+  spec_  <- parts_[, 3]
+
+  out_ <- paste0(
+    clf_model_short(parts_[, 2]),
+    " L",  stringr::str_match(spec_, "_L(\\d+)")[, 2],
+    " E",  stringr::str_match(spec_, "_E([0-9.]+)")[, 2],
+    " LR", stringr::str_match(spec_, "_LR([0-9.e+-]+?)_W")[, 2],
+    " W",  stringr::str_match(spec_, "_W([01])")[, 2]
+  )
+  if (.keep_task) paste0(parts_[, 1], ": ", out_) else out_
+}
+
+
+# 2. Disk cache -----------------------------------------------------------
+# Lightweight memoisation for expensive report artifacts. A chunk always runs,
+# but the costly computation behind it happens once.
+#
+# WARNING: the key is a NAME, not a hash of the data behind it. If the label
+# spine changes, a warm cache will serve pre-change results with no error. Delete
+# 2_output/_cache/ whenever the sample changes.
 
 #' Compute-once disk cache for a report artifact
 #'
 #' Returns the cached value for .key when present (and .overwrite is FALSE);
-#' otherwise evaluates .expr, stores it, and returns it. .expr is a lazily-evaluated
-#' argument -- on a cache hit it is never forced, so the computation does not run.
-#' This is the substitute for scattering `eval: !expr runs_exist_` across chunks:
-#' the chunk runs unconditionally, the disk read happens at most once, and an
-#' existing result is never clobbered unless asked.
+#' otherwise evaluates .expr, stores it, and returns it. .expr is lazily
+#' evaluated -- on a cache hit it is never forced, so the computation does not
+#' run. Flip everything at once with options(clf.cache.overwrite = TRUE).
 #'
 #' @param .key Character. Cache name; sanitised into a file name.
 #' @param .expr Expression evaluated only on a miss (untouched on a hit).
-#' @param .overwrite Logical. Recompute and overwrite even if cached. Defaults to
-#'   getOption("clf.cache.overwrite", FALSE).
+#' @param .overwrite Logical. Recompute and overwrite even if cached.
 #' @param .dir Cache directory (created if needed).
 #' @return The cached or freshly-computed value.
 clf_cache <- function(.key, .expr,
@@ -68,7 +182,7 @@ clf_cache <- function(.key, .expr,
                       .dir = here::here("2_output", "_cache")) {
   if (FALSE) {
     .key       <- "kw_overall"
-    .expr      <- clf_load_overall(.lP$Output$RunsDir)
+    .expr      <- clf_load_overall(.lP$Runs$Kw)
     .overwrite <- FALSE
     .dir       <- here::here("2_output", "_cache")
   }
@@ -79,19 +193,18 @@ clf_cache <- function(.key, .expr,
     cli::cli_alert_info("cache hit: {(.key)}")
     return(readRDS(path_))
   }
-  val_ <- .expr                       # forces the promise -- compute now
+  val_ <- .expr
   saveRDS(val_, path_)
-  act_ <- if (.overwrite) "overwrite" else "write"
-  cli::cli_alert_success("cache {act_}: {(.key)}")
+  cli::cli_alert_success("cache {if (.overwrite) 'overwrite' else 'write'}: {(.key)}")
   val_
 }
 
 
-# Sample preparation ------------------------------------------------------
+# 3. Sample construction --------------------------------------------------
 
 #' Read one parsed document's full text from its per-document parquet
 #'
-#' Returns NA on any failure (missing file/column/empty) so the caller can
+#' Returns NA on any failure (missing file / column / empty) so the caller can
 #' tally misses instead of aborting the whole run.
 #'
 #' @param .path Character. Path to the per-document parquet.
@@ -104,104 +217,118 @@ clf_read_text <- function(.path) {
   paste(txt_, collapse = "\n")
 }
 
-#' Build the single prepared classification sample with frozen stratified folds
+#' Build the prepared training sample, reporting every document that drops out
 #'
-#' Consumes the pre-pathed labelled df as the spine and emits the ONE prepared
-#' table both tracks read. Renames source columns to ClassBroad (Level1) and
-#' ClassDetailed (DocClassFinal1); carries the dual-class second label
-#' (ClassDetailed2), the amendment label (AmendType), and -- new vs the old BERT
-#' prep -- DocDesc / DocName for the keyword track (empty string when absent).
-#' Recodes the label source to LabelRound, reads text, and deals a deterministic
-#' stratified k-fold assignment (stratified on ClassDetailed, reused for
-#' ClassBroad and AmendType so all tasks share folds). By default keeps all rounds
-#' (the full combined sample); pass .round = "Round2" to restrict to gold labels.
+#' This is the only place a document can leave the sample, and it narrates each
+#' departure. Four gates, in order:
 #'
-#' @param .tab_input Tibble. Must contain DocID, Path, Level1, DocClassFinal1.
-#'   DocClassFinal2, AmendType, Provenance, DocDesc, DocName are used if present.
-#' @param .path_labels Path to label parquet (used only to join Provenance if absent).
-#' @param .round Character or NULL. Keep only this round; NULL keeps all.
+#'   1. HAS A CLASS LABEL. Unresolved documents (no Schema-2 label and no
+#'      mappable Schema-1 label) carry NA and cannot train anything.
+#'   2. HAS A FILE PATH. The label list is joined to the parsed-contract tree by
+#'      DocID; a document with no matching file cannot supply text.
+#'   3. FILE EXISTS ON DISK. Guards against a stale path cache.
+#'   4. TEXT IS NON-EMPTY. A parquet that reads but yields nothing is useless.
+#'
+#' What survives gets ClassBroad / ClassDetailed / ClassDetailed2 / AmendType,
+#' a LabelRound recode (S1_fallback -> Round1 automated, S2 -> Round2 manual),
+#' DocDesc / DocName for the keyword track, and a deterministic stratified fold.
+#' The intake cascade is attached as attr(out, "Intake") for clf_report_intake().
+#'
+#' @param .tab_input Tibble. Needs DocID, Path, Level1, DocClassFinal1;
+#'   DocClassFinal2, AmendType, Provenance, DocDesc, DocName used if present.
+#' @param .round Character or NULL. Keep only this LabelRound; NULL keeps all.
 #' @param .k Integer. Number of folds.
-#' @param .seed Integer. RNG seed.
+#' @param .seed Integer. RNG seed for the fold deal.
 #' @return Tibble: DocID, Text, DocDesc, DocName, ClassBroad, ClassDetailed,
-#'   ClassDetailed2, AmendType, LabelRound, Fold.
-clf_prepare_sample <- function(.tab_input, .path_labels = NULL,
-                               .round = NULL, .k = 5L, .seed = 42L) {
+#'   ClassDetailed2, AmendType, LabelRound, Fold. Carries attr "Intake".
+clf_prepare_sample <- function(.tab_input, .round = NULL, .k = 5L, .seed = 42L) {
   if (FALSE) {
-    .tab_input   <- fils_class_sample
-    .path_labels <- .lP$Input$ClassificationSample
-    .round       <- NULL
-    .k           <- 5L
-    .seed        <- 42L
+    .tab_input <- fils_class_sample
+    .round     <- NULL
+    .k         <- 5L
+    .seed      <- 42L
   }
 
   need_ <- c("DocID", "Path", "Level1", "DocClassFinal1")
-  miss_cols_ <- setdiff(need_, names(.tab_input))
-  if (length(miss_cols_) > 0L) cli::cli_abort("Input missing columns: {miss_cols_}")
+  miss_ <- setdiff(need_, names(.tab_input))
+  if (length(miss_) > 0L) cli::cli_abort("Input missing columns: {miss_}")
 
-  round_lab_ <- if (is.null(.round)) "all rounds" else .round
+  cli::cli_h2("Building the training sample")
 
-  # NA-fill optional columns so the select is stable whether or not they exist
-  if (!"DocClassFinal2" %in% names(.tab_input)) .tab_input <- .tab_input |> dplyr::mutate(DocClassFinal2 = NA_character_)
-  if (!"AmendType"      %in% names(.tab_input)) .tab_input <- .tab_input |> dplyr::mutate(AmendType = NA_character_)
+  # Optional columns: materialise as NA so the select below is stable.
+  for (col_ in c("DocClassFinal2", "AmendType", "DocDesc", "DocName")) {
+    if (!col_ %in% names(.tab_input)) {
+      .tab_input[[col_]] <- NA_character_
+    }
+  }
+  if (!"Provenance" %in% names(.tab_input)) {
+    cli::cli_abort("Input has no Provenance column -- cannot derive LabelRound.")
+  }
 
   tab_ <- .tab_input |>
     dplyr::select(DocID, Path,
                   ClassBroad = Level1, ClassDetailed = DocClassFinal1,
-                  ClassDetailed2 = DocClassFinal2, AmendType,
-                  dplyr::any_of(c("Provenance", "DocDesc", "DocName")))
-
-  # carry the keyword-track fields; create empty if the metadata join was absent
-  if (!"DocDesc" %in% names(tab_)) tab_ <- tab_ |> dplyr::mutate(DocDesc = NA_character_)
-  if (!"DocName" %in% names(tab_)) tab_ <- tab_ |> dplyr::mutate(DocName = NA_character_)
-
-  if (!"Provenance" %in% names(tab_)) {
-    if (is.null(.path_labels)) {
-      cli::cli_abort("No Provenance column and no labels path to join it from.")
-    }
-    prov_ <- arrow::read_parquet(.path_labels) |> dplyr::select(DocID, Provenance)
-    tab_ <- tab_ |> dplyr::left_join(prov_, by = dplyr::join_by(DocID))
-  }
-
-  # recode label source: S1_fallback -> Round1 (automated), S2 -> Round2 (manual)
-  tab_ <- tab_ |>
+                  ClassDetailed2 = DocClassFinal2, AmendType, Provenance,
+                  DocDesc, DocName) |>
     dplyr::mutate(
       LabelRound = dplyr::case_when(
         .data$Provenance == "S1_fallback" ~ "Round1",
         .data$Provenance == "S2"          ~ "Round2",
-        TRUE                               ~ NA_character_
+        TRUE                              ~ NA_character_
       )
-    ) |>
-    dplyr::select(-dplyr::any_of("Provenance"))
+    )
 
+  # Gate 0: optional round restriction (not a data-quality drop).
+  n_read_ <- nrow(tab_)
   if (!is.null(.round)) {
     tab_ <- tab_ |> dplyr::filter(.data$LabelRound == .round)
+    cli::cli_alert_info("Restricted to {(.round)}: {nrow(tab_)} of {n_read_} rows")
   }
+  n_start_ <- nrow(tab_)
 
+  # Gate 1: a usable class label.
   tab_ <- tab_ |> dplyr::filter(!is.na(.data$ClassBroad), !is.na(.data$ClassDetailed))
-  cli::cli_alert_info("{round_lab_}: {nrow(tab_)} docs after label filter")
+  n_lab_ <- nrow(tab_)
 
+  # Gate 2: a path from the contract-file join.
+  tab_ <- tab_ |> dplyr::filter(!is.na(.data$Path))
+  n_path_ <- nrow(tab_)
+
+  # Gate 3: that path resolves on disk.
   tab_ <- tab_ |> dplyr::filter(fs::file_exists(.data$Path))
-  cli::cli_alert_info("Reading {nrow(tab_)} document texts ...")
-  tab_ <- tab_ |> dplyr::mutate(Text = purrr::map_chr(.data$Path, clf_read_text, .progress = TRUE))
+  n_disk_ <- nrow(tab_)
 
-  ready_ <- tab_ |> dplyr::filter(!is.na(.data$Text), trimws(.data$Text) != "")
-  drop_txt_ <- nrow(tab_) - nrow(ready_)
-  if (drop_txt_ > 0L) cli::cli_alert_warning("Dropped {drop_txt_} docs with empty/unreadable text")
+  # Gate 4: the file yields text.
+  cli::cli_alert_info("Reading {n_disk_} document texts ...")
+  tab_ <- tab_ |>
+    dplyr::mutate(Text = purrr::map_chr(.data$Path, clf_read_text, .progress = TRUE)) |>
+    dplyr::filter(!is.na(.data$Text), trimws(.data$Text) != "")
+  n_text_ <- nrow(tab_)
 
-  # title coverage is informative for the keyword track (docdesc-only abstains
-  # where the title is empty); report it once here.
-  ready_ <- ready_ |>
-    dplyr::mutate(dplyr::across(dplyr::any_of(c("DocDesc", "DocName")), ~ dplyr::coalesce(.x, "")))
-  n_no_desc_ <- sum(ready_$DocDesc == "")
-  if (n_no_desc_ > 0L) cli::cli_alert_info("{n_no_desc_} docs have empty DocDesc (keyword docdesc model abstains on these)")
+  if (n_text_ == 0L) cli::cli_abort("No documents survived intake -- nothing to prepare.")
 
-  thin_ <- ready_ |> dplyr::count(.data$ClassDetailed) |> dplyr::filter(.data$n < .k)
+  intake_ <- tibble::tribble(
+    ~Stage,                      ~Docs,
+    "Label rows in",             n_start_,
+    "Has a class label",         n_lab_,
+    "Has a contract file path",  n_path_,
+    "File exists on disk",       n_disk_,
+    "Text is non-empty",         n_text_
+  ) |>
+    dplyr::mutate(Dropped = dplyr::lag(.data$Docs, default = n_start_) - .data$Docs)
+
+  # Deal the folds. Stratified on ClassDetailed and reused by every task, so the
+  # rarest detailed class is the binding constraint on how thin a fold can get.
+  thin_ <- tab_ |> dplyr::count(.data$ClassDetailed) |> dplyr::filter(.data$n < .k)
   if (nrow(thin_) > 0L) {
-    cli::cli_alert_warning("Classes with < {(.k)} docs (a fold may lack them): {paste(thin_$ClassDetailed, collapse = ', ')}")
+    cli::cli_alert_warning(
+      "Classes with fewer than {(.k)} docs (a fold may lack them): {paste(thin_$ClassDetailed, collapse = ', ')}"
+    )
   }
 
   set.seed(.seed)
-  out_ <- ready_ |>
+  out_ <- tab_ |>
+    dplyr::mutate(dplyr::across(dplyr::any_of(c("DocDesc", "DocName")), ~ dplyr::coalesce(.x, ""))) |>
     dplyr::arrange(.data$ClassDetailed, .data$DocID) |>
     dplyr::group_by(.data$ClassDetailed) |>
     dplyr::mutate(Fold = ((sample(dplyr::n()) - 1L) %% .k) + 1L) |>
@@ -209,11 +336,16 @@ clf_prepare_sample <- function(.tab_input, .path_labels = NULL,
     dplyr::transmute(DocID, Text, DocDesc, DocName, ClassBroad, ClassDetailed,
                      ClassDetailed2, AmendType, LabelRound, Fold)
 
-  cli::cli_alert_success("Prepared {nrow(out_)} docs across {(.k)} folds")
+  attr(out_, "Intake") <- intake_
+  cli::cli_alert_success("Training sample: {nrow(out_)} docs across {(.k)} folds")
   out_
 }
 
 #' Write the prepared sample to parquet
+#'
+#' Note the "Intake" attribute does not survive the parquet round-trip; it is a
+#' session artifact for the 03A report only.
+#'
 #' @param .tab Prepared tibble from clf_prepare_sample().
 #' @param .path_out Output parquet path.
 #' @return Invisible path written.
@@ -224,57 +356,100 @@ clf_write_prepared <- function(.tab, .path_out) {
   invisible(.path_out)
 }
 
-#' Per-fold class counts for one granularity (eyeball the stratification)
-#' @param .tab Prepared tibble.
-#' @param .level One of "ClassDetailed", "ClassBroad", "AmendType".
-#' @return Tibble: Label, one column per fold, Total.
-clf_fold_overview <- function(.tab, .level = c("ClassDetailed", "ClassBroad", "AmendType")) {
-  .level <- match.arg(.level)
-  .tab |>
-    dplyr::filter(!is.na(.data[[.level]])) |>
-    dplyr::count(Label = .data[[.level]], .data$Fold) |>
-    tidyr::pivot_wider(names_from = "Fold", values_from = "n",
-                       values_fill = 0L, names_prefix = "F") |>
-    dplyr::rowwise() |>
-    dplyr::mutate(Total = sum(dplyr::c_across(dplyr::starts_with("F")))) |>
-    dplyr::ungroup() |>
-    dplyr::arrange(dplyr::desc(.data$Total))
-}
 
+# 4. Report: what goes into training --------------------------------------
+# Each clf_report_* prints one block and returns its tibble invisibly, so the
+# numbers stay available for further work. clf_report_sample() runs them all.
 
-# Sample description (publication tables) ---------------------------------
-
-#' Headline composition of the labelled sample (one row, publication summary)
-#'
-#' The "here is our data resource" line: total docs, the Round1 / Round2 split,
-#' how many carry a dual-class second label, and the amendment-task breakdown.
-#'
-#' @param .tab Prepared tibble.
-#' @return One-row tibble.
-clf_sample_composition <- function(.tab) {
-  if (FALSE) .tab <- arrow::read_parquet(.lP$Output$Prepared)
-  tibble::tibble(
-    N          = nrow(.tab),
-    nRound1    = sum(.tab$LabelRound == "Round1", na.rm = TRUE),
-    nRound2    = sum(.tab$LabelRound == "Round2", na.rm = TRUE),
-    nDualClass = sum(!is.na(.tab$ClassDetailed2)),
-    nOriginal  = sum(.tab$AmendType == "Original", na.rm = TRUE),
-    nAmended   = sum(.tab$AmendType == "Amended", na.rm = TRUE),
-    nAmendNA   = sum(is.na(.tab$AmendType))
+#' Intake cascade: how the label list became the training sample
+#' @param .tab Prepared tibble (must carry attr "Intake").
+#' @return Invisibly the intake tibble.
+clf_report_intake <- function(.tab) {
+  intake_ <- attr(.tab, "Intake")
+  if (is.null(intake_)) {
+    cli::cli_alert_warning("No intake record (attribute lost -- was this read back from parquet?)")
+    return(invisible(NULL))
+  }
+  cli::cli_h2("1. Intake: which documents made it in")
+  intake_ |>
+    dplyr::mutate(
+      Kept = clf_pct(.data$Docs / max(.data$Docs)),
+      Dropped = as.integer(.data$Dropped)
+    ) |>
+    clf_say_table()
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Every drop is accounted for above. A nonzero drop at {.strong File exists on disk} \\
+     or {.strong Has a contract file path} is a join / path problem, not a labelling one."
   )
+  invisible(intake_)
 }
 
-#' Class distribution at one granularity (count + share, sorted)
-#'
-#' Works for ClassDetailed / ClassBroad (no NAs by construction) and for the
-#' amendment task AmendType (which does carry NAs). With .include_na = TRUE the
-#' NA docs become an explicit "(unlabeled)" row -- the honest way to show the
-#' AmendType breakdown, where the unlabeled share is the part the amendment
-#' classifier never sees.
-#'
+#' The three tasks: what each one actually trains on
 #' @param .tab Prepared tibble.
-#' @param .level "ClassDetailed", "ClassBroad", or "AmendType".
-#' @param .include_na Logical. Keep NA as an "(unlabeled)" row (default FALSE).
+#' @return Invisibly the task summary tibble.
+clf_report_tasks <- function(.tab) {
+  if (FALSE) .tab <- arrow::read_parquet(.lP$Output$Prepared)
+
+  one_ <- function(.name, .col) {
+    v_ <- .tab[[.col]]
+    ok_ <- v_[!is.na(v_)]
+    tab_n_ <- sort(table(ok_))
+    tibble::tibble(
+      Task          = .name,
+      Column        = .col,
+      Docs          = length(ok_),
+      Unlabelled    = sum(is.na(v_)),
+      Classes       = length(tab_n_),
+      SmallestClass = paste0(names(tab_n_)[[1]], " (",
+                             format(tab_n_[[1]], big.mark = ",", trim = TRUE), ")")
+    )
+  }
+
+  out_ <- dplyr::bind_rows(
+    one_("Detailed",  "ClassDetailed"),
+    one_("Broad",     "ClassBroad"),
+    one_("Amendment", "AmendType")
+  )
+
+  cli::cli_h2("2. The three tasks")
+  clf_say_table(out_)
+  cli::cli_text("")
+  cli::cli_bullets(c(
+    "*" = "All three are predicted from the same {.strong Text} column.",
+    "*" = "All three share the same folds, dealt stratified on {.strong ClassDetailed}.",
+    "*" = "{.strong Unlabelled} docs are dropped by the trainer for that task only.",
+    "*" = "The smallest class drives macro-F1, which weights every class equally."
+  ))
+  invisible(out_)
+}
+
+#' Per-class distribution for one task, split by label round
+#' @param .tab Prepared tibble.
+#' @param .level One of ClassDetailed, ClassBroad, AmendType.
+#' @return Invisibly the distribution tibble.
+clf_report_classes <- function(.tab, .level = c("ClassDetailed", "ClassBroad", "AmendType")) {
+  .level <- match.arg(.level)
+  n_ <- sum(!is.na(.tab[[.level]]))
+
+  out_ <- .tab |>
+    dplyr::filter(!is.na(.data[[.level]])) |>
+    dplyr::count(Class = .data[[.level]], .data$LabelRound) |>
+    tidyr::pivot_wider(names_from = "LabelRound", values_from = "n", values_fill = 0L) |>
+    dplyr::mutate(N = as.integer(rowSums(dplyr::across(dplyr::where(is.numeric))))) |>
+    dplyr::arrange(dplyr::desc(.data$N)) |>
+    dplyr::mutate(Pct = clf_pct(.data$N / n_)) |>
+    dplyr::relocate(Class, N, Pct, dplyr::any_of(c("Round1", "Round2")))
+
+  cli::cli_h2("3. Class distribution -- {(.level)}")
+  clf_say_table(out_)
+  invisible(out_)
+}
+
+#' Class counts and shares for one task (tibble form; feeds the plot layer)
+#' @param .tab Prepared tibble.
+#' @param .level One of ClassDetailed, ClassBroad, AmendType.
+#' @param .include_na Logical. Fold NA into an explicit "(unlabeled)" class.
 #' @return Tibble: Class, N, Pct (descending by N).
 clf_class_distribution <- function(.tab, .level = c("ClassDetailed", "ClassBroad", "AmendType"),
                                    .include_na = FALSE) {
@@ -291,44 +466,120 @@ clf_class_distribution <- function(.tab, .level = c("ClassDetailed", "ClassBroad
     dplyr::arrange(dplyr::desc(.data$N))
 }
 
-#' Document-length distribution (the max_len rationale)
-#'
-#' Contracts are long; at 512 tokens the model sees only the opening pages. The
-#' word thresholds (~200w ~ 256 tokens, ~400w ~ 512 tokens) quantify how much
-#' tail is truncated and motivate the 256-vs-512 sweep axis.
-#'
+#' Dual-class documents: headline count and the primary -> secondary pairs
 #' @param .tab Prepared tibble.
-#' @param .text_col Column to measure (default "Text").
-#' @return One-row tibble of length summaries.
-clf_length_summary <- function(.tab, .text_col = "Text") {
-  n_ <- stringi::stri_count_words(.tab[[.text_col]])
-  tibble::tibble(
-    N           = length(n_),
-    Median      = stats::median(n_),
-    P90         = stats::quantile(n_, 0.90, names = FALSE),
-    P99         = stats::quantile(n_, 0.99, names = FALSE),
-    PctOver200w = mean(n_ > 200),
-    PctOver400w = mean(n_ > 400)
+#' @return Invisibly the pairs tibble.
+clf_report_duals <- function(.tab, .n = 12L) {
+  dual_ <- .tab |> dplyr::filter(!is.na(.data$ClassDetailed2))
+
+  cli::cli_h2("4. Dual-class documents")
+  cli::cli_alert_info(
+    "{nrow(dual_)} of {nrow(.tab)} docs ({clf_pct(nrow(dual_) / nrow(.tab))}) carry a second valid category."
   )
+  if (nrow(dual_) == 0L) return(invisible(NULL))
+
+  by_round_ <- dual_ |> dplyr::count(.data$LabelRound, name = "Docs")
+  clf_say_table(by_round_, "By label round")
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Round1 is automated and emits one label, so duals should be Round2-only."
+  )
+
+  pairs_ <- dual_ |>
+    dplyr::count(Primary = .data$ClassDetailed, Secondary = .data$ClassDetailed2, name = "Docs") |>
+    dplyr::arrange(dplyr::desc(.data$Docs))
+
+  clf_say_table(utils::head(pairs_, .n),
+                paste0("Primary -> secondary (top ", min(.n, nrow(pairs_)), " of ", nrow(pairs_), ")"))
+  cli::cli_text("")
+  cli::cli_bullets(c(
+    "*" = "{.strong Primary} is the training target. {.strong Secondary} is never trained on.",
+    "*" = "The primary was assigned by manual review, so the direction is meaningful.",
+    "*" = "Lenient scoring accepts either; the strict-lenient gap is the ambiguity cost."
+  ))
+  invisible(pairs_)
 }
 
-#' Missingness audit across all prepared columns
-#'
-#' Per-column NA count / share, plus an empty-string count for character columns
-#' (DocDesc / DocName are coalesced to "" in prep, so an absent title shows up as
-#' empty, not NA). Two kinds of NA live in this table and the distinction is
-#' editorial, not mechanical:
-#'   - STRUCTURAL: ClassDetailed2 is NA for every single-class doc (the large
-#'     majority). That is the definition of a single-class doc, not missing data.
-#'   - GENUINE: AmendType is NA for docs never labelled for the amendment task;
-#'     that subset is simply excluded when the amendment classifier trains.
-#' ClassBroad / ClassDetailed / Text / Fold are NA-free by construction (the prep
-#' filters or assigns them), so a nonzero count there signals an upstream problem.
-#'
+#' Fold balance for one task
 #' @param .tab Prepared tibble.
-#' @return Tibble: Column, nNA, PctNA, nEmpty (descending by nNA).
-clf_na_overview <- function(.tab) {
-  if (FALSE) .tab <- arrow::read_parquet(.lP$Output$Prepared)
+#' @param .level One of ClassDetailed, ClassBroad, AmendType.
+#' @return Invisibly the per-fold tibble.
+clf_report_folds <- function(.tab, .level = c("ClassDetailed", "ClassBroad", "AmendType")) {
+  .level <- match.arg(.level)
+  out_ <- clf_fold_overview(.tab, .level)
+  cli::cli_h2("5. Fold balance -- {(.level)}")
+  clf_say_table(out_)
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Each fold is held out once. A class thin enough to vanish from a fold makes \\
+     that fold's per-class recall undefined -- watch the smallest rows."
+  )
+  invisible(out_)
+}
+
+#' Per-fold counts for one task (tibble form; used by 03B as well)
+#' @param .tab Prepared tibble.
+#' @param .level One of ClassDetailed, ClassBroad, AmendType.
+#' @return Tibble: Label, one column per fold, Total.
+clf_fold_overview <- function(.tab, .level = c("ClassDetailed", "ClassBroad", "AmendType")) {
+  .level <- match.arg(.level)
+  .tab |>
+    dplyr::filter(!is.na(.data[[.level]])) |>
+    dplyr::count(Label = .data[[.level]], .data$Fold) |>
+    tidyr::pivot_wider(names_from = "Fold", names_prefix = "Fold", values_from = "n",
+                       values_fill = 0L) |>
+    dplyr::mutate(Total = as.integer(rowSums(dplyr::across(dplyr::starts_with("Fold"))))) |>
+    dplyr::arrange(dplyr::desc(.data$Total))
+}
+
+#' Document length against the transformer context windows
+#' @param .tab Prepared tibble.
+#' @return Invisibly the summary tibble.
+clf_report_length <- function(.tab) {
+  words_ <- stringi::stri_count_regex(.tab$Text, "\\S+")
+  out_ <- tibble::tibble(
+    Statistic = c("Min", "25th pct", "Median", "Mean", "75th pct", "Max"),
+    Words     = as.integer(round(c(min(words_), stats::quantile(words_, 0.25),
+                                   stats::median(words_), mean(words_),
+                                   stats::quantile(words_, 0.75), max(words_))))
+  )
+  cli::cli_h2("6. Document length")
+  clf_say_table(out_)
+  cli::cli_text("")
+  over_ <- tibble::tibble(
+    Window       = c("256 tokens (~200 words)", "512 tokens (~400 words)"),
+    DocsOver     = c(sum(words_ > 200), sum(words_ > 400)),
+    ShareOver    = clf_pct(c(mean(words_ > 200), mean(words_ > 400)))
+  )
+  clf_say_table(over_, "Documents exceeding the context window")
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Most contracts overflow both windows, so the model reads the opening pages \\
+     only. That is the bet the pipeline rests on: contract type is legible from \\
+     the title and preamble."
+  )
+
+  # The short tail is the one that can hurt: a doc with a handful of words passed
+  # the non-empty gate but carries no signal, and trains on noise.
+  thin_ <- c(10L, 50L, 100L, 200L)
+  short_ <- tibble::tibble(
+    Under = paste0("< ", thin_, " words"),
+    Docs  = purrr::map_int(thin_, \(.n) sum(words_ < .n)),
+    Share = clf_pct(purrr::map_dbl(thin_, \(.n) mean(words_ < .n)))
+  )
+  clf_say_table(short_, "Short documents (parsing artifacts)")
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "These passed the non-empty gate but may carry no usable signal. A handful is \\
+     noise to tolerate; hundreds would justify a minimum-length gate."
+  )
+  invisible(out_)
+}
+
+#' Missingness audit across the prepared columns
+#' @param .tab Prepared tibble.
+#' @return Invisibly the missingness tibble.
+clf_report_missing <- function(.tab) {
   n_ <- nrow(.tab)
   na_ <- .tab |>
     dplyr::summarise(dplyr::across(dplyr::everything(), ~ sum(is.na(.x)))) |>
@@ -336,60 +587,182 @@ clf_na_overview <- function(.tab) {
   empty_ <- .tab |>
     dplyr::summarise(dplyr::across(dplyr::where(is.character), ~ sum(.x == "", na.rm = TRUE))) |>
     tidyr::pivot_longer(dplyr::everything(), names_to = "Column", values_to = "nEmpty")
-  na_ |>
+
+  out_ <- na_ |>
     dplyr::left_join(empty_, by = dplyr::join_by(Column)) |>
     dplyr::mutate(
       nEmpty = dplyr::coalesce(.data$nEmpty, 0L),
-      PctNA  = .data$nNA / n_
+      PctNA  = clf_pct(.data$nNA / n_)
     ) |>
     dplyr::select(Column, nNA, PctNA, nEmpty) |>
     dplyr::arrange(dplyr::desc(.data$nNA), dplyr::desc(.data$nEmpty))
+
+  cli::cli_h2("7. Missing data")
+  clf_say_table(out_)
+  cli::cli_text("")
+  cli::cli_bullets(c(
+    "v" = "{.strong ClassDetailed2} NA is expected -- it means 'single-class doc'.",
+    "v" = "{.strong DocDesc} nEmpty is expected -- docs with no filer title; the keyword docdesc model abstains on these.",
+    "x" = "Anything else nonzero is a bug. ClassBroad / ClassDetailed / AmendType / Text / Fold should all be zero."
+  ))
+  invisible(out_)
 }
 
-#' Dual-class headline: count, share, and Round split
+#' The whole 03A report in one call
 #'
-#' Dual-class docs carry a second valid label (ClassDetailed2). Automated Round1
-#' can only emit a single label, so dual labels should be confined to Round2
-#' (manual / gold) -- the Round split below confirms it. We keep the second label
-#' for lenient robustness scoring and this description, but never train or predict
-#' multi-label.
+#' Prints, in order: intake cascade, the three tasks, class distributions, dual
+#' labels, fold balance, document length, missingness. This is the block to copy
+#' out of the console when something needs checking.
 #'
-#' @param .tab Prepared tibble.
-#' @return One-row tibble: nDual, PctDual, nDualRound1, nDualRound2.
-clf_dual_class_overview <- function(.tab) {
-  dual_ <- .tab |> dplyr::filter(!is.na(.data$ClassDetailed2))
-  tibble::tibble(
-    nDual       = nrow(dual_),
-    PctDual     = nrow(dual_) / nrow(.tab),
-    nDualRound1 = sum(dual_$LabelRound == "Round1", na.rm = TRUE),
-    nDualRound2 = sum(dual_$LabelRound == "Round2", na.rm = TRUE)
-  )
+#' @param .tab Prepared tibble from clf_prepare_sample().
+#' @return Invisibly .tab.
+clf_report_sample <- function(.tab) {
+  if (FALSE) .tab <- tab_prep
+  cli::cli_h1("03A -- what goes into training")
+  clf_report_intake(.tab)
+  clf_report_tasks(.tab)
+  clf_report_classes(.tab, "ClassDetailed")
+  clf_report_classes(.tab, "ClassBroad")
+  clf_report_classes(.tab, "AmendType")
+  clf_report_duals(.tab)
+  clf_report_folds(.tab, "ClassDetailed")
+  clf_report_length(.tab)
+  clf_report_missing(.tab)
+  cli::cli_rule()
+  invisible(.tab)
 }
 
-#' Co-occurring class pairs among dual-class docs (unordered)
+
+# 5. Report: results across runs ------------------------------------------
+# Console printers for the 03B / 03C / 03D results sections. The computation
+# lives in section 6 below; these only format it.
+
+#' Leaderboard as a compact console table, one column per swept axis
 #'
-#' Since the two labels are co-equal (order is meaningless), the pair {A, B} is
-#' counted the same however it was entered. The result shows which contract types
-#' are taxonomically adjacent -- the honest way to surface the dual-class docs
-#' rather than reducing them to a single count.
+#' clf_leaderboard_show() carries ConfigName, which is ~80 characters and makes
+#' the table unreadable in a console. This decomposes it back into the axes that
+#' actually varied -- model, max_len, epochs, LR, class weights -- so the winning
+#' recipe is legible at a glance. Axes constant across the whole leaderboard are
+#' dropped and reported once underneath, since a column of identical values is
+#' noise.
 #'
-#' @param .tab Prepared tibble.
-#' @return Tibble: Pair, N (descending by N).
-clf_dual_class_pairs <- function(.tab) {
-  .tab |>
-    dplyr::filter(!is.na(.data$ClassDetailed2)) |>
+#' @param .tab_overall Output of clf_load_overall().
+#' @param .label_col Task to rank ("ClassDetailed", "ClassBroad", "AmendType").
+#' @param .n Integer. Rows to show.
+#' @return Invisibly the compact tibble.
+clf_report_leaderboard <- function(.tab_overall, .label_col = "ClassDetailed", .n = 15L) {
+  if (FALSE) {
+    .tab_overall <- clf_load_overall(.lP$Runs$Bert)
+    .label_col   <- "ClassDetailed"
+    .n           <- 15L
+  }
+  axes_ <- .tab_overall |>
+    dplyr::filter(.data$LabelCol == .label_col, !.data$Smoke) |>
+    dplyr::summarise(
+      Model   = dplyr::first(.data$Model),
+      MaxLen  = dplyr::first(.data$MaxLen),
+      Epochs  = dplyr::first(.data$Epochs),
+      LR      = dplyr::first(.data$LR),
+      Weights = dplyr::first(as.integer(as.logical(.data$ClassWeights))),
+      .by = ConfigName
+    )
+
+  board_ <- .tab_overall |>
+    dplyr::filter(.data$LabelCol == .label_col) |>
+    clf_leaderboard() |>
+    dplyr::select(ConfigName, nFolds, F1macro_mean, F1macro_sd, Acc_mean, Acc_sd) |>
+    dplyr::left_join(axes_, by = dplyr::join_by(ConfigName)) |>
     dplyr::mutate(
-      Pair = purrr::map2_chr(
-        .data$ClassDetailed, .data$ClassDetailed2,
-        \(.a, .b) paste(sort(c(.a, .b)), collapse = " + ")
-      )
+      Rank     = dplyr::row_number(),
+      Model    = clf_model_short(.model = .data$Model),
+      LR       = formatC(.data$LR, format = "g"),
+      Epochs   = as.integer(.data$Epochs),
+      MaxLen   = as.integer(.data$MaxLen),
+      MacroF1  = sprintf("%.3f +/- %.3f", .data$F1macro_mean, .data$F1macro_sd),
+      Accuracy = sprintf("%.3f +/- %.3f", .data$Acc_mean, .data$Acc_sd)
     ) |>
-    dplyr::count(.data$Pair, name = "N") |>
-    dplyr::arrange(dplyr::desc(.data$N))
+    dplyr::select(Rank, Model, MaxLen, Epochs, LR, Weights, nFolds, MacroF1, Accuracy) |>
+    head(.n)
+
+  const_ <- board_ |>
+    dplyr::select(Model, MaxLen, Epochs, LR, Weights) |>
+    purrr::map_lgl(\(.c) dplyr::n_distinct(.c) == 1L)
+  fixed_ <- names(const_)[const_]
+
+  cli::cli_h2("Leaderboard -- {(.label_col)} (top {nrow(board_)})")
+  board_ |> dplyr::select(-dplyr::all_of(fixed_)) |> clf_say_table()
+  if (length(fixed_) > 0L) {
+    held_ <- purrr::map_chr(fixed_, \(.a) paste0(.a, "=", board_[[.a]][[1]]))
+    cli::cli_text("")
+    cli::cli_alert_info("Constant across every row shown: {paste(held_, collapse = ', ')}")
+  }
+  cli::cli_text("")
+  cli::cli_alert_info("Weights: 1 = class-weighted loss, 0 = unweighted.")
+  invisible(board_)
+}
+
+#' Marginal effect of each swept axis on macro-F1, as one console table
+#'
+#' @param .tab_overall Output of clf_load_overall().
+#' @param .label_col Task to analyse.
+#' @param .axes Character vector of axis column names.
+#' @return Invisibly the stacked effect tibble.
+clf_report_effects <- function(.tab_overall, .label_col = "ClassDetailed",
+                               .axes = c("Model", "MaxLen", "Epochs", "ClassWeights", "LR")) {
+  present_ <- .axes[.axes %in% names(.tab_overall)]
+  out_ <- purrr::map(present_, \(.axis) {
+    clf_effect(.tab_overall, .axis, .label_col = .label_col) |>
+      dplyr::rename(Level = 1) |>
+      dplyr::mutate(Axis = .axis, Level = as.character(Level)) |>
+      dplyr::relocate(Axis)
+  }) |>
+    purrr::list_rbind()
+
+  cli::cli_h2("Marginal effect of each axis -- {(.label_col)}")
+  out_ |>
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+    clf_say_table()
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Each row averages over every other axis on the balanced grid. A gap smaller \\
+     than the fold-to-fold sd on the leaderboard is not a real effect."
+  )
+  invisible(out_)
+}
+
+#' Headline scores as a console table
+#' @param .tab_pred Pooled predictions.
+#' @param .title Heading.
+#' @return Invisibly the scores tibble.
+clf_report_scores <- function(.tab_pred, .title = "Headline scores") {
+  out_ <- clf_scores(.tab_pred)
+  cli::cli_h2("{(.title)}")
+  out_ |>
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+    clf_say_table()
+  invisible(out_)
+}
+
+#' Per-class precision / recall / F1 as a console table
+#' @param .tab_pred Pooled predictions.
+#' @param .title Heading.
+#' @return Invisibly the per-class tibble.
+clf_report_perclass <- function(.tab_pred, .title = "Per-class scores") {
+  out_ <- clf_perclass(.tab_pred)
+  cli::cli_h2("{(.title)}")
+  out_ |>
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
+    clf_say_table()
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Macro-F1 is the unweighted mean of the F1 column, so the thinnest classes \\
+     move it as much as the largest ones."
+  )
+  invisible(out_)
 }
 
 
-# Overview: load + leaderboard --------------------------------------------
+# 6. Overview: load + leaderboard -----------------------------------------
 
 #' Bind all per-fold overall-metrics rows from one or more runs trees
 #'
@@ -757,7 +1130,8 @@ clf_plot_leaderboard <- function(.tab_overall, .label_col = NULL, .n = 15L) {
     if (is.null(.label_col)) .tab_overall else dplyr::filter(.tab_overall, .data$LabelCol == .label_col)
   ) |> head(.n)
   p_ <- lb_ |>
-    ggplot2::ggplot(ggplot2::aes(x = forcats::fct_reorder(ConfigName, F1macro_mean), y = F1macro_mean)) +
+    dplyr::mutate(Config = clf_config_label(.config_name = .data$ConfigName)) |>
+    ggplot2::ggplot(ggplot2::aes(x = forcats::fct_reorder(Config, F1macro_mean), y = F1macro_mean)) +
     ggplot2::geom_errorbar(
       ggplot2::aes(ymin = F1macro_mean - F1macro_sd, ymax = F1macro_mean + F1macro_sd),
       width = 0.25, linewidth = 0.3
