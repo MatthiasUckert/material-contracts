@@ -135,19 +135,25 @@ fold they are entitled to.
 .dir_prep <- init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare")
 .dir_bert <- init_create_script_dir(.dir_here = here::here(), .name_script = "03B-ClassifyTrainBERT")
 .dir_kw   <- init_create_script_dir(.dir_here = here::here(), .name_script = "03C-ClassifyTrainKeyword")
+.dir_llm  <- init_create_script_dir(.dir_here = here::here(), .name_script = "03D-ClassifyLLM")
 
 .lP <- list(
   Input = list(
-    # Paths are rebuilt through the same helper the upstream scripts wrote with, so they cannot drift
+    # Rebuilt from the same directory helper the upstream scripts wrote with, so they cannot drift
     # from where the files actually landed.
-    Prepared = utils_file_path(.dir_prep, "prepared.parquet")
+    Prepared = fs::path(.dir_prep, "prepared.parquet")
   ),
   Runs = list(
-    Bert = utils_file_path(.dir_bert, "runs"), # written by 03B
-    Kw   = utils_file_path(.dir_kw,   "runs")  # written by 03C
+    # fs::path for inputs, utils_file_path for outputs. The project helper creates the directory it
+    # names, which is right for somewhere this document writes and wrong for somewhere it reads: a
+    # runs root conjured into existence reports Found = TRUE while holding nothing.
+    Bert = fs::path(.dir_bert, "runs"), # written by 03B
+    Kw   = fs::path(.dir_kw,   "runs"), # written by 03C
+    Llm  = fs::path(.dir_llm,  "runs")  # written by 03D; absent until that stage has run
   ),
   Output = list(
-    Policy = utils_file_path(.dir_main, "policy") # the deployment decisions 03E reads
+    Policy = utils_file_path(.dir_main, "policy"),    # per-task routing policies
+    Deploy = utils_file_path(.dir_main, "deployment") # the manifest 03F reads
   ),
   Param = list(
     Floors    = c(0, 0.70, 0.80, 0.90), # score floors crossed into the policy grid
@@ -155,7 +161,11 @@ fold they are entitled to.
     Families  = c("cascade", "perclass"), # gating families searched
     Folds     = 5L,                     # folds an arm must cover to enter the nested search
     Holdout   = 5L,                     # the fold a written term list never read
-    Tolerance = 0.005                   # macro-F1 band treated as indistinguishable
+    Tolerance = 0.005,                  # macro-F1 band treated as indistinguishable
+    # The generative arm is the most independent vote and the most expensive to run at corpus scale,
+    # so it is pinned in the manifest and left off unless a caller asks for it.
+    DefaultVoteSet = "core",
+    DefaultKinds   = c("transformer", "keyword")
   )
 )
 ```
@@ -173,6 +183,28 @@ pipeline has already been bitten by: a key naming a computation rather than fing
 #| label: load-prepared-sample
 if (!fs::file_exists(.lP$Input$Prepared)) cli::cli_abort("Run 03A before this document")
 tab_prep <- arrow::read_parquet(file = .lP$Input$Prepared)
+```
+
+The runs roots are resolved once, against the filesystem. A stage that has not run yet leaves no
+directory, and globbing a missing one aborts -- so this document would refuse to render at all
+because a later, optional arm was absent. Filtering to what exists means the analysis degrades to the
+arms available rather than failing, and prints which those are so a thin inventory is never a
+surprise.
+
+```{r}
+#| label: resolve-runs-roots
+.dir_runs <- c(.lP$Runs$Bert, .lP$Runs$Kw, .lP$Runs$Llm)
+.dir_runs <- .dir_runs[fs::dir_exists(.dir_runs)]
+
+tibble::tibble(
+  Root  = c("BERT (03B)", "Keyword (03C)", "LLM (03D)"),
+  Path  = c(.lP$Runs$Bert, .lP$Runs$Kw, .lP$Runs$Llm),
+  Found = fs::dir_exists(c(.lP$Runs$Bert, .lP$Runs$Kw, .lP$Runs$Llm))
+) |>
+  dplyr::mutate(Path = fs::path_rel(Path, here::here())) |>
+  clf_say_table(.title = "Runs roots feeding this document")
+
+if (length(.dir_runs) == 0L) cli::cli_abort("No runs on disk; run 03B before this document")
 ```
 
 # The hierarchy
@@ -250,7 +282,7 @@ count as commitments, how wide the search is, and what counts as a tie.
 ```{r}
 #| label: run-detailed
 res_det <- orch_run_task(
-  .runs_roots  = c(.lP$Runs$Bert, .lP$Runs$Kw), # both trees; the run schema is shared
+  .runs_roots  = .dir_runs,                    # every tree that exists; the run schema is shared
   .label_col   = "ClassDetailed",               # task
   .tab_prep    = tab_prep,                      # prepared sample
   .extra_arms  = arm_hier,                      # the broad-constrained transformer
@@ -289,7 +321,7 @@ orch_report_stability(.tab_nested = res_det$Nested)
 ```{r}
 #| label: run-broad
 res_broad <- orch_run_task(
-  .runs_roots  = c(.lP$Runs$Bert, .lP$Runs$Kw), # both trees
+  .runs_roots  = .dir_runs,                    # every tree that exists
   .label_col   = "ClassBroad",                  # task
   .tab_prep    = tab_prep,                      # prepared sample
   .extra_arms  = arm_rollup,                    # the rolled-up detailed prediction
@@ -326,7 +358,7 @@ classed as a terminal, and no cascade exists to search over.
 ```{r}
 #| label: run-amendment
 res_amend <- orch_run_task(
-  .runs_roots  = c(.lP$Runs$Bert, .lP$Runs$Kw), # both trees
+  .runs_roots  = .dir_runs,                    # every tree that exists
   .label_col   = "AmendType",                   # task
   .tab_prep    = tab_prep,                      # prepared sample
   .extra_arms  = NULL,                          # no hierarchy to exploit on a binary task
@@ -428,6 +460,255 @@ clf_say_table(
 )
 ```
 
+# Agreement, and the flag that ships with the data
+
+Everything above decides which single label to release. This section asks the question a user of the
+released dataset actually faces, and which nothing so far answers: **how much to trust the label in
+front of them.**
+
+The dataset covers far more filings than the 4,398 that carry a hand label, so a reader currently has
+one global number and no way to tell a confidently-classified contract from a marginal one. A
+per-document flag changes the offer. It lets them restrict to concurring documents for a clean
+sample, or split on the flag as a robustness check, which is a materially different thing from a
+single macro-F1 -- and it answers directly the reviewer question about what a headline accuracy
+figure means for a reader holding one contract.
+
+## Why this is shippable and "where the model is wrong" is not
+
+Whether two methods agree is visible on an unlabelled filing: run both and compare. Whether a method
+is *wrong* is not, and no amount of care makes it so. That asymmetry is the entire reason the flag is
+built from concurrence rather than from error, and it is enforced structurally:
+`orch_agreement_pattern()` never selects a truth column. What it computes is exactly what can be
+recomputed on a document that was never labelled. Reliability is estimated afterwards, separately,
+from the labelled sample.
+
+## Which arms may vote
+
+Chosen on independence, not on accuracy, and stated here rather than derived from a score. The
+constrained transformer is built from the plain transformer's own probability vector -- it is not a
+second opinion, it agrees with its parent by construction, and counting it would manufacture
+unanimity out of one model. A second checkpoint trained on the same folds is barely better: different
+weights, identical supervision, and errors that concentrate in the same places. What earns a vote is
+a genuinely different route to the answer.
+
+So the rule is **one seat per method family**: lexical matching, representation learning, and a model
+with no exposure to this sample at all. Role plays no part in it. The LLM arm commits on every
+document and is therefore classed as a terminal rather than a gated arm, which is irrelevant to
+whether its opinion is worth hearing -- a routing role and a vote are different jobs, and selecting
+voters by role would have silently excluded the most independent arm available.
+
+The transformer seat goes to the arm that actually shipped the label rather than to whichever
+checkpoint scored highest, because the flag describes the label that was released.
+
+```{r}
+#| label: agreement-voting-arms
+seats_ <- res_det$ArmsCV |>
+  dplyr::mutate(
+    Family = dplyr::case_when(
+      grepl("^keyword-", Kind) ~ "lexical",
+      grepl("^llm-", Kind)     ~ "generative",
+      TRUE                     ~ "transformer"
+    )
+  ) |>
+  dplyr::slice_max(MacroF1, n = 1L, by = Family, with_ties = FALSE) |>
+  dplyr::mutate(Arm = dplyr::if_else(Family == "transformer", res_det$Incumbent, Arm))
+
+arms_voting <- intersect(seats_$Arm, unique(res_det$Spine$Arm))
+
+# Coverage and accuracy come from the spine, not from the inventory, and only Family comes from the
+# seat table. The two sources both carry those columns and a plain join would suffix them into
+# ambiguity; more to the point, Role is derived from the spine, so the numbers standing beside it
+# have to be the spine's or the row explains itself with figures that did not produce it. They
+# coincide for a categorical task and part company for a binary one, where the spine has already
+# silenced the keyword arm's negative class.
+seats_ |>
+  dplyr::filter(Arm %in% arms_voting) |>
+  dplyr::select(Family, Arm) |>
+  dplyr::left_join(
+    res_det$Roles |> dplyr::select(Arm, Role, Coverage, Accuracy),
+    by = dplyr::join_by(Arm)
+  ) |>
+  dplyr::mutate(Coverage = clf_pct(Coverage), Accuracy = clf_pct(Accuracy)) |>
+  clf_say_table(.title = "Arms permitted to vote on the confidence flag")
+```
+
+Derived arms are excluded by construction, since `ArmsCV` holds only arms read from run folders and
+the constrained transformer is built in memory. If the generative row is absent, 03D has not run and
+the flag rests on two families rather than three -- weaker, but still computable, and the table above
+says so rather than leaving it to be inferred from a number that looks fine.
+
+```{r}
+#| label: agreement-tiers
+pattern_det <- orch_agreement_pattern(
+  .spine    = res_det$Spine,   # every arm's prediction, per document
+  .tab_pred = res_det$Nested,  # the labels actually shipped
+  .arms     = arms_voting      # who votes, decided above on independence grounds
+)
+
+agree_det <- orch_agreement(
+  .pattern  = pattern_det,     # the label-free pattern
+  .tab_pred = res_det$Nested   # the truth, consulted only now
+)
+
+orch_report_agreement(
+  .tab  = agree_det,   # tier reliabilities
+  .arms = arms_voting  # named in the heading, since a tier means nothing without them
+)
+```
+
+The unanimous tier's error rate is the number that bounds what this flag can claim. Independent
+methods converging on the *same wrong answer* is the failure a concurrence flag is structurally
+blind to, and it is the figure to quote when describing the flag's limits rather than its strengths.
+
+## The null: does agreement beat the transformer's own probability?
+
+The transformer already emits a confidence signal, and 03B already showed it separates errors. If the
+tiers stop separating once documents are compared at equal probability, then agreement is a proxy for
+that probability and the honest recommendation is to ship the simpler number and drop the flag.
+
+```{r}
+#| label: agreement-vs-probability
+agree_prob_det <- orch_agreement_vs_prob(
+  .pattern   = pattern_det,        # the label-free pattern
+  .tab_pred  = res_det$Nested,     # shipped labels and truth
+  .spine     = res_det$Spine,      # supplies the incumbent's probability
+  .incumbent = res_det$Incumbent,  # whose Score is that probability
+  .n_bands   = 4L                  # equal-count bands; the distribution is massed near one
+)
+
+orch_report_agreement_vs_prob(.tab = agree_prob_det)
+```
+
+Read across a row, not down a column. Tiers separating within a band means concurrence carries
+information the probability does not, and the two combined beat either alone. Flat rows mean the flag
+is redundant, and saying so is a result rather than a disappointment.
+
+
+## Two voting sets, because one of them costs ten hours
+
+The generative arm is the most independent vote available and the only one that saw none of this
+sample. It is also the expensive one: at the rate 03D measured, running it over the 1.1 million
+contracts in the corpus is hours of inference rather than minutes. A deployment that leaves it off is
+therefore a realistic case, not a hypothetical, and it needs its own reliability numbers.
+
+A tier's reliability is a property of **who voted**. Estimating it on three arms and deploying with
+two would ship numbers describing a vote that never happened, and nothing downstream could catch it:
+a two-arm pattern computed at deployment looks exactly like a two-arm pattern computed here. So both
+sets are estimated now and the manifest records which one a caller gets unless they ask otherwise.
+
+```{r}
+#| label: agreement-sets
+sets_voting <- list(
+  core = intersect(seats_$Arm[seats_$Family != "generative"], unique(res_det$Spine$Arm)),
+  full = arms_voting
+)
+sets_voting <- sets_voting[purrr::map_int(sets_voting, length) > 0L]
+
+agree_sets <- orch_agreement_sets(
+  .spine    = res_det$Spine,  # every arm's prediction, per document
+  .tab_pred = res_det$Nested, # the labels actually shipped
+  .sets     = sets_voting     # one reliability table per set
+)
+
+orch_report_agreement_sets(
+  .tab     = agree_sets,               # every set side by side
+  .default = .lP$Param$DefaultVoteSet  # the set a caller gets unless they ask otherwise
+)
+```
+
+The generative arm is pinned in the manifest but **not enabled by default**. A caller who wants the
+three-family flag asks for it and pays for it; a caller who does not gets the cheaper flag with
+reliability numbers that describe the vote they actually ran.
+
+# The deployment manifest
+
+The artifacts written above name configurations, and a configuration is not a model. A string like
+`ClassDetailed__nlpaueb-legal-bert...__L256_E6...` identifies a recipe that was cross-validated, not
+a directory holding weights. A downstream stage handed only that string would have to reconstruct the
+path from a naming convention -- and a convention shared between training and inference is one that
+will eventually be changed in one place and not the other.
+
+So the manifest resolves every arm to a concrete artifact, records the parameters it was validated
+under and what it scored, and states which arms are on by default. It is the single file 03F reads
+and the single thing that must be archived alongside the released labels for anyone to reproduce
+them.
+
+Paths come from each upstream stage's own helpers rather than from a convention restated here, which
+is the same rule that keeps the run roots from drifting.
+
+```{r}
+#| label: deploy-artifacts
+# Built from the seat table rather than by listing arms and kinds side by side. Two parallel vectors
+# only stay aligned while every family is present, and the generative seat is empty until 03D has
+# run -- at which point a hand-built pair silently shortens on one side and lengthens on the other.
+tab_artifacts <- seats_ |>
+  dplyr::filter(Arm %in% arms_voting) |>
+  dplyr::transmute(
+    Arm,
+    Kind = dplyr::case_when(
+      Family == "transformer" ~ "transformer",
+      Family == "lexical"     ~ "keyword",
+      Family == "generative"  ~ "llm"
+    ),
+    ConfigName = purrr::map_chr(Arm, function(.a) {
+      res_det$Arms$ConfigName[res_det$Arms$Arm == .a][1]
+    })
+  ) |>
+  dplyr::mutate(
+    # fs::path, not utils_file_path. Two reasons, and the second is the serious one. It is
+    # vectorised, where the project's path helper takes scalars and case_when hands it a whole
+    # column. And it is PURE: utils_file_path creates the directory it names, so using it here would
+    # conjure an empty model_final/<config>__FINAL/model into existence and that empty directory
+    # would then satisfy the manifest's own existence check. A path builder used to describe an
+    # input defeats the verification meant to catch a missing one.
+    Path = dplyr::case_when(
+      # 03B writes the all-data refit as <config>__FINAL/model under its model_final directory.
+      Kind == "transformer" ~ as.character(
+        fs::path(.dir_bert, "model_final", paste0(ConfigName, "__FINAL"), "model")
+      ),
+      # 03C writes the published table as <stem>.parquet under its table directory.
+      Kind == "keyword" ~ as.character(
+        fs::path(.dir_kw, "table", "keyword_table_detailed.parquet")
+      ),
+      # The LLM ships no weights; the reproducible artifact is the run that fixed its prompt.
+      Kind == "llm" ~ as.character(fs::path(.dir_llm, "runs"))
+    ),
+    Params = purrr::map2(Kind, ConfigName, function(.k, .c) {
+      switch(.k,
+        transformer = list(config_name = .c, max_len = 256L),
+        keyword     = list(config_name = .c, source = "text"),
+        llm         = list(config_name = .c, model = "qwen3:8b",
+                           note = "prompt recipe is stored in the run's config.json"),
+        list()
+      )
+    })
+  )
+
+tab_artifacts |>
+  dplyr::mutate(Path = fs::path_rel(Path, here::here())) |>
+  dplyr::select(Arm, Kind, Path) |>
+  clf_say_table(.title = "Artifacts to pin")
+```
+
+```{r}
+#| label: deploy-save-manifest
+orch_save_manifest(
+  .results      = list(res_det, res_broad, res_amend), # every task's policy and validated score
+  .artifacts    = tab_artifacts,                       # arm to artifact, verified on disk
+  .agreement    = agree_sets,                          # reliability under every voting set
+  .sets         = sets_voting,                         # the sets themselves
+  .default_set  = .lP$Param$DefaultVoteSet,            # what a caller gets unless they ask
+  .default_kinds = .lP$Param$DefaultKinds,             # kinds enabled without being asked for
+  .dir          = .lP$Output$Deploy,                   # the directory 03F reads
+  .tab_prep     = tab_prep                             # provenance: sample size and fold count
+)
+```
+
+03F reads `manifest.json` and nothing else. Every default it applies is a value recorded here, so a
+caller who overrides one is visibly departing from a validated configuration rather than quietly
+choosing a different one.
+
+
 # Validation
 
 The routed labels must not contradict each other across taxonomy levels in a released dataset. Rolling
@@ -485,7 +766,7 @@ if (nrow(res_det$ArmsHeld) > 0L) {
   spine_hold <- dplyr::bind_rows(
     spine_hold,
     orch_spine(
-      .runs_roots = c(.lP$Runs$Bert, .lP$Runs$Kw), # both trees
+      .runs_roots = .dir_runs,                    # every tree that exists
       .arms       = res_det$ArmsHeld,              # the fold-restricted arms
       .tab_prep   = tab_prep                       # document-level columns
     ) |>
@@ -597,15 +878,31 @@ purrr::walk2(
       .final       = .r$Final,        # chosen policy plus its per-class gate
       .arms        = .r$Arms,         # records the ConfigName behind each arm name
       .label_col   = .r$LabelCol,     # the task this policy applies to
-      .dir         = .lP$Output$Policy, # destination 03E reads
-      .commit_only = .commit,         # recorded so 03E reproduces the same abstention rule
+      .dir         = .lP$Output$Policy, # destination 03F reads
+      .commit_only = .commit,         # recorded so 03F reproduces the abstention rule
       .stem        = "routing_policy" # file stem
     )
   }
 )
 ```
 
-03E reads these files and applies them. It makes no routing decision of its own: an apply script that
+```{r}
+#| label: deploy-save-confidence
+orch_save_confidence(
+  .agreement = agree_det,          # tier reliabilities estimated on the labelled sample
+  .arms      = arms_voting,        # who voted, so the flag is reproducible downstream
+  .label_col = res_det$LabelCol,   # the task it applies to
+  .dir       = .lP$Output$Policy,  # destination 03F reads
+  .stem      = "confidence_flag"   # file stem
+)
+```
+
+03F recomputes the tier for every document in the corpus -- it can, since the pattern needs no labels
+-- and attaches the reliability estimated here. Splitting it this way keeps the estimate out of the
+apply stage: 03F does arithmetic on a rule it was handed, and cannot quietly re-estimate reliability
+on a corpus that has no labels to estimate it from.
+
+03F reads these files and applies them. It makes no routing decision of its own: an apply script that
 re-derived a policy would be free to re-derive it differently, and the released labels would then
 depend on which script last ran.
 
@@ -711,6 +1008,16 @@ orch_plot_stability(.tab_nested = res_amend$Nested)
 
 :::
 
+## The confidence flag
+
+```{r}
+#| label: fig-agreement-tiers
+#| fig-height: 3.0
+#| fig-cap: "Accuracy of the shipped label by agreement tier, detailed taxonomy. Bar shading is the
+#|   share of the corpus each tier covers: a tier can be near-perfect and still too small to use."
+orch_plot_agreement(.tab = agree_det)
+```
+
 ## Per-category performance after routing
 
 ::: {.panel-tabset}
@@ -746,7 +1053,7 @@ clf_plot_perclass(.tab_pred = res_amend$Nested)
 
 # Next
 
-`03E` applies the deployed models to the full corpus, reading the routing policies written here rather
+`03F` applies the deployed models to the full corpus, reading the routing policies written here rather
 than deciding its own. The keyword table remains an independent artifact of 03C: it ships alongside
 the archived dataset and does not enter the labelling path, whatever this document concludes about
 routing.
@@ -755,3 +1062,4 @@ One extension needs no change here. Regenerating the curated term lists once per
 the written-list arms out of Robustness into the nested search proper, at which point the `nFolds`
 filter admits them automatically and the mined and curated arms compete on equal terms across all five
 folds.
+

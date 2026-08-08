@@ -62,7 +62,14 @@ clf_fmt_table <- function(.tab, .indent = 2L) {
   is_num_ <- purrr::map_lgl(.tab, is.numeric)
   cells_ <- purrr::map2(.tab, is_num_, \(.col, .num) {
     if (!.num) return(tidyr::replace_na(as.character(.col), "-"))
-    if (is.integer(.col)) {
+    # A count that arrives as a double -- and most do, since n() / total, sum() and nrow() all
+    # produce one -- would otherwise print as 874.000, which reads as a measurement carrying three
+    # significant decimals rather than as a tally. Whole-valued columns holding anything above one
+    # are therefore formatted as counts. The upper-bound test is what protects proportions: a
+    # coverage column that happens to be exactly 1 everywhere stays a decimal, because collapsing it
+    # would hide that it is a share.
+    whole_ <- all(.col == round(.col), na.rm = TRUE) && any(abs(.col) > 1, na.rm = TRUE)
+    if (is.integer(.col) || whole_) {
       format(.col, big.mark = ",", trim = TRUE, scientific = FALSE)
     } else {
       formatC(.col, format = "f", digits = 3)

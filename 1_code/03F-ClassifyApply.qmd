@@ -1,0 +1,331 @@
+---
+title: "Contract Classification -- Applying the Deployed Classifier (03F)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+knitr::opts_chunk$set(
+  root.dir  = here::here(),
+  message   = TRUE,       # mandatory: cli writes through the message stream under knitr
+  warning   = FALSE,
+  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
+  fig.width = 7.5,
+  fig.align = "center",
+  dpi       = 200,
+  out.width = "100%"
+)
+
+options(cli.num_colors = 1, cli.width = 120)
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+```{r}
+#| label: load-libraries
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+
+# 03A supplies the scoring and formatting layer, 03B the transformer inference call, 03D the
+# generative arm's prompt machinery. Nothing here re-implements any of them: the deployed classifier
+# is the same code the folds were run through, pointed at documents that carry no labels.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03D-ClassifyLLM"),
+  .f = function(.s) {
+    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+           encoding = "UTF-8")
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/03F-ClassifyApply.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+Every decision has been made. 03B chose a transformer and refit it on all labelled documents, 03C
+published a keyword table, 03D added a generative arm, and 03E decided how to combine them and how
+much to trust each result. This stage does none of that again. It reads what 03E wrote and applies
+it to the corpus.
+
+That separation is the point. An apply stage free to make its own decisions is an apply stage whose
+output depends on which version of it last ran, and a released dataset cannot be defended on those
+terms. So `mc_classify()` reads every default from the manifest and has almost none of its own, and
+an argument passed explicitly is recorded as a **departure** in the result rather than quietly
+honoured -- a caller can run a different checkpoint, they simply cannot do so invisibly.
+
+## What comes back
+
+One row per document per task: the label, which arm decided it, that arm's confidence, what every arm
+said independently, the agreement tier, and the reliability estimated for that tier under the voting
+set that was actually used. A user of the released dataset can condition on trust without re-running
+anything, which is a materially different offer from a single headline accuracy.
+
+## Why the generative arm is off by default
+
+It is the most independent vote available and the only arm that saw none of the labelled sample, so
+it is the one that most improves the flag. It is also hours of inference across a corpus of this
+size rather than minutes. It is therefore pinned in the manifest and disabled: asking for it is one
+argument, and a run that does not ask gets the two-family flag together with reliability numbers
+estimated on the vote it actually ran.
+
+That last clause is the part that would be easy to get wrong. A two-arm agreement pattern computed at
+deployment is indistinguishable from a two-arm pattern computed on the labelled sample, so shipping
+one set of reliabilities for every voting set would produce numbers that look entirely reasonable and
+describe a vote that never happened. 03E estimates each set separately and the manifest records which
+one a run is using.
+
+# Configuration
+
+```{r}
+#| label: configure-paths
+.dir_prep <- init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare")
+.dir_orch <- init_create_script_dir(.dir_here = here::here(), .name_script = "03E-ClassifyOrchestrate")
+
+.lP <- list(
+  Input = list(
+    # fs::path, not utils_file_path: the project helper creates what it names, and a corpus file
+    # whose directory was conjured into existence would make the fallback below unreachable.
+    Manifest = fs::path(.dir_orch, "deployment", "manifest.json"), # written by 03E
+    Prepared = fs::path(.dir_prep, "prepared.parquet"),            # labelled sample
+    Corpus   = fs::path(.dir_prep, "corpus.parquet")               # documents to label
+  ),
+  Output = list(
+    Labels = utils_file_path(.dir_main, "labels") # the released labels
+  ),
+  Engine = list(
+    Python = "~/.venvs/contracts-engine/bin/python",   # the environment 03B trains in
+    Script = here::here("1_code", "_Engines", "bert_classify.py")
+  ),
+  Param = list(
+    BatchSize = 32L,   # documents per forward pass
+    ChunkSize = 50000L # documents per output file; a corpus pass should not be one write
+  )
+)
+```
+
+Nothing here is cached. The expensive work is the model passes themselves, and those are checkpointed
+by writing labelled chunks as they complete, which is a resumable design rather than a cache: an
+interrupted run restarts at the first chunk that has no output file.
+
+```{r}
+#| label: load-manifest
+man <- mc_manifest(.path = .lP$Input$Manifest)
+mc_report_manifest(.man = man)
+```
+
+Read that block before anything else. Every line of it is a decision someone made once and validated,
+and a run applying the wrong quarter's configuration should be visible in the first screen of output
+rather than in the released labels.
+
+```{r}
+#| label: load-documents
+tab_prep <- arrow::read_parquet(file = .lP$Input$Prepared)
+
+# The labelled sample stands in for the corpus until the full extract is wired in, so this document
+# renders end to end from the first day rather than waiting on the upstream join. Every number below
+# is therefore a rehearsal, and the switch to the corpus changes one path.
+tab_docs <- if (fs::file_exists(.lP$Input$Corpus)) {
+  arrow::read_parquet(file = .lP$Input$Corpus)
+} else {
+  cli::cli_alert_warning(
+    "No corpus extract at {.lP$Input$Corpus}; rehearsing on the labelled sample instead."
+  )
+  tab_prep |> dplyr::select(DocID, Text, dplyr::any_of("DocDesc"))
+}
+
+cli::cli_alert_info("{nrow(tab_docs)} document{?s} to label.")
+```
+
+# A rehearsal on one chunk
+
+Before a corpus pass, one chunk end to end. It exercises every arm, the routing policy and the flag
+lookup, and it costs seconds -- which is the right price for discovering that a model directory moved
+or that the keyword lexicon has a column the applier does not expect.
+
+```{r}
+#| label: rehearse-chunk
+labelled_head <- mc_classify(
+  .docs       = dplyr::slice_head(tab_docs, n = 200L), # one chunk
+  .manifest   = man,                                   # every default comes from here
+  .tasks      = "ClassDetailed",                       # one task for the rehearsal
+  .arms       = NULL,                                  # NULL takes the manifest's enabled set
+  .voting_set = NULL,                                  # NULL takes the manifest default
+  .tab_prep   = tab_prep,                              # only used if the generative arm runs
+  .python     = .lP$Engine$Python,                     # inference environment
+  .script     = .lP$Engine$Script,                     # inference script
+  .batch_size = .lP$Param$BatchSize                    # documents per forward pass
+)
+
+mc_report_run(.tab = labelled_head)
+```
+
+```{r}
+#| label: rehearse-inspect
+labelled_head |>
+  dplyr::select(DocID, Label, DecidedBy, Prob, Tier, Reliability) |>
+  head(10) |>
+  clf_say_table(.title = "First ten labelled documents")
+```
+
+A `DecidedBy` column showing only the terminal arm is the expected result rather than a
+disappointment: 03E concluded that routing does not beat the transformer, so a policy that routes
+nothing is the policy it deployed. What the other arms contribute here is the confidence flag, not
+the label.
+
+# The corpus pass
+
+Chunked, and each chunk written as it completes. A corpus pass is measured in hours, so a failure at
+document nine hundred thousand should cost one chunk rather than the run, and a restart should
+resume rather than begin again.
+
+```{r}
+#| label: apply-corpus
+fs::dir_create(.lP$Output$Labels)
+
+chunks_ <- split(
+  tab_docs,
+  ceiling(seq_len(nrow(tab_docs)) / .lP$Param$ChunkSize)
+)
+cli::cli_alert_info("{length(chunks_)} chunk{?s} of up to {.lP$Param$ChunkSize} documents.")
+
+purrr::iwalk(chunks_, function(.chunk, .i) {
+  path_ <- fs::path(.lP$Output$Labels, sprintf("labels_%04d.parquet", as.integer(.i)))
+  if (fs::file_exists(path_)) {
+    cli::cli_alert_info("Chunk {.i}: already written, skipping.")
+    return(invisible(NULL))
+  }
+  out_ <- mc_classify(
+    .docs       = .chunk,             # this chunk
+    .manifest   = man,                # every default comes from here
+    .tasks      = NULL,               # NULL labels every task the manifest carries
+    .tab_prep   = tab_prep,           # only used if the generative arm runs
+    .python     = .lP$Engine$Python,  # inference environment
+    .script     = .lP$Engine$Script,  # inference script
+    .batch_size = .lP$Param$BatchSize # documents per forward pass
+  )
+  arrow::write_parquet(out_, path_)
+  cli::cli_alert_success("Chunk {.i}: {nrow(out_)} row{?s} written.")
+})
+```
+
+# Results
+
+```{r}
+#| label: results-summary
+tab_labels <- fs::dir_ls(.lP$Output$Labels, glob = "*.parquet") |>
+  purrr::map(arrow::read_parquet) |>
+  purrr::list_rbind()
+
+tab_labels |>
+  dplyr::summarise(nDocs = dplyr::n_distinct(DocID), .by = Task) |>
+  clf_say_table(.title = "Documents labelled, per task")
+```
+
+```{r}
+#| label: results-distribution
+tab_labels |>
+  dplyr::filter(Task == "ClassDetailed") |>
+  dplyr::count(Label, name = "nDocs", sort = TRUE) |>
+  dplyr::mutate(Share = clf_pct(nDocs / sum(nDocs))) |>
+  clf_say_table(.title = "Category distribution across the corpus")
+```
+
+The corpus distribution against the labelled sample's is the first thing worth checking, and it is a
+validity check rather than a curiosity. The labelled sample was drawn to be representative; a
+category that is common in the corpus and rare in the sample, or the reverse, is either a sampling
+artifact worth documenting or a model failing systematically outside the distribution it was trained
+on. Which of the two it is cannot be settled here, but a large gap is a reason to look.
+
+```{r}
+#| label: results-confidence
+tab_labels |>
+  dplyr::filter(Task == "ClassDetailed") |>
+  dplyr::count(VotingSet, Tier, name = "nDocs") |>
+  dplyr::mutate(Share = clf_pct(nDocs / sum(nDocs))) |>
+  clf_say_table(.title = "Confidence tiers across the corpus")
+```
+
+If the tier distribution here differs markedly from 03E's on the labelled sample, the flag is
+behaving differently outside the data it was estimated on, and its reliability numbers should be
+treated with more caution than the table suggests. That comparison belongs in the paper.
+
+# Validation
+
+The deployed classifier applied to the labelled sample must reproduce what 03E measured. Any gap is a
+deployment fault -- a wrong checkpoint, a different context length, a lexicon that moved -- rather
+than a modelling result, and it is the one check that catches an artifact mismatch the manifest's
+existence test cannot.
+
+```{r}
+#| label: validation-roundtrip
+round_trip <- mc_classify(
+  .docs     = tab_prep |> dplyr::select(DocID, Text, dplyr::any_of("DocDesc")) |>
+    dplyr::slice_head(n = 1000L),
+  .manifest = man,                # the deployed configuration
+  .tasks    = "ClassDetailed",    # the headline task
+  .tab_prep = tab_prep,           # only used if the generative arm runs
+  .python   = .lP$Engine$Python,  # inference environment
+  .script   = .lP$Engine$Script   # inference script
+)
+
+round_trip |>
+  dplyr::inner_join(
+    tab_prep |> dplyr::select(DocID, TrueLabel = ClassDetailed),
+    by = dplyr::join_by(DocID)
+  ) |>
+  dplyr::summarise(
+    nDocs    = dplyr::n(),
+    Accuracy = mean(Label == TrueLabel)
+  ) |>
+  dplyr::mutate(Accuracy = clf_pct(Accuracy)) |>
+  clf_say_table(.title = "Deployed classifier on labelled documents")
+```
+
+This number will sit **above** the cross-validated estimate, and that is expected rather than
+reassuring: the deployed model was refit on every labelled document, so these are documents it has
+seen. It is a plumbing check, not a performance claim. The honest figure for the paper remains 03E's
+nested estimate, and quoting this one instead would be reporting training accuracy.
+
+# Overview
+
+```{r}
+#| label: overview-report
+mc_report_manifest(.man = man)
+mc_report_run(.tab = tab_labels)
+```
+
+# Next
+
+The released dataset is these labels plus the manifest that produced them. Both have to be archived
+together: labels without the manifest cannot be reproduced, and the manifest without the labels is a
+recipe nobody ran.
+
+Two things remain open and belong in the paper rather than in code. Whether the generative arm is
+worth enabling for the release is a cost decision that 03E's voting-set comparison answers
+empirically -- if the three-family flag separates the corpus no better than the two-family one, it is
+not worth the hours. And the corpus tier distribution against the labelled sample's is the evidence
+for how far the confidence flag can be trusted outside the data that produced it.

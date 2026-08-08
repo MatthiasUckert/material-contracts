@@ -91,18 +91,25 @@ ORCH_NONE <- "(none)"
 orch_arm_name <- function(.tab) {
   if (FALSE) .tab <- meta_
 
-  base_ <- dplyr::if_else(
-    grepl("^keyword-", .tab$Kind),
-    paste0("kw-", sub("^keyword-", "", .tab$Kind)),
-    clf_model_short(.model = .tab$Kind)
+  base_ <- dplyr::case_when(
+    grepl("^keyword-", .tab$Kind) ~ paste0("kw-", sub("^keyword-", "", .tab$Kind)),
+    # LLM run identifiers already strip punctuation from the model tag, so the name is readable as
+    # written and only needs the family prefix kept.
+    grepl("^llm-", .tab$Kind)     ~ .tab$Kind,
+    TRUE                          ~ clf_model_short(.model = .tab$Kind)
   )
   base_ <- sub("^kw-docdesc$", "kw-desc", base_)
 
-  cand_ <- c("TermsTag", "Stopwords", "NWords", "NgramMax", "MinReach", "MaxTerms", "Tau",
+  # Ordered by how much a level means to a reader, because the loop below stops as soon as names are
+  # unique and therefore names an arm by whichever listed axis separates it first.
+  cand_ <- c("TermsTag", "Tier", "Shots", "Guidance", "Stopwords", "NWords", "NgramMax",
+             "MinReach", "MaxTerms", "Tau", "NChars", "AllowAbstain", "Think",
              "MaxLen", "Epochs", "LR", "ClassWeights")
   cand_ <- intersect(cand_, names(.tab))
-  abbr_ <- c(TermsTag = "", Stopwords = "SW", NWords = "W", NgramMax = "N", MinReach = "R",
-             MaxTerms = "M", Tau = "T", MaxLen = "L", Epochs = "E", LR = "LR", ClassWeights = "CW")
+  abbr_ <- c(TermsTag = "", Tier = "", Shots = "S", Guidance = "G", Stopwords = "SW", NWords = "W",
+             NgramMax = "N", MinReach = "R", MaxTerms = "M", Tau = "T", NChars = "C",
+             AllowAbstain = "A", Think = "R", MaxLen = "L", Epochs = "E", LR = "LR",
+             ClassWeights = "CW")
 
   out_ <- base_
   for (grp_ in unique(base_)) {
@@ -174,11 +181,15 @@ orch_arms <- function(.runs_roots, .label_col = "ClassDetailed", .none = ORCH_NO
     dplyr::filter(.data$LabelCol == .label_col, !.data$Smoke)
   if (nrow(overall_) == 0L) cli::cli_abort("No runs for {(.label_col)} under the given roots.")
 
-  # Only the columns that exist across both engines; keyword runs carry selection axes, transformer
-  # runs carry hyperparameters, and each is NA on the other's rows.
+  # Only the columns that exist across the engines. Keyword runs carry selection axes, transformer
+  # runs hyperparameters, LLM runs prompt axes, and each is NA on the others' rows. Every axis any
+  # engine sweeps has to be listed: an axis omitted here is invisible to the namer below, so two
+  # configurations differing only on it would collapse to one arm and the lower-scoring one would be
+  # dropped without a word. That is how a four-configuration LLM sweep becomes one arm.
   keep_ <- intersect(
     c("Source", "Stopwords", "NWords", "NgramMax", "MinReach", "MaxTerms", "Tau", "Origin",
-      "TermsFile", "MaxLen", "Epochs", "LR", "ClassWeights"),
+      "TermsFile", "MaxLen", "Epochs", "LR", "ClassWeights",
+      "Tier", "Guidance", "Shots", "NChars", "AllowAbstain", "Think"),
     names(overall_)
   )
 
@@ -1143,9 +1154,9 @@ orch_policy_final <- function(.spine, .policies, .tolerance = 0.005, .lenient = 
   )
 }
 
-#' Write the deployment decision 03E consumes
+#' Write the deployment decision 03F consumes
 #'
-#' 03E applies a model to the full corpus and should make no decisions of its own. Everything it
+#' 03F applies a model to the full corpus and should make no decisions of its own. Everything it
 #' needs is written here as data: the arm order, the floor, the family, the terminal, the
 #' configuration behind each arm name, and the per-class gate if there is one.
 #'
@@ -1360,7 +1371,522 @@ orch_report_verdicts <- function(.tab) {
 }
 
 
-# 11. Figures --------------------------------------------------------------------------------------
+# 11. Agreement as a shipped confidence flag -------------------------------------------------------
+# Everything above asks which single label to ship. This section asks a different question, and for a
+# reader of the released dataset a more useful one: HOW MUCH TO TRUST each label individually.
+#
+# The dataset covers far more documents than the 4,398 that carry a hand label, so a user of it
+# currently knows one global number and nothing about the document in front of them. A per-document
+# flag lets them condition -- restrict to concurring documents for a clean sample, or split on the
+# flag as a robustness check -- which is a materially different offer from a single macro-F1.
+#
+# WHY THIS CAN BE SHIPPED AND "WHERE THE MODEL IS WRONG" CANNOT
+# Whether two methods agree is visible on an unlabelled filing: run both, compare. Whether a method
+# is WRONG is not, and no amount of care makes it so. That asymmetry is the whole reason the flag is
+# built from agreement rather than from error. orch_agreement_pattern() therefore never touches the
+# truth column, and is written so a reader can confirm that by looking at it: the reliability of each
+# pattern is estimated separately, afterwards, from the labelled sample.
+#
+# WHICH ARMS MAY VOTE
+# Not all of them, and the criterion is independence rather than accuracy. A constrained transformer
+# built from the plain transformer's own probability vector is not a second opinion; it agrees with
+# its parent by construction, and counting it would manufacture unanimity out of one model. The same
+# caution applies to two checkpoints trained on the same folds. The voting set is therefore chosen in
+# the document, on stated grounds, and passed in.
+#
+# THE NULL THIS SECTION HAS TO CLEAR
+# The transformer already emits a confidence signal, and 03B already showed it separates errors. If
+# agreement adds nothing beyond that probability, the honest recommendation is to ship the
+# probability and skip the flag. orch_agreement_vs_prob() is that test, and it is reported next to
+# the headline rather than left for a reader to think of.
+
+#' Per-document agreement pattern, computed without reference to the truth
+#'
+#' Deliberately blind. This function takes the shipped predictions and the arms' predictions and
+#' returns how many arms had an opinion and how many of those concurred. It selects no truth column
+#' and joins no labelled table, so what it computes is exactly what can be recomputed on a filing
+#' that was never labelled -- which is the property that makes the flag shippable at all.
+#'
+#' An abstaining arm neither agrees nor dissents, so it is excluded from both counts rather than
+#' scored as disagreement. Treating silence as dissent would penalise a document for a keyword table
+#' that simply had no term for it.
+#'
+#' @param .spine Routing spine, one row per document and arm.
+#' @param .tab_pred Shipped predictions (DocID, PredLabel).
+#' @param .arms Character vector of arm names permitted to vote. Chosen on independence grounds by
+#'   the caller, since an arm derived from another is not a second opinion.
+#' @param .none Character. Abstention sentinel.
+#' @return Tibble: DocID, nCommit, nConcur, nDissent, Tier.
+orch_agreement_pattern <- function(.spine, .tab_pred, .arms, .none = ORCH_NONE) {
+  if (FALSE) {
+    .spine    <- res_det$Spine
+    .tab_pred <- res_det$Nested
+    .arms     <- c("legal-bert", "kw-text")
+    .none     <- ORCH_NONE
+  }
+  ship_ <- .tab_pred |> dplyr::select(DocID, ShipLabel = .data$PredLabel)
+
+  .spine |>
+    dplyr::filter(.data$Arm %in% .arms, .data$Pred != .none) |>
+    dplyr::select(DocID, Arm, Pred) |>
+    dplyr::inner_join(ship_, by = dplyr::join_by(DocID)) |>
+    dplyr::summarise(
+      nCommit  = dplyr::n(),
+      nConcur  = sum(.data$Pred == .data$ShipLabel),
+      .by = DocID
+    ) |>
+    dplyr::mutate(
+      nDissent = .data$nCommit - .data$nConcur,
+      Tier = dplyr::case_when(
+        .data$nCommit <= 1L                     ~ "sole",
+        .data$nDissent == 0L                    ~ "unanimous",
+        .data$nConcur > .data$nDissent          ~ "majority",
+        TRUE                                    ~ "split"
+      ),
+      Tier = factor(.data$Tier, levels = c("unanimous", "majority", "sole", "split"))
+    ) |>
+    # Documents no permitted arm committed on still need a row, or the flag would be missing rather
+    # than low and a downstream join would silently drop them.
+    dplyr::right_join(ship_ |> dplyr::select(DocID), by = dplyr::join_by(DocID)) |>
+    tidyr::replace_na(list(nCommit = 0L, nConcur = 0L, nDissent = 0L)) |>
+    dplyr::mutate(Tier = factor(dplyr::coalesce(as.character(.data$Tier), "sole"),
+                                levels = c("unanimous", "majority", "sole", "split")))
+}
+
+#' Estimate how reliable each agreement tier is
+#'
+#' The labelled sample's only job here. The pattern is fixed before any label is consulted, so this
+#' is a description of a fixed rule rather than a selection among rules, and needs no nesting: no
+#' tier was chosen because it scored well.
+#'
+#' Coverage matters as much as accuracy. A tier that is 99% right on 4% of the corpus is not a usable
+#' flag, and a reader deciding whether to condition on it needs both numbers side by side.
+#'
+#' @param .pattern Output of orch_agreement_pattern().
+#' @param .tab_pred Shipped predictions carrying TrueLabel.
+#' @return Tibble: Tier, nDocs, Share, Accuracy, ErrorRate, CumShare, CumAccuracy.
+orch_agreement <- function(.pattern, .tab_pred) {
+  if (FALSE) {
+    .pattern  <- pattern_det
+    .tab_pred <- res_det$Nested
+  }
+  n_ <- nrow(.tab_pred)
+  .pattern |>
+    dplyr::inner_join(
+      .tab_pred |> dplyr::select(DocID, TrueLabel, PredLabel),
+      by = dplyr::join_by(DocID)
+    ) |>
+    dplyr::mutate(Correct = .data$PredLabel == .data$TrueLabel) |>
+    dplyr::summarise(
+      nDocs    = dplyr::n(),
+      Share    = dplyr::n() / n_,
+      Accuracy = mean(.data$Correct),
+      .by = Tier
+    ) |>
+    dplyr::arrange(.data$Tier) |>
+    dplyr::mutate(
+      ErrorRate   = 1 - .data$Accuracy,
+      # Read down the table: what a user restricting to this tier or better would obtain.
+      CumShare    = cumsum(.data$nDocs) / n_,
+      CumAccuracy = cumsum(.data$Accuracy * .data$nDocs) / cumsum(.data$nDocs)
+    )
+}
+
+#' Report the flag with the reading a user of the dataset needs
+#' @param .tab Output of orch_agreement().
+#' @param .arms Arms that voted, named in the heading so the flag is never read without them.
+#' @return Invisibly .tab.
+orch_report_agreement <- function(.tab, .arms) {
+  if (FALSE) {
+    .tab  <- agree_det
+    .arms <- c("legal-bert", "kw-text")
+  }
+  cli::cli_h2("Agreement tiers, voting arms: {toString(.arms)}")
+  .tab |>
+    dplyr::mutate(
+      Share       = clf_pct(.data$Share),
+      Accuracy    = clf_pct(.data$Accuracy),
+      CumShare    = clf_pct(.data$CumShare),
+      CumAccuracy = clf_pct(.data$CumAccuracy),
+      ErrorRate   = NULL
+    ) |>
+    clf_say_table()
+  cli::cli_text("")
+
+  una_ <- .tab |> dplyr::filter(.data$Tier == "unanimous")
+  if (nrow(una_) == 1L) {
+    cli::cli_alert_info(
+      "Where every voting arm concurred -- {clf_pct(una_$Share)} of documents -- the shipped label \\
+       is still wrong {clf_pct(una_$ErrorRate)} of the time. That residual is the flag's ceiling: \\
+       independent methods making the SAME mistake is the failure a concurrence flag cannot see."
+    )
+  }
+  cli::cli_alert_info(
+    "Read CumAccuracy down the table for what a user restricting to this tier or better obtains. A \\
+     flag earns its place only if the top tier is both cleaner and large enough to be worth using."
+  )
+  invisible(.tab)
+}
+
+#' Does agreement add anything the transformer's own probability does not?
+#'
+#' The null this section has to clear. The transformer already emits a usable confidence signal, and
+#' if the tiers stop separating once documents are compared at equal probability, then agreement is
+#' a proxy for that probability and the honest recommendation is to ship the simpler number.
+#'
+#' Bands are equal-count rather than equal-width, because the probability distribution is heavily
+#' massed near one and fixed-width bands would put almost every document in the top bin and measure
+#' nothing.
+#'
+#' @param .pattern Output of orch_agreement_pattern().
+#' @param .tab_pred Shipped predictions carrying TrueLabel.
+#' @param .spine Routing spine, supplying the incumbent's probability.
+#' @param .incumbent Arm whose Score is the probability.
+#' @param .n_bands Number of equal-count probability bands.
+#' @return Tibble: ProbBand, Tier, nDocs, Accuracy.
+orch_agreement_vs_prob <- function(.pattern, .tab_pred, .spine, .incumbent, .n_bands = 4L) {
+  if (FALSE) {
+    .pattern   <- pattern_det
+    .tab_pred  <- res_det$Nested
+    .spine     <- res_det$Spine
+    .incumbent <- res_det$Incumbent
+    .n_bands   <- 4L
+  }
+  prob_ <- .spine |>
+    dplyr::filter(.data$Arm == .incumbent) |>
+    dplyr::select(DocID, Prob = .data$Score)
+
+  .pattern |>
+    dplyr::inner_join(.tab_pred |> dplyr::select(DocID, TrueLabel, PredLabel),
+                      by = dplyr::join_by(DocID)) |>
+    dplyr::inner_join(prob_, by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(
+      Correct  = .data$PredLabel == .data$TrueLabel,
+      ProbBand = dplyr::ntile(.data$Prob, .n_bands)
+    ) |>
+    dplyr::summarise(
+      nDocs    = dplyr::n(),
+      Accuracy = mean(.data$Correct),
+      .by = c(ProbBand, Tier)
+    ) |>
+    dplyr::arrange(.data$ProbBand, .data$Tier)
+}
+
+#' Report the cross-tabulation, wide, so tiers can be compared within a band
+#' @param .tab Output of orch_agreement_vs_prob().
+#' @return Invisibly .tab.
+orch_report_agreement_vs_prob <- function(.tab) {
+  if (FALSE) .tab <- agree_prob_det
+  cli::cli_h2("Agreement within transformer-confidence bands")
+  .tab |>
+    dplyr::mutate(Cell = paste0(clf_pct(.data$Accuracy), " (", .data$nDocs, ")")) |>
+    dplyr::select(ProbBand, Tier, Cell) |>
+    tidyr::pivot_wider(names_from = Tier, values_from = Cell, values_fill = "-") |>
+    clf_say_table()
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "Band 1 is the least confident quarter, band {max(.tab$ProbBand)} the most. Read ACROSS a row: \\
+     tiers still separating at equal probability means agreement carries information the \\
+     probability does not, and the flag is worth shipping. Rows that are flat mean it does not."
+  )
+  invisible(.tab)
+}
+
+#' Write the confidence flag definition and its estimated reliability
+#'
+#' 03F recomputes the tier for every document in the corpus -- it can, since the pattern needs no
+#' labels -- and attaches the reliability estimated here. Splitting it this way is what keeps the
+#' estimate out of the apply stage: 03F does arithmetic on a rule it was handed, and cannot quietly
+#' re-estimate reliability on a corpus that has no labels to estimate it from.
+#'
+#' @param .agreement Output of orch_agreement().
+#' @param .arms Arms permitted to vote, recorded so the flag is reproducible.
+#' @param .label_col Task the flag applies to.
+#' @param .dir Output directory.
+#' @param .stem File stem.
+#' @return Invisibly the directory.
+orch_save_confidence <- function(.agreement, .arms, .label_col, .dir, .stem = "confidence_flag") {
+  if (FALSE) {
+    .agreement <- agree_det
+    .arms      <- c("legal-bert", "kw-text")
+    .label_col <- "ClassDetailed"
+    .dir       <- .lP$Output$Policy
+  }
+  fs::dir_create(.dir)
+  arrow::write_parquet(
+    .agreement |> dplyr::mutate(LabelCol = .label_col, .before = 1),
+    fs::path(.dir, paste0(.stem, "_", .label_col, ".parquet"))
+  )
+  jsonlite::write_json(
+    list(
+      label_col   = .label_col,
+      written_by  = "03E orch_save_confidence",
+      written_at  = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+      voting_arms = as.list(.arms),
+      tiers       = as.list(levels(.agreement$Tier)),
+      note        = paste(
+        "Tier is recomputed from the voting arms' predictions and needs no labels.",
+        "Accuracy is estimated on the labelled sample and must not be re-estimated downstream."
+      )
+    ),
+    fs::path(.dir, paste0(.stem, "_", .label_col, ".json")), auto_unbox = TRUE, pretty = TRUE
+  )
+  cli::cli_alert_success("Wrote the {(.label_col)} confidence flag over {length(.arms)} voting arms")
+  invisible(.dir)
+}
+
+#' Accuracy by agreement tier, with the share each tier covers
+#'
+#' Both numbers in one frame, because either alone is misleading: a tier can be almost perfectly
+#' accurate and cover too little of the corpus to be worth conditioning on.
+#'
+#' @param .tab Output of orch_agreement().
+#' @return A ggplot.
+orch_plot_agreement <- function(.tab) {
+  if (FALSE) .tab <- agree_det
+  p_ <- .tab |>
+    ggplot2::ggplot(ggplot2::aes(x = Tier, y = Accuracy)) +
+    ggplot2::geom_col(ggplot2::aes(alpha = Share), width = 0.7, fill = "grey30", color = "grey20") +
+    ggplot2::geom_text(
+      ggplot2::aes(label = paste0(sprintf("%.1f%%", 100 * Accuracy), "\n n=", nDocs)),
+      vjust = -0.3, size = 3
+    ) +
+    ggplot2::scale_alpha_continuous(range = c(0.35, 1), labels = scales::percent) +
+    ggplot2::scale_y_continuous(limits = c(0, 1.12), expand = ggplot2::expansion(mult = c(0, 0))) +
+    ggplot2::labs(x = NULL, y = "Accuracy of the shipped label", alpha = "Share of corpus")
+  clf_apply_theme(.plot = p_)
+}
+
+
+# 12. The deployment manifest ----------------------------------------------------------------------
+# Everything above concludes; this section writes those conclusions down in a form another process can
+# execute. The distinction matters because the artifacts written so far name CONFIGURATIONS, and a
+# configuration is not a model: `ClassDetailed__nlpaueb-legal-bert...__L256_E6...` identifies a recipe
+# that was cross-validated, not a directory holding weights. A downstream stage handed only that
+# string would have to reconstruct the path from a naming convention, and a naming convention shared
+# by inference is a naming convention that will eventually be changed in one place and not the other.
+#
+# So the manifest resolves every arm to a concrete artifact on disk, records the parameters that
+# artifact was validated under, and states which arms are on by default. It is the single file 03F
+# reads, and the single thing that has to be archived alongside the released labels for anyone to
+# reproduce them.
+#
+# ARTIFACT PATHS COME FROM THE DOCUMENT, NOT FROM A CONVENTION HERE
+# 03B names its deployable model `<config>__FINAL/model` and 03C writes `<stem>.parquet`, and this
+# file knows neither. The qmd builds the arm-to-artifact table using each upstream stage's own path
+# helpers -- the same rule that keeps run roots from drifting -- and passes it in. What this function
+# adds is verification: an arm whose artifact is missing is reported rather than written, because a
+# manifest promising a model that is not there is worse than no manifest.
+
+#' Estimate the confidence flag under several voting sets at once
+#'
+#' A tier's reliability is a property of WHO VOTED. Estimating it on three arms and then deploying
+#' with two would ship numbers describing a vote that never happened, and nothing downstream could
+#' detect the mismatch, because a two-arm pattern computed at deployment looks exactly like a
+#' two-arm pattern computed here.
+#'
+#' So every voting set that might be used is estimated now, and the manifest records which is the
+#' default. The generative arm is expensive at corpus scale, so a deployment that leaves it off is a
+#' realistic case rather than a hypothetical, and it needs its own reliability table.
+#'
+#' @param .spine Routing spine.
+#' @param .tab_pred Shipped predictions carrying TrueLabel.
+#' @param .sets Named list of arm-name vectors, one per voting set.
+#' @param .none Character. Abstention sentinel.
+#' @return Tibble: SetName, Arms, Tier, nDocs, Share, Accuracy, ErrorRate, CumShare, CumAccuracy.
+orch_agreement_sets <- function(.spine, .tab_pred, .sets, .none = ORCH_NONE) {
+  if (FALSE) {
+    .spine    <- res_det$Spine
+    .tab_pred <- res_det$Nested
+    .sets     <- list(core = c("legal-bert", "kw-text"))
+    .none     <- ORCH_NONE
+  }
+  purrr::imap(.sets, function(.arms, .name) {
+    arms_ <- intersect(.arms, unique(.spine$Arm))
+    if (length(arms_) == 0L) {
+      cli::cli_alert_warning("Voting set {(.name)} has no arms present in the spine; skipped.")
+      return(NULL)
+    }
+    if (length(arms_) < length(.arms)) {
+      cli::cli_alert_warning(
+        "Voting set {(.name)} is missing {setdiff(.arms, arms_)}; estimated on what is present."
+      )
+    }
+    pat_ <- orch_agreement_pattern(.spine = .spine, .tab_pred = .tab_pred, .arms = arms_,
+                                   .none = .none)
+    orch_agreement(.pattern = pat_, .tab_pred = .tab_pred) |>
+      dplyr::mutate(SetName = .name, Arms = paste(arms_, collapse = " + "), .before = 1)
+  }) |>
+    purrr::list_rbind()
+}
+
+#' Report every voting set side by side
+#'
+#' The comparison that decides whether the expensive arm earns its place. A set that separates the
+#' corpus no better than a cheaper one is not worth ten hours of inference, and that is a judgement a
+#' reader should be able to make from one table rather than by holding two in their head.
+#'
+#' @param .tab Output of orch_agreement_sets().
+#' @param .default Name of the set the manifest will mark as on by default.
+#' @return Invisibly .tab.
+orch_report_agreement_sets <- function(.tab, .default = NULL) {
+  if (FALSE) {
+    .tab     <- agree_sets
+    .default <- "core"
+  }
+  cli::cli_h2("Confidence flag under each voting set")
+  .tab |>
+    dplyr::mutate(
+      Share       = clf_pct(.data$Share),
+      Accuracy    = clf_pct(.data$Accuracy),
+      CumShare    = clf_pct(.data$CumShare),
+      CumAccuracy = clf_pct(.data$CumAccuracy),
+      ErrorRate   = NULL
+    ) |>
+    dplyr::select(SetName, Tier, nDocs, Share, Accuracy, CumShare, CumAccuracy) |>
+    clf_say_table()
+  cli::cli_text("")
+
+  top_ <- .tab |>
+    dplyr::filter(.data$Tier == "unanimous") |>
+    dplyr::select(SetName, Arms, Share, Accuracy)
+  if (nrow(top_) > 0L) {
+    top_ |>
+      dplyr::mutate(Share = clf_pct(.data$Share), Accuracy = clf_pct(.data$Accuracy)) |>
+      clf_say_table(.title = "Top tier, set by set")
+    cli::cli_text("")
+    cli::cli_alert_info(
+      "A set earns its cost by covering MORE of the corpus at a HIGHER accuracy in this row. A set \\
+       that only raises accuracy by quarantining more documents has moved the threshold, not the \\
+       information."
+    )
+  }
+  if (!is.null(.default)) {
+    cli::cli_alert_info("The manifest will mark {(.default)} as the set applied unless asked otherwise.")
+  }
+  invisible(.tab)
+}
+
+#' Write the single file 03F reads
+#'
+#' Pins every decision this document reached, resolved to artifacts that exist. What a downstream
+#' stage needs and cannot re-derive: which model file, at which context length, under which routing
+#' rule, with which voting set behind the confidence flag, and what each of those scored when it was
+#' validated. Recording the scores matters as much as the paths -- a manifest that says what to run
+#' but not how well it ran invites deployment of a configuration nobody can defend.
+#'
+#' Arms are verified rather than trusted. An artifact that is absent is reported and the arm is
+#' marked unavailable, so a manifest never promises a model that is not on disk.
+#'
+#' @param .results List of orch_run_task() outputs, one per task.
+#' @param .artifacts Tibble: Arm, Kind, Path, plus any parameters worth pinning as a Params list
+#'   column. Built in the document from each upstream stage's own path helpers.
+#' @param .agreement Output of orch_agreement_sets().
+#' @param .sets Named list of voting sets.
+#' @param .default_set Name of the set applied unless a caller asks otherwise.
+#' @param .default_kinds Arm KINDS enabled by default at deployment. Kinds rather than arm names,
+#'   because a name is derived at run time and would have to be guessed in a configuration block. An
+#'   arm pinned but not enabled is available to a caller who asks for it and skipped otherwise.
+#' @param .dir Output directory.
+#' @param .tab_prep Prepared sample, for the provenance block.
+#' @return Invisibly the manifest list.
+orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default_set,
+                               .default_kinds, .dir, .tab_prep) {
+  if (FALSE) {
+    .results      <- list(res_det, res_broad, res_amend)
+    .artifacts    <- tab_artifacts
+    .agreement    <- agree_sets
+    .sets         <- sets_voting
+    .default_set  <- "core"
+    .default_kinds <- c("transformer", "keyword")
+    .dir          <- .lP$Output$Deploy
+    .tab_prep     <- tab_prep
+  }
+  fs::dir_create(.dir)
+
+  found_ <- .artifacts |>
+    dplyr::mutate(Exists = fs::file_exists(.data$Path) | fs::dir_exists(.data$Path))
+  found_ |>
+    dplyr::mutate(Path = fs::path_rel(.data$Path, here::here())) |>
+    dplyr::select(Arm, Kind, Exists, Path) |>
+    clf_say_table(.title = "Artifacts backing each arm")
+  if (any(!found_$Exists)) {
+    cli::cli_alert_warning(
+      "Missing on disk: {found_$Arm[!found_$Exists]}. Marked unavailable in the manifest rather \\
+       than written as if present."
+    )
+  }
+
+  arms_ <- purrr::map(seq_len(nrow(found_)), function(.i) {
+    r_ <- found_[.i, ]
+    list(
+      arm       = r_$Arm,
+      kind      = r_$Kind,
+      artifact  = as.character(fs::path_rel(r_$Path, here::here())),
+      available = unname(r_$Exists),
+      enabled   = r_$Kind %in% .default_kinds,
+      params    = if ("Params" %in% names(r_)) r_$Params[[1]] else NULL
+    )
+  })
+
+  tasks_ <- purrr::map(.results, function(.r) {
+    pol_ <- .r$Final$Policy
+    cmp_ <- .r$Compare
+    list(
+      label_col = .r$LabelCol,
+      incumbent = .r$Incumbent,
+      policy    = list(
+        family   = pol_$Family,
+        terminal = pol_$Terminal,
+        floor    = pol_$Floor,
+        order    = as.list(pol_$Order[[1]]),
+        label    = pol_$Label
+      ),
+      validated = list(
+        estimate     = "nested five-fold selection on the labelled sample",
+        macro_f1     = cmp_$MacroF1[cmp_$Strategy == "Nested selection (the procedure)"][1],
+        accuracy     = cmp_$Accuracy[cmp_$Strategy == "Nested selection (the procedure)"][1],
+        incumbent_f1 = cmp_$MacroF1[grepl("(incumbent)", cmp_$Strategy, fixed = TRUE)][1]
+      )
+    )
+  })
+  names(tasks_) <- purrr::map_chr(.results, "LabelCol")
+
+  man_ <- list(
+    manifest_version = 1L,
+    written_by       = "03E orch_save_manifest",
+    written_at       = format(Sys.time(), "%Y-%m-%d %H:%M:%S"),
+    sample           = list(
+      n_labelled = nrow(.tab_prep),
+      n_folds    = dplyr::n_distinct(.tab_prep$Fold)
+    ),
+    tasks      = tasks_,
+    arms       = arms_,
+    confidence = list(
+      sets        = purrr::map(.sets, as.list),
+      default_set = .default_set,
+      reliability = "confidence_flag.parquet",
+      note        = paste(
+        "Tier is recomputed from the voting arms and needs no labels.",
+        "Accuracy is estimated here and must not be re-estimated downstream.",
+        "A deployment using a different voting set must read that set's reliability row."
+      )
+    )
+  )
+
+  jsonlite::write_json(man_, fs::path(.dir, "manifest.json"), auto_unbox = TRUE, pretty = TRUE,
+                       null = "null")
+  arrow::write_parquet(.agreement, fs::path(.dir, "confidence_flag.parquet"))
+
+  cli::cli_alert_success(
+    "Wrote manifest for {length(tasks_)} task{?s} over {sum(found_$Exists)} available arm{?s}; \\
+     {sum(found_$Kind %in% .default_kinds)} enabled by default."
+  )
+  invisible(man_)
+}
+
+
+# 13. Figures --------------------------------------------------------------------------------------
 
 #' Macro-F1 by strategy, with the incumbent marked
 #'

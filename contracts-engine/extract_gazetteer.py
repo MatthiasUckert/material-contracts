@@ -1,390 +1,438 @@
-#!/usr/bin/env python
-"""BERT classifier for the material-contracts sample (fold-based, per-run folders).
+#!/usr/bin/env python3
+"""Gazetteer place extractor with offsets -- the paper's geographic lookup, gated.
 
-Consumes prepared parquet [DocID, Text, ClassBroad, ClassDetailed,
-ClassDetailed2, AmendType, LabelRound, Fold]. Trains one sequence-classification
-model on one label column (--label-col: any column, e.g. ClassDetailed,
-ClassBroad, AmendType) using one text column, holding out one fold
-(--test-fold). Rows with NA in the chosen label are dropped (lets AmendType,
-with some NA, train cleanly). Optional inverse-frequency class weighting. Writes
-a self-describing run folder. Loop --test-fold 1..k from R for CV.
+Input : one or more parquet paths (files and/or folders), one row = one document.
+Output: one parquet (DocID, Start, Stop, Span, Label, LabelRaw, Engine, Model).
+
+Stamps Engine = "paper", Model = MODEL. Label is always "GPE"; LabelRaw carries the
+resolved GeoClass ("US State", "Country", "US County", "US Populated Place"), which is
+what downstream aggregation pivots on. Coordinates and ISO3 are NOT emitted -- the
+candidate schema has no room for them and they are recoverable by joining the uppercased
+Span back to the lookup.
+
+WHY THIS IS NOT A PLAIN DICTIONARY MATCH
+The lookup holds 181,810 place names, and 31,925 of them are also English dictionary
+words (the IsWord flag, built by testing each name against SCOWL). Matching them all
+produces nonsense: "Enterprise", "Superior", "Eagle", "Mobile", "Reading" and "Bath" are
+all US populated places. The original approach dropped every name flagged IsWord, which
+removes the noise and, with it, 40 of the 50 US states -- including Delaware, California
+and Texas, since single-word state names are all in the dictionary. The ten states that
+survive are the multi-word ones (New York, North Carolina, Rhode Island and so on), so a
+state-level geography built that way is a sample of state names by orthography.
+
+This extractor keeps those names and gates them on context instead. A place name is
+emitted when it is either self-evidencing or corroborated by a nearby anchor:
+
+  ANCHOR      US State, or Country outside AMBIGUOUS_COUNTRIES. Emitted unconditionally.
+              A US state name in a US commercial contract is a state; the handful of
+              country names that are also ordinary nouns or given names are listed out
+              and demoted rather than trusted.
+  DISTINCTIVE Any other place with IsWord == 0. Emitted when an anchor occurs within
+              --state-window characters. Loose, because the name itself carries most of
+              the evidence.
+  WORD-LIKE   Any other place with IsWord == 1. Emitted when an anchor occurs within
+              --word-window characters. Strict, because the name carries none.
+
+Distance is the gap between the nearest edges of the two spans, so "Palo Alto,
+California" scores 2. A document with no anchor at all emits only its anchors, which is
+to say nothing: a city named with no jurisdiction anywhere near it is not evidence about
+where a contracting party sits, and that is the distinction the geography variable has to
+support.
+
+MATCHING
+Names are matched as token n-grams, not as substrings, so "READING" inside "PROOFREADING"
+cannot fire and no word-boundary regex is needed. Tokens are ASCII letter runs (the
+lookup is ASCII-only by construction); each token is uppercased for the dictionary probe
+while its offsets come from the original text, so casing never moves an offset. Matching
+is longest-first and left-to-right without overlap, so "NEW YORK" wins over "YORK" and
+consumes it.
+
+Where one name belongs to several classes -- 1,701 do -- the class is resolved by
+precedence US State > Country > US County > US Populated Place. "New York" is therefore a
+state rather than one of the eight populated places sharing the name, and "Georgia" is a
+state rather than a country. Both are the right reading in a US filing.
+
+--max-chars N truncates every document to its first N characters BEFORE extraction
+(0 = off). --timeout N caps each document (seconds; 0 = off); on timeout the document is
+skipped and emits a marker row (LabelRaw = "timeout:gazetteer", null span) so the
+orchestrator records Status = 'timeout' and can re-run it.
+
+Offsets are 0-based, half-open, code-point indices: text[Start:Stop] == Span. Aligned
+schema/CLI with extract_spacy.py / extract_lexnlp.py / extract_dateregex.py.
 """
-
-import os
-os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
 import argparse
-import contextlib
-import json
-import subprocess
+import bisect
+import os
+import re
+import signal
 import sys
-import time
-from datetime import datetime, timezone
+from multiprocessing import Pool
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
-import torch
-import transformers
-from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-    set_seed,
-)
+import pyarrow.dataset as pads
+from tqdm import tqdm
 
-import logging
+ENGINE = "paper"
+MODEL = "gazetteer-v1"   # identifies THIS gate + lookup pairing; bump on any rule change
+COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
+
+# Class precedence when one name carries several -- 1,701 names do. Lower index wins.
+# Populated place outranks county deliberately: filings give addresses, and an address
+# names a city. "Palo Alto" is a city in California and also a county in Iowa; "Mobile"
+# is a city in Alabama and also the county around it. Reading both as cities is right far
+# more often than not, and the county reading survives where the text says so, because
+# "County of X" leaves X matching on its own.
+CLASS_RANK = ["US State", "Country", "US Populated Place", "US County"]
+
+# Classes that need no corroboration.
+ANCHOR_CLASSES = {"US State", "Country"}
+
+# Country names that are also ordinary English nouns or common given names. Left in the
+# lookup but demoted out of the anchor set, so they must be corroborated like any other
+# word-like name. Without this, every "turkey" and every person called Jordan is a
+# geopolitical entity. EDITORIAL: this list is a judgement call and is meant to be read
+# and argued with, not treated as settled.
+# Names that also resolve to a US State are deliberately absent: "Georgia" is ambiguous
+# between a state and a country, but both readings are geographic and precedence already
+# picks the state, which is the right reading in a US filing.
+AMBIGUOUS_COUNTRIES = {
+    "CHAD", "GUINEA", "JERSEY", "JORDAN", "MALI", "TOGO", "TURKEY",
+}
+
+# Separators permitted between a dictionary-word place and the anchor that licenses it.
+SEPARATOR_RX = re.compile(r"[\s,.;:()\[\]-]*")
+
+# Single-token street-type suffixes. Each is a real populated place somewhere, and each is
+# overwhelmingly an address component in a filing: "1 Chase Plaza, New York" would
+# otherwise license Plaza on the comma alone. Dropped from the index entirely, which is
+# safe for multi-word names -- "Overland Park" is a two-token entry and is untouched.
+# EDITORIAL: like AMBIGUOUS_COUNTRIES, this list is meant to be read and argued with.
+ADDRESS_WORDS = {
+    "AVENUE", "BOULEVARD", "CIRCLE", "COURT", "DRIVE", "HIGHWAY", "LANE", "PARKWAY",
+    "PLAZA", "ROAD", "STREET", "TERRACE", "TURNPIKE",
+}
+
+# Token = a run of ASCII letters, optionally carrying internal apostrophes. The lookup is
+# ASCII-only (it was filtered on stri_enc_isascii when built), so anything outside this
+# class cannot match and is skipped without loss.
+TOKEN_RX = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)*")
+
+# Set in main() before the pool forks.
+_NAME_INFO = {}     # tuple(tokens) -> (GeoClass, IsWord)
+_FIRST_LENS = {}    # first token -> tuple of n-gram lengths, longest first
+_STATE_WINDOW = 200
+_WORD_WINDOW = 40
+_TIMEOUT = 0
 
 
-class _DropNewWeightsWarning(logging.Filter):
-    """Suppress only the 'newly initialized classifier head' notice from
-    from_pretrained; all other transformers warnings still propagate."""
-    _NEEDLES = (
-        "were not initialized from the model checkpoint",
-        "You should probably TRAIN this model",
-    )
-
-    def filter(self, record):
-        msg = record.getMessage()
-        return not any(n in msg for n in self._NEEDLES)
+class _ExtractorTimeout(Exception):
+    pass
 
 
-logging.getLogger("transformers.modeling_utils").addFilter(_DropNewWeightsWarning())
+def _alarm_handler(signum, frame):
+    raise _ExtractorTimeout()
 
 
-def pick_device():
-    if torch.backends.mps.is_available():
-        return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+def _init_worker(lookup, state_window, word_window, timeout):
+    """Pool initializer: build the index and install the SIGALRM handler in this process.
 
+    The index is built per worker rather than built once and inherited. Inheriting works
+    only under the fork start method; macOS and Windows default to spawn, where a worker
+    re-imports this module and begins with empty globals. A fork-only design therefore
+    matches nothing, raises nothing, and writes a sentinel for every document -- and the
+    ledger records that as a clean no-hit, which is never re-run. Rebuilding costs a few
+    seconds per worker, in parallel, once per invocation.
 
-def fmt_num(x):
-    xf = float(x)
-    return str(int(xf)) if xf.is_integer() else f"{xf:g}"
-
-
-def git_commit():
-    try:
-        return subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, check=True
-        ).stdout.strip()
-    except Exception:
-        return None
-
-
-class RunLogger:
-    """Per-run logging: detail to run.log, only key lines to the real console.
-
-    All the per-fold chatter (device, label/data summary, the transformers epoch
-    logs, library warnings) goes to <run_dir>/run.log. The console -- which is the
-    R console during a serial sweep -- receives only the start line and the final
-    acc/f1 line, so a 320-run sweep stays a readable progress strip. The console
-    stream is captured at construction so summary lines survive the fd-level
-    redirection used around training.
+    The emptiness check converts the same failure into a crash if it ever recurs by
+    another route: an extractor that finds nothing must fail loudly, not quietly.
     """
+    global _NAME_INFO, _FIRST_LENS, _STATE_WINDOW, _WORD_WINDOW, _TIMEOUT
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    _STATE_WINDOW = state_window
+    _WORD_WINDOW = word_window
+    _TIMEOUT = timeout
+    _NAME_INFO, _FIRST_LENS = build_index(lookup)
+    _demote_ambiguous()
+    if not _NAME_INFO:
+        raise SystemExit(f"gazetteer index is empty after loading {lookup}")
 
-    def __init__(self, log_path, console):
-        self._fh = open(log_path, "w", buffering=1)   # line-buffered
-        self._console = console
 
-    @property
-    def file(self):
-        return self._fh
+def resolve_inputs(paths):
+    """A single file, a folder, or several of each -> a flat list of parquet files."""
+    files = []
+    for p in paths:
+        pth = Path(p)
+        files += sorted(str(f) for f in pth.rglob("*.parquet")) if pth.is_dir() else [str(pth)]
+    if not files:
+        raise SystemExit("no parquet files found in the given path(s)")
+    return files
 
-    def log(self, msg=""):
-        """File only."""
-        self._fh.write(f"{msg}\n")
-        self._fh.flush()
 
-    def say(self, msg=""):
-        """Console + file."""
-        self._console.write(f"{msg}\n")
-        self._console.flush()
-        self.log(msg)
+def truncate_texts(texts, max_chars):
+    """Cut every text to its first max_chars characters (0/None = off).
+    Returns (texts, n_truncated). Non-strings pass through untouched."""
+    if not max_chars or max_chars <= 0:
+        return texts, 0
+    n_trunc = sum(1 for t in texts if isinstance(t, str) and len(t) > max_chars)
+    if n_trunc:
+        texts = [t[:max_chars] if isinstance(t, str) and len(t) > max_chars else t
+                 for t in texts]
+    return texts, n_trunc
 
-    def close(self):
+
+def build_index(lookup_path):
+    """Collapse the lookup parquet into the two dictionaries the scanner needs.
+
+    Returns (name_info, first_lens) where name_info maps a token tuple to its resolved
+    (GeoClass, IsWord) and first_lens maps a first token to the n-gram lengths worth
+    probing at that position, longest first. The second dictionary is what keeps the scan
+    cheap: most tokens in a contract begin no place name at all, so they cost one failed
+    dictionary probe rather than eleven.
+    """
+    df = pd.read_parquet(lookup_path, columns=["GeoName", "GeoClass", "IsWord"])
+    rank = {c: i for i, c in enumerate(CLASS_RANK)}
+    df = df.assign(Rank=df["GeoClass"].map(rank))
+    if df["Rank"].isna().any():
+        bad = sorted(set(df.loc[df["Rank"].isna(), "GeoClass"]))
+        raise SystemExit(f"lookup carries unranked GeoClass values: {bad}")
+
+    # One row per name: the most specific class, and IsWord set if any row flags it.
+    df = (df.sort_values("Rank")
+            .groupby("GeoName", as_index=False)
+            .agg(GeoClass=("GeoClass", "first"), IsWord=("IsWord", "max")))
+
+    name_info = {}
+    first_lens = {}
+    for name, klass, is_word in df.itertuples(index=False):
+        toks = tuple(name.split())
+        if not toks:
+            continue
+        name_info[toks] = (klass, int(is_word))
+        first_lens.setdefault(toks[0], set()).add(len(toks))
+    first_lens = {k: tuple(sorted(v, reverse=True)) for k, v in first_lens.items()}
+    return name_info, first_lens
+
+
+def scan(text):
+    """Every non-overlapping gazetteer match in one text, longest-first, left to right.
+
+    Returns a list of (start, stop, geo_class, is_word). Offsets index `text` directly.
+    """
+    toks = [(m.group(0).upper(), m.start(), m.end(), m.group(0)[0].isupper())
+            for m in TOKEN_RX.finditer(text)]
+    n = len(toks)
+    out = []
+    i = 0
+    while i < n:
+        lens = _FIRST_LENS.get(toks[i][0]) if toks[i][3] else None
+        if lens is not None:
+            matched = 0
+            for L in lens:                       # longest first
+                if i + L > n:
+                    continue
+                info = _NAME_INFO.get(tuple(toks[j][0] for j in range(i, i + L)))
+                if info is not None:
+                    out.append((toks[i][1], toks[i + L - 1][2], info[0], info[1]))
+                    matched = L
+                    break
+            if matched:
+                i += matched                     # consume the whole match
+                continue
+        i += 1
+    return out
+
+
+def gate(matches, text):
+    """Keep the anchors, plus the gated matches that an anchor corroborates.
+
+    Anchors are the self-evidencing classes; every other match must have one within a
+    window whose width depends on whether the name is also a dictionary word. Distance is
+    the gap between the nearest edges of the two spans, so an adjacent anchor scores 0 and
+    the measure does not punish long place names.
+    """
+    anchors = [(s, e) for s, e, k, _ in matches if k in ANCHOR_CLASSES]
+    if not anchors:
+        return []
+
+    anchor_spans = set(anchors)
+    kept = []
+    for s, e, klass, is_word in matches:
+        if (s, e) in anchor_spans and klass in ANCHOR_CLASSES:
+            kept.append((s, e, klass))
+        elif is_word:
+            if _adjacent_anchor(e, anchors, text):
+                kept.append((s, e, klass))
+        elif _nearest_gap(s, e, anchors) <= _STATE_WINDOW:
+            kept.append((s, e, klass))
+    kept.sort()
+    return kept
+
+
+def _adjacent_anchor(stop, anchors, text):
+    """True when an anchor follows within --word-window characters and nothing but
+    separators lies between.
+
+    Plain proximity cannot gate a dictionary word, because an address block is dense with
+    anchors and licenses every token in it: in "400 Hamilton Avenue, Palo Alto,
+    California", the state sits within forty characters of Hamilton, Avenue and Palo Alto
+    alike. What distinguishes the city is that it abuts the state with only a comma
+    between them, which is how US addresses are written. Requiring a separator-only gap
+    therefore keeps "Mobile, Alabama" and drops the street it stands on.
+
+    Anchors are position-sorted, so the search bisects to the first candidate rather than
+    walking from the start. Scanning linearly here is quadratic in the number of matches,
+    which is invisible on a normal contract and fatal on the multi-megabyte outliers the
+    corpus contains.
+    """
+    idx = bisect.bisect_left(anchors, (stop, -1))   # first anchor starting at or after stop
+    for j in range(idx, len(anchors)):
+        a_s = anchors[j][0]
+        if a_s - stop > _WORD_WINDOW:
+            break
+        if SEPARATOR_RX.fullmatch(text[stop:a_s]):
+            return True
+    return False
+
+
+def _nearest_gap(start, stop, anchors):
+    """Smallest edge-to-edge gap between [start, stop) and any anchor span (0 if they
+    touch or overlap). Anchors are sorted, so the search is a bisect plus two probes."""
+    idx = bisect.bisect_left(anchors, (start, stop))
+    best = None
+    for j in (idx - 1, idx, idx + 1):
+        if 0 <= j < len(anchors):
+            a_s, a_e = anchors[j]
+            if a_s < stop and start < a_e:      # overlapping spans are zero distance
+                gap = 0
+            else:
+                gap = a_s - stop if a_s >= stop else start - a_e
+            if best is None or gap < best:
+                best = gap
+    return best if best is not None else 10 ** 9
+
+
+def extract_one(args):
+    """Rows for one document. Always returns >=1 row: a null-span sentinel if nothing
+    survives the gate (including blank text). The whole document is capped at _TIMEOUT
+    seconds if set; on timeout it emits a marker row so the orchestrator can record the
+    status and re-run it later."""
+    docid, text = args
+    rows = []
+    if isinstance(text, str) and text.strip():
         try:
-            self._fh.flush()
-            self._fh.close()
-        except Exception:
-            pass
+            if _TIMEOUT > 0:
+                signal.alarm(_TIMEOUT)
+            try:
+                kept = gate(scan(text), text)
+            finally:
+                if _TIMEOUT > 0:
+                    signal.alarm(0)
+        except _ExtractorTimeout:
+            print(f"[timeout] {docid}: gazetteer > {_TIMEOUT}s, skipped", file=sys.stderr)
+            return [(docid, None, None, None, None, "timeout:gazetteer", ENGINE, MODEL)]
+        except Exception:                  # one bad document must not kill the run
+            kept = []
+        rows = [(docid, s, e, text[s:e], "GPE", klass, ENGINE, MODEL) for s, e, klass in kept]
+    if not rows:
+        rows.append((docid, None, None, None, None, None, ENGINE, MODEL))
+    return rows
 
 
-@contextlib.contextmanager
-def redirect_fds(target):
-    """Point stdout/stderr (fd 1/2) at an open file for the duration.
+def _demote_ambiguous():
+    """Drop the street-type suffixes and move ambiguous country names out of the anchor set.
 
-    Operates at the file-descriptor level via os.dup2 so that transformers
-    logging, tqdm, and any C-level writes all land in the log regardless of which
-    stream reference they captured at import time -- the failure mode a plain
-    contextlib.redirect_stdout cannot cover. Original fds are restored on exit,
-    so a traceback from a failed run still reaches the console.
+    They stay matchable, but as word-like names needing corroboration, by relabelling
+    them to the class they also hold as a US place where they have one and forcing the
+    IsWord flag otherwise. Done once after the index is built so the scanner itself stays
+    free of special cases.
     """
-    sys.stdout.flush()
-    sys.stderr.flush()
-    saved_out, saved_err = os.dup(1), os.dup(2)
-    tfd = target.fileno()
-    os.dup2(tfd, 1)
-    os.dup2(tfd, 2)
-    try:
-        yield
-    finally:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.dup2(saved_out, 1)
-        os.dup2(saved_err, 2)
-        os.close(saved_out)
-        os.close(saved_err)
+    for name in ADDRESS_WORDS:
+        _NAME_INFO.pop((name,), None)
 
-
-class TextDataset(torch.utils.data.Dataset):
-    def __init__(self, encodings, labels):
-        self.encodings = encodings
-        self.labels = labels
-
-    def __len__(self):
-        return len(self.labels)
-
-    def __getitem__(self, idx):
-        item = {k: v[idx] for k, v in self.encodings.items()}
-        item["labels"] = self.labels[idx]
-        return item
-
-
-class WeightedTrainer(Trainer):
-    """Trainer with a fixed class-weight vector in the cross-entropy loss."""
-    def __init__(self, class_weights=None, **kwargs):
-        super().__init__(**kwargs)
-        self.class_weights = class_weights
-
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        labels = inputs.pop("labels")
-        outputs = model(**inputs)
-        logits = outputs.logits
-        weight = None if self.class_weights is None else self.class_weights.to(logits.device)
-        loss_fct = torch.nn.CrossEntropyLoss(weight=weight)
-        loss = loss_fct(logits.view(-1, model.config.num_labels), labels.view(-1))
-        return (loss, outputs) if return_outputs else loss
-
-
-def smoke_subset(df, label_col, n_per_class):
-    parts = [g.sample(min(len(g), n_per_class), random_state=0)
-             for _, g in df.groupby(label_col)]
-    return pd.concat(parts).reset_index(drop=True)
+    for name in AMBIGUOUS_COUNTRIES:
+        key = tuple(name.split())
+        info = _NAME_INFO.get(key)
+        if info is None:
+            continue
+        klass, _ = info
+        if klass != "Country":          # a US State reading is never demoted
+            continue
+        _NAME_INFO[key] = ("US Populated Place", 1)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="prepared parquet")
-    ap.add_argument("--label-col", default="ClassDetailed")
-    ap.add_argument("--text-col", default="Text")
-    ap.add_argument("--fold-col", default="Fold")
-    ap.add_argument("--test-fold", type=int, default=1)
-    ap.add_argument("--model", default="roberta-base")
-    ap.add_argument("--max-len", type=int, default=512)
-    ap.add_argument("--epochs", type=float, default=6.0)
-    ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--class-weights", dest="class_weights", action="store_true", default=False)
-    ap.add_argument("--runs-root", default="2_output/03-Classification/runs")
-    ap.add_argument("--save-model", dest="save_model", action="store_true", default=True)
-    ap.add_argument("--no-save-model", dest="save_model", action="store_false")
-    ap.add_argument("--save-probs", dest="save_probs", action="store_true", default=True)
-    ap.add_argument("--no-save-probs", dest="save_probs", action="store_false")
-    ap.add_argument("--overwrite", action="store_true")
-    ap.add_argument("--smoke", action="store_true")
+    ap.add_argument("inputs", nargs="+", help="parquet file(s) and/or folder(s)")
+    ap.add_argument("--output", required=True, help="output parquet path")
+    ap.add_argument("--id-col", default="DocID")
+    ap.add_argument("--text-col", default="TextRaw")
+    ap.add_argument("--label", nargs="+", default=["GPE"],
+                    help="unified labels to extract; this engine supports: GPE")
+    ap.add_argument("--lookup", required=True, help="geo_lookup.parquet")
+    ap.add_argument("--state-window", type=int, default=200,
+                    help="chars within which an anchor licenses a distinctive name")
+    ap.add_argument("--word-window", type=int, default=40,
+                    help="chars within which an anchor licenses a dictionary-word name")
+    ap.add_argument("--max-chars", type=int, default=0,
+                    help="truncate each document to its first N characters (0 = off)")
+    ap.add_argument("--timeout", type=int, default=120,
+                    help="per-document cap in seconds (0 = off)")
+    ap.add_argument("--n-process", type=int, default=1, help="worker processes (<=0 = all cores)")
+    ap.add_argument("--chunk-size", type=int, default=8, help="docs per task when parallelising")
+    ap.add_argument("--no-progress", action="store_true", help="disable the progress bar")
     args = ap.parse_args()
 
-    set_seed(args.seed)
-    device = pick_device()
+    init_args = (args.lookup, max(0, args.state_window), max(0, args.word_window),
+                 max(0, args.timeout))
 
-    model_slug = args.model.replace("/", "-")
-    wtag = 1 if args.class_weights else 0
-    config_name = (
-        f"{args.label_col}__{model_slug}__T{args.text_col}_"
-        f"L{args.max_len}_E{fmt_num(args.epochs)}_B{args.batch_size}_"
-        f"LR{args.lr:g}_W{wtag}_S{args.seed}"
-    )
-    run_name = f"{config_name}_F{args.test_fold}"
-    run_token = f"bert:{model_slug}:{args.label_col}:T{args.text_col}:W{wtag}:F{args.test_fold}"
+    df = (pads.dataset(resolve_inputs(args.inputs), format="parquet")
+              .to_table(columns=[args.id_col, args.text_col])
+              .to_pandas())
 
-    runs_root = Path(args.runs_root)
-    if args.smoke:
-        runs_root = runs_root / "_smoke"
-    run_dir = runs_root / run_name
-
-    done_marker = run_dir / "metrics_overall.parquet"
-    if done_marker.exists() and not args.overwrite and not args.smoke:
-        print(f"[skip  ] run exists: {run_dir} (use --overwrite to redo)")
+    if "GPE" not in args.label:
+        print(f"no gazetteer extractor for {args.label}; writing sentinels only", file=sys.stderr)
+        rows = [(docid, None, None, None, None, None, ENGINE, MODEL)
+                for docid in df[args.id_col].tolist()]
+        out = pd.DataFrame(rows, columns=COLUMNS)
+        out[["Start", "Stop"]] = out[["Start", "Stop"]].astype("Int64")
+        out.to_parquet(args.output, index=False)
+        print(f"{len(df)} doc(s) -> 0 candidate(s)  [{ENGINE}:{MODEL}]")
         return
-    run_dir.mkdir(parents=True, exist_ok=True)
-    log = RunLogger(run_dir / "run.log", console=sys.stdout)
 
-    df = pd.read_parquet(args.data)
-    missing = {"DocID", args.text_col, args.label_col, args.fold_col} - set(df.columns)
-    if missing:
-        raise SystemExit(f"prepared data missing columns: {sorted(missing)}")
+    # Cheap up-front validation so a bad lookup path fails here rather than inside every
+    # worker at once. The index itself is built per worker; see _init_worker.
+    n_names = len(pd.read_parquet(args.lookup, columns=["GeoName"]))
+    print(f"gazetteer: {n_names} lookup row(s), state-window={init_args[1]}, "
+          f"word-window={init_args[2]}", file=sys.stderr)
 
-    # drop rows with no label for this task (e.g. NA AmendType); no-op for the
-    # class columns, which have no NA.
-    df = df[df[args.label_col].notna()].copy()
+    texts = df[args.text_col].tolist()
+    texts, n_trunc = truncate_texts(texts, args.max_chars)
+    if n_trunc:
+        print(f"{n_trunc} doc(s) truncated to {args.max_chars} chars", file=sys.stderr)
+    items = list(zip(df[args.id_col].tolist(), texts))
 
-    train_df = df[df[args.fold_col] != args.test_fold].copy()
-    test_df = df[df[args.fold_col] == args.test_fold].copy()
-    if args.smoke:
-        train_df = smoke_subset(train_df, args.label_col, 8)
-        test_df = smoke_subset(test_df, args.label_col, 4)
-        args.epochs = 1.0
+    nproc = args.n_process if args.n_process > 0 else (os.cpu_count() or 1)
+    desc = f"{ENGINE}:{MODEL} (n_process={nproc})"
 
-    labels_sorted = sorted(train_df[args.label_col].unique().tolist())
-    lab2id = {lab: i for i, lab in enumerate(labels_sorted)}
-    id2lab = {i: lab for lab, i in lab2id.items()}
-    test_df = test_df[test_df[args.label_col].isin(lab2id)].copy()
+    rows = []
+    if nproc == 1:
+        _init_worker(*init_args)
+        for it in tqdm(items, total=len(items), unit="doc", desc=desc,
+                       file=sys.stderr, disable=args.no_progress):
+            rows.extend(extract_one(it))
+    else:
+        with Pool(processes=nproc, initializer=_init_worker, initargs=init_args) as pool:
+            for r in tqdm(pool.imap_unordered(extract_one, items, chunksize=args.chunk_size),
+                          total=len(items), unit="doc", desc=desc,
+                          file=sys.stderr, disable=args.no_progress):
+                rows.extend(r)
 
-    log.say(f"[run   ] {run_name}")
-    log.log(f"[device] {device}")
-    log.log(f"[label ] {args.label_col} | text={args.text_col} | classes={len(labels_sorted)} | "
-            f"weights={bool(args.class_weights)} | test_fold={args.test_fold}")
-    log.log(f"[data  ] train={len(train_df)} test={len(test_df)}")
-
-    started = time.time()
-    started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-    # Heavy compute: silence the console and capture everything (transformers
-    # epoch logs, library warnings, any progress output) into run.log at the fd
-    # level, so the R console sees only the start/done lines above and below.
-    with redirect_fds(log.file):
-        tok = AutoTokenizer.from_pretrained(args.model)
-
-        def encode(texts):
-            # static max_length padding keeps shapes constant, which avoids MPS
-            # kernel recompiles across batches.
-            return tok(texts, truncation=True, max_length=args.max_len,
-                       padding="max_length", return_tensors="pt")
-
-        train_txt = train_df[args.text_col].fillna("").astype(str).tolist()
-        test_txt = test_df[args.text_col].fillna("").astype(str).tolist()
-        train_enc = encode(train_txt)
-        test_enc = encode(test_txt)
-        train_y = torch.tensor([lab2id[x] for x in train_df[args.label_col]])
-        test_y = torch.tensor([lab2id[x] for x in test_df[args.label_col]])
-
-        model = AutoModelForSequenceClassification.from_pretrained(
-            args.model, num_labels=len(labels_sorted), id2label=id2lab, label2id=lab2id
-        )
-
-        targs = TrainingArguments(
-            output_dir=str(run_dir / "hf"),
-            num_train_epochs=args.epochs,
-            per_device_train_batch_size=args.batch_size,
-            per_device_eval_batch_size=args.batch_size,
-            learning_rate=args.lr,
-            seed=args.seed,
-            save_strategy="no",
-            logging_strategy="epoch",
-            disable_tqdm=True,          # epoch logs only; keeps run.log readable
-            report_to="none",
-            dataloader_pin_memory=False,
-            fp16=False,
-            bf16=False,
-        )
-
-        if args.class_weights:
-            counts = train_df[args.label_col].value_counts().reindex(labels_sorted).to_numpy()
-            cw = counts.sum() / (len(counts) * counts)            # sklearn "balanced", mean ~1
-            class_weights = torch.tensor(cw, dtype=torch.float)
-            trainer = WeightedTrainer(class_weights=class_weights, model=model, args=targs,
-                                      train_dataset=TextDataset(train_enc, train_y))
-        else:
-            trainer = Trainer(model=model, args=targs,
-                              train_dataset=TextDataset(train_enc, train_y))
-
-        trainer.train()
-
-        pred = trainer.predict(TextDataset(test_enc, test_y))
-        probs = torch.softmax(torch.tensor(pred.predictions), dim=-1).numpy()
-        pred_ids = probs.argmax(axis=-1)
-        scores = probs.max(axis=-1)
-        true_ids = test_y.numpy()
-
-    ended_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    duration = round(time.time() - started, 1)
-
-    pd.DataFrame({
-        "ConfigName": config_name, "Run": run_token,
-        "DocID": test_df["DocID"].to_numpy(),
-        "TrueLabel": [id2lab[i] for i in true_ids],
-        "PredLabel": [id2lab[i] for i in pred_ids],
-        "Score": scores, "Fold": args.test_fold,
-    }).to_parquet(run_dir / "predictions.parquet", index=False)
-
-    if args.save_probs:
-        wide = pd.DataFrame(probs, columns=labels_sorted)
-        wide.insert(0, "DocID", test_df["DocID"].to_numpy())
-        wide.insert(0, "ConfigName", config_name)
-        wide.melt(id_vars=["ConfigName", "DocID"], var_name="Class", value_name="Prob") \
-            .to_parquet(run_dir / "probabilities.parquet", index=False)
-
-    acc = float(accuracy_score(true_ids, pred_ids))
-    f1_macro = float(f1_score(true_ids, pred_ids, average="macro"))
-    f1_weight = float(f1_score(true_ids, pred_ids, average="weighted"))
-    pd.DataFrame([{
-        "ConfigName": config_name, "Run": run_token, "RunName": run_name, "Model": args.model,
-        "LabelCol": args.label_col, "TextCol": args.text_col, "ClassWeights": bool(args.class_weights),
-        "TestFold": args.test_fold, "MaxLen": args.max_len, "Epochs": args.epochs,
-        "BatchSize": args.batch_size, "LR": args.lr, "Seed": args.seed, "Device": device,
-        "nTrain": len(train_df), "nTest": len(test_df), "nClasses": len(labels_sorted),
-        "Accuracy": acc, "F1_macro": f1_macro, "F1_weighted": f1_weight,
-        "DurationSec": duration, "Smoke": bool(args.smoke),
-    }]).to_parquet(run_dir / "metrics_overall.parquet", index=False)
-
-    p, r, f, s = precision_recall_fscore_support(
-        true_ids, pred_ids, labels=list(range(len(labels_sorted))), zero_division=0
-    )
-    pd.DataFrame({
-        "ConfigName": config_name, "Run": run_token, "Label": labels_sorted,
-        "Precision": p, "Recall": r, "F1": f, "Support": s.astype(int),
-    }).to_parquet(run_dir / "metrics_perclass.parquet", index=False)
-
-    try:
-        pd.DataFrame(trainer.state.log_history).to_parquet(
-            run_dir / "train_log.parquet", index=False
-        )
-    except Exception as e:
-        log.log(f"[warn  ] could not write train_log: {e}")
-
-    if args.save_model:
-        model.save_pretrained(run_dir / "model")
-        tok.save_pretrained(run_dir / "model")
-
-    manifest = {
-        "config_name": config_name, "run_name": run_name, "run_token": run_token,
-        "smoke": bool(args.smoke), "model": args.model, "label_col": args.label_col,
-        "text_col": args.text_col, "class_weights": bool(args.class_weights),
-        "test_fold": args.test_fold, "max_len": args.max_len, "epochs": args.epochs,
-        "batch_size": args.batch_size, "lr": args.lr, "seed": args.seed, "device": device,
-        "n_classes": len(labels_sorted), "labels": labels_sorted, "label2id": lab2id,
-        "data_path": str(args.data), "n_train": len(train_df), "n_test": len(test_df),
-        "accuracy": acc, "f1_macro": f1_macro, "f1_weighted": f1_weight,
-        "duration_sec": duration, "started_at": started_iso, "ended_at": ended_iso,
-        "saved_model": bool(args.save_model),
-        "versions": {"python": sys.version.split()[0],
-                     "torch": torch.__version__,
-                     "transformers": transformers.__version__},
-        "git_commit": git_commit(),
-    }
-    (run_dir / "config.json").write_text(json.dumps(manifest, indent=2))
-
-    log.say(f"[done  ] acc={acc:.3f} f1_macro={f1_macro:.3f} f1_weighted={f1_weight:.3f} ({duration}s)")
-    log.log(f"[write ] {run_dir}")
-    log.close()
+    out = pd.DataFrame(rows, columns=COLUMNS)
+    out[["Start", "Stop"]] = out[["Start", "Stop"]].astype("Int64")
+    n_cand = int(out["Start"].notna().sum())
+    out.to_parquet(args.output, index=False)
+    print(f"{len(df)} doc(s) -> {n_cand} candidate(s)  [{ENGINE}:{MODEL}]")
 
 
 if __name__ == "__main__":
