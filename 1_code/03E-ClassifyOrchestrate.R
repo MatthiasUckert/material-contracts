@@ -1611,6 +1611,12 @@ orch_save_policy <- function(.final, .arms, .label_col, .dir, .commit_only = NUL
 #' @param .runs_roots Character vector of runs directories.
 #' @param .label_col Task to run.
 #' @param .tab_prep Prepared sample.
+#' @param .crowned Character or NULL. The CONFIGURATION the training stage crowned and deployed, which
+#'   this stage resolves to its own arm name and takes as the status quo. A configuration name rather
+#'   than an arm name because arms are named here, under a convention reconciling four engines; a
+#'   second namer upstream would be a second convention. NULL falls back to the most accurate terminal
+#'   and says so, which was the source of a three-way disagreement between trainer, stage and
+#'   manifest.
 #' @param .extra_arms Optional spine-form rows for a derived arm, or NULL.
 #' @param .floors,.max_depth,.families Policy-space controls.
 #' @param .commit_only Labels a keyword arm may commit to, or NULL for all.
@@ -1622,6 +1628,7 @@ orch_save_policy <- function(.final, .arms, .label_col, .dir, .commit_only = NUL
 #' @return List: LabelCol, Arms, ArmsCV, ArmsHeld, Spine, Roles, Incumbent, Terminals, Gated,
 #'   Policies, Nested, Compare, Movement, Derived, Final.
 orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
+                          .crowned = NULL,
                           .extra_arms = NULL,
                           .floors = c(0, 0.70, 0.80, 0.90),
                           .max_depth = 2L,
@@ -1636,6 +1643,7 @@ orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
     .runs_roots  <- c(.lP$Runs$Bert, .lP$Runs$Kw)
     .label_col   <- "ClassDetailed"
     .tab_prep    <- tab_prep
+    .crowned     <- "ClassDetailed__nlpaueb-legal-bert-base-uncased__TText_L256_E6_B32_LR2e-05_W1_S42"
     .extra_arms  <- arm_hier
     .commit_only <- NULL
   }
@@ -1675,9 +1683,37 @@ orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
   if (nrow(real_term_) == 0L) {
     cli::cli_abort("{(.label_col)}: every terminal arm is derived; nothing deployable to fall back on.")
   }
-  inc_ <- real_term_ |>
-    dplyr::slice_max(.data$Accuracy, n = 1L, with_ties = FALSE) |>
-    dplyr::pull(Arm)
+
+  # THE INCUMBENT IS GIVEN, NOT CHOSEN HERE. It is the arm the training stage crowned and deployed,
+  # supplied by the caller. Ranking the terminals again in this stage -- on accuracy, where the
+  # trainer ranked on macro-F1 -- produced a third answer to a question two stages had already
+  # answered, and the three disagreed: the manifest pinned a model that was never fitted while naming
+  # a terminal that was never pinned. One stage decides, and it is the one that trained the models.
+  inc_ <- if (!is.null(.crowned) && length(.crowned) == 1L && !is.na(.crowned)) {
+    hit_ <- arms_cv_$Arm[arms_cv_$ConfigName == .crowned]
+    if (length(hit_) == 0L) {
+      cli::cli_abort(c(
+        "{(.label_col)}: the deployed configuration is not in this task's arm inventory.",
+        "i" = "Deployed: {.val {(.crowned)}}",
+        "i" = "The inventory keeps one configuration per arm name, so a crowned configuration that \\
+               lost its own arm to a higher-scoring sibling will not appear. Re-run the trainer's \\
+               deployment, or widen the inventory."
+      ))
+    }
+    if (!hit_[[1]] %in% real_term_$Arm) {
+      cli::cli_abort(c(
+        "{(.label_col)}: the deployed arm {.val {hit_[[1]]}} is not a runnable terminal here.",
+        "i" = "Terminals present: {real_term_$Arm}"
+      ))
+    }
+    hit_[[1]]
+  } else {
+    cli::cli_alert_warning(
+      "No deployed configuration supplied for {(.label_col)}; falling back to the most accurate \\
+       terminal. Pass {.arg .crowned} so this stage reports the arm that actually ships."
+    )
+    real_term_ |> dplyr::slice_max(.data$Accuracy, n = 1L, with_ties = FALSE) |> dplyr::pull(Arm)
+  }
   if (length(derived_) > 0L) {
     cli::cli_alert_info(
       "{length(derived_)} derived arm{?s} in the search ({derived_}): eligible to win a fold, \
@@ -2204,84 +2240,181 @@ orch_report_agreement_sets <- function(.tab, .default = NULL) {
   invisible(.tab)
 }
 
-#' Resolve one task's arms to the artifacts that would run them
+#' Every deployable transformer on disk, with the crowned one marked
 #'
-#' Per task, not once for the study, because 03B crowns a different configuration for each: the
-#' detailed task deploys one context length and the broad task another, so a single arm list pins the
-#' wrong checkpoint for two tasks out of three and the apply stage discovers it by finding no
-#' predictions for a terminal it was told to use.
+#' Discovered rather than constructed. The previous version built a path from a configuration name and
+#' trusted it to exist, so a stage that had deployed a different configuration -- the trainer crowns
+#' on macro-F1, this stage was ranking terminals on accuracy -- produced a manifest pointing at a
+#' model nobody had fitted. Listing what is actually there cannot make that mistake, and it finds
+#' every context length the trainer deployed rather than only the one this stage thought to ask for.
 #'
-#' Availability is the honest part. 03C publishes a keyword table for the detailed taxonomy only, so
-#' the lexical arm has runs for every task and an artifact for one. That is reported as unavailable
-#' rather than assumed present, and the consequence -- a task with a single deployable arm cannot
-#' support a concurrence flag, because there is nobody to concur with -- follows from the table
-#' instead of surprising someone later.
+#' A run directory is named for the configuration it holds, so the configuration is read back off the
+#' directory rather than assumed. Anything that does not join to this task's arm inventory is dropped:
+#' a model on disk that this task never evaluated is a leftover, not an arm.
 #'
-#' @param .res One orch_run_task() output.
-#' @param .dir_bert,.dir_kw,.dir_llm Output directories of 03B, 03C and 03D.
-#' @param .kw_stems Named character vector, task to published lexicon stem. A task absent from it has
-#'   no published keyword table and its lexical arm is marked unavailable.
-#' @return Tibble: LabelCol, Arm, Kind, Path, Params.
-orch_artifacts <- function(.res, .dir_bert, .dir_kw, .dir_llm, .kw_stems) {
+#' @param .arms Arm inventory for one task, from orch_arms().
+#' @param .dir_bert Output root of the training stage.
+#' @param .default Character. The arm the trainer crowned and deployed for this task.
+#' @return Tibble: Arm, Kind, ConfigName, MaxLen, Path, Default, MacroF1.
+orch_catalogue_bert <- function(.arms, .dir_bert, .default) {
   if (FALSE) {
-    .res       <- res_det
-    .dir_bert  <- .dir_bert
-    .kw_stems  <- c(ClassDetailed = "keyword_table_detailed")
+    .arms     <- res_det$ArmsCV
+    .dir_bert <- .dir_bert
+    .default  <- res_det$Incumbent
   }
-  .res$ArmsCV |>
-    dplyr::transmute(
-      LabelCol = .res$LabelCol,
-      Arm,
-      ConfigName,
-      MacroF1,
-      Kind = dplyr::case_when(
-        grepl("^keyword-", .data$Kind) ~ "keyword",
-        grepl("^llm-", .data$Kind)     ~ "llm",
-        TRUE                           ~ "transformer"
-      )
-    ) |>
-    # One seat per method family, the same independence rule the voting set uses, with the
-    # transformer seat pinned to the arm that actually shipped this task's label. slice_max rather
-    # than slice(1): taking the first row would inherit whatever order the inventory happened to
-    # arrive in, which is a sort key away from silently pinning a different checkpoint.
-    dplyr::slice_max(.data$MacroF1, n = 1L, by = Kind, with_ties = FALSE) |>
+  root_ <- fs::path(.dir_bert, "model_final")
+  if (!fs::dir_exists(root_)) {
+    cli::cli_abort(c("No deployed models under {.path {(root_)}}.",
+                     "i" = "Run the training stage's deployment section first."))
+  }
+  dirs_ <- fs::dir_ls(root_, type = "directory", glob = "*__FINAL")
+  if (length(dirs_) == 0L) cli::cli_abort("No __FINAL directories under {.path {(root_)}}.")
+
+  found_ <- tibble::tibble(
+    ConfigName = sub("__FINAL$", "", fs::path_file(dirs_)),
+    Path       = as.character(fs::path(dirs_, "model"))
+  ) |>
+    dplyr::filter(fs::dir_exists(.data$Path))
+
+  out_ <- .arms |>
+    dplyr::filter(!grepl("^keyword-", .data$Kind), !grepl("^llm-", .data$Kind)) |>
+    dplyr::select(Arm, ConfigName, MaxLen, MacroF1) |>
+    dplyr::inner_join(found_, by = dplyr::join_by(ConfigName)) |>
+    dplyr::mutate(Kind = "transformer", MaxLen = as.integer(.data$MaxLen),
+                  Default = .data$Arm == .default) |>
+    dplyr::arrange(.data$MaxLen)
+
+  if (nrow(out_) == 0L) {
+    cli::cli_abort(c(
+      "No deployed model joins this task's arm inventory.",
+      "i" = "On disk: {utils::head(found_$ConfigName, 2)}",
+      "i" = "In the inventory: {utils::head(.arms$ConfigName, 2)}"
+    ))
+  }
+  if (!any(out_$Default)) {
+    cli::cli_abort(c(
+      "The deployed arm {.val {(.default)}} has no model on disk.",
+      "i" = "Deployed here: {out_$Arm}",
+      "i" = "A manifest naming an artifact that is absent is one the apply stage cannot execute."
+    ))
+  }
+  dplyr::select(out_, Arm, Kind, ConfigName, MaxLen, Path, Default, MacroF1)
+}
+
+#' Every published keyword table on disk, with the marked one flagged
+#'
+#' The keyword stage publishes a table per truncation window and marks which to apply. Both travel:
+#' the window is that arm's cost knob, and a caller with throughput figures may reasonably prefer a
+#' cheaper table than the one the evidence marked. Reading the catalogue that stage wrote, rather than
+#' rebuilding the choice here, is what stops the two from disagreeing.
+#'
+#' @param .dir_kw Output root of the keyword stage.
+#' @param .label_col Character. Task.
+#' @param .catalogue The keyword stage's published catalogue.
+#' @return Tibble: Arm, Kind, NWords, Path, Default, Coverage, Realised.
+orch_catalogue_keyword <- function(.dir_kw, .label_col, .catalogue) {
+  if (FALSE) {
+    .dir_kw    <- .dir_kw
+    .label_col <- "ClassDetailed"
+    .catalogue <- kw_cat
+  }
+  mine_ <- .catalogue |> dplyr::filter(.data$Task == .label_col)
+  if (nrow(mine_) == 0L) {
+    cli::cli_abort("The keyword catalogue lists no table for {(.label_col)}.")
+  }
+
+  out_ <- mine_ |>
     dplyr::mutate(
-      Arm = dplyr::if_else(.data$Kind == "transformer", .res$Incumbent, .data$Arm),
-      ConfigName = purrr::map2_chr(.data$Kind, .data$Arm, function(.k, .a) {
-        hit_ <- .res$Arms$ConfigName[.res$Arms$Arm == .a]
-        if (length(hit_) == 0L) NA_character_ else hit_[[1]]
-      }),
-      Path = purrr::pmap_chr(
-        list(.data$Kind, .data$ConfigName, .data$LabelCol),
-        function(.k, .c, .t) {
-          switch(.k,
-            transformer = as.character(fs::path(.dir_bert, "model_final",
-                                                paste0(.c, "__FINAL"), "model")),
-            keyword = if (.t %in% names(.kw_stems)) {
-              as.character(fs::path(.dir_kw, "table", paste0(.kw_stems[[.t]], ".parquet")))
-            } else {
-              NA_character_
-            },
-            llm = as.character(fs::path(.dir_llm, "runs")),
-            NA_character_
-          )
-        }
-      ),
-      Params = purrr::pmap(
-        list(.data$Kind, .data$ConfigName, .data$LabelCol),
-        function(.k, .c, .t) {
-          switch(.k,
-            transformer = list(config_name = .c, label_col = .t),
-            keyword     = list(config_name = .c, source = "text"),
-            llm         = list(config_name = .c,
-                               note = "prompt recipe is stored in the run config.json"),
-            list()
-          )
-        }
-      )
+      Kind = "keyword",
+      Arm  = paste0("kw-text:W",
+                    dplyr::if_else(.data$NWords == 0L, "full", as.character(.data$NWords))),
+      Path = purrr::map2_chr(.data$Task, .data$NWords, function(.t, .w) {
+        as.character(fs::path(.dir_kw, "table", paste0(kw_table_stem(.t, .w), ".parquet")))
+      })
     ) |>
-    dplyr::filter(!is.na(.data$Path)) |>
-    dplyr::select(LabelCol, Arm, Kind, ConfigName, Path, Params)
+    dplyr::filter(fs::file_exists(.data$Path))
+
+  if (nrow(out_) == 0L) {
+    cli::cli_abort(c(
+      "The catalogue lists tables for {(.label_col)} but none is on disk.",
+      "i" = "Expected under {.path {as.character(fs::path(.dir_kw, 'table'))}}."
+    ))
+  }
+  if (!any(out_$Default)) cli::cli_abort("The marked table for {(.label_col)} is not on disk.")
+  out_ |> dplyr::select(Arm, Kind, NWords, Path, Default, Coverage, Realised)
+}
+
+#' Assemble the deployable catalogue for one task
+#'
+#' This stage selects nothing. It reads what the training stage crowned and what the keyword stage
+#' marked, finds the artifacts behind them, and records every variant beside the default so a later
+#' decision can be made with the numbers in hand. Two stages have already answered which model is
+#' best; a third opinion here would not be more information, it would be a disagreement.
+#'
+#' @param .res One task's result from orch_run_task().
+#' @param .dir_bert Output root of the training stage.
+#' @param .dir_kw Output root of the keyword stage.
+#' @param .kw_catalogue The keyword stage's published catalogue.
+#' @return Tibble: LabelCol, Arm, Kind, Variant, Path, Default, Score, Measure, MaxLen, NWords.
+orch_artifacts <- function(.res, .dir_bert, .dir_kw, .kw_catalogue) {
+  if (FALSE) {
+    .res          <- res_det
+    .dir_bert     <- .dir_bert
+    .dir_kw       <- .dir_kw
+    .kw_catalogue <- kw_cat
+  }
+  bert_ <- orch_catalogue_bert(
+    .arms = .res$ArmsCV, .dir_bert = .dir_bert, .default = .res$Incumbent
+  ) |>
+    dplyr::transmute(
+      LabelCol = .res$LabelCol, Arm, Kind, Path, Default,
+      Variant = paste0("L", .data$MaxLen), MaxLen = .data$MaxLen, NWords = NA_integer_,
+      Score = .data$MacroF1, Measure = "macro-F1, cross-validated"
+    )
+
+  kw_ <- orch_catalogue_keyword(
+    .dir_kw = .dir_kw, .label_col = .res$LabelCol, .catalogue = .kw_catalogue
+  ) |>
+    dplyr::transmute(
+      LabelCol = .res$LabelCol, Arm, Kind, Path, Default,
+      Variant = paste0("W", dplyr::if_else(.data$NWords == 0L, "full",
+                                           as.character(.data$NWords))),
+      MaxLen = NA_integer_, NWords = .data$NWords,
+      Score = .data$Coverage, Measure = "coverage at the published precision"
+    )
+
+  dplyr::bind_rows(bert_, kw_)
+}
+
+#' Print the catalogue this stage is about to pin
+#'
+#' Read before the manifest is written. Every row ships and every row is applicable; the marked one is
+#' what runs unless a caller asks otherwise. Where a variant scores within noise of the default at a
+#' fraction of the cost, this table is where that becomes visible.
+#'
+#' @param .tab Output of orch_artifacts(), bound across tasks.
+#' @return Invisibly .tab.
+orch_report_catalogue <- function(.tab) {
+  if (FALSE) .tab <- tab_artifacts
+  cli::cli_h2("Deployable catalogue")
+  .tab |>
+    dplyr::mutate(
+      Default = dplyr::if_else(.data$Default, "<-", ""),
+      Score   = sprintf("%.3f", .data$Score)
+    ) |>
+    dplyr::select(LabelCol, Kind, Variant, Default, Arm, Score, Measure) |>
+    tbl_say()
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "The arrow marks what the training and keyword stages crowned. This stage records that choice \\
+     rather than making one of its own, and ships every variant beside it so a later caller can \\
+     trade accuracy against inference cost with the numbers in front of them."
+  )
+  cli::cli_alert_info(
+    "Score is not comparable across kinds: a transformer row carries cross-validated macro-F1, a \\
+     keyword row the share of the corpus its table labels at its published precision."
+  )
+  invisible(.tab)
 }
 
 #' Write the single file 03F reads
@@ -2321,40 +2454,53 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
   }
   fs::dir_create(.dir)
 
-  found_ <- .artifacts |>
-    dplyr::mutate(Exists = fs::file_exists(.data$Path) | fs::dir_exists(.data$Path))
-  found_ |>
-    dplyr::mutate(Path = fs::path_rel(.data$Path, here::here())) |>
-    dplyr::select(LabelCol, Arm, Kind, Exists, Path) |>
-    tbl_say(.title = "Artifacts backing each arm, per task")
+  # Everything reaching this point was discovered on disk, so existence is established rather than
+  # asserted. What is checked here is the one property the catalogue cannot guarantee: that each task
+  # has a marked variant of each kind, since the apply stage runs the marked one.
+  found_ <- .artifacts
+  gaps_  <- found_ |>
+    dplyr::summarise(nDefault = sum(.data$Default), .by = c(LabelCol, Kind)) |>
+    dplyr::filter(.data$nDefault != 1L)
+  if (nrow(gaps_) > 0L) {
+    cli::cli_abort(c(
+      "Every task and kind needs exactly one marked variant; {nrow(gaps_)} do{?es/} not.",
+      "i" = "{gaps_$LabelCol} / {gaps_$Kind}: {gaps_$nDefault} marked.",
+      "i" = "A manifest without a default is one the apply stage cannot execute unattended."
+    ))
+  }
 
   thin_ <- found_ |>
-    dplyr::filter(.data$Exists, .data$Kind %in% .default_kinds) |>
+    dplyr::filter(.data$Default, .data$Kind %in% .default_kinds) |>
     dplyr::count(LabelCol, name = "nEnabled") |>
     dplyr::filter(.data$nEnabled < 2L)
   if (nrow(thin_) > 0L) {
     cli::cli_alert_warning(
-      "{nrow(thin_)} task{?s} deploy a single arm ({thin_$LabelCol}): a concurrence flag needs \
+      "{nrow(thin_)} task{?s} deploy a single arm ({thin_$LabelCol}): a concurrence flag needs \\
        somebody to concur with, so those tasks ship a label without one."
     )
   }
-  if (any(!found_$Exists)) {
-    cli::cli_alert_warning(
-      "Missing on disk: {found_$Arm[!found_$Exists]}. Marked unavailable in the manifest rather \\
-       than written as if present."
-    )
-  }
 
+  # One record per variant, not per arm. The apply stage runs the marked one unless a caller names
+  # another, so both travel and the choice stays open. Params carry what inference needs to reproduce
+  # the encoding the artifact was fitted or mined under -- the context length for a transformer, the
+  # truncation window for a keyword table. Omitting either lets the apply stage fall back to a default
+  # that has nothing to do with how the artifact was built, which is silent and wrong.
   arm_block_ <- function(.tab) {
     purrr::map(seq_len(nrow(.tab)), function(.i) {
       r_ <- .tab[.i, ]
       list(
-        arm       = r_$Arm,
-        kind      = r_$Kind,
-        artifact  = as.character(fs::path_rel(r_$Path, here::here())),
-        available = unname(r_$Exists),
-        enabled   = r_$Kind %in% .default_kinds && isTRUE(r_$Exists),
-        params    = if ("Params" %in% names(r_)) r_$Params[[1]] else NULL
+        arm      = r_$Arm,
+        kind     = r_$Kind,
+        variant  = r_$Variant,
+        artifact = as.character(fs::path_rel(r_$Path, here::here())),
+        default  = isTRUE(r_$Default),
+        enabled  = r_$Kind %in% .default_kinds,
+        scored   = list(value = unname(r_$Score), measure = r_$Measure),
+        params   = switch(r_$Kind,
+          transformer = list(max_len = unname(r_$MaxLen)),
+          keyword     = list(n_words = unname(r_$NWords), source = "text"),
+          list()
+        )
       )
     })
   }
@@ -2419,7 +2565,7 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
   arrow::write_parquet(.agreement, fs::path(.dir, "confidence_flag.parquet"))
 
   cli::cli_alert_success(
-    "Wrote manifest for {length(tasks_)} task{?s} over {sum(found_$Exists)} available arm{?s}; \\
+    "Wrote manifest for {length(tasks_)} task{?s} over {nrow(found_)} variant{?s}; \\
      {sum(found_$Kind %in% .default_kinds)} enabled by default."
   )
   invisible(man_)

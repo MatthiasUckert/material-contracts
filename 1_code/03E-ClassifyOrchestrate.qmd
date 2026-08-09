@@ -162,7 +162,12 @@ fold they are entitled to.
   Input = list(
     # Rebuilt from the same directory helper the upstream scripts wrote with, so they cannot drift
     # from where the files actually landed.
-    Prepared = fs::path(.dir_prep, "prepared.parquet")
+    Prepared = fs::path(.dir_prep, "prepared.parquet"),
+    # What the two training stages crowned. This stage reads those decisions rather than making its
+    # own: three stages ranking the same models on three criteria produced three answers, and the
+    # manifest ended up naming a model nobody had fitted.
+    BertCrown = fs::path(.dir_bert, "model_final", "deployed.parquet"),
+    KwCatalog = fs::path(.dir_kw, "table", "catalogue.parquet")
   ),
   Runs = list(
     # fs::path for inputs, utils_file_path for outputs. The project helper creates the directory it
@@ -211,6 +216,28 @@ directory, and globbing a missing one aborts -- so this document would refuse to
 because a later, optional arm was absent. Filtering to what exists means the analysis degrades to the
 arms available rather than failing, and prints which those are so a thin inventory is never a
 surprise.
+
+```{r}
+#| label: load-upstream-crowns
+# The arm each training stage deployed, and every variant it shipped beside it. Read here so the
+# rest of this document can report what ships without deciding what ships.
+kw_cat <- arrow::read_parquet(file = .lP$Input$KwCatalog)
+
+kw_cat |>
+  dplyr::filter(Default) |>
+  dplyr::transmute(Task, Window = dplyr::if_else(NWords == 0L, "full", as.character(NWords)),
+                   Coverage = tbl_pct(Coverage), Realised = tbl_pct(Realised)) |>
+  tbl_say(.title = "Keyword tables marked for deployment")
+
+# 03B records the configuration, not the arm: arms are named here, under a convention that reconciles
+# four engines, and a second namer upstream would be a second convention. The join below is what turns
+# the crowned configuration into this document's name for it.
+bert_crown <- arrow::read_parquet(file = .lP$Input$BertCrown)
+
+bert_crown |>
+  dplyr::transmute(Task = LabelCol, MaxLen, Config, MacroF1 = sprintf("%.3f", MacroF1)) |>
+  tbl_say(.title = "Transformer configurations crowned and deployed")
+```
 
 ```{r}
 #| label: resolve-runs-roots
@@ -306,6 +333,7 @@ res_det <- orch_run_task(
   .runs_roots  = .dir_runs,                    # every tree that exists; the run schema is shared
   .label_col   = "ClassDetailed",               # task
   .tab_prep    = tab_prep,                      # prepared sample
+  .crowned     = bert_crown$ConfigName[bert_crown$LabelCol == "ClassDetailed"], # 03B's deployed config
   .extra_arms  = arm_hier,                      # the broad-constrained transformer
   .floors      = .lP$Param$Floors,              # score floors to cross in
   .max_depth   = .lP$Param$MaxDepth,            # longest cascade
@@ -345,6 +373,7 @@ res_broad <- orch_run_task(
   .runs_roots  = .dir_runs,                    # every tree that exists
   .label_col   = "ClassBroad",                  # task
   .tab_prep    = tab_prep,                      # prepared sample
+  .crowned     = bert_crown$ConfigName[bert_crown$LabelCol == "ClassBroad"], # 03B's deployed config
   .extra_arms  = arm_rollup,                    # the rolled-up detailed prediction
   .floors      = .lP$Param$Floors,              # unchanged
   .max_depth   = .lP$Param$MaxDepth,            # unchanged
@@ -382,6 +411,7 @@ res_amend <- orch_run_task(
   .runs_roots  = .dir_runs,                    # every tree that exists
   .label_col   = "AmendType",                   # task
   .tab_prep    = tab_prep,                      # prepared sample
+  .crowned     = bert_crown$ConfigName[bert_crown$LabelCol == "AmendType"], # 03B's deployed config
   .extra_arms  = NULL,                          # no hierarchy to exploit on a binary task
   .floors      = .lP$Param$Floors,              # unchanged
   .max_depth   = .lP$Param$MaxDepth,            # unchanged
@@ -882,34 +912,24 @@ is the same rule that keeps the run roots from drifting.
 
 ```{r}
 #| label: deploy-artifacts
-# Which lexicons 03C published, one per task. Stating the stems here rather than deriving them from
-# the task name is deliberate: 03C names these files and this stage reads them, and a convention
-# shared between two stages is one that will eventually be changed in one place and not the other.
-# A stem naming a file that is not there becomes a reported gap rather than a silent absence.
-.kw_stems <- c(
-  ClassDetailed = "keyword_table_detailed",
-  ClassBroad    = "keyword_table_broad",
-  AmendType     = "keyword_table_amendment"
-)
-
+# Discovered, not constructed. Every deployed model under the training stage's output and every
+# published table under the keyword stage's, joined to this task's arm inventory, with the variant
+# each stage crowned marked. Building a path from a configuration name and trusting it to exist is
+# what pinned a model nobody had fitted.
 tab_artifacts <- purrr::map(
   .x = list(res_det, res_broad, res_amend),
   .f = function(.r) {
     orch_artifacts(
-      .res      = .r,          # one task's arms and incumbent
-      .dir_bert = .dir_bert,   # 03B's output root
-      .dir_kw   = .dir_kw,     # 03C's output root
-      .dir_llm  = .dir_llm,    # 03D's output root
-      .kw_stems = .kw_stems    # which tasks have a published lexicon
+      .res          = .r,        # one task's arms and its deployed incumbent
+      .dir_bert     = .dir_bert, # 03B's output root
+      .dir_kw       = .dir_kw,   # 03C's output root
+      .kw_catalogue = kw_cat     # what 03C published and marked
     )
   }
 ) |>
   purrr::list_rbind()
 
-tab_artifacts |>
-  dplyr::mutate(Path = fs::path_rel(Path, here::here())) |>
-  dplyr::select(LabelCol, Arm, Kind, Path) |>
-  tbl_say(.title = "Artifacts to pin, per task")
+orch_report_catalogue(.tab = tab_artifacts)
 ```
 
 Each task crowned its own configuration, so each pins its own checkpoint. A single global arm list
