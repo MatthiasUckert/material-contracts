@@ -410,17 +410,30 @@ ent_resolve_places <- function(.con) {
 #' and places are. Two things are still worth carrying. The largest amount in a document is a
 #' heuristic a reading session argued for -- par value and per-share prices repeat many times while
 #' an aggregate principal amount appears once, and ranking by magnitude separates them almost
-#' perfectly. And the count of redaction markers is a variable in its own right, because the figures
-#' withheld are systematically the commercially material ones, which is why they were withheld.
+#' perfectly. And redaction is a variable in its own right, because the figures withheld are
+#' systematically the commercially material ones, which is why they were withheld.
 #'
 #' The amount is parsed from the span rather than trusted: a money span carrying no currency marker
 #' and no thousands separator is a section number, which is the largest false-positive family in the
 #' label.
 #'
+#' REDACTION IS COUNTED IN REGIONS, NOT MARKERS
+#' A redacted table contributes one marker per cell, so a marker count measures how tabular a
+#' contract is at least as much as how much was withheld. Measured on the sample: 84.8% of 60,547
+#' markers come from 106 documents, and a single contract carries 14,689 of them across 193
+#' regions. The median document has five markers and three regions. Runs of markers separated by
+#' less than .gap characters are therefore collapsed, and the count of regions is what leaves this
+#' function. NMarkers is kept beside it because the ratio is itself diagnostic -- a document at
+#' seventy markers per region is one redacted schedule, not seventy withheld terms.
+#'
 #' @param .con Session with roles built.
+#' @param .gap Integer. Markers closer than this belong to one redacted region.
 #' @return Tibble: one row per document with the money and redaction summaries.
-ent_resolve_value <- function(.con) {
-  if (FALSE) .con <- con
+ent_resolve_value <- function(.con, .gap = 200L) {
+  if (FALSE) {
+    .con <- con
+    .gap <- 200L
+  }
 
   # Digits only, after stripping the grouping separators; a span with neither a currency symbol nor
   # a separator is not an amount.
@@ -431,16 +444,25 @@ ent_resolve_value <- function(.con) {
     "WITH m AS ( ",
     "  SELECT DocID, ", num_, " AS Amount FROM roles ",
     "  WHERE Label = 'MONEY' AND (", cur_, " OR regexp_matches(Span, '[0-9],[0-9]{3}'))), ",
-    "r AS (SELECT DocID, COUNT(*) AS NRedact, ",
-    "        COUNT(DISTINCT LabelRaw) AS NRedactClasses FROM roles ",
-    "      WHERE Label = 'REDACT' GROUP BY DocID) ",
+    # Gaps and islands: a marker opens a new region when the run of blank space before it exceeds
+    # the gap, and the running sum of those openings numbers the regions within each document.
+    "o AS (SELECT DocID, Start, Stop, LabelRaw, ",
+    "        LAG(Stop) OVER (PARTITION BY DocID ORDER BY Start) AS PrevStop ",
+    "      FROM roles WHERE Label = 'REDACT'), ",
+    "f AS (SELECT *, CASE WHEN PrevStop IS NULL OR Start - PrevStop > ", as.integer(.gap),
+    "        THEN 1 ELSE 0 END AS NewRegion FROM o), ",
+    "g AS (SELECT *, SUM(NewRegion) OVER (PARTITION BY DocID ORDER BY Start ",
+    "        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS RegionID FROM f), ",
+    "r AS (SELECT DocID, COUNT(DISTINCT RegionID) AS NRedact, COUNT(*) AS NRedactMarkers, ",
+    "        COUNT(DISTINCT LabelRaw) AS NRedactClasses FROM g GROUP BY DocID) ",
     "SELECT COALESCE(m.DocID, r.DocID) AS DocID, ",
     "  COUNT(m.Amount) AS NAmounts, max(m.Amount) AS MaxAmount, ",
-    "  any_value(r.NRedact) AS NRedact, any_value(r.NRedactClasses) AS NRedactClasses ",
+    "  any_value(r.NRedact) AS NRedact, any_value(r.NRedactMarkers) AS NRedactMarkers, ",
+    "  any_value(r.NRedactClasses) AS NRedactClasses ",
     "FROM m FULL JOIN r ON m.DocID = r.DocID GROUP BY 1"
   )) |>
     tibble::as_tibble() |>
-    dplyr::mutate(dplyr::across(c(NAmounts, NRedact, NRedactClasses), as.integer))
+    dplyr::mutate(dplyr::across(c(NAmounts, NRedact, NRedactMarkers, NRedactClasses), as.integer))
 }
 
 
@@ -508,12 +530,21 @@ ent_report_resolve <- function(.n_deployed, .n_roles, .tab) {
     .tab = tibble::tibble(
       Item = c("Deployed spans", "Spans surviving stops", "Documents resolved",
                "Documents with >=2 parties", "Documents with a contract start",
-               "Documents with a contract end", "Documents with an amount"),
+               "Documents with a contract end", "Documents with an amount",
+               "Documents with a redaction", "Redacted regions", "Redaction markers"),
       N = c(.n_deployed, .n_roles, nrow(.tab),
             sum(.tab$NParties >= 2L, na.rm = TRUE),
             sum(!is.na(.tab$ContractStart)), sum(!is.na(.tab$ContractEnd)),
-            sum(!is.na(.tab$MaxAmount)))
+            sum(!is.na(.tab$MaxAmount)),
+            sum(dplyr::coalesce(.tab$NRedact, 0L) > 0L),
+            sum(.tab$NRedact, na.rm = TRUE),
+            sum(.tab$NRedactMarkers, na.rm = TRUE))
     )
+  )
+  cli::cli_alert_info(
+    "Redaction is counted in REGIONS. A redacted schedule contributes one marker per cell, so the \\
+     marker total is a statement about how tabular the corpus is: on this sample 85% of markers \\
+     come from 106 documents, and one contract carries 14,689 of them across 193 regions."
   )
   invisible(.tab)
 }

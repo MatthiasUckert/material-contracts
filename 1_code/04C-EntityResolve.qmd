@@ -135,9 +135,13 @@ systematically the commercially material ones.
   ),
   Params = list(
     CtxMax  = 400L,    # widest context materialised; caps the reach of any rule
-    HeadPos = 0.10     # an organisation this far into the document, with no cue, still reads as a
+    HeadPos = 0.10,    # an organisation this far into the document, with no cue, still reads as a
                        # party: the preamble is where parties are named and a cue list is never
                        # complete
+    # Redaction markers closer than this belong to one withheld thing. A redacted schedule puts a
+    # marker in every cell, and 85% of all markers on this sample come from 106 documents, so the
+    # count that means "how much was withheld" is regions rather than markers.
+    RedactGap = 200L
   )
 )
 
@@ -222,7 +226,7 @@ matters, because position in the preamble is itself evidence and the party resol
 tab_parties <- ent_resolve_parties(.con = con, .head_pos = .lP$Params$HeadPos)
 tab_dates   <- ent_resolve_dates(.con = con, .formats = .DATE_FORMATS)
 tab_places  <- ent_resolve_places(.con = con)
-tab_value   <- ent_resolve_value(.con = con)
+tab_value   <- ent_resolve_value(.con = con, .gap = .lP$Params$RedactGap)
 
 # The published measure has to come from the UNFILTERED store over full text. Taking it from the
 # deployed set leaves only preamble dates, every one of which precedes the filing, and the measure
@@ -317,6 +321,7 @@ tab_vars |>
     PctWithEnd   = mean(!is.na(.data$ContractEnd)),
     PctWithValue = mean(!is.na(.data$MaxAmount)),
     MedRedact    = stats::median(dplyr::coalesce(.data$NRedact, 0L)),
+    PctRedacted  = mean(dplyr::coalesce(.data$NRedact, 0L) > 0L),
     .by = Class
   ) |>
   dplyr::arrange(dplyr::desc(.data$NDocs)) |>

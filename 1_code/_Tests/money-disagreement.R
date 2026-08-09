@@ -92,7 +92,6 @@ DBI::dbGetQuery(con, paste0(
 )) |>
   tibble::as_tibble() |> print(n = 25)
 
-DBI::dbDisconnect(con, shutdown = TRUE)
 
 
 # Does the regex REACH a before_unit redaction, or merely sit near one? -------------------
@@ -131,3 +130,5 @@ DBI::dbGetQuery(con, paste0(
     PctOverlapping = NOverlapping / NSites
   ) |>
   print(n = 10)
+
+DBI::dbDisconnect(con, shutdown = TRUE)

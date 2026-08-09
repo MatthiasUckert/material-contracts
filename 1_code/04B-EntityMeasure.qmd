@@ -11,18 +11,18 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 knitr::opts_knit$set(root.dir = here::here())
 
 knitr::opts_chunk$set(
-  root.dir  = here::here(),
-  message   = TRUE,       # mandatory: cli writes through the message stream under knitr, so
-                          # message = FALSE would discard this document's entire output
-  warning   = FALSE,
-  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
-  fig.width = 7.5,        # fixed for every figure; only height varies, and only with row count
+  root.dir = here::here(),
+  message = TRUE, # mandatory: cli writes through the message stream under knitr, so
+  # message = FALSE would discard this document's entire output
+  warning = FALSE,
+  comment = "", # drops the "##" prefix, so console blocks copy verbatim
+  fig.width = 7.5, # fixed for every figure; only height varies, and only with row count
   fig.align = "center",
-  dpi       = 200,
+  dpi = 200,
   out.width = "100%"
 )
 
-options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+options(cli.num_colors = 1, cli.width = 120) # plain ASCII; ANSI codes paste as garbage
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -50,13 +50,13 @@ source(
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
   .dir_here    = here::here(), # project root
-  .name_script = .name_script  # this document's name; the output directory is derived from it
+  .name_script = .name_script # this document's name; the output directory is derived from it
 ))
 
 cat("Function File: ")
 (.path_fun <- init_create_script_fun(
   .dir_here    = here::here(), # project root
-  .name_script = .name_script  # resolves to 1_code/04B-EntityMeasure.R
+  .name_script = .name_script # resolves to 1_code/04B-EntityMeasure.R
 ))
 source(file = .path_fun, encoding = "UTF-8")
 ```
@@ -138,16 +138,18 @@ need either the redaction cross-check or hand labels.
 #| label: configure-paths
 # The bundle root, and the folder each reading session wrote to. Two sessions have run; the first
 # was moved aside before the second was built, so the names differ on disk.
-.DIR_COWORK  <- fs::path("/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts",
-                         "MatContractData")
-.FOLDER_RUN1 <- "EntitiesClaude_run1"   # <- the backup of the first session
-.FOLDER_RUN2 <- "EntitiesClaude"        # <- the second session
+.DIR_COWORK <- fs::path(
+  "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts",
+  "MatContractData"
+)
+.FOLDER_RUN1 <- "_EntitiesClaude" # <- the backup of the first session
+.FOLDER_RUN2 <- "EntitiesClaude" # <- the second session
 
 .lP <- list(
   Input = list(
-    Text    = "2_output/04A-EntityExtract/sample_text.parquet",
+    Text = "2_output/04A-EntityExtract/sample_text.parquet",
     Anchors = "2_output/04A-EntityExtract/sample_anchors.parquet",
-    Store   = "2_output/04A-EntityExtract/Store/EntityCandidates.duckdb",
+    Store = "2_output/04A-EntityExtract/Store/EntityCandidates.duckdb",
     # Written by 04B-CoWorkCompile.R from each reading session's responses. Both are scored:
     # the sessions read different documents, so their union covers more vocabulary than either,
     # and Source keeps the recurrence question answerable afterwards.
@@ -155,28 +157,28 @@ need either the redaction cross-check or hand labels.
     # SET .FOLDER_RUN1 BELOW to whatever the first bundle was renamed to. Getting it wrong is not
     # fatal and not silent -- ent_read_rules() reports the file as missing -- but the run scores
     # only the session it found, and the rules the other one validated never reach 04C.
-    Rules   = c(
+    Rules = c(
       run1 = fs::path(.DIR_COWORK, .FOLDER_RUN1, "compiled", "entity_rules.parquet"),
       run2 = fs::path(.DIR_COWORK, .FOLDER_RUN2, "compiled", "entity_rules.parquet")
     )
   ),
   Output = list(
-    Hits   = utils_file_path(.dir_main, "anchor_hits.parquet"),    # per-span anchor labels
-    Scores = utils_file_path(.dir_main, "rule_scores.parquet"),    # every rule, measured
-    Kept   = utils_file_path(.dir_main, "rules_kept.parquet"),     # the survivors, for 04D
-    Policy = utils_file_path(.dir_main, "extraction_policy.parquet")  # engine and cap, for 04E
+    Hits   = utils_file_path(.dir_main, "anchor_hits.parquet"), # per-span anchor labels
+    Scores = utils_file_path(.dir_main, "rule_scores.parquet"), # every rule, measured
+    Kept   = utils_file_path(.dir_main, "rules_kept.parquet"), # the survivors, for 04D
+    Policy = utils_file_path(.dir_main, "extraction_policy.parquet") # engine and cap, for 04E
   ),
   Params = list(
-    FoldHoldout    = 5L,     # the fold the reading session never saw
-    DateWindowDays = 730L,   # how far before its filing a contract may be dated
-    CtxMax         = 400L,   # widest context materialised; caps the window any rule may use
-    MinFire        = 30L,    # below this a rule is too rare to judge on precision
-    MinLift        = 1.2,    # kept rules must beat the base rate by at least this factor
-    RecallTol      = 0.10,   # recall points an engine may trail the best and still be considered
-    CostTol        = 0.15,   # relative cost gap treated as a tie between engines
+    FoldHoldout    = 5L, # the fold the reading session never saw
+    DateWindowDays = 730L, # how far before its filing a contract may be dated
+    CtxMax         = 400L, # widest context materialised; caps the window any rule may use
+    MinFire        = 30L, # below this a rule is too rare to judge on precision
+    MinLift        = 1.2, # kept rules must beat the base rate by at least this factor
+    RecallTol      = 0.10, # recall points an engine may trail the best and still be considered
+    CostTol        = 0.15, # relative cost gap treated as a tie between engines
     HeadChars      = c(1500L, 3000L, 5000L, 10000L, 20000L),
     TailChars      = c(0L, 2000L, 5000L),
-    CapChars       = 3000L   # retained for reference; the artifact takes its window from .WINDOW
+    CapChars       = 3000L # retained for reference; the artifact takes its window from .WINDOW
   )
 )
 
@@ -186,11 +188,11 @@ need either the redaction cross-check or hand labels.
 # Month-first precedes day-first, so an ambiguous slash date reads as US convention -- correct for
 # an SEC filing -- while an unambiguous day-first date such as 26/8/2013 still resolves.
 .DATE_FORMATS <- c(
-  "%B %d, %Y", "%B %d %Y",               # January 5, 2019
-  "%b %d, %Y", "%b %d %Y",               # Jan 5, 2019
-  "%d %B, %Y", "%d %B %Y",               # 5 August 2005
-  "%d %b, %Y", "%d %b %Y",               # 5 Oct 2015
-  "%m/%d/%Y",  "%d/%m/%Y",               # 8/26/2013, then unambiguous day-first
+  "%B %d, %Y", "%B %d %Y", # January 5, 2019
+  "%b %d, %Y", "%b %d %Y", # Jan 5, 2019
+  "%d %B, %Y", "%d %B %Y", # 5 August 2005
+  "%d %b, %Y", "%d %b %Y", # 5 Oct 2015
+  "%m/%d/%Y",  "%d/%m/%Y", # 8/26/2013, then unambiguous day-first
   "%Y-%m-%d",  "%m-%d-%Y", "%Y/%m/%d",
   "%d-%b-%Y",  "%m.%d.%Y"
 )
@@ -214,14 +216,14 @@ need either the redaction cross-check or hand labels.
 .ALIGNED <- tibble::tribble(
   ~Label,  ~Role,           ~Direction,
   "ORG",   "party",         "high",
-  "ORG",   "agent",         "low",      # the filer is not its own administrative agent
-  "ORG",   "regulator",     "low",      # the SEC is never a party to the contract it receives
-  "ORG",   "third_party",   "low",      # counsel, accountants, brokers
+  "ORG",   "agent",         "low", # the filer is not its own administrative agent
+  "ORG",   "regulator",     "low", # the SEC is never a party to the contract it receives
+  "ORG",   "third_party",   "low", # counsel, accountants, brokers
   "DATE",  "signing",       "high",
   "DATE",  "effective",     "high",
   "DATE",  "term_start",    "high",
-  "DATE",  "statutory",     "low",      # "Act of 1933" is never the contract's own date
-  "DATE",  "expiry",        "low",      # expiry follows the filing; the anchor precedes it
+  "DATE",  "statutory",     "low", # "Act of 1933" is never the contract's own date
+  "DATE",  "expiry",        "low", # expiry follows the filing; the anchor precedes it
   "GPE",   "party_address", "high",
   "GPE",   "performance",   "low",
   "GPE",   "incidental",    "low"
@@ -242,11 +244,11 @@ need either the redaction cross-check or hand labels.
 # reported as unmeasured rather than scored against a signal that cannot see them.
 .REDACT_SHAPE <- tibble::tribble(
   ~Role,                ~Shape,
-  "royalty_rate",       "ShapeRate",     # a percent sign survived the gap
-  "aggregate_amount",   "ShapeValue",    # a currency symbol did
+  "royalty_rate",       "ShapeRate", # a percent sign survived the gap
+  "aggregate_amount",   "ShapeValue", # a currency symbol did
   "milestone_payment",  "ShapeValue",
-  "unit_price",         "ShapeUnit",     # "per share", "per barrel"
-  "term_length",        "ShapePeriod"    # "days", "months"
+  "unit_price",         "ShapeUnit", # "per share", "per barrel"
+  "term_length",        "ShapePeriod" # "days", "months"
 )
 
 # Engines for the labels the anchor cannot rank. Money has no external record of a contract's value
@@ -263,12 +265,12 @@ need either the redaction cross-check or hand labels.
 # of 4,398 documents. The tail here is a declared correction to a measurement that could not see
 # the quantity it was being used to choose.
 .WINDOW <- tibble::tribble(
-  ~Label,   ~CapChars, ~TailChars, ~WindowBasis,
-  "ORG",        3000L,         0L, "measured: 91.7% document recall, 4.8% of characters",
-  "DATE",       3000L,      5000L, "declared: the anchor is a start date and cannot see expiry",
-  "GPE",        3000L,      5000L, "measured: 80.2% against 53.7% for a prefix of the same size",
-  "MONEY",      3000L,      5000L, "declared: no anchor",
-  "REDACT",     3000L,      5000L, "declared: no anchor"
+  ~Label, ~CapChars, ~TailChars, ~WindowBasis,
+  "ORG", 3000L, 0L, "measured: 91.7% document recall, 4.8% of characters",
+  "DATE", 3000L, 5000L, "declared: the anchor is a start date and cannot see expiry",
+  "GPE", 100000000L, 0L, "full text: extraction is cheap and the window is not measurable",
+  "MONEY", 100000000L, 0L, "full text: same",
+  "REDACT", 100000000L, 0L, "full text: a cap drops 86% of markers"
 )
 
 fs::file_exists(c(.lP$Input$Text, .lP$Input$Anchors, .lP$Input$Store, .lP$Input$Rules))
@@ -289,15 +291,15 @@ occurrences -- are brought into R, parsed once, and the verdict joined back.
 tab_keys <- ent_anchor_keys(.path_anchors = .lP$Input$Anchors)
 
 con <- ent_session(
-  .db_path = .lP$Input$Store,   # attached read-only; nothing here can write to 04A's artifact
-  .keys    = tab_keys           # registered so the anchor tests can join on it
+  .db_path = .lP$Input$Store, # attached read-only; nothing here can write to 04A's artifact
+  .keys    = tab_keys # registered so the anchor tests can join on it
 )
 
 ent_write_anchor_hits(
   .con         = con,
-  .path_out    = .lP$Output$Hits,             # read by every section below, and by 04D
-  .window_days = .lP$Params$DateWindowDays,   # a contract dated earlier than this is not its own
-  .formats     = .DATE_FORMATS                # parsed in the database, not in R; see above
+  .path_out    = .lP$Output$Hits, # read by every section below, and by 04D
+  .window_days = .lP$Params$DateWindowDays, # a contract dated earlier than this is not its own
+  .formats     = .DATE_FORMATS # parsed in the database, not in R; see above
 )
 
 tab_cov <- ent_anchor_coverage(.con = con)
@@ -349,16 +351,16 @@ clf_say_table(
 
 tab_scores <- ent_rule_scores(
   .con       = con,
-  .path_text = .lP$Input$Text,        # supplies the context either side of each span
-  .rules     = tab_rules,             # cues and stops; sections and notes are not machine-applied
+  .path_text = .lP$Input$Text, # supplies the context either side of each span
+  .rules     = tab_rules, # cues and stops; sections and notes are not machine-applied
   .fold      = .lP$Params$FoldHoldout,
-  .ctx_max   = .lP$Params$CtxMax      # widest context held, so no rule can reach further
+  .ctx_max   = .lP$Params$CtxMax # widest context held, so no rule can reach further
 )
 
 tab_rules_scored <- ent_rule_verdict(
   .tab      = tab_scores,
-  .aligned  = .ALIGNED,               # which roles the anchor can speak to
-  .min_fire = .lP$Params$MinFire      # below this, precision is noise
+  .aligned  = .ALIGNED, # which roles the anchor can speak to
+  .min_fire = .lP$Params$MinFire # below this, precision is noise
 )
 
 ent_report_rules(.tab = tab_rules_scored, .n = 10L)
@@ -390,8 +392,8 @@ form shares none.
 ```{r}
 #| label: check-redaction
 tab_redact <- ent_redaction_check(
-  .con   = con,           # reuses the context table built for rule scoring
-  .rules = tab_rules      # only the MONEY cues carrying the redacted role
+  .con   = con, # reuses the context table built for rule scoring
+  .rules = tab_rules # only the MONEY cues carrying the redacted role
 )
 
 ent_report_redaction(.tab = tab_redact)
@@ -401,8 +403,8 @@ ent_report_redaction(.tab = tab_redact)
 #| label: check-redaction-shape
 tab_shape <- ent_redaction_shape(
   .con       = con,
-  .rules     = tab_rules,        # the redaction cues, whatever session proposed them
-  .shape_map = .REDACT_SHAPE     # which roles the surviving punctuation can speak to
+  .rules     = tab_rules, # the redaction cues, whatever session proposed them
+  .shape_map = .REDACT_SHAPE # which roles the surviving punctuation can speak to
 )
 
 ent_report_redaction_shape(.tab = tab_shape)
@@ -431,7 +433,7 @@ ent_redaction_sites(.con = con, .path_text = .lP$Input$Text)
 
 tab_reach <- ent_redaction_reach(
   .con  = con,
-  .near = 3L      # a span touching the marker or its currency symbol counts as reaching it
+  .near = 3L # a span touching the marker or its currency symbol counts as reaching it
 )
 
 ent_report_redaction_reach(.tab = tab_reach)
@@ -463,8 +465,8 @@ That distinction decides the shape of the corpus pass, so it is measured rather 
 tab_window <- ent_window_grid(
   .con       = con,
   .path_text = .lP$Input$Text,
-  .head      = c(0.02, 0.05, 0.10, 0.20),   # fraction of the document read from the front
-  .tail      = c(0, 0.05, 0.10, 0.20)       # and from the back; 0 is the prefix window 04A costed
+  .head      = c(0.02, 0.05, 0.10, 0.20), # fraction of the document read from the front
+  .tail      = c(0, 0.05, 0.10, 0.20) # and from the back; 0 is the prefix window 04A costed
 )
 
 ent_report_window(.tab = tab_window)
@@ -494,9 +496,9 @@ least one mention survives is the quantity a cap should be chosen on, and the tw
 tab_wchar <- ent_window_chars(
   .con       = con,
   .path_text = .lP$Input$Text,
-  .head      = .lP$Params$HeadChars,   # character budgets from the front
-  .tail      = .lP$Params$TailChars,   # and from the back; 0 is the plain prefix window
-  .policy    = NULL                    # every engine pooled, which is the optimistic reading
+  .head      = .lP$Params$HeadChars, # character budgets from the front
+  .tail      = .lP$Params$TailChars, # and from the back; 0 is the plain prefix window
+  .policy    = NULL # every engine pooled, which is the optimistic reading
 )
 
 ent_report_window_chars(.tab = tab_wchar)
@@ -525,7 +527,7 @@ difference.
 #| label: choose-engines
 tab_policy <- ent_choose_engines(
   .tab        = tab_eng,
-  .defaults   = .DEFAULT_ENGINE,       # labels the anchor cannot rank still need an engine
+  .defaults   = .DEFAULT_ENGINE, # labels the anchor cannot rank still need an engine
   .recall_tol = .lP$Params$RecallTol,
   .cost_tol   = .lP$Params$CostTol
 ) |>
@@ -546,7 +548,7 @@ tab_wdeploy <- ent_window_chars(
   .path_text = .lP$Input$Text,
   .head      = .lP$Params$HeadChars,
   .tail      = .lP$Params$TailChars,
-  .policy    = dplyr::select(tab_policy, Label, Combo)   # one engine per label
+  .policy    = dplyr::select(tab_policy, Label, Combo) # one engine per label
 )
 
 ent_report_window_chars(.tab = tab_wdeploy)
@@ -573,7 +575,7 @@ mattered, which was never "what headings exist" but "does this heading appear, a
 #| label: probe-sections
 tab_sections <- ent_probe_sections(
   .path_text = .lP$Input$Text,
-  .headings  = .HEADINGS      # conventional Exhibit-10 furniture plus the session's four proposals
+  .headings  = .HEADINGS # conventional Exhibit-10 furniture plus the session's four proposals
 )
 
 ent_report_sections(.tab = tab_sections)
@@ -590,17 +592,19 @@ Two checks on the anchor itself, because everything above rests on it.
 ```{r}
 #| label: validate-anchor
 tibble::tibble(
-  Check = c("Documents with a company key",
-            "Documents with an address",
-            "Documents with a filing date",
-            "Company keys under 5 characters (dropped)",
-            "Date-anchored spans that post-date the filing"),
+  Check = c(
+    "Documents with a company key",
+    "Documents with an address",
+    "Documents with a filing date",
+    "Company keys under 5 characters (dropped)",
+    "Date-anchored spans that post-date the filing"
+  ),
   N = c(
     sum(!is.na(tab_keys$AnchorKey)),
     sum(!is.na(tab_keys$AnchorText)),
     sum(!is.na(tab_keys$DateFiled)),
     sum(is.na(tab_keys$AnchorKey) & !is.na(tab_keys$Class)),
-    0L   # excluded by construction in ent_write_anchor_hits(); reported so the claim is visible
+    0L # excluded by construction in ent_write_anchor_hits(); reported so the claim is visible
   )
 ) |>
   clf_say_table(.title = "Anchor construction")
@@ -628,8 +632,10 @@ these numbers as if they were ordinary precision would dismiss every useful rule
 #| label: inspect-unmeasured
 tab_rules_scored |>
   dplyr::count(.data$Label, .data$Measurable, name = "N") |>
-  tidyr::pivot_wider(names_from = Measurable, values_from = N, values_fill = 0L,
-                     names_prefix = "Measurable_") |>
+  tidyr::pivot_wider(
+    names_from = Measurable, values_from = N, values_fill = 0L,
+    names_prefix = "Measurable_"
+  ) |>
   clf_say_table(.title = "Rules the anchor can and cannot judge")
 ```
 
@@ -640,8 +646,10 @@ address roles EDGAR never recorded -- agents, guarantors, regulators, governing 
 ```{r}
 #| label: inspect-anchor-sensitivity
 purrr::map(c(365L, 730L, 1095L), function(.w) {
-  ent_write_anchor_hits(.con = con, .path_out = NULL, .window_days = .w,
-                        .formats = .DATE_FORMATS)   # session only
+  ent_write_anchor_hits(
+    .con = con, .path_out = NULL, .window_days = .w,
+    .formats = .DATE_FORMATS
+  ) # session only
   ent_anchor_coverage(.con = con) |>
     dplyr::filter(.data$Label == "DATE") |>
     dplyr::transmute(WindowDays = .w, DocsMatched, PctMatched, BaseRate)
@@ -660,7 +668,7 @@ as conditional on it.
 #| label: restore-anchor-hits
 ent_write_anchor_hits(
   .con         = con,
-  .path_out    = NULL,                        # the file on disk was never touched by the loop
+  .path_out    = NULL, # the file on disk was never touched by the loop
   .window_days = .lP$Params$DateWindowDays,
   .formats     = .DATE_FORMATS
 )
@@ -678,12 +686,16 @@ arrow::write_parquet(tab_rules_scored, .lP$Output$Scores)
 
 tab_kept <- tab_rules_scored |>
   dplyr::filter(
-    .data$Verdict %in% c("strong", "useful", "safe", "consistent: avoids the anchor",
-                         "role misassigned: fires on anchor") |
+    .data$Verdict %in% c(
+      "strong", "useful", "safe", "consistent: avoids the anchor",
+      "role misassigned: fires on anchor"
+    ) |
       (stringr::str_starts(.data$Verdict, "unmeasured") & .data$NFire >= .lP$Params$MinFire)
   ) |>
-  dplyr::select(Kind, Label, Role, SuggestedRole, Pattern, Side, Window, NFire, Precision, Recall,
-                Lift, Direction, Measurable, Verdict)
+  dplyr::select(
+    Kind, Label, Role, SuggestedRole, Pattern, Side, Window, NFire, Precision, Recall,
+    Lift, Direction, Measurable, Verdict
+  )
 
 arrow::write_parquet(tab_kept, .lP$Output$Kept)
 
@@ -693,18 +705,24 @@ arrow::write_parquet(tab_kept, .lP$Output$Kept)
 tab_policy_out <- tab_policy |>
   dplyr::left_join(
     tab_wdeploy |>
-      dplyr::select(Label, Head, Tail, DocRecallAtCap = DocRecall,
-                    SpansKeptAtCap = SpansKept, CharsKeptAtCap = CharsKept),
+      dplyr::select(Label, Head, Tail,
+        DocRecallAtCap = DocRecall,
+        SpansKeptAtCap = SpansKept, CharsKeptAtCap = CharsKept
+      ),
     by = dplyr::join_by(Label, CapChars == Head, TailChars == Tail)
   )
 
 arrow::write_parquet(tab_policy_out, .lP$Output$Policy)
 clf_say_table(
   .tab = tab_policy_out |>
-    dplyr::mutate(dplyr::across(c(Recall, DocRecallAtCap, SpansKeptAtCap, CharsKeptAtCap),
-                                \(.x) clf_pct(.x))) |>
-    dplyr::select(Label, Combo, Basis, CapChars, TailChars, Recall, DocRecallAtCap,
-                  SpansKeptAtCap, CharsKeptAtCap),
+    dplyr::mutate(dplyr::across(
+      c(Recall, DocRecallAtCap, SpansKeptAtCap, CharsKeptAtCap),
+      \(.x) clf_pct(.x)
+    )) |>
+    dplyr::select(
+      Label, Combo, Basis, CapChars, TailChars, Recall, DocRecallAtCap,
+      SpansKeptAtCap, CharsKeptAtCap
+    ),
   .title = "Extraction policy for 04E"
 )
 
@@ -765,16 +783,20 @@ same height as one on the left is paying an order of magnitude in adjudication c
 #| fig-cap: "Share of known entities kept against share of all candidates kept, by window shape."
 tab_window |>
   dplyr::filter(.data$Label != "MONEY") |>
-  ggplot2::ggplot(ggplot2::aes(x = SpansKept, y = AnchorKept,
-                               colour = factor(Tail), group = factor(Tail))) +
+  ggplot2::ggplot(ggplot2::aes(
+    x = SpansKept, y = AnchorKept,
+    colour = factor(Tail), group = factor(Tail)
+  )) +
   ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey60") +
   ggplot2::geom_line() +
   ggplot2::geom_point(size = 1.6) +
   ggplot2::scale_x_continuous(labels = scales::percent) +
   ggplot2::scale_y_continuous(labels = scales::percent) +
   ggplot2::facet_wrap(~Label, nrow = 1) +
-  ggplot2::labs(x = "Share of all candidates kept", y = "Share of known entities kept",
-                colour = "Tail") +
+  ggplot2::labs(
+    x = "Share of all candidates kept", y = "Share of known entities kept",
+    colour = "Tail"
+  ) +
   ggplot2::theme_bw(base_size = 9)
 ```
 
