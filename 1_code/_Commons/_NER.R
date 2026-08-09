@@ -440,6 +440,85 @@ ner_redaction <- function(
   return(invisible(.output))
 }
 
+# Run extract_moneyregex.py over parquet input(s); returns the output path. A rule arm for the one
+# label that never had a measured engine (Engine = "paper", Model = "moneyregex-v1", Label =
+# "MONEY", LabelRaw = the form matched: symbol_amount / symbol_redact / symbol_bare / euro_letter /
+# amount_word / words_only). Money is the only reason a transformer sits in the deployed policy, and
+# the resolver already filters that transformer's spans to those carrying a currency marker -- so a
+# pattern was doing the discriminating either way. If .output exists it is skipped (cheap guard; the
+# real skip logic is the DuckDB ledger) unless .overwrite = TRUE.
+ner_moneyregex <- function(
+    .inputs,
+    .output,
+    .id_col = "DocID",
+    .text_col = "TextRaw",
+    .labels = "MONEY", # full supported set
+    .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
+    .timeout = 0L, # per-document cap in seconds; 0 = off
+    .n_process = 16L,
+    .chunk_size = 64L,
+    .overwrite = FALSE,
+    .no_progress = FALSE,
+    .engine_dir = here::here("contracts-engine"),
+    .quiet = FALSE
+) {
+  if (FALSE) {
+    .inputs <- fil_sample_dirs$Path[20]
+    .output <- file.path(.lP$Cache$NerTest, "test_moneyregex.parquet")
+    .id_col <- "DocID"
+    .text_col <- "TextRaw"
+    .labels <- "MONEY"
+    .max_chars <- NULL
+    .timeout <- 0L
+    .n_process <- 16L
+    .chunk_size <- 64L
+    .overwrite <- FALSE
+    .no_progress <- FALSE
+    .engine_dir <- here::here("contracts-engine")
+    .quiet <- FALSE
+  }
+  
+  if (fs::file_exists(.output)) {
+    if (isTRUE(.overwrite)) {
+      fs::file_delete(.output)
+    } else {
+      if (!.quiet) cli::cli_alert_info("Output exists, skipping: {.path {(.output)}}")
+      return(invisible(.output))
+    }
+  }
+  
+  t0_ <- Sys.time()
+  
+  python_ <- fs::path(.engine_dir, ".venv", "bin", "python")
+  script_ <- fs::path(.engine_dir, "extract_moneyregex.py")
+  if (!fs::file_exists(python_)) cli::cli_abort("No engine venv at {.path {python_}}.")
+  if (!fs::file_exists(script_)) cli::cli_abort("Missing {.path {script_}}.")
+  fs::dir_create(fs::path_dir(.output))
+  
+  args_ <- c(
+    script_, fs::path_abs(.inputs),
+    "--output", .output,
+    "--id-col", .id_col,
+    "--text-col", .text_col,
+    "--label", .labels,
+    "--n-process", as.integer(.n_process),
+    "--chunk-size", as.integer(.chunk_size),
+    "--timeout", as.integer(.timeout)
+  )
+  if (!is.null(.max_chars)) args_ <- c(args_, "--max-chars", as.integer(.max_chars))
+  if (isTRUE(.no_progress)) args_ <- c(args_, "--no-progress")
+  
+  status_ <- system2(python_, args_,
+                     stdout = if (.quiet) FALSE else "",
+                     stderr = if (.quiet) FALSE else ""
+  )
+  if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_moneyregex.py failed (status {status_}).")
+  
+  elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
+  if (!.quiet) cli::cli_alert_success("moneyregex [moneyregex-v1] done in {elapsed_}s -> {.path {(.output)}}")
+  return(invisible(.output))
+}
+
 # Unified NER orchestrator: runs the requested engine x model combos over the
 # input parquet(s) and folds everything into the DuckDB store. Per combo: ask the
 # ledger what's missing (skip if nothing) -> slice the missing docs by
@@ -452,6 +531,7 @@ ner_redaction <- function(
 #   "paper:dateregex-v1"   -- paper date regexes (Engine "paper", Label DATE)
 #   "paper:gazetteer-v1"   -- paper place gazetteer (Engine "paper", Label GPE)
 #   "paper:redaction-v1"   -- paper redaction indicators (Engine "paper", Label REDACT)
+#   "paper:moneyregex-v1"  -- paper monetary patterns (Engine "paper", Label MONEY)
 # The "paper" engine groups the paper's own ported extractors (provenance axis
 # for the head-to-head: paper vs spacy vs lexnlp), separated by Model. The token
 # is the combo's identity everywhere: ner_arg keys, staging names, runs ledger.
@@ -523,7 +603,8 @@ ner_run <- function(
     "lexnlp"             = c("ORG", "DATE", "MONEY"),
     "paper:dateregex-v1" = "DATE",
     "paper:gazetteer-v1" = "GPE",
-    "paper:redaction-v1" = "REDACT"
+    "paper:redaction-v1" = "REDACT",
+    "paper:moneyregex-v1" = "MONEY"
   )
   
   # Parse .run tokens ("engine" or "engine:model") into the combo grid. Model =
@@ -545,11 +626,11 @@ ner_run <- function(
       tibble::tibble(Engine = "lexnlp", Model = "lexnlp", ModelArg = "lexnlp")
     } else { # paper
       if (length(parts_) < 2L) {
-        cli::cli_abort("paper needs a model: {.val {(.tok)}} -> one of dateregex-v1|gazetteer-v1|redaction-v1")
+        cli::cli_abort("paper needs a model: {.val {(.tok)}} -> one of dateregex-v1|gazetteer-v1|redaction-v1|moneyregex-v1")
       }
       model_ <- parts_[2]
-      if (!model_ %in% c("dateregex-v1", "gazetteer-v1", "redaction-v1")) {
-        cli::cli_abort("Unknown paper model {.val {model_}}; expected dateregex-v1|gazetteer-v1|redaction-v1.")
+      if (!model_ %in% c("dateregex-v1", "gazetteer-v1", "redaction-v1", "moneyregex-v1")) {
+        cli::cli_abort("Unknown paper model {.val {model_}}; expected dateregex-v1|gazetteer-v1|redaction-v1|moneyregex-v1.")
       }
       tibble::tibble(Engine = "paper", Model = model_, ModelArg = model_)
     }
@@ -644,6 +725,13 @@ ner_run <- function(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,
           .labels = labels_, .max_chars = .max_chars, .quiet = .quiet
+        )
+      } else if (engine_ == "paper" && model_ == "moneyregex-v1") {
+        ner_moneyregex(
+          .inputs = input_, .output = stage_,
+          .id_col = .id_col, .text_col = .text_col,
+          .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
+          .n_process = n_process_, .chunk_size = batch_, .quiet = .quiet
         )
       } else if (engine_ == "paper" && model_ == "redaction-v1") {
         ner_redaction(

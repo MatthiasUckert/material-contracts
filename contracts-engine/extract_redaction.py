@@ -83,10 +83,32 @@ RX_BARE = re.compile(r"(?<![*\w])\*{3,}(?![*\w])")
 BULLETS = "\u25cf\u2022\u2026\u00b7\u2219\u0095\u0097\u0086\u2010\u2043"
 RX_BULLETS_ONLY = re.compile(r"^[" + re.escape(BULLETS) + r"\s]+$")
 
-RX_CONF = re.compile(r"CONFIDENTIAL|REDACT|CTR")
+RX_CONF = re.compile(r"CONFIDENTIAL|REDACT|\bCTR\b")
 RX_OMIT = re.compile(r"INTENTIONALLY|OMITTED|DELETE")
 RX_STARS_ONLY = re.compile(r"^[*\s]+$")
 RX_DOTS = re.compile(r"\.{3}")
+
+# Page filler. "[Remainder of page intentionally left blank]" sits immediately before the
+# execution clause of a great many contracts and conceals nothing whatever, but it carries
+# the word INTENTIONALLY and so classified as an omission. A reading session put it at
+# roughly one marker in six, which is the margin by which a redaction count built this way
+# overstates itself. Tested before the omission branch, and separated from a genuine
+# "[INTENTIONALLY OMITTED]" by LEFTBLANK rather than by the shared word.
+RX_FILLER = re.compile(r"LEFT\s*BLANK|PAGE\s*FOLLOWS|SIGNATURE\s*PAGE")
+
+# A filing's opening legend explains the convention by quoting the marker: "...such excluded
+# information is indicated by [***]". That occurrence describes a marker rather than standing
+# where content was removed, so it is a false site. Recognised by the verb immediately to its
+# left rather than by anything about the bracket itself.
+RX_LEGEND = re.compile(r"(INDICATED|DENOTED|MARKED|REPRESENTED|REPLACED|SHOWN)\s+BY\s*$",
+                       re.IGNORECASE)
+LEGEND_LOOKBACK = 80
+
+# A rule of asterisks drawn as a border above a notary seal, or as the underline beneath a
+# signature line, occupies its whole line. A redaction never does: it stands inside a
+# sentence. The test is the line, not the length, because a genuine "[*****]" is legitimate
+# and a five-asterisk divider is not.
+RX_LINE_RULE = re.compile(r"^[*\s_-]+$")
 
 _TIMEOUT = 0
 
@@ -141,9 +163,15 @@ def classify(span):
     whitespace removed -- so that "[ * * * ]" and "[***]" reach the same verdict while the
     offsets continue to index the untouched original.
     """
-    norm = re.sub(r"\s+", "", span).upper()
+    # Whitespace is COLLAPSED, not removed. Removing it destroys word boundaries, and the
+    # abbreviation CTR then matches inside eleCTRonically -- so "[electronically]", an
+    # ordinary bracketed word, classifies as a confidential-treatment marker. The published
+    # version strips whitespace and tests the same three strings, so it carries this too.
+    norm = re.sub(r"\s+", " ", span).upper().strip()
     inner = norm[1:-1] if len(norm) >= 2 else ""
     if not inner:
+        return None
+    if RX_FILLER.search(inner):
         return None
     if RX_CONF.search(inner):
         return "RedactExplicit"
@@ -156,25 +184,55 @@ def classify(span):
     return None
 
 
+def is_legend(text, start):
+    """True when the marker is being described rather than standing in for removed content."""
+    left = text[max(0, start - LEGEND_LOOKBACK):start]
+    return RX_LEGEND.search(left.rstrip()) is not None
+
+
+def is_line_rule(text, start, stop):
+    """True when the match occupies its entire line, i.e. is a drawn rule rather than a gap."""
+    a = text.rfind("\n", 0, start) + 1
+    b = text.find("\n", stop)
+    line = text[a:(b if b >= 0 else len(text))]
+    return RX_LINE_RULE.match(line) is not None
+
+
 def find_indicators(text):
     """Every redaction indicator in one text, as (start, stop, span, class).
 
     Brackets are taken first and their spans recorded, so a bare asterisk run sitting
     inside one is not emitted twice under two different classes.
+
+    Three exclusions, each from a reading session's account of what the earlier version
+    was picking up: page filler, which conceals nothing; a marker quoted in a filing's
+    opening legend, which describes the convention rather than marking a gap; and a rule
+    of asterisks drawn as a border, which is typography. Counts of what each removed are
+    returned alongside, because an exclusion nobody can see is indistinguishable from a
+    pattern that never matched.
     """
     out = []
     covered = []
+    dropped = {"filler_or_other": 0, "legend": 0, "line_rule": 0}
     for m in RX_BRACKET.finditer(text):
-        klass = classify(m.group(0))
         covered.append((m.start(), m.end()))
-        if klass is not None:
-            out.append((m.start(), m.end(), m.group(0), klass))
+        klass = classify(m.group(0))
+        if klass is None:
+            dropped["filler_or_other"] += 1
+            continue
+        if klass == "RedactSymbol" and is_legend(text, m.start()):
+            dropped["legend"] += 1
+            continue
+        out.append((m.start(), m.end(), m.group(0), klass))
     for m in RX_BARE.finditer(text):
         if any(a <= m.start() and m.end() <= b for a, b in covered):
             continue
+        if is_line_rule(text, m.start(), m.end()):
+            dropped["line_rule"] += 1
+            continue
         out.append((m.start(), m.end(), m.group(0), "RedactBare"))
     out.sort(key=lambda r: r[0])
-    return out
+    return out, dropped
 
 
 def extract_one(args):
@@ -188,7 +246,7 @@ def extract_one(args):
             if _TIMEOUT > 0:
                 signal.alarm(_TIMEOUT)
             try:
-                hits = find_indicators(text)
+                hits, _ = find_indicators(text)
             finally:
                 if _TIMEOUT > 0:
                     signal.alarm(0)

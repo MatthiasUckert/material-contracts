@@ -136,7 +136,8 @@ having, since writing that documentation is the main human cost of adopting this
   ),
   Engine = list(
     Host    = "http://localhost:11434", # local Ollama
-    NumCtx  = 8192L,                    # a header excerpt plus a short instruction fits easily
+    CtxMin  = 8192L,                    # floor: free on this hardware, and keeps caches valid
+    CtxMax  = 32768L,                   # ceiling: above this a configuration is refused, not trimmed
     Timeout = 600                       # a 32b model on a long excerpt can take minutes
   ),
   Param = list(
@@ -338,7 +339,7 @@ llm_report_cost(
   .limit       = .lP$Param$Limit,     # project what will actually run, not the whole corpus
   .seed        = 42L,                 # same documents on every render
   .host        = .lP$Engine$Host,     # local Ollama
-  .num_ctx     = .lP$Engine$NumCtx,   # context window
+  .num_ctx     = NULL,                # derived from the longest prompt, not fixed
   .timeout     = .lP$Engine$Timeout   # per-request ceiling
 )
 ```
@@ -366,7 +367,9 @@ llm_sweep(
   .seed          = 42L,                    # fixes which documents a preview draws
   .overwrite     = FALSE,                  # FALSE skips work already present on disk
   .host          = .lP$Engine$Host,
-  .num_ctx       = .lP$Engine$NumCtx,
+  .num_ctx       = NULL,                   # derived per configuration
+  .ctx_min       = .lP$Engine$CtxMin,       # floor
+  .ctx_max       = .lP$Engine$CtxMax,       # ceiling
   .timeout       = .lP$Engine$Timeout
 )
 ```
@@ -409,6 +412,24 @@ grid_cross |>
 ```
 
 ```{r}
+#| label: budget-crossfold
+llm_report_budget(
+  .grid       = grid_cross,        # what would be run
+  .tab_prep   = tab_prep,          # supplies the worked examples
+  .task_lines = .lP$TaskLines,     # the instruction per task
+  .ctx_min    = .lP$Engine$CtxMin, # floor
+  .ctx_max    = .lP$Engine$CtxMax  # ceiling
+)
+```
+
+Worked examples dominate this budget: twelve categories at four examples each is forty-eight
+excerpts against one document. The window is therefore derived per configuration rather than fixed,
+because one number cannot be right for zero shots and for four. Below what a prompt needs the server
+does not error -- it trims the FRONT of the prompt, removing the instruction and the category list,
+and the model answers from a contract with no task. Under a JSON enum that still returns a valid
+category name.
+
+```{r}
 #| label: sweep-crossfold
 llm_sweep(
   .grid          = grid_cross,             # configurations to run
@@ -424,7 +445,9 @@ llm_sweep(
   .seed          = 42L,                    # fixes which examples each fold draws
   .overwrite     = FALSE,                  # FALSE skips work already present on disk
   .host          = .lP$Engine$Host,
-  .num_ctx       = .lP$Engine$NumCtx,
+  .num_ctx       = NULL,                   # derived per configuration
+  .ctx_min       = .lP$Engine$CtxMin,       # floor
+  .ctx_max       = .lP$Engine$CtxMax,       # ceiling
   .timeout       = .lP$Engine$Timeout
 )
 ```
@@ -582,7 +605,9 @@ llm_sweep(
   .seed          = 42L,                    # same documents as the blind preview
   .overwrite     = FALSE,                  # FALSE skips work already present on disk
   .host          = .lP$Engine$Host,
-  .num_ctx       = .lP$Engine$NumCtx,
+  .num_ctx       = NULL,                   # derived per configuration
+  .ctx_min       = .lP$Engine$CtxMin,       # floor
+  .ctx_max       = .lP$Engine$CtxMax,       # ceiling
   .timeout       = .lP$Engine$Timeout
 )
 ```

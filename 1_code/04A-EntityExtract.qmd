@@ -254,12 +254,12 @@ ent_write_anchors(
 
 ## The engine set
 
-Eight combinations run. Each carries its own throughput settings, because the constraints differ in
+Nine combinations run. Each carries its own throughput settings, because the constraints differ in
 kind rather than degree: the CNN spaCy models parallelise across CPU processes, the transformer
 occupies one device and cannot be shared across processes, LexNLP runs in a container and its date
-grammar stalls pathologically on a small number of documents, and the three ported paper extractors
-are pattern matching, dictionary lookup and bracket matching, with nothing to tune beyond their
-worker count.
+grammar stalls pathologically on a small number of documents, and the four ported paper extractors
+are pattern matching, dictionary lookup, bracket matching and monetary patterns, with nothing to
+tune beyond their worker count.
 
 The last of those is not an entity extractor in the usual sense. `paper:redaction-v1` emits the
 bracketed redaction indicators the published analysis counted -- `[***]`, `[CONFIDENTIAL TREATMENT
@@ -283,7 +283,8 @@ ner_tuning <- list(
   "lexnlp"                = list(n_process = 24L, batch_size =   8L, timeout =  60L),
   "spacy:en_core_web_trf" = list(n_process =  1L, batch_size = 128L, timeout = 600L),
   "paper:gazetteer-v1"    = list(n_process = 16L, batch_size =   8L, timeout = 120L),
-  "paper:redaction-v1"    = list(n_process = 16L, batch_size =  64L, timeout =   0L)
+  "paper:redaction-v1"    = list(n_process = 16L, batch_size =  64L, timeout =   0L),
+  "paper:moneyregex-v1"   = list(n_process = 16L, batch_size =  64L, timeout =   0L)
 )
 
 lst_run_args <- ner_run_args(.tuning = ner_tuning)

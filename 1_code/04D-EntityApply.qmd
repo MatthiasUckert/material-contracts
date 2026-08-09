@@ -1,0 +1,462 @@
+---
+title: "Entity Extraction at Scale -- Applying the Deployed Policy (04D)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+knitr::opts_chunk$set(
+  root.dir  = here::here(),
+  message   = TRUE,       # mandatory: cli writes through the message stream under knitr
+  warning   = FALSE,
+  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
+  fig.width = 7.5,
+  fig.align = "center",
+  dpi       = 200,
+  out.width = "100%"
+)
+
+options(cli.num_colors = 1, cli.width = 120)
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+```{r}
+#| label: load-libraries
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_NER.R", encoding = "UTF-8")
+
+# 03A supplies the console formatter and the text reader; 04B the anchor logic, the session helpers
+# and the date cleaner; 04C the resolvers. Nothing here re-implements any of them: the corpus is
+# resolved by the code the sample was validated with, pointed at documents that carry no labels.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "04B-EntityMeasure", "04C-EntityResolve"),
+  .f = function(.s) {
+    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+           encoding = "UTF-8")
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/04D-EntityApply.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+Every decision has been made. 04A extracted eight engines over full text and described what came
+back. 04B measured which engine to keep per label, which character budget to read it under, and
+which of two reading sessions' rules survive contact with the EDGAR anchors. 04C turned spans into
+the four published variables and checked them against facts EDGAR recorded.
+
+This stage does none of that again. It reads `extraction_policy.parquet` and `rules_kept.parquet`
+and applies them to a corpus that carries no labels.
+
+That separation is the point. An apply stage free to choose its own engine or its own window is one
+whose output depends on which version of it last ran, and a released dataset cannot be defended on
+those terms. The engine per label, the budget from each end and the rules all arrive as artifacts.
+What is left here is bookkeeping: index the tree, slice the text, run the extractors, resolve, write.
+
+## The window is two slices, not one truncation
+
+`--max-chars` truncates a prefix, and 04B found that geography needs the end of a contract as much
+as the beginning: a governing-law clause sits in the final fifth, and a head-only window costs
+twenty-six points of document-level recall on places.
+
+So a label carrying a tail budget is extracted **twice**, from a head slice and a tail slice, and the
+tail's offsets are shifted back onto the full document before anything reads them. Splicing the two
+into one string would have been less code and would have made every offset index a text that exists
+nowhere. A document shorter than both budgets is its own slice twice over, so the union is
+deduplicated on the span rather than on the document.
+
+## The anchors travel with the release
+
+The filer's name and its filing date are EDGAR facts, available for every contract in the corpus and
+not only for the labelled sample. The consistency checks 04C ran as diagnostics therefore run here
+too, and **every released row carries** whether the filer appeared among its resolved parties and
+whether its contract date precedes its filing.
+
+A user can condition on those without re-running anything, which is a materially different offer
+from a single headline number.
+
+## What this document cannot carry over from 04C
+
+One column changes meaning at scale and should not be read across. The published term measure is
+the latest date *anywhere in the document* minus the filing date, and at corpus scale there is no
+unfiltered store to take it from -- only what the deployed engines returned inside the window. The
+column is still written, because it is what a corpus-scale reproduction of the published definition
+can see, but the figure that reproduces that definition on full text is 04C's, on the sample.
+
+# Configuration
+
+```{r}
+#| label: configure-paths
+.dir_measure <- init_create_script_dir(.dir_here = here::here(), .name_script = "04B-EntityMeasure")
+
+.lP <- list(
+  Input = list(
+    # fs::path, not utils_file_path: the project helper creates what it names, and a corpus tree
+    # conjured into existence would report itself present while holding nothing.
+    Policy      = fs::path(.dir_measure, "extraction_policy.parquet"), # written by 04B
+    Kept        = fs::path(.dir_measure, "rules_kept.parquet"),        # written by 04B
+    DirCorpus   = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/Exhibit10/",
+    MetaData    = "../pMatDisc/2_output/01-GetEDGAR/Output/FullMetaData.parquet",
+    LandingPage = "../pMatDisc/2_output/01-GetEDGAR/Output/LandingPage.parquet"
+  ),
+  Cache = list(
+    CorpusFiles = utils_file_path(.dir_main, "Cache", "CorpusFiles.parquet") # DocID to Path index
+  ),
+  Output = list(
+    Vars = utils_file_path(.dir_main, "variables")  # the released variables
+  ),
+  Work = list(
+    Dir = utils_file_path(.dir_main, "Work")        # slices and extractor output, deleted per chunk
+  ),
+  Param = list(
+    ChunkSize  = 500L,   # documents per output file; a corpus pass should not be one write
+    CtxMax     = 400L,   # context width the rules are matched in, as 04B scored them
+    HeadPos    = 0.10,   # an uncued organisation this far in still reads as a party
+    IndexRerun = FALSE,  # TRUE re-walks the tree; FALSE reuses the cached index
+    Device     = "auto", # CNN models to CPU, transformer to Metal
+    # The switch that decides whether this document is a rehearsal or the release. An integer draws
+    # that many documents at random from the whole tree and writes them to a separate directory;
+    # NULL processes the corpus. Set an integer, read the throughput, then set NULL.
+    Limit      = 2000L
+  )
+)
+
+# Per-combo throughput settings, as in 04A. The transformer occupies one device and cannot be shared
+# across processes; LexNLP runs in a container and its date grammar stalls on a few long documents.
+.KNOBS <- list(
+  "lexnlp"                = list(n_process = 24L, batch_size =  8L, timeout = 60L),
+  "spacy:en_core_web_trf" = list(n_process =  1L, batch_size = 128L, timeout = 600L),
+  "paper:gazetteer-v1"    = list(n_process = 16L, batch_size =  8L, timeout = 120L),
+  "paper:redaction-v1"    = list(n_process = 16L, batch_size = 64L, timeout =  0L),
+  "paper:dateregex-v1"    = list(n_process =  1L, batch_size = NULL, timeout = 0L)
+)
+
+# The same formats 04B parsed with and 04C resolved with. Three copies of one list is two too many;
+# they are written out rather than sourced so that a change in one is visibly a change in all.
+.DATE_FORMATS <- c(
+  "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
+  "%d %B, %Y", "%d %B %Y", "%d %b, %Y", "%d %b %Y",
+  "%m/%d/%Y",  "%d/%m/%Y", "%Y-%m-%d",  "%m-%d-%Y", "%Y/%m/%d", "%d-%b-%Y", "%m.%d.%Y"
+)
+
+fs::file_exists(c(.lP$Input$Policy, .lP$Input$Kept))
+```
+
+Nothing here is cached except the file index. The expensive work is the extractor passes, and those
+are checkpointed by writing resolved chunks as they complete -- a resumable design rather than a
+cache: an interrupted run restarts at the first chunk with no output file.
+
+# The policy
+
+```{r}
+#| label: load-policy
+tab_policy <- ent_read_policy(.path = .lP$Input$Policy)
+tab_rules  <- arrow::read_parquet(.lP$Input$Kept)
+tab_plan   <- ent_slice_plan(.policy = tab_policy)
+
+clf_say_table(
+  .tab = tab_policy |>
+    dplyr::select(Label, Combo, Basis, CapChars, TailChars, DocRecallAtCap) |>
+    dplyr::mutate(
+      dplyr::across(c(CapChars, TailChars), as.integer),
+      DocRecallAtCap = clf_pct(.data$DocRecallAtCap)
+    ),
+  .title = "Policy this pass applies"
+)
+```
+
+Read that table before anything else. Every line is a decision made once and validated, and a run
+applying the wrong configuration should be visible in the first screen of output rather than in the
+released variables. `Basis` distinguishes an engine chosen on measured recall from one asserted
+because no anchor could rank it -- money and redaction are the second kind.
+
+```{r}
+#| label: show-plan
+clf_say_table(
+  .tab = tab_plan |>
+    dplyr::mutate(Labels = purrr::map_chr(.data$Labels, \(.x) paste(.x, collapse = ", "))),
+  .title = "Extractor runs per chunk"
+)
+```
+
+Several labels share an engine under different windows, so running once per label would extract the
+same head twice. Grouping by engine and slice runs each combination once and keeps only the labels
+that asked for it.
+
+```{r}
+#| label: build-index
+tab_index <- ent_corpus_index(
+  .dir_corpus   = .lP$Input$DirCorpus,     # the parsed-contract tree, Exhibit 10 only
+  .path_meta    = .lP$Input$MetaData,      # filer name and filing date
+  .path_landing = .lP$Input$LandingPage,   # registered addresses
+  .path_cache   = .lP$Cache$CorpusFiles,   # walking a million files is cached, not repeated
+  .rerun        = .lP$Param$IndexRerun,
+  .limit        = .lP$Param$Limit,         # NULL processes the corpus; an integer rehearses
+  .seed         = 42L
+)
+
+.dir_out <- ent_output_dir(.dir = .lP$Output$Vars, .limit = .lP$Param$Limit)
+
+tab_index |>
+  dplyr::summarise(
+    Documents   = dplyr::n(),
+    WithCompany = sum(!is.na(.data$CompanyName)),
+    WithFiled   = sum(!is.na(.data$DateFiled))
+  ) |>
+  clf_say_table(.title = paste0("Corpus to process -> ", fs::path_rel(.dir_out, here::here())))
+```
+
+The corpus is an index here, not a table. The labelled sample fits in memory and the corpus does
+not: over a million contracts of full text is hundreds of gigabytes, so what is held throughout is
+one row per document with its path and the EDGAR facts. Text is read one chunk at a time and
+discarded. Any code that treats corpus text as a column runs out of memory somewhere past the first
+hundred thousand documents.
+
+# A rehearsal on one chunk
+
+Before a corpus pass, one chunk end to end. It exercises every extractor, both slices, the offset
+shift and the whole resolver chain, and it costs a minute -- which is the right price for
+discovering that a model directory moved or that the policy names an engine with no branch.
+
+```{r}
+#| label: rehearse-chunk
+docs_head <- ent_read_chunk(.chunk = dplyr::slice_head(tab_index, n = 50L))
+
+cand_head <- ent_extract_chunk(
+  .docs     = docs_head,
+  .plan     = tab_plan,             # one run per engine per slice
+  .dir_work = .lP$Work$Dir,         # slices and raw output, deleted as they are consumed
+  .knobs    = .KNOBS,
+  .device   = .lP$Param$Device
+)
+
+cand_head |>
+  dplyr::count(.data$Label, .data$Engine, .data$Model, name = "N") |>
+  clf_say_table(.title = "Candidates from one rehearsal chunk")
+```
+
+```{r}
+#| label: rehearse-resolve
+path_text_ <- fs::path(.lP$Work$Dir, "rehearse_text.parquet")
+con_head <- ent_chunk_session(.cands = cand_head, .docs = docs_head, .path_text = path_text_)
+
+vars_head <- ent_resolve_chunk(
+  .con       = con_head,
+  .path_text = path_text_,
+  .rules     = tab_rules,
+  .keys      = dplyr::transmute(
+    docs_head, DocID, Fold = NA_integer_, Class = NA_character_,
+    DateFiled  = suppressWarnings(anytime::anydate(as.character(.data$DateFiled))),
+    AnchorKey  = ent_norm_company(.data$CompanyName),
+    AnchorText = NA_character_
+  ),
+  .formats   = .DATE_FORMATS,
+  .ctx_max   = .lP$Param$CtxMax,
+  .head_pos  = .lP$Param$HeadPos
+)
+
+DBI::dbDisconnect(con_head, shutdown = TRUE)
+
+vars_head |>
+  dplyr::select(DocID, NParties, ContractStart, ContractEnd, MaxAmount, NRedact, HasFilerParty) |>
+  head(10) |>
+  clf_say_table(.title = "First ten resolved documents")
+```
+
+An empty `ContractEnd` column is the expected result rather than a disappointment: 04C found an
+expiry date for well under one percent of the labelled sample, and a rehearsal of fifty documents
+will usually find none. What the rehearsal is checking is that every extractor ran, that the tail
+slice's offsets landed on the full document, and that the resolvers produced columns rather than
+errors.
+
+# The corpus pass
+
+Chunked, and each chunk written as it completes. A corpus pass is measured in hours, so a failure at
+document nine hundred thousand should cost one chunk rather than the run, and a restart should
+resume rather than begin again.
+
+```{r}
+#| label: apply-corpus
+fs::dir_create(.dir_out)
+
+chunks_ <- split(tab_index, ceiling(seq_len(nrow(tab_index)) / .lP$Param$ChunkSize))
+cli::cli_alert_info("{length(chunks_)} chunk{?s} of up to {(.lP$Param$ChunkSize)} documents.")
+
+purrr::iwalk(chunks_, function(.chunk, .i) {
+  path_ <- fs::path(.dir_out, sprintf("vars_%04d.parquet", as.integer(.i)))
+  if (fs::file_exists(path_)) {
+    cli::cli_alert_info("Chunk {(.i)}: already written, skipping.")
+    return(invisible(NULL))
+  }
+
+  t0_ <- Sys.time()
+  docs_ <- ent_read_chunk(.chunk = .chunk)
+  if (nrow(docs_) == 0L) {
+    cli::cli_alert_warning("Chunk {(.i)}: no readable documents; nothing written.")
+    return(invisible(NULL))
+  }
+
+  cand_ <- ent_extract_chunk(
+    .docs = docs_, .plan = tab_plan, .dir_work = .lP$Work$Dir,
+    .knobs = .KNOBS, .device = .lP$Param$Device
+  )
+  ptxt_ <- fs::path(.lP$Work$Dir, sprintf("text_%04d.parquet", as.integer(.i)))
+  con_  <- ent_chunk_session(.cands = cand_, .docs = docs_, .path_text = ptxt_)
+
+  out_ <- ent_resolve_chunk(
+    .con       = con_,
+    .path_text = ptxt_,
+    .rules     = tab_rules,
+    .keys      = dplyr::transmute(
+      docs_, DocID, Fold = NA_integer_, Class = NA_character_,
+      DateFiled  = suppressWarnings(anytime::anydate(as.character(.data$DateFiled))),
+      AnchorKey  = ent_norm_company(.data$CompanyName),
+      AnchorText = NA_character_
+    ),
+    .formats   = .DATE_FORMATS,
+    .ctx_max   = .lP$Param$CtxMax,
+    .head_pos  = .lP$Param$HeadPos
+  )
+  DBI::dbDisconnect(con_, shutdown = TRUE)
+  fs::file_delete(ptxt_[fs::file_exists(ptxt_)])
+
+  arrow::write_parquet(out_, path_)
+  ent_write_timing(
+    .dir     = .dir_out,
+    .chunk   = .i,
+    .n_docs  = nrow(out_),
+    .seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs")),
+    .n_cands = nrow(cand_)
+  )
+  cli::cli_alert_success("Chunk {(.i)}: {nrow(out_)} document{?s} written.")
+})
+```
+
+```{r}
+#| label: apply-throughput
+ent_report_throughput(.dir = .dir_out, .n_corpus = nrow(tab_index))
+```
+
+Set `Limit` to `NULL` once that projection is acceptable. The rate is measured on this machine under
+this configuration, so it is the only figure worth planning a night around. `CandsPerDoc` times the
+corpus is what has to be stored if the spans are released alongside the variables.
+
+# Results
+
+```{r}
+#| label: results-summary
+tab_vars <- fs::dir_ls(.dir_out, glob = "*.parquet") |>
+  purrr::map(arrow::read_parquet) |>
+  purrr::list_rbind()
+
+ent_report_apply(.tab = tab_vars)
+```
+
+# Validation
+
+```{r}
+#| label: validate-release
+tab_vars |>
+  dplyr::summarise(
+    Documents      = dplyr::n(),
+    MedParties     = stats::median(.data$NParties, na.rm = TRUE),
+    PctFilerParty  = mean(.data$HasFilerParty, na.rm = TRUE),
+    PctStartBefore = mean(.data$ContractStart <= .data$DateFiled, na.rm = TRUE),
+    PctAnyPlace    = mean(dplyr::coalesce(.data$NPlaces, 0L) > 0L),
+    PctAnyAmount   = mean(!is.na(.data$MaxAmount))
+  ) |>
+  dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) clf_pct(.x))) |>
+  clf_say_table(.title = "The release against the EDGAR facts")
+```
+
+`PctFilerParty` is the number to compare against 04C. The sample put it at 64.8% under the same
+policy, so a corpus figure far from that means the corpus differs from the sample in some way the
+sample could not show -- and a figure close to it means the pipeline behaves as it was measured to.
+
+```{r}
+#| label: validate-coverage
+tab_vars |>
+  dplyr::summarise(
+    dplyr::across(
+      c(NParties, NPlaces, NPartyAddress, NRedact, NAmounts),
+      \(.x) mean(dplyr::coalesce(.x, 0L) > 0L)
+    )
+  ) |>
+  tidyr::pivot_longer(dplyr::everything(), names_to = "Variable", values_to = "Coverage") |>
+  dplyr::mutate(Coverage = clf_pct(.data$Coverage)) |>
+  dplyr::arrange(dplyr::desc(.data$Variable)) |>
+  clf_say_table(.title = "Share of released documents carrying each variable")
+```
+
+Coverage is not uniform and must not be reported as though it were. A variable present in a third of
+documents and nine tenths of another type is two different variables, and which contract types can
+carry each one at all is the column that matters for the paper.
+
+# Deployment
+
+```{r}
+#| label: deploy-summary
+tibble::tibble(
+  Artifact = c("Released variables", "Timings"),
+  Path     = c(.dir_out, fs::path(.dir_out, "_timing"))
+) |>
+  dplyr::mutate(
+    Files = purrr::map_int(.data$Path, \(.p) {
+      if (!fs::dir_exists(.p)) return(0L)
+      length(fs::dir_ls(.p, glob = "*.parquet"))
+    }),
+    MB   = purrr::map_dbl(.data$Path, \(.p) {
+      if (!fs::dir_exists(.p)) return(0)
+      round(sum(as.numeric(fs::file_size(fs::dir_ls(.p, glob = "*.parquet")))) / 1024^2, 1)
+    }),
+    Path = fs::path_rel(.data$Path, here::here())
+  ) |>
+  clf_say_table(.title = "Written by 04D")
+```
+
+# Next
+
+The variables are written; what remains is the paper. Three things belong in it as limitations
+rather than being discovered by a reader.
+
+**Money is unvalidated.** EDGAR records no contract value, so the largest-amount heuristic is
+carried because it is the best available, not because it has been checked. Only the redaction role
+has external corroboration, and that speaks to six cues.
+
+**The contract term is thin.** 04C found an expiry date for well under one percent of the sample,
+and a window sensitivity check showed the cause is not the window. Until that is understood, the
+term variable covers a small and possibly unrepresentative subset, and the published measure it
+would replace remains the one with a standard deviation nobody can defend.
+
+**Nothing validates the variables themselves.** The anchors confirm that the filer appears among the
+resolved parties and that the contract date precedes its filing, which establishes that the
+extraction finds real things. It does not establish that the party count, the term or the value are
+right. That needs a document-level gold set of fifty to eighty contracts, and it is the one piece of
+this family that cannot be built from EDGAR facts or a reading session.

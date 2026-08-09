@@ -38,6 +38,11 @@
 .DIR_BUNDLE <- fs::path("/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts",
                         "MatContractData", "EntitiesClaude")
 
+# A previous bundle to compare against, or NULL. Recurrence between two independent sessions is the
+# only reliability evidence the reading arm can produce: a rule proposed twice, from different
+# documents, is a property of the corpus rather than of one draw.
+.DIR_PRIOR  <- NULL
+
 .KINDS      <- c("cue", "stop", "section", "note")
 .SIDES      <- c("left", "right", "either", "span", "heading", "")
 .MAX_WORDS  <- 8L     # longest cue phrase kept; money cues are long and formulaic
@@ -235,7 +240,9 @@ cwec_compile <- function(.dir_bundle, .kinds = .KINDS, .sides = .SIDES,
 
   thin_ <- rules_ |> dplyr::count(.data$Label, .data$Role, name = "N") |> dplyr::filter(.data$N < 3L)
   if (nrow(thin_) > 0L) {
-    cli::cli_alert_info("Role{?s} with fewer than three rules -- these will not carry a column in 04D:")
+    cli::cli_alert_info(
+      "{nrow(thin_)} role{?s} with fewer than three rules; {?it/they} will not carry a column in 04D:"
+    )
     print(thin_, n = Inf)
   }
   if (nrow(suspect_) > 0L) {
@@ -275,6 +282,39 @@ lst_rules <- cwec_compile(
   .min_chars  = .MIN_CHARS,     # shortest token retained inside a phrase
   .max_window = .MAX_WINDOW     # widest reach a cue may claim
 )
+
+# Recurrence against the prior run, where one was named.
+if (!is.null(.DIR_PRIOR) && !is.null(lst_rules$rules)) {
+  path_prior_ <- fs::path(.DIR_PRIOR, "compiled", "entity_rules.parquet")
+  if (fs::file_exists(path_prior_)) {
+    prior_ <- arrow::read_parquet(path_prior_)
+    now_   <- lst_rules$rules
+
+    cli::cli_h3("Recurrence against the previous session")
+    dplyr::full_join(
+      dplyr::distinct(prior_, Label, Kind, Pattern) |> dplyr::mutate(InPrior = TRUE),
+      dplyr::distinct(now_,   Label, Kind, Pattern) |> dplyr::mutate(InNow = TRUE),
+      by = dplyr::join_by(Label, Kind, Pattern)
+    ) |>
+      dplyr::mutate(dplyr::across(c(InPrior, InNow), \(.x) tidyr::replace_na(.x, FALSE))) |>
+      dplyr::summarise(
+        Both       = sum(.data$InPrior & .data$InNow),
+        PriorOnly  = sum(.data$InPrior & !.data$InNow),
+        NowOnly    = sum(!.data$InPrior & .data$InNow),
+        .by = c(Label, Kind)
+      ) |>
+      dplyr::arrange(.data$Label, .data$Kind) |>
+      print(n = Inf)
+    cli::cli_alert_info(
+      "Both is the recurrence. It is the number to read, not the totals: the two bundles differ in \\
+       size, so a rule appearing in one and not the other is as often a sampling difference as a \\
+       disagreement. Compare recurrence among the rules the previous run VALIDATED, not among all \\
+       of them."
+    )
+  } else {
+    cli::cli_alert_warning("No prior rules at {.path {path_prior_}}; skipping the comparison")
+  }
+}
 
 cli::cli_h2("Next")
 cli::cli_text(

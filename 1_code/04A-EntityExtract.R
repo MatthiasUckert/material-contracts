@@ -193,7 +193,7 @@ ent_build_sample <- function(.path_prepared, .path_meta, .path_landing = NULL,
   attr(out_, "Anchors") <- anchors_
   gap_ <- anchors_$Column[anchors_$Status != "found"]
   if (length(gap_) > 0L) {
-    cli::cli_alert_warning("Anchor column{?s} unusable: {gap_}")
+    cli::cli_alert_warning("{length(gap_)} anchor column{?s} unusable: {gap_}")
   }
   out_
 }

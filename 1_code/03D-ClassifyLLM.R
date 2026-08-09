@@ -272,8 +272,8 @@ llm_check_models <- function(.models, .host = "http://localhost:11434") {
   miss_ <- setdiff(.models, have_)
   if (length(miss_) > 0L) {
     cli::cli_abort(c(
-      "Model{?s} not present on this server: {miss_}",
-      "i" = "Pull {?it/them} with {.code ollama pull {miss_}}, or drop {?it/them} from the grid.",
+      "{length(miss_)} model{?s} not present on this server: {miss_}",
+      "i" = "Pull with {.code ollama pull}, or remove from the grid.",
       "i" = "Available: {have_}"
     ))
   }
@@ -460,11 +460,15 @@ llm_call <- function(.prompt, .labels, .model = "qwen3:32b", .allow_abstain = FA
 #' @param .think Reasoning regime the run used. In the name for the same reason the cap is: two runs
 #'   differing only in whether the model reasoned first are different runs and must not share a
 #'   folder.
+#' @param .num_ctx Context window. Also in the name, because a window below what a prompt needs
+#'   changes the answer -- the server trims the front of the prompt and the model works from a
+#'   contract with no instruction. Two runs at different windows are different runs, and without
+#'   this the idempotence check would skip a re-run under a corrected window as already done.
 #' @param .seed Stamped for parity.
 #' @return Character scalar.
 llm_config_name <- function(.label_col, .model, .tier, .guidance, .shots, .n_chars,
                             .allow_abstain, .prompt_hash, .limit = NULL, .think = FALSE,
-                            .seed = 42L) {
+                            .num_ctx = 8192L, .seed = 42L) {
   if (FALSE) {
     .label_col     <- "ClassDetailed"
     .model         <- "qwen3:32b"
@@ -476,6 +480,7 @@ llm_config_name <- function(.label_col, .model, .tier, .guidance, .shots, .n_cha
     .prompt_hash   <- "a1b2c3"
     .limit         <- 100L
     .think         <- FALSE
+    .num_ctx       <- 8192L
     .seed          <- 42L
   }
   paste0(
@@ -486,10 +491,160 @@ llm_config_name <- function(.label_col, .model, .tier, .guidance, .shots, .n_cha
     "_C", .n_chars,
     "_A", as.integer(.allow_abstain),
     "_R", if (is.null(.think)) "d" else as.integer(.think),
+    "_K", .num_ctx,
     "_X", .prompt_hash,
     if (is.null(.limit)) "" else paste0("_L", .limit),
     "_S", .seed
   )
+}
+
+#' The longest prompt a configuration can produce
+#'
+#' Exact rather than sampled. The document contributes at most `.n_chars` because the excerpt is
+#' truncated there, and every other part is fixed for a configuration, so the ceiling is reached by
+#' any document at least that long and can be measured by building one prompt against a maximal
+#' filler. Sampling real documents would give the same answer more slowly and occasionally miss it.
+#'
+#' Characters are converted to tokens by a stated ratio rather than by tokenising, because the
+#' tokenizer lives inside the server and this has to run before the first request. Underestimating
+#' tokens is the dangerous direction -- it silently truncates -- so the default is deliberately
+#' pessimistic for English legal text, where long entity names and citation strings pack more tokens
+#' per character than prose.
+#'
+#' @param .labels_block Rendered category list.
+#' @param .task_line The instruction.
+#' @param .examples Rendered example block, or NULL.
+#' @param .allow_abstain Logical.
+#' @param .n_chars Document window in characters.
+#' @param .chars_per_token Assumed density. Lower is more conservative.
+#' @return Tibble: Chars, EstTokens.
+llm_prompt_budget <- function(.labels_block, .task_line, .examples, .allow_abstain, .n_chars,
+                              .chars_per_token = 3.2) {
+  if (FALSE) {
+    .labels_block    <- llm_render_labels(llm_labels(tab_prep, "ClassDetailed"))
+    .task_line       <- "Classify this contract into exactly one category."
+    .examples        <- NULL
+    .allow_abstain   <- FALSE
+    .n_chars         <- 6000L
+    .chars_per_token <- 3.2
+  }
+  filler_ <- strrep("x", .n_chars)
+  n_ <- nchar(llm_prompt(
+    .text          = filler_,
+    .labels_block  = .labels_block,
+    .task_line     = .task_line,
+    .examples      = .examples,
+    .allow_abstain = .allow_abstain,
+    .n_chars       = .n_chars
+  ))
+  tibble::tibble(Chars = as.integer(n_), EstTokens = as.integer(ceiling(n_ / .chars_per_token)))
+}
+
+#' Context window a prompt budget requires
+#'
+#' The window is a capacity floor, not a modelling choice: above the point where nothing truncates it
+#' changes no answer, and below it the server silently trims the FRONT of the prompt -- which is
+#' where the instruction and the category list live, leaving the model a contract and no task. That
+#' failure does not error. Under a JSON enum the model still returns a valid category name, just an
+#' uninformed one.
+#'
+#' Rounded up to a power of two above a floor, and both choices are deliberate. The floor costs
+#' nothing on hardware with memory to spare and stops a short prompt from getting its own bespoke
+#' window. The coarse grid means a small change to the wording does not shift the window, which
+#' matters because the window is part of the cache key: a scheme that tracked the budget exactly
+#' would invalidate every cached answer whenever a comma moved.
+#'
+#' @param .tokens Estimated tokens the longest prompt needs.
+#' @param .min Floor, which should be the window already in use so valid work stays valid.
+#' @param .headroom Multiplier over the estimate.
+#' @param .max Ceiling. Above this the configuration is refused rather than truncated.
+#' @return Integer context window.
+llm_ctx_for <- function(.tokens, .min = 8192L, .headroom = 1.25, .max = 32768L) {
+  if (FALSE) {
+    .tokens   <- 11500L
+    .min      <- 8192L
+    .headroom <- 1.25
+    .max      <- 32768L
+  }
+  need_ <- .tokens * .headroom
+  ctx_  <- max(.min, 2^ceiling(log2(max(need_, 1))))
+  if (ctx_ > .max) {
+    cli::cli_abort(c(
+      "This configuration needs about {round(need_)} tokens of context, above the {(.max)} ceiling.",
+      "i" = "Shorten the document window, shorten the worked examples, or raise the ceiling if the \\
+             model supports it."
+    ))
+  }
+  as.integer(ctx_)
+}
+
+#' Report what each configuration in a grid will demand of the context window
+#'
+#' Read before a sweep. A configuration that will not fit fails after its first long document rather
+#' than its first document, because prompt length varies with the contract and short ones fit -- so
+#' the failure arrives late, looks intermittent, and costs whatever ran before it.
+#'
+#' @param .grid Output of llm_grid().
+#' @param .tab_prep Prepared sample.
+#' @param .task_lines Named character vector of instructions.
+#' @param .definitions Optional definitions tibble.
+#' @param .example_chars Characters shown per worked example.
+#' @param .ctx_min,.ctx_max Floor and ceiling for the derived window.
+#' @param .seed Fixed, so example draws match the sweep's.
+#' @return Invisibly a tibble of budgets.
+llm_report_budget <- function(.grid, .tab_prep, .task_lines, .definitions = NULL,
+                              .example_chars = 700L, .ctx_min = 8192L, .ctx_max = 32768L,
+                              .seed = 42L) {
+  if (FALSE) {
+    .grid       <- grid_cross
+    .tab_prep   <- tab_prep
+    .task_lines <- .lP$TaskLines
+  }
+  out_ <- purrr::map(seq_len(nrow(.grid)), function(.i) {
+    cell_   <- .grid[.i, ]
+    labels_ <- llm_labels(.tab_prep = .tab_prep, .label_col = cell_$LabelCol)
+    block_  <- llm_render_labels(.labels = labels_, .definitions = .definitions,
+                                 .guidance = cell_$Guidance)
+    ex_ <- if (cell_$Shots > 0L) {
+      llm_render_examples(
+        .tab = llm_examples(.tab_prep = .tab_prep, .label_col = cell_$LabelCol,
+                            .folds = sort(unique(.tab_prep$Fold))[-1], # one fold held out, as in the sweep
+                            .per_class = cell_$Shots, .seed = .seed),
+        .label_col = cell_$LabelCol, .n_chars = .example_chars
+      )
+    } else {
+      NULL
+    }
+    b_ <- llm_prompt_budget(
+      .labels_block = block_, .task_line = .task_lines[[cell_$LabelCol]], .examples = ex_,
+      .allow_abstain = cell_$AllowAbstain, .n_chars = cell_$NChars
+    )
+    tibble::tibble(
+      Model = cell_$Model, Tier = cell_$Tier, Shots = cell_$Shots,
+      ExampleChars = if (cell_$Shots > 0L) nchar(ex_ %||% "") else 0L,
+      Chars = b_$Chars, EstTokens = b_$EstTokens,
+      NumCtx = tryCatch(
+        llm_ctx_for(.tokens = b_$EstTokens, .min = .ctx_min, .max = .ctx_max),
+        error = function(e) NA_integer_
+      )
+    )
+  }) |>
+    purrr::list_rbind()
+
+  cli::cli_h2("Context budget per configuration")
+  clf_say_table(.tab = out_)
+  cli::cli_text("")
+  over_ <- out_ |> dplyr::filter(is.na(.data$NumCtx))
+  if (nrow(over_) > 0L) {
+    cli::cli_alert_danger(
+      "{nrow(over_)} configuration{?s} exceed the {(.ctx_max)} ceiling and will not run."
+    )
+  }
+  cli::cli_alert_info(
+    "The window is derived per configuration, not fixed: below what a prompt needs the server trims \\
+     its FRONT, removing the instruction and the category list while still returning a valid label."
+  )
+  invisible(out_)
 }
 
 #' Classify a set of documents under one configuration, cached and resumable
@@ -688,6 +843,8 @@ llm_write_run <- function(.runs_root, .config_name, .run_name, .pred, .spec, .pr
     NChars       = as.integer(.spec$n_chars),
     AllowAbstain = .spec$allow_abstain,
     Think        = if (is.null(.spec$think)) NA else as.logical(.spec$think),
+    NumCtx       = as.integer(.spec$num_ctx %||% NA_integer_),
+    EstTokens    = as.integer(.spec$est_tokens %||% NA_integer_),
     PromptHash   = .spec$prompt_hash,
     Limit        = if (is.null(.spec$limit)) NA_integer_ else as.integer(.spec$limit),
     Coverage     = sc_$Coverage,
@@ -791,6 +948,11 @@ llm_grid <- function(.label_cols = "ClassDetailed", .models = "qwen3:32b",
 #' @param .example_folds Folds a tuned configuration may draw examples from. Crossfold ignores this
 #'   and uses the complement of whichever fold it is classifying, which is the whole point of it.
 #' @param .overwrite Logical. Re-ask every document.
+#' @param .example_chars Characters shown per worked example. Forty-eight examples at seven hundred
+#'   characters is thirty-six thousand characters of demonstration against a six-thousand-character
+#'   document, so this is the lever when the examples come to outweigh the thing being classified.
+#' @param .num_ctx Context window, or NULL to derive it from the longest prompt this cell produces.
+#' @param .ctx_min,.ctx_max Floor and ceiling for the derived window.
 #' @param .limit Cap on documents classified, or NULL for the whole entitled set. A capped run is
 #'   written to a sibling preview root under a name carrying the cap, so it cannot be mistaken for,
 #'   or pooled with, a full one.
@@ -799,7 +961,9 @@ llm_grid <- function(.label_cols = "ClassDetailed", .models = "qwen3:32b",
 #' @return Tibble of the runs written, invisibly.
 llm_run_cell <- function(.cell, .tab_prep, .definitions = NULL, .task_lines, .runs_root, .cache_dir,
                          .folds_full = 1:5, .fold_holdout = 5L, .example_folds = 1:4,
-                         .overwrite = FALSE, .limit = NULL, .seed = 42L, ...) {
+                         .overwrite = FALSE, .limit = NULL, .seed = 42L,
+                         .example_chars = 700L, .num_ctx = NULL, .ctx_min = 8192L,
+                         .ctx_max = 32768L, ...) {
   if (FALSE) {
     .cell        <- grid_blind[1, ]
     .tab_prep    <- tab_prep
@@ -814,16 +978,59 @@ llm_run_cell <- function(.cell, .tab_prep, .definitions = NULL, .task_lines, .ru
                                .guidance = .cell$Guidance)
 
   cross_ <- identical(.cell$Tier, "crossfold")
+  folds_ <- if (.cell$Tier == "tuned") .fold_holdout else .folds_full
 
-  # A crossfold cell has no single example block -- it has one per fold, by design. Its examples are
-  # therefore built inside the fold loop below, and NULL here.
-  ex_tab_ <- if (.cell$Shots > 0L && !cross_) {
-    llm_examples(.tab_prep = .tab_prep, .label_col = .cell$LabelCol, .folds = .example_folds,
-                 .per_class = .cell$Shots)
+  # Every fold's example block is built here rather than inside the loop below. The context window
+  # has to be sized before the first request, a crossfold cell has one block per fold, and the
+  # longest of them is what the window must accommodate. Building them is slicing a table; measuring
+  # them is what stops a run failing on its first LONG document rather than its first document.
+  ex_by_fold_ <- if (cross_ && .cell$Shots > 0L) {
+    purrr::set_names(
+      purrr::map(folds_, function(.k) {
+        llm_render_examples(
+          .tab = llm_examples(.tab_prep = .tab_prep, .label_col = .cell$LabelCol,
+                              .folds = setdiff(folds_, .k), .per_class = .cell$Shots,
+                              .seed = .seed),
+          .label_col = .cell$LabelCol, .n_chars = .example_chars
+        )
+      }),
+      as.character(folds_)
+    )
   } else {
     NULL
   }
-  ex_ <- llm_render_examples(.tab = ex_tab_, .label_col = .cell$LabelCol)
+
+  ex_tab_ <- if (.cell$Shots > 0L && !cross_) {
+    llm_examples(.tab_prep = .tab_prep, .label_col = .cell$LabelCol, .folds = .example_folds,
+                 .per_class = .cell$Shots, .seed = .seed)
+  } else {
+    NULL
+  }
+  ex_ <- llm_render_examples(.tab = ex_tab_, .label_col = .cell$LabelCol,
+                             .n_chars = .example_chars)
+
+  # Sized from the longest prompt this cell can produce, over every fold's examples. A fixed window
+  # is right for one shot count and wrong for the others, and wrong quietly: below what a prompt
+  # needs the server trims its FRONT, taking the instruction and the category list with it.
+  budget_ <- purrr::map(c(list(ex_), ex_by_fold_), function(.e) {
+    llm_prompt_budget(
+      .labels_block  = block_,
+      .task_line     = .task_lines[[.cell$LabelCol]],
+      .examples      = .e,
+      .allow_abstain = .cell$AllowAbstain,
+      .n_chars       = .cell$NChars
+    )
+  }) |>
+    purrr::list_rbind()
+  need_ <- max(budget_$EstTokens)
+  ctx_  <- .num_ctx %||% llm_ctx_for(.tokens = need_, .min = .ctx_min, .max = .ctx_max)
+  if (!is.null(.num_ctx) && .num_ctx < need_) {
+    cli::cli_alert_warning(
+      "Forced window {(.num_ctx)} is below the {need_} tokens this configuration needs; the server \\
+       will trim the front of the prompt."
+    )
+  }
+  cli::cli_alert_info("Context: {need_} token{?s} estimated, window {ctx_}.")
 
   # The hash covers everything a reader would call "the prompt": the categories as rendered, the
   # instruction, the examples, the window, and whether declining was permitted. The cap is NOT in it,
@@ -849,11 +1056,11 @@ llm_run_cell <- function(.cell, .tab_prep, .definitions = NULL, .task_lines, .ru
     .allow_abstain = .cell$AllowAbstain,
     .prompt_hash   = hash_,
     .limit         = .limit,
-    .think         = .cell$Think
+    .think         = .cell$Think,
+    .num_ctx       = ctx_
   )
   root_ <- llm_runs_root(.runs_root = .runs_root, .limit = .limit)
 
-  folds_ <- if (.cell$Tier == "tuned") .fold_holdout else .folds_full
   docs_  <- .tab_prep |>
     dplyr::filter(.data$Fold %in% folds_, !is.na(.data[[.cell$LabelCol]]))
   if (!is.null(.limit)) {
@@ -882,6 +1089,7 @@ llm_run_cell <- function(.cell, .tab_prep, .definitions = NULL, .task_lines, .ru
       .n_chars       = .cell$NChars,
       .cache_dir     = .cache_dir,
       .think         = .cell$Think,
+      .num_ctx       = ctx_,
       .overwrite     = .overwrite,
       ...
     )
@@ -894,18 +1102,12 @@ llm_run_cell <- function(.cell, .tab_prep, .definitions = NULL, .task_lines, .ru
     # redrawn rather than reused because reusing one fold's draw would put that fold's labelled
     # documents into the prompt facing every other fold, which is the leak this tier exists to avoid.
     pred_ <- purrr::map(sort(unique(docs_$Fold)), function(.k) {
-      ex_k_ <- llm_render_examples(
-        .tab = llm_examples(
-          .tab_prep  = .tab_prep,
-          .label_col = .cell$LabelCol,
-          .folds     = setdiff(folds_, .k),
-          .per_class = .cell$Shots,
-          .seed      = .seed
-        ),
-        .label_col = .cell$LabelCol
-      )
+      # Built above rather than here, because the context window had to be sized before the first
+      # request and that needs every fold's block, not just this one's.
+      ex_k_ <- ex_by_fold_[[as.character(.k)]]
       if (.k == min(docs_$Fold)) ex_first_ <<- ex_k_
-      cli::cli_alert_info("Fold {(.k)}: examples drawn from fold{?s} {setdiff(folds_, .k)}")
+      comp_ <- setdiff(folds_, .k)
+      cli::cli_alert_info("Fold {(.k)}: examples from {length(comp_)} other fold{?s}: {comp_}")
       classify_(.tab = dplyr::filter(docs_, .data$Fold == .k), .examples = ex_k_)
     }) |>
       purrr::list_rbind()
@@ -918,7 +1120,8 @@ llm_run_cell <- function(.cell, .tab_prep, .definitions = NULL, .task_lines, .ru
     label_col = .cell$LabelCol, model = .cell$Model, tier = .cell$Tier,
     guidance = .cell$Guidance, shots = .cell$Shots, n_chars = .cell$NChars,
     allow_abstain = .cell$AllowAbstain, think = .cell$Think, prompt_hash = hash_,
-    limit = .limit, seed = .seed, labels = labels_
+    limit = .limit, seed = .seed, num_ctx = ctx_, example_chars = .example_chars,
+    est_tokens = need_, labels = labels_
   )
   # For crossfold this is the first fold's rendering, which is representative rather than complete;
   # the recipe in the spec is what reproduces the rest.
@@ -1226,8 +1429,8 @@ llm_report_effect <- function(.tab_overall, .axis, .label_col = "ClassDetailed")
 
   if (length(skip_) > 0L) {
     cli::cli_alert_info(
-      "Not shown for tier{?s} {skip_}: {(.axis)} takes one level there, so the axis is constant \\
-       and any number would describe the tier rather than the axis."
+      "Not shown for {length(skip_)} tier{?s} ({skip_}): {(.axis)} takes one level there, so the \\
+       axis is constant and any number would describe the tier rather than the axis."
     )
   }
   invisible(out_)

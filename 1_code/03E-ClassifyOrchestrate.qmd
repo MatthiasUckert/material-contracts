@@ -500,6 +500,12 @@ voters by role would have silently excluded the most independent arm available.
 The transformer seat goes to the arm that actually shipped the label rather than to whichever
 checkpoint scored highest, because the flag describes the label that was released.
 
+Derived arms are excluded twice over. `ArmsCV` holds only arms read from run folders, so the
+constrained transformer never reaches the seat table; and the incumbent is now chosen among terminal
+arms that exist on disk, so it cannot arrive through that door either. It could before: the
+constrained arm edges the plain one on accuracy, so it won the incumbent slot on a technicality and
+carried itself into the vote as the transformer seat -- a model voting to agree with itself.
+
 ```{r}
 #| label: agreement-voting-arms
 seats_ <- res_det$ArmsCV |>
@@ -525,7 +531,7 @@ seats_ |>
   dplyr::filter(Arm %in% arms_voting) |>
   dplyr::select(Family, Arm) |>
   dplyr::left_join(
-    res_det$Roles |> dplyr::select(Arm, Role, Coverage, Accuracy),
+    res_det$Roles |> dplyr::select(Arm, Role, Derived, Coverage, Accuracy),
     by = dplyr::join_by(Arm)
   ) |>
   dplyr::mutate(Coverage = clf_pct(Coverage), Accuracy = clf_pct(Accuracy)) |>
@@ -638,57 +644,34 @@ is the same rule that keeps the run roots from drifting.
 
 ```{r}
 #| label: deploy-artifacts
-# Built from the seat table rather than by listing arms and kinds side by side. Two parallel vectors
-# only stay aligned while every family is present, and the generative seat is empty until 03D has
-# run -- at which point a hand-built pair silently shortens on one side and lengthens on the other.
-tab_artifacts <- seats_ |>
-  dplyr::filter(Arm %in% arms_voting) |>
-  dplyr::transmute(
-    Arm,
-    Kind = dplyr::case_when(
-      Family == "transformer" ~ "transformer",
-      Family == "lexical"     ~ "keyword",
-      Family == "generative"  ~ "llm"
-    ),
-    ConfigName = purrr::map_chr(Arm, function(.a) {
-      res_det$Arms$ConfigName[res_det$Arms$Arm == .a][1]
-    })
-  ) |>
-  dplyr::mutate(
-    # fs::path, not utils_file_path. Two reasons, and the second is the serious one. It is
-    # vectorised, where the project's path helper takes scalars and case_when hands it a whole
-    # column. And it is PURE: utils_file_path creates the directory it names, so using it here would
-    # conjure an empty model_final/<config>__FINAL/model into existence and that empty directory
-    # would then satisfy the manifest's own existence check. A path builder used to describe an
-    # input defeats the verification meant to catch a missing one.
-    Path = dplyr::case_when(
-      # 03B writes the all-data refit as <config>__FINAL/model under its model_final directory.
-      Kind == "transformer" ~ as.character(
-        fs::path(.dir_bert, "model_final", paste0(ConfigName, "__FINAL"), "model")
-      ),
-      # 03C writes the published table as <stem>.parquet under its table directory.
-      Kind == "keyword" ~ as.character(
-        fs::path(.dir_kw, "table", "keyword_table_detailed.parquet")
-      ),
-      # The LLM ships no weights; the reproducible artifact is the run that fixed its prompt.
-      Kind == "llm" ~ as.character(fs::path(.dir_llm, "runs"))
-    ),
-    Params = purrr::map2(Kind, ConfigName, function(.k, .c) {
-      switch(.k,
-        transformer = list(config_name = .c, max_len = 256L),
-        keyword     = list(config_name = .c, source = "text"),
-        llm         = list(config_name = .c, model = "qwen3:8b",
-                           note = "prompt recipe is stored in the run's config.json"),
-        list()
-      )
-    })
-  )
+# Which lexicons 03C actually published. It writes a keyword table for the detailed taxonomy only,
+# so the lexical arm has runs for every task and a shippable artifact for one. Stating that here
+# rather than inferring it downstream is what turns a missing file into a reported gap.
+.kw_stems <- c(ClassDetailed = "keyword_table_detailed")
+
+tab_artifacts <- purrr::map(
+  .x = list(res_det, res_broad, res_amend),
+  .f = function(.r) {
+    orch_artifacts(
+      .res      = .r,          # one task's arms and incumbent
+      .dir_bert = .dir_bert,   # 03B's output root
+      .dir_kw   = .dir_kw,     # 03C's output root
+      .dir_llm  = .dir_llm,    # 03D's output root
+      .kw_stems = .kw_stems    # which tasks have a published lexicon
+    )
+  }
+) |>
+  purrr::list_rbind()
 
 tab_artifacts |>
   dplyr::mutate(Path = fs::path_rel(Path, here::here())) |>
-  dplyr::select(Arm, Kind, Path) |>
-  clf_say_table(.title = "Artifacts to pin")
+  dplyr::select(LabelCol, Arm, Kind, Path) |>
+  clf_say_table(.title = "Artifacts to pin, per task")
 ```
+
+Each task crowned its own configuration, so each pins its own checkpoint. A single global arm list
+would name the detailed task's model for all three, and the apply stage would discover it by finding
+no predictions for a terminal it had been told to use.
 
 ```{r}
 #| label: deploy-save-manifest
@@ -851,6 +834,26 @@ purrr::map(
 The folds paid for the estimate; the full sample produces the artifact. The policy deployed is the one
 the same selection crowns with every fold available, under the same tolerance, so the artifact cannot
 contradict the document's own conclusion by preferring a fourth-decimal winner.
+
+```{r}
+#| label: deploy-derived
+purrr::map(list(res_det, res_broad, res_amend), function(.r) {
+  tibble::tibble(
+    LabelCol  = .r$LabelCol,
+    Incumbent = .r$Incumbent,
+    Derived   = if (length(.r$Derived) == 0L) "-" else paste(.r$Derived, collapse = ", ")
+  )
+}) |>
+  purrr::list_rbind() |>
+  clf_say_table(.title = "Derived arms: in the search, out of the deployment")
+```
+
+A derived arm competes on equal terms and can win a fold on its merits, which is why it is built at
+all. What it cannot do is be deployed: the manifest has no way to express *run the broad model, then
+constrain the detailed one*, so an artifact naming it would be one 03F cannot execute. Deployment
+selection therefore ranks every policy and chooses among the executable ones. A derived arm winning
+by a margin the tolerance recognises would be a finding worth building support for, not something to
+ship quietly.
 
 ```{r}
 #| label: deploy-leaderboards

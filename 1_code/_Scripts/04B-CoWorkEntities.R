@@ -32,6 +32,23 @@
 # agreement, and the joint filings give two anchors in the same document. It is a real limitation
 # and the compile step reports rules that look identity-bound.
 #
+# THE ANCHOR LOGIC IS NOT DUPLICATED HERE ANY MORE
+# The first version of this script carried its own copy of the company normaliser so that it could
+# stay standalone. That cost exactly what duplication always costs: when the scoring side learned
+# that EDGAR stores states as two-letter codes and contracts write them out, this side did not, and
+# the geographic contrast a reading session saw was built from cities alone while the measurement
+# behind it was not. The bundle and the scoring must agree about what an anchor is or they are about
+# different sets. So this script now sources 04B-EntityMeasure.R for that logic. It is a pure
+# function library with no side effects, and one source() removes a whole class of error.
+#
+# THE FIFTH UNIT
+# 04A now emits bracketed redaction indicators as spans, which opens a question nothing else in the
+# family can ask: not how much was withheld, which the published analysis already counts, but WHAT.
+# A marker sits exactly where a commercially material figure used to be, so the text around it is a
+# labelled slot -- and a cue that precedes "[***]" in one contract precedes an amount in another.
+# That makes redaction sites a training set for slot-finding that should transfer to unredacted
+# documents, which is the nearest thing to a handle on money this family has.
+#
 # MONEY HAS NO ANCHOR
 # Nothing in EDGAR records a contract's value, so the money unit cannot be built as a contrast and
 # is not pretended to be one. It is exploratory: a stratified sample of amounts in context, labelled
@@ -48,6 +65,10 @@
 # The bundle lives outside the repository. The reading session has file access, so an instruction
 # not to open 2_output is a request; a folder that does not contain it is a guarantee.
 
+# The anchor logic lives in 04B-EntityMeasure.R and is sourced rather than copied: the contrast a
+# session reads and the measurement applied to its answers have to be about the same anchor.
+source(here::here("1_code", "04B-EntityMeasure.R"), encoding = "UTF-8")
+
 .PATH_TEXT    <- here::here("2_output", "04A-EntityExtract", "sample_text.parquet")
 .PATH_ANCHORS <- here::here("2_output", "04A-EntityExtract", "sample_anchors.parquet")
 .PATH_STORE   <- here::here("2_output", "04A-EntityExtract", "Store", "EntityCandidates.duckdb")
@@ -58,28 +79,39 @@
 # One unit per entity type. Roles are a CLOSED vocabulary: a free-text role cannot be dispatched on
 # downstream, and 04D needs to turn these into columns. The session is given the list and told to use
 # it verbatim.
+#
+# NEx is the examples shown per set. Redaction gets twice the rest because it is the only unit
+# asking a question no previous session has seen, while the other four are a second pass over
+# vocabulary that is largely taken: 51 organisation cues came out of 80 examples last time and
+# fourteen survived measurement, so example 120 in that unit is worth much less than example 40 was.
 .UNITS <- tibble::tibble(
-  Label = c("ORG", "DATE", "GPE", "MONEY"),
-  Slug  = c("01-org", "02-date", "03-gpe", "04-money"),
+  Label = c("ORG", "DATE", "GPE", "MONEY", "REDACT"),
+  Slug  = c("01-org", "02-date", "03-gpe", "04-money", "05-redaction"),
+  NEx   = c(60L, 60L, 60L, 60L, 120L),
   Roles = list(
     c("party", "agent", "guarantor", "affiliate", "third_party", "regulator"),
     c("signing", "effective", "term_start", "expiry", "statutory", "other"),
     c("party_address", "incorporation", "governing_law", "performance", "incidental"),
-    c("contract_value", "periodic_payment", "fee", "cap", "per_unit", "redacted", "other")
+    c("contract_value", "periodic_payment", "fee", "cap", "per_unit", "redacted", "other"),
+    # What the marker HIDES, not what the marker is. section_body is the whole-clause case that
+    # "[INTENTIONALLY OMITTED]" marks, which is a different thing from a withheld number.
+    c("royalty_rate", "milestone_payment", "unit_price", "aggregate_amount", "party_name",
+      "term_length", "section_body", "other")
   )
 )
 
 .FOLDS_GENERATE <- 1:4        # folds the session may read
 .FOLD_HOLDOUT   <- 5L         # reserved for scoring the rules; never bundled
 
-.N_TARGET   <- 40L            # anchor-matched candidates shown per unit
-.N_OTHER    <- 40L            # unmatched candidates shown per unit
 .N_CONTEXT  <- 240L           # characters of context each side of a span
-.N_PER_DOC  <- 4L             # candidates drawn per document per label, so no document dominates
+# Two per document rather than four. The example count is what costs reading time; the number of
+# DISTINCT documents behind it is what buys variation, and halving the cap doubles the second at no
+# cost in the first.
+.N_PER_DOC  <- 2L
 .N_DOCS_FULL <- 8L            # complete contracts included for the section-map question
 .N_HEADINGS <- 150L           # rows of the measured heading inventory
 .N_RULES    <- 30L            # rules requested per unit
-.SEED       <- 42L
+.SEED       <- 43L            # a different draw from run 1, so the two sessions read different text
 
 .DATE_WINDOW_DAYS <- 730L     # a contract date is expected within two years before the filing
 
@@ -95,42 +127,6 @@ cwe_slug <- function(.x) {
     stringi::stri_trans_tolower() |>
     stringi::stri_replace_all_regex("[^a-z0-9]+", "-") |>
     stringi::stri_replace_all_regex("^-+|-+$", "")
-}
-
-#' Reduce a company name to a matchable key
-#'
-#' The filer is recorded as a legal name and appears in the contract in whatever form the drafter
-#' chose, so "ACME HOLDINGS, INC." has to reach "Acme Holdings". Punctuation goes, trailing legal
-#' forms go, a leading article goes. Corporate-form words are stripped only from the END: "Trust"
-#' is a legal form in "Acme Trust" and part of the name in "Trust Bancorp".
-#'
-#' This only has to be good enough to assemble a contrast set for reading. The measured version, on
-#' which recall floors are reported, belongs in the 04B document where its rules can be argued.
-#'
-#' @param .x Character vector of company names.
-#' @return Character vector of keys, NA where nothing usable survives.
-cwe_norm_company <- function(.x) {
-  if (FALSE) .x <- c("ACME HOLDINGS, INC.", "The Boeing Company", "Beta Bank, N.A.")
-
-  suffix_ <- c("INC", "INCORPORATED", "CORP", "CORPORATION", "LLC", "LLP", "LP", "LTD", "LIMITED",
-               "PLC", "NV", "BV", "SA", "AG", "GMBH", "CO", "COMPANY", "TRUST", "NA")
-
-  out_ <- .x |>
-    stringi::stri_trans_toupper() |>
-    stringi::stri_replace_all_regex("[^A-Z0-9 ]", " ") |>
-    stringi::stri_replace_all_regex("\\s+", " ") |>
-    stringi::stri_trim_both() |>
-    stringi::stri_replace_first_regex("^THE ", "")
-
-  purrr::map_chr(out_, function(.s) {
-    if (is.na(.s)) return(NA_character_)
-    toks_ <- strsplit(.s, " ", fixed = TRUE)[[1]]
-    while (length(toks_) > 1L && toks_[length(toks_)] %in% suffix_) {
-      toks_ <- toks_[-length(toks_)]
-    }
-    key_ <- paste(toks_, collapse = " ")
-    if (nchar(key_) < 5L) NA_character_ else key_
-  })
 }
 
 #' Slice a context window around a span and mark the span inside it
@@ -199,7 +195,7 @@ cwe_pull <- function(.con, .label, .anchored = NULL, .n_per_doc = 4L) {
     .n_per_doc <- 4L
   }
 
-  # Normalised span, built identically to cwe_norm_company's first pass so the two are comparable.
+  # Normalised span, built identically to ent_norm_company's first pass so the two are comparable.
   norm_ <- "trim(regexp_replace(regexp_replace(upper(c.Span), '[^A-Z0-9 ]', ' ', 'g'), '\\s+', ' ', 'g'))"
 
   pred_ <- if (is.null(.anchored)) {
@@ -215,8 +211,9 @@ cwe_pull <- function(.con, .label, .anchored = NULL, .n_per_doc = 4L) {
   if (isFALSE(.anchored) && !identical(pred_, "TRUE")) pred_ <- paste0("NOT (", pred_, ")")
 
   DBI::dbGetQuery(.con, paste0(
-    "SELECT DocID, Start, Stop, Span, Combos, Class, Fold FROM ( ",
-    "  SELECT c.DocID, c.Start, c.Stop, c.Span, a.Class, a.Fold, ",
+    "SELECT DocID, Start, Stop, Span, LabelRaw, Combos, Class, Fold FROM ( ",
+    "  SELECT c.DocID, c.Start, c.Stop, c.Span, ",
+    "         any_value(c.LabelRaw) AS LabelRaw, a.Class, a.Fold, ",
     "         string_agg(DISTINCT CASE WHEN c.Engine = c.Model THEN c.Engine ",
     "                    ELSE c.Engine || ':' || c.Model END, ',') AS Combos ",
     "  FROM candidates c JOIN cwe_anchor a USING (DocID) ",
@@ -265,20 +262,25 @@ cwe_flag_date <- function(.tab, .filed, .window_days = 730L) {
 #'
 #' @param .tab Candidate tibble carrying Class and Pos.
 #' @param .n Integer rows wanted.
+#' @param .by_labelraw Logical. Deal across LabelRaw as well, so a unit whose engine emits several
+#'   classes shows all of them. Redaction needs it: an omitted SECTION and a withheld NUMBER are
+#'   different questions, and a proportional draw would bury whichever class is rarer.
 #' @return Tibble of at most .n rows.
-cwe_spread <- function(.tab, .n) {
+cwe_spread <- function(.tab, .n, .by_labelraw = FALSE) {
   if (FALSE) {
-    .tab <- tab_target
-    .n   <- 40L
+    .tab         <- tab_target
+    .n           <- 60L
+    .by_labelraw <- FALSE
   }
   if (nrow(.tab) == 0L) return(.tab)
+  keys_ <- if (isTRUE(.by_labelraw)) c("Class", "Band", "LabelRaw") else c("Class", "Band")
   .tab |>
     dplyr::mutate(
       Band = cut(.data$Pos, breaks = c(-0.01, 0.1, 0.5, 0.9, 1.01),
                  labels = c("head", "early", "late", "tail"))
     ) |>
     dplyr::slice_sample(prop = 1) |>
-    dplyr::mutate(Slot = dplyr::row_number(), .by = c("Class", "Band")) |>
+    dplyr::mutate(Slot = dplyr::row_number(), .by = dplyr::all_of(keys_)) |>
     dplyr::arrange(.data$Slot) |>
     utils::head(.n) |>
     dplyr::select(-Slot)
@@ -370,9 +372,14 @@ cwe_write_contexts <- function(.tab, .path, .title, .note) {
     "_No examples available._"
   } else {
     purrr::map_chr(seq_len(nrow(.tab)), function(.i) {
+      lab_ <- if (!is.null(.tab$LabelRaw) && !is.na(.tab$LabelRaw[[.i]])) {
+        paste0("  |  ", .tab$LabelRaw[[.i]])
+      } else {
+        ""
+      }
       paste0(
-        sprintf("### %03d  |  %s  |  %s  |  %.0f%% through document",
-                .i, .tab$Class[[.i]], .tab$Combos[[.i]], 100 * .tab$Pos[[.i]]),
+        sprintf("### %03d  |  %s%s  |  %s  |  %.0f%% through document",
+                .i, .tab$Class[[.i]], lab_, .tab$Combos[[.i]], 100 * .tab$Pos[[.i]]),
         "\n\n",
         .tab$Marked[[.i]], "\n"
       )
@@ -396,14 +403,24 @@ cwe_unit_readme <- function(.label, .roles, .n_target, .n_other, .n_rules, .slug
   if (FALSE) {
     .label    <- "ORG"
     .roles    <- .UNITS$Roles[[1]]
-    .n_target <- 40L
-    .n_other  <- 40L
+    .n_target <- 60L
+    .n_other  <- 60L
     .n_rules  <- 30L
     .slug     <- "01-org"
     .anchored <- TRUE
   }
 
-  sets_ <- if (.anchored) {
+  sets_ <- if (identical(.label, "REDACT")) {
+    c(paste0("- `SAMPLE.md` -- ", .n_other, " redaction markers in context"),
+      "",
+      "Each marker stands where something was removed before filing. The class of marker is",
+      "in the header line: a symbol form such as `[***]` normally replaces a value, while",
+      "`[INTENTIONALLY OMITTED]` normally replaces a whole clause. Read the surrounding",
+      "text and say WHAT IS MISSING, and which phrase tells you.",
+      "",
+      "This is the question the rest of the project cannot ask. The number of redactions per",
+      "contract is already counted; what they conceal is not known.")
+  } else if (.anchored) {
     c(paste0("- `TARGET.md` -- ", .n_target, " spans that ARE the known entity"),
       paste0("- `OTHER.md`  -- ", .n_other, " spans that are not"),
       "",
@@ -418,8 +435,23 @@ cwe_unit_readme <- function(.label, .roles, .n_target, .n_other, .n_rules, .slug
       "sample and say which cues mark which role, and where the roles differ by contract type.")
   }
 
+  extra_ <- if (identical(.label, "REDACT")) {
+    c("",
+      "## Two things per rule",
+      "",
+      "`Role` is what the marker hides. `Pattern` is the phrase in the surrounding text that",
+      "tells you so. A rule therefore reads: when this phrase sits near a marker, the thing",
+      "removed was of this kind.",
+      "",
+      "Some markers will be uninformative -- the surrounding text says nothing about what was",
+      "there. Say so in a `note` rather than guessing; how often that happens is itself the",
+      "answer to whether this question can be asked at scale.")
+  } else {
+    character()
+  }
+
   c(paste0("# Unit: ", .label), "",
-    sets_, "",
+    sets_, extra_, "",
     "## Roles for this unit",
     "",
     "Use these strings exactly in the `Role` field. Do not invent others:",
@@ -520,6 +552,19 @@ cwe_instructions <- function(.units, .n_rules, .n_context) {
     "showed you: how often it fires, and whether what it keeps is right. Rules that fail are",
     "dropped mechanically and cost nothing. Rules you never proposed cannot be recovered.",
     "",
+    "## The redaction unit is a different question",
+    "",
+    "One unit holds redaction markers rather than entities. Each marker stands where something",
+    "was removed from the contract before it was filed, so the text around it describes a gap.",
+    "For those, `Role` is WHAT WAS REMOVED and `Pattern` is the phrase that tells you.",
+    "",
+    "The class of marker is shown in each example's header line. A symbol form normally",
+    "replaces a value; a wording such as an intentional omission normally replaces a whole",
+    "clause. Treat those as different cases.",
+    "",
+    "Where the surrounding text gives no clue what was removed, say so in a `note` instead of",
+    "guessing. How often that happens is itself a result.",
+    "",
     "## The document structure question",
     "",
     "`SECTIONS.md` lists the headings that actually occur in this corpus, with the share of",
@@ -609,8 +654,7 @@ cwe_sections_md <- function(.tab, .n_docs) {
 #' @param .units Tibble of Label, Slug, Roles.
 #' @param .folds_generate Folds the session may read.
 #' @param .fold_holdout Fold reserved for scoring; never bundled.
-#' @param .n_target,.n_other Examples per unit.
-#' @param .n_context Context characters each side.
+#' @param .n_context Context characters each side. Per-unit example counts come from .units$NEx.
 #' @param .n_per_doc Cap per document per label.
 #' @param .n_docs_full Complete contracts included for the structure question.
 #' @param .n_headings Rows of the heading inventory.
@@ -621,9 +665,9 @@ cwe_sections_md <- function(.tab, .n_docs) {
 cwe_write_bundle <- function(.path_text, .path_anchors, .path_store, .dir_bundle,
                              .units = .UNITS,
                              .folds_generate = 1:4, .fold_holdout = 5L,
-                             .n_target = 40L, .n_other = 40L, .n_context = 240L,
-                             .n_per_doc = 4L, .n_docs_full = 8L, .n_headings = 150L,
-                             .n_rules = 30L, .window_days = 730L, .seed = 42L) {
+                             .n_context = 240L,
+                             .n_per_doc = 2L, .n_docs_full = 8L, .n_headings = 150L,
+                             .n_rules = 30L, .window_days = 730L, .seed = 43L) {
   if (FALSE) {
     .path_text      <- .PATH_TEXT
     .path_anchors   <- .PATH_ANCHORS
@@ -632,15 +676,13 @@ cwe_write_bundle <- function(.path_text, .path_anchors, .path_store, .dir_bundle
     .units          <- .UNITS
     .folds_generate <- 1:4
     .fold_holdout   <- 5L
-    .n_target       <- 40L
-    .n_other        <- 40L
     .n_context      <- 240L
-    .n_per_doc      <- 4L
+    .n_per_doc      <- 2L
     .n_docs_full    <- 8L
     .n_headings     <- 150L
     .n_rules        <- 30L
     .window_days    <- 730L
-    .seed           <- 42L
+    .seed           <- 43L
   }
 
   for (p_ in c(.path_text, .path_anchors, .path_store)) {
@@ -651,20 +693,11 @@ cwe_write_bundle <- function(.path_text, .path_anchors, .path_store, .dir_bundle
   }
   set.seed(.seed)
 
-  anch_ <- arrow::read_parquet(.path_anchors) |>
+  # Built by the measurement library, so the geographic anchor here carries the expanded state
+  # names it carries there. Copying this logic is what let the two drift the first time.
+  anch_ <- ent_anchor_keys(.path_anchors = .path_anchors) |>
     dplyr::filter(.data$Fold %in% .folds_generate) |>
-    dplyr::transmute(
-      DocID, Fold,
-      Class      = .data$ClassDetailed,
-      DateFiled  = as.character(.data$DateFiled),
-      AnchorKey  = cwe_norm_company(.data$CompanyName),
-      AnchorText = stringi::stri_trans_toupper(paste(
-        dplyr::coalesce(.data$BusinessAddress, ""),
-        dplyr::coalesce(.data$MailingAddress, "")
-      ))
-    ) |>
-    dplyr::mutate(AnchorText = dplyr::if_else(trimws(.data$AnchorText) == "", NA_character_,
-                                              .data$AnchorText))
+    dplyr::mutate(DateFiled = as.character(.data$DateFiled))
 
   if (any(anch_$Fold == .fold_holdout)) {
     cli::cli_abort("Holdout fold {(.fold_holdout)} leaked into the pool -- aborting")
@@ -699,10 +732,11 @@ cwe_write_bundle <- function(.path_text, .path_anchors, .path_store, .dir_bundle
       dplyr::select(-TextRaw)
   }
 
-  out_ <- purrr::pmap(.units, function(Label, Slug, Roles) {
+  out_ <- purrr::pmap(.units, function(Label, Slug, NEx, Roles) {
     cli::cli_h3("{Label}")
     dir_u_ <- fs::path(.dir_bundle, "units", Slug)
     anchored_ <- Label %in% c("ORG", "GPE", "DATE")
+    by_raw_   <- identical(Label, "REDACT")
 
     if (identical(Label, "DATE")) {
       all_ <- cwe_pull(con_, Label, .anchored = NULL, .n_per_doc = .n_per_doc * 2L) |>
@@ -717,26 +751,34 @@ cwe_write_bundle <- function(.path_text, .path_anchors, .path_store, .dir_bundle
       tgt_ <- oth_[0, ]   # no anchor exists for this label; an empty TARGET, not a wasted query
     }
 
-    tgt_ <- if (nrow(tgt_) > 0L) cwe_spread(finish_(tgt_), .n_target) else tgt_
-    oth_ <- cwe_spread(finish_(oth_), .n_other)
+    tgt_ <- if (nrow(tgt_) > 0L) cwe_spread(finish_(tgt_), NEx) else tgt_
+    oth_ <- cwe_spread(finish_(oth_), NEx, .by_labelraw = by_raw_)
 
     if (anchored_) {
       cwe_write_contexts(tgt_, fs::path(dir_u_, "TARGET.md"), paste0(Label, " -- TARGET"),
                          "Spans that external records confirm are present in the contract.")
       cwe_write_contexts(oth_, fs::path(dir_u_, "OTHER.md"), paste0(Label, " -- OTHER"),
                          "Spans with no such confirmation. Some are correct; most are not.")
-      if (nrow(tgt_) < .n_target) {
-        cli::cli_alert_warning("{Label}: only {nrow(tgt_)} anchored example{?s} (asked {(.n_target)})")
+      if (nrow(tgt_) < NEx) {
+        cli::cli_alert_warning("{Label}: only {nrow(tgt_)} anchored example{?s} (asked {NEx})")
       }
     } else {
-      cwe_write_contexts(oth_, fs::path(dir_u_, "SAMPLE.md"), paste0(Label, " -- SAMPLE"),
-                         "A spread of spans across contract types. No external anchor exists here.")
+      note_ <- if (by_raw_) {
+        "Redaction markers across contract types and marker classes. What was removed is the question."
+      } else {
+        "A spread of spans across contract types. No external anchor exists here."
+      }
+      cwe_write_contexts(oth_, fs::path(dir_u_, "SAMPLE.md"), paste0(Label, " -- SAMPLE"), note_)
     }
 
     writeLines(
       cwe_unit_readme(Label, Roles, nrow(tgt_), nrow(oth_), .n_rules, Slug, anchored_),
       fs::path(dir_u_, "UNIT.md")
     )
+    if (by_raw_ && nrow(oth_) > 0L) {
+      mix_ <- oth_ |> dplyr::count(.data$LabelRaw, name = "N")
+      cli::cli_alert_info("Marker classes shown: {paste0(mix_$LabelRaw, '=', mix_$N, collapse = ', ')}")
+    }
     tibble::tibble(Unit = Slug, Label = Label, NTarget = nrow(tgt_), NOther = nrow(oth_))
   }) |>
     purrr::list_rbind()
@@ -775,8 +817,6 @@ cwe_write_bundle <- function(.path_text, .path_anchors, .path_store, .dir_bundle
       store_path      = as.character(.path_store),
       folds_generate  = .folds_generate,
       fold_holdout    = .fold_holdout,
-      n_target        = .n_target,
-      n_other         = .n_other,
       n_context       = .n_context,
       n_per_doc       = .n_per_doc,
       n_rules_asked   = .n_rules,
@@ -815,8 +855,6 @@ if (fs::dir_exists(.DIR_BUNDLE) && length(fs::dir_ls(.DIR_BUNDLE)) > 0L) {
     .units          = .UNITS,              # one unit per entity type, with its closed role vocabulary
     .folds_generate = .FOLDS_GENERATE,     # folds the session may read
     .fold_holdout   = .FOLD_HOLDOUT,       # never bundled; the honest estimate comes from here
-    .n_target       = .N_TARGET,           # anchor-matched examples per unit
-    .n_other        = .N_OTHER,            # unmatched examples per unit
     .n_context      = .N_CONTEXT,          # characters each side of a span
     .n_per_doc      = .N_PER_DOC,          # cap per document, so no contract dominates a unit
     .n_docs_full    = .N_DOCS_FULL,        # complete contracts for the structure question

@@ -508,6 +508,22 @@ ent_rule_scores <- function(.con, .path_text, .rules, .fold = 5L, .ctx_max = 400
     .RX_REDACT_SYM, "')"
   ))
 
+  # What the characters immediately either side of a span imply about it. Read off the ends of the
+  # context columns rather than the middle: a currency symbol four characters back is the one the
+  # removal left standing, and one four hundred characters back is somebody else's.
+  for (col_ in c("ShapeValue BOOLEAN", "ShapeRate BOOLEAN", "ShapePeriod BOOLEAN",
+                 "ShapeUnit BOOLEAN")) {
+    DBI::dbExecute(.con, paste0("ALTER TABLE ctx ADD COLUMN ", col_))
+  }
+  DBI::dbExecute(.con, paste0(
+    "UPDATE ctx SET ",
+    "  ShapeValue  = regexp_matches(right(LeftCtx, 4), '", ent_sql_currency(), "\\s*$'), ",
+    "  ShapeRate   = regexp_matches(left(RightCtx, 3), '^\\s*%'), ",
+    "  ShapePeriod = regexp_matches(left(RightCtx, 24), ",
+    "    '^\\s*((business|calendar)\\s+)?(day|month|year|week)s?'), ",
+    "  ShapeUnit   = regexp_matches(left(RightCtx, 24), '^\\s*per\\s+[a-z]')"
+  ))
+
   base_ <- DBI::dbGetQuery(.con, paste0(
     "SELECT Label, COUNT(*) AS NCand, SUM(CASE WHEN IsAnchor THEN 1 ELSE 0 END) AS NAnchor ",
     "FROM ctx GROUP BY Label"
@@ -727,18 +743,42 @@ ent_probe_sections <- function(.path_text, .headings) {
 #' SpansKept is what 04D then has to resolve. CharsKept is what 04E has to read, and it is the only
 #' one that maps to wall-clock time.
 #'
+#' Restricted to the deployed engine where .policy is given. Pooling every engine overstates what
+#' the corpus pass achieves: a document counts as recovered if ANY of eight engines found the anchor
+#' there, and only one of them will run.
+#'
 #' @param .con Session with anchor_hits built.
 #' @param .path_text Canonical text parquet.
 #' @param .head,.tail Integer vectors of character budgets from the front and the back.
+#' @param .policy Tibble of Label and Combo to restrict to, or NULL for all engines pooled.
 #' @return Tibble: Label, Head, Tail, NAnchorDocs, DocRecall, SpansKept, CharsKept.
 ent_window_chars <- function(.con, .path_text,
                              .head = c(1500L, 3000L, 5000L, 10000L, 20000L),
-                             .tail = c(0L, 2000L, 5000L)) {
+                             .tail = c(0L, 2000L, 5000L),
+                             .policy = NULL) {
   if (FALSE) {
     .con       <- con
     .path_text <- .lP$Input$Text
     .head      <- c(1500L, 3000L, 5000L, 10000L, 20000L)
     .tail      <- c(0L, 2000L, 5000L)
+    .policy    <- tab_policy
+  }
+
+  # Anchor spans, optionally narrowed to the spans the deployed engine actually proposed.
+  if (is.null(.policy)) {
+    DBI::dbExecute(.con, "CREATE OR REPLACE TABLE ahwin AS SELECT * FROM anchor_hits")
+  } else {
+    ent_put_table(.con = .con, .name = "wpolicy", .tab = dplyr::mutate(
+      .policy,
+      Engine = sub(":.*$", "", .data$Combo),
+      Model  = dplyr::if_else(grepl(":", .data$Combo, fixed = TRUE),
+                              sub("^[^:]*:", "", .data$Combo), .data$Combo)
+    ))
+    DBI::dbExecute(.con, paste0(
+      "CREATE OR REPLACE TABLE ahwin AS SELECT DISTINCT ah.* FROM anchor_hits ah ",
+      "JOIN s.candidates c USING (DocID, Label, Start, Stop) ",
+      "JOIN wpolicy p ON c.Label = p.Label AND c.Engine = p.Engine AND c.Model = p.Model"
+    ))
   }
 
   ent_put_table(.con = .con, .name = "cgrid",
@@ -750,7 +790,7 @@ ent_window_chars <- function(.con, .path_text,
 
   DBI::dbGetQuery(.con, paste0(
     "WITH pos AS (SELECT ah.Label, ah.DocID, ah.IsAnchor, ah.Start, ah.Stop, l.DocLen ",
-    "             FROM anchor_hits ah JOIN lens l USING (DocID)), ",
+    "             FROM ahwin ah JOIN lens l USING (DocID)), ",
     "base AS (SELECT Label, COUNT(DISTINCT DocID) AS NAnchorDocs FROM pos WHERE IsAnchor ",
     "         GROUP BY Label), ",
     "chars AS (SELECT g.Head, g.Tail, ",
@@ -783,18 +823,27 @@ ent_window_chars <- function(.con, .path_text,
 #' inside any measurement error, and without it the rule would trade three points of recall for a
 #' rounding difference.
 #'
+#' Labels with no anchor get a DECLARED engine rather than no row at all. The first version filtered
+#' them out, and 04C then joined its candidate set against a policy with holes in it: money and
+#' redaction were dropped silently and the value column came back empty for every contract. A policy
+#' is a deployment specification, not a selection result, so it has to name an engine for everything
+#' the corpus pass will run -- with Basis recording which choices were measured and which asserted.
+#'
 #' @param .tab Tibble from ent_engine_recall().
+#' @param .defaults Named character vector: engine to declare for labels the anchor cannot rank.
 #' @param .recall_tol Recall points below the best an engine may sit and still be considered.
 #' @param .cost_tol Relative cost gap treated as a tie.
-#' @return Tibble: Label, Combo, Recall, SpansPerAnchor, NConsidered, Rule.
-ent_choose_engines <- function(.tab, .recall_tol = 0.10, .cost_tol = 0.15) {
+#' @return Tibble: Label, Combo, Basis, Recall, SpansPerAnchor, NConsidered, Rule.
+ent_choose_engines <- function(.tab, .defaults = character(0),
+                               .recall_tol = 0.10, .cost_tol = 0.15) {
   if (FALSE) {
     .tab         <- tab_eng
+    .defaults    <- .DEFAULT_ENGINE
     .recall_tol  <- 0.10
     .cost_tol    <- 0.15
   }
 
-  .tab |>
+  measured_ <- .tab |>
     dplyr::filter(!is.na(.data$Recall), .data$SpansPerAnchor > 0) |>
     dplyr::mutate(BestRecall = max(.data$Recall), .by = Label) |>
     dplyr::filter(.data$Recall >= .data$BestRecall - .recall_tol) |>
@@ -806,11 +855,27 @@ ent_choose_engines <- function(.tab, .recall_tol = 0.10, .cost_tol = 0.15) {
     dplyr::filter(.data$SpansPerAnchor <= .data$MinCost * (1 + .cost_tol)) |>
     dplyr::slice_max(.data$Recall, n = 1L, by = Label, with_ties = FALSE) |>
     dplyr::transmute(
-      Label, Combo, Recall, SpansPerAnchor, NConsidered,
+      Label, Combo, Basis = "measured", Recall, SpansPerAnchor, NConsidered,
       Rule = paste0("within ", round(100 * .recall_tol), " recall points of best, ",
                     "cheapest to within ", round(100 * .cost_tol), "%")
-    ) |>
-    dplyr::arrange(.data$Label)
+    )
+
+  need_ <- setdiff(unique(.tab$Label), measured_$Label)
+  declared_ <- tibble::tibble(
+    Label          = need_,
+    Combo          = unname(.defaults[need_]),
+    Basis          = "declared",
+    Recall         = NA_real_,
+    SpansPerAnchor = NA_real_,
+    NConsidered    = NA_integer_,
+    Rule           = "no anchor; engine asserted, not measured"
+  )
+  gap_ <- declared_$Label[is.na(declared_$Combo)]
+  if (length(gap_) > 0L) {
+    cli::cli_abort("No default engine declared for {gap_}; 04C would drop the label silently.")
+  }
+
+  dplyr::bind_rows(measured_, declared_) |> dplyr::arrange(.data$Label)
 }
 
 
@@ -874,6 +939,218 @@ ent_redaction_check <- function(.con, .rules) {
 }
 
 
+# 8b. What the redaction markers conceal --------------------------------
+# The redaction unit asks what was removed, and nothing external records that either. But the
+# characters immediately around a marker often survive the removal and identify it: a currency
+# symbol left standing before the gap, a percent sign after it, a unit noun following. That is
+# evidence of a different kind from a phrase in the surrounding sentence, which is what makes it a
+# test of the proposed cues rather than a restatement of them.
+
+#' Currency class, built from code points so the source stays ASCII
+#'
+#' DuckDB's regular expressions do not accept \u escapes, so the characters have to reach the SQL
+#' literally; the house rule keeps them out of the R file. Building the class at run time satisfies
+#' both. Dollar covers US$ and R$ as well, since both end in the symbol.
+#'
+#' @return A SQL character class as a string.
+ent_sql_currency <- function() {
+  if (FALSE) NULL
+  paste0("[", intToUtf8(c(0x24, 0xA3, 0xA5, 0x20AC)), "]")
+}
+
+#' Read one or more compiled rule files and tag where each came from
+#'
+#' Two reading sessions have now proposed rules from different documents. Scoring their union is
+#' worth more than scoring either alone, and tagging the source keeps the recurrence question
+#' answerable afterwards: a rule both sessions proposed is a property of the corpus, one only a
+#' single session proposed may be a property of its draw.
+#'
+#' @param .paths Named character vector of compiled rule parquets; names become Source.
+#' @return Tibble of rules with a Source column, deduplicated on the rule itself.
+ent_read_rules <- function(.paths) {
+  if (FALSE) .paths <- .lP$Input$Rules
+
+  have_ <- .paths[fs::file_exists(.paths)]
+  if (length(have_) == 0L) cli::cli_abort("No rule files found at {.path {(.paths)}}")
+  miss_ <- names(.paths)[!fs::file_exists(.paths)]
+  if (length(miss_) > 0L) {
+    cli::cli_alert_warning("{length(miss_)} rule file{?s} missing: {miss_}")
+  }
+
+  purrr::imap(have_, \(.p, .nm) dplyr::mutate(arrow::read_parquet(.p), Source = .nm)) |>
+    purrr::list_rbind() |>
+    dplyr::summarise(
+      Source = paste(sort(unique(.data$Source)), collapse = "+"),
+      dplyr::across(c(Rationale, Evidence), \(.x) dplyr::first(.x)),
+      .by = c(Kind, Label, Role, Pattern, Side, Window)
+    )
+}
+
+#' Score the redaction cues against the characters the removal left behind
+#'
+#' The role a session assigned says what it believes was removed. The shape says what the surviving
+#' punctuation implies. Where the two agree above the base rate, the cue is finding the kind of gap
+#' it claims to. Roles the shape cannot speak to -- a removed party name, a deleted clause body --
+#' are reported as unmeasured rather than scored against a signal that does not apply to them.
+#'
+#' @param .con Session with ctx built by ent_rule_scores().
+#' @param .rules Tibble of compiled rules.
+#' @param .shape_map Tibble of Role and the Shape column each expects.
+#' @return Tibble: Role, Shape, Pattern, Side, Window, NFire, NShape, BaseRate, Precision, Lift.
+ent_redaction_shape <- function(.con, .rules, .shape_map) {
+  if (FALSE) {
+    .con       <- con
+    .rules     <- tab_rules
+    .shape_map <- .REDACT_SHAPE
+  }
+
+  red_ <- .rules |>
+    dplyr::filter(.data$Label == "REDACT", .data$Kind == "cue") |>
+    dplyr::inner_join(.shape_map, by = dplyr::join_by(Role)) |>
+    dplyr::mutate(RuleID = dplyr::row_number())
+  if (nrow(red_) == 0L) return(red_)
+  ent_put_table(.con = .con, .name = "shaperules", .tab = red_)
+
+  base_ <- DBI::dbGetQuery(.con, paste0(
+    "SELECT COUNT(*) AS NCand, ",
+    "  SUM(CASE WHEN ShapeValue  THEN 1 ELSE 0 END) AS ShapeValue, ",
+    "  SUM(CASE WHEN ShapeRate   THEN 1 ELSE 0 END) AS ShapeRate, ",
+    "  SUM(CASE WHEN ShapePeriod THEN 1 ELSE 0 END) AS ShapePeriod, ",
+    "  SUM(CASE WHEN ShapeUnit   THEN 1 ELSE 0 END) AS ShapeUnit ",
+    "FROM ctx WHERE Label = 'REDACT'"
+  )) |>
+    tidyr::pivot_longer(-NCand, names_to = "Shape", values_to = "NBase") |>
+    dplyr::mutate(BaseRate = .data$NBase / .data$NCand)
+
+  DBI::dbGetQuery(.con, paste0(
+    "SELECT r.RuleID, COUNT(*) AS NFire, ",
+    "  SUM(CASE r.Shape WHEN 'ShapeValue'  THEN CASE WHEN c.ShapeValue  THEN 1 ELSE 0 END ",
+    "                   WHEN 'ShapeRate'   THEN CASE WHEN c.ShapeRate   THEN 1 ELSE 0 END ",
+    "                   WHEN 'ShapePeriod' THEN CASE WHEN c.ShapePeriod THEN 1 ELSE 0 END ",
+    "                   WHEN 'ShapeUnit'   THEN CASE WHEN c.ShapeUnit   THEN 1 ELSE 0 END ",
+    "                   ELSE 0 END) AS NShape ",
+    "FROM ctx c JOIN shaperules r ON c.Label = r.Label ",
+    "WHERE CASE r.Side ",
+    "  WHEN 'left'  THEN contains(right(c.LeftCtx,  r.Window), r.Pattern) ",
+    "  WHEN 'right' THEN contains(left(c.RightCtx,  r.Window), r.Pattern) ",
+    "  ELSE contains(right(c.LeftCtx, r.Window), r.Pattern) ",
+    "       OR contains(left(c.RightCtx, r.Window), r.Pattern) END ",
+    "GROUP BY r.RuleID"
+  )) |>
+    tibble::as_tibble() |>
+    dplyr::right_join(red_, by = dplyr::join_by(RuleID)) |>
+    dplyr::left_join(dplyr::select(base_, Shape, BaseRate), by = dplyr::join_by(Shape)) |>
+    dplyr::mutate(
+      NFire     = as.integer(dplyr::coalesce(.data$NFire, 0)),
+      NShape    = as.integer(dplyr::coalesce(.data$NShape, 0)),
+      Precision = .data$NShape / dplyr::na_if(.data$NFire, 0L),
+      Lift      = .data$Precision / dplyr::na_if(.data$BaseRate, 0)
+    ) |>
+    dplyr::select(Role, Shape, Pattern, Side, Window, NFire, NShape, BaseRate, Precision, Lift) |>
+    dplyr::arrange(dplyr::desc(.data$Lift))
+}
+
+
+# 8c. Can an engine find a withheld amount at all? ------------------------
+# Money is the one label with no anchor, so the engine behind it went into the policy as a declared
+# default. Cross-engine agreement narrows the question -- the regex arm and the transformer overlap
+# at Jaccard 0.77, the highest of any cross-family pair in the store -- but agreement on what both
+# find says nothing about what only one of them can.
+#
+# A redaction marker is where an amount used to be. Whether an engine proposes a span there is a
+# CAPABILITY question rather than a tuned metric, and it is the case that matters most, because a
+# figure is withheld precisely when it is commercially material.
+
+#' Redaction sites, classified by the characters the removal left behind
+#'
+#' The class is read off the text either side of the marker and not from any engine's output, so the
+#' definition does not presuppose the answer. Two classes carry information:
+#'
+#'   after_currency  A currency symbol immediately precedes the marker: "$[***]", "a price of $ per
+#'                   share". The amount is gone and the symbol is not.
+#'   before_unit     A percent sign or a unit noun immediately follows: "[***]% of net sales",
+#'                   "[***] days after notice". Nothing marks it as money except what it is measured
+#'                   in, so an engine keying on currency cannot reach it either.
+#'
+#' The second class is the honest half of this test. It favours no engine and bounds what is
+#' recoverable at all, which is worth knowing before a redaction-aware money variable is promised.
+#'
+#' @param .con Session with the store attached as s.
+#' @param .path_text Canonical text parquet.
+#' @return Invisibly the row count of the table created.
+ent_redaction_sites <- function(.con, .path_text) {
+  if (FALSE) {
+    .con       <- con
+    .path_text <- .lP$Input$Text
+  }
+
+  cur_ <- ent_sql_currency()
+  DBI::dbExecute(.con, paste0(
+    "CREATE OR REPLACE TABLE site AS ",
+    "SELECT row_number() OVER () AS SiteID, r.DocID, r.Start, r.Stop, ",
+    "  CASE WHEN regexp_matches(substring(t.TextRaw, greatest(1, r.Start - 2), ",
+    "                           least(3, r.Start)), '", cur_, "\\s*$') THEN 'after_currency' ",
+    "       WHEN regexp_matches(substring(t.TextRaw, r.Stop + 1, 14), ",
+    "            '^\\s*(%|per\\s+[a-z]|(business |calendar )?(day|month|year|week)s?)') ",
+    "         THEN 'before_unit' ",
+    "       ELSE 'other' END AS Site ",
+    "FROM s.candidates r JOIN read_parquet('", as.character(fs::path_abs(.path_text)),
+    "') t USING (DocID) WHERE r.Label = 'REDACT' AND r.Start IS NOT NULL"
+  ))
+  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS N FROM site")$N
+  cli::cli_alert_success("Redaction sites classified: {n_}")
+  invisible(n_)
+}
+
+#' Which money engines propose a span where an amount was removed
+#'
+#' A site counts as covered when the engine returns a money span overlapping it or within .near
+#' characters. Overlap alone would be too strict: an engine may tag the currency symbol without
+#' reaching into the bracket, and that is still finding the amount.
+#'
+#' Read the two site classes differently. On after_currency the regex arm has a pattern written for
+#' exactly this shape, so a difference there is expected and the size of it is the result; a
+#' transformer has nothing to tag, since the number it would recognise is the thing that was
+#' removed. On before_unit neither engine has any reason to fire, and a low figure for both is a
+#' statement about the ceiling rather than about either of them.
+#'
+#' @param .con Session with site built.
+#' @param .near Characters either side of a site within which a span counts as covering it.
+#' @return Tibble: Combo, Site, NSites, NCovered, PctCovered.
+ent_redaction_reach <- function(.con, .near = 3L) {
+  if (FALSE) {
+    .con  <- con
+    .near <- 3L
+  }
+
+  DBI::dbExecute(.con, paste0(
+    "CREATE OR REPLACE TABLE mon AS ",
+    "SELECT DocID, Start, Stop, ",
+    "  CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END AS Combo ",
+    "FROM s.candidates WHERE Label = 'MONEY' AND Start IS NOT NULL"
+  ))
+  DBI::dbExecute(.con, "CREATE OR REPLACE TABLE engines AS SELECT DISTINCT Combo FROM mon")
+
+  DBI::dbGetQuery(.con, paste0(
+    "WITH pair AS ( ",
+    "  SELECT DISTINCT s.SiteID, m.Combo FROM site s JOIN mon m ON m.DocID = s.DocID ",
+    "    AND m.Stop >= s.Start - ", as.integer(.near), " ",
+    "    AND m.Start <= s.Stop + ", as.integer(.near), ") ",
+    "SELECT e.Combo, s.Site, COUNT(DISTINCT s.SiteID) AS NSites, ",
+    "       COUNT(DISTINCT p.SiteID) AS NCovered ",
+    "FROM site s CROSS JOIN engines e ",
+    "LEFT JOIN pair p ON p.SiteID = s.SiteID AND p.Combo = e.Combo ",
+    "GROUP BY e.Combo, s.Site ORDER BY s.Site, COUNT(DISTINCT p.SiteID) DESC"
+  )) |>
+    tibble::as_tibble() |>
+    dplyr::mutate(
+      NSites     = as.integer(.data$NSites),
+      NCovered   = as.integer(.data$NCovered),
+      PctCovered = .data$NCovered / dplyr::na_if(.data$NSites, 0L)
+    )
+}
+
+
 # 9. Report ---------------------------------------------------------------
 
 #' Anchor availability and how often any engine found it
@@ -904,7 +1181,7 @@ ent_report_engines <- function(.tab) {
   cli::cli_h2("Engine recall on the known entity, all documents")
   clf_say_table(
     .tab = .tab |>
-      dplyr::filter(.data$Label != "MONEY") |>
+      dplyr::filter(!.data$Label %in% c("MONEY", "REDACT")) |>
       dplyr::mutate(
         Recall         = clf_pct(.data$Recall),
         SpansPerAnchor = round(.data$SpansPerAnchor, 1)
@@ -917,8 +1194,8 @@ ent_report_engines <- function(.tab) {
      is louder, not better, and SpansPerAnchor is the adjudication cost per known entity recovered."
   )
   cli::cli_alert_warning(
-    "MONEY is omitted: EDGAR records no contract value, so no anchor exists and nothing in this \\
-     table could be computed for it."
+    "MONEY and REDACT are omitted: neither has an anchor -- EDGAR records no contract value and no \\
+     redaction ground truth -- so nothing in this table could be computed for either."
   )
   invisible(.tab)
 }
@@ -1113,6 +1390,56 @@ ent_report_redaction <- function(.tab) {
   invisible(.tab)
 }
 
+#' Whether the redaction cues agree with the punctuation the removal left behind
+#' @param .tab Tibble from ent_redaction_shape().
+#' @return Invisibly .tab.
+ent_report_redaction_shape <- function(.tab) {
+  if (FALSE) .tab <- tab_shape
+
+  cli::cli_h2("Redaction: proposed role against surviving punctuation")
+  if (nrow(.tab) == 0L) {
+    cli::cli_alert_warning("No redaction cues carry a role the shape test can speak to.")
+    return(invisible(.tab))
+  }
+  clf_say_table(
+    .tab = .tab |>
+      dplyr::filter(.data$NFire > 0L) |>
+      dplyr::mutate(
+        dplyr::across(c(BaseRate, Precision), \(.x) clf_pct(.x)),
+        Lift = round(.data$Lift, 2)
+      ) |>
+      dplyr::select(Role, Shape, Pattern, Side, NFire, BaseRate, Precision, Lift)
+  )
+  cli::cli_alert_info(
+    "A currency symbol left standing before the gap, a percent sign after it, a unit noun \\
+     following: the characters survived the removal and say what kind of thing was there. Lift \\
+     above 1 means the cue and the punctuation agree, which is independent evidence because one is \\
+     a phrase and the other is not. Roles no shape can speak to -- a removed party name, a deleted \\
+     clause -- are absent from this table rather than scored against a signal that misses them."
+  )
+  invisible(.tab)
+}
+
+#' Which money engines reach a withheld amount
+#' @param .tab Tibble from ent_redaction_reach().
+#' @return Invisibly .tab.
+ent_report_redaction_reach <- function(.tab) {
+  if (FALSE) .tab <- tab_reach
+
+  cli::cli_h2("Money engines at redaction sites")
+  clf_say_table(
+    .tab = .tab |> dplyr::mutate(PctCovered = clf_pct(.data$PctCovered))
+  )
+  cli::cli_alert_info(
+    "A redaction marker is where an amount used to be, so this asks whether an engine can find one \\
+     at all -- a capability, not a tuned score. On after_currency the symbol survived and the \\
+     number did not, which is the case a transformer structurally cannot tag. On before_unit \\
+     nothing marks the gap as money except what it is measured in, and a low figure for every \\
+     engine is a statement about the ceiling rather than about any of them."
+  )
+  invisible(.tab)
+}
+
 #' Every 04B report block, in order
 #' @param .tab_cov Tibble from ent_anchor_coverage().
 #' @param .tab_eng Tibble from ent_engine_recall().
@@ -1122,9 +1449,11 @@ ent_report_redaction <- function(.tab) {
 #' @param .tab_wchar Tibble from ent_window_chars().
 #' @param .tab_policy Tibble from ent_choose_engines().
 #' @param .tab_redact Tibble from ent_redaction_check().
+#' @param .tab_shape Tibble from ent_redaction_shape().
+#' @param .tab_reach Tibble from ent_redaction_reach().
 #' @return Invisibly NULL.
 ent_report_all <- function(.tab_cov, .tab_eng, .tab_rules, .tab_window, .tab_sections,
-                           .tab_wchar, .tab_policy, .tab_redact) {
+                           .tab_wchar, .tab_policy, .tab_redact, .tab_shape, .tab_reach) {
   if (FALSE) {
     .tab_cov      <- tab_cov
     .tab_eng      <- tab_eng
@@ -1134,11 +1463,15 @@ ent_report_all <- function(.tab_cov, .tab_eng, .tab_rules, .tab_window, .tab_sec
     .tab_wchar    <- tab_wchar
     .tab_policy   <- tab_policy
     .tab_redact   <- tab_redact
+    .tab_shape    <- tab_shape
+    .tab_reach    <- tab_reach
   }
   ent_report_anchors(.tab = .tab_cov)
   ent_report_engines(.tab = .tab_eng)
   ent_report_rules(.tab = .tab_rules, .n = 10L)
   ent_report_redaction(.tab = .tab_redact)
+  ent_report_redaction_shape(.tab = .tab_shape)
+  ent_report_redaction_reach(.tab = .tab_reach)
   ent_report_window(.tab = .tab_window)
   ent_report_window_chars(.tab = .tab_wchar)
   ent_report_sections(.tab = .tab_sections)

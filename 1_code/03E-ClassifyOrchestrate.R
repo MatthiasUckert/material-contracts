@@ -1133,19 +1133,41 @@ orch_report_movement <- function(.tab) {
 #' @param .spine Routing spine.
 #' @param .policies Output of orch_policy_grid().
 #' @param .tolerance Macro-F1 band treated as indistinguishable.
+#' @param .deployable Arm names that exist as artifacts. Policies naming anything else are ranked and
+#'   reported but not chosen, because a deployment artifact referring to an arm built in memory is
+#'   one the apply stage cannot execute. A derived arm that won by a real margin would be a finding
+#'   worth building support for, not something to ship silently.
 #' @param .lenient Logical. Lenient scoring during selection.
 #' @param .none Character. Abstention sentinel.
 #' @return List: Policy (one-row tibble), Fit (per-class gate), Rank (full leaderboard).
-orch_policy_final <- function(.spine, .policies, .tolerance = 0.005, .lenient = FALSE,
-                              .none = ORCH_NONE) {
+orch_policy_final <- function(.spine, .policies, .tolerance = 0.005, .deployable = NULL,
+                              .lenient = FALSE, .none = ORCH_NONE) {
   if (FALSE) {
-    .spine     <- spine_det
-    .policies  <- policies_det
-    .tolerance <- 0.005
+    .spine       <- spine_det
+    .policies    <- policies_det
+    .tolerance   <- 0.005
+    .deployable  <- arms_cv_$Arm
   }
   rank_ <- orch_score_policies(.spine = .spine, .policies = .policies, .lenient = .lenient,
                                .none = .none)
-  pick_ <- orch_pick_policy(.rank = rank_, .tolerance = .tolerance)
+
+  ok_ <- if (is.null(.deployable)) {
+    rank_
+  } else {
+    keep_ <- purrr::map_lgl(rank_$PolicyID, function(.id) {
+      pol_ <- .policies |> dplyr::filter(.data$PolicyID == .id)
+      all(c(pol_$Order[[1]], pol_$Terminal) %in% .deployable)
+    })
+    if (!any(keep_)) cli::cli_abort("No policy uses only deployable arms.")
+    if (any(!keep_)) {
+      cli::cli_alert_info(
+        "{sum(!keep_)} polic{?y/ies} excluded from deployment: they name an arm with no artifact."
+      )
+    }
+    rank_[keep_, ]
+  }
+
+  pick_ <- orch_pick_policy(.rank = ok_, .tolerance = .tolerance)
   pol_  <- .policies |> dplyr::filter(.data$PolicyID == pick_$PolicyID)
   list(
     Policy = pol_,
@@ -1189,13 +1211,15 @@ orch_save_policy <- function(.final, .arms, .label_col, .dir, .commit_only = NUL
     family      = pol_$Family,
     terminal    = pol_$Terminal,
     floor       = pol_$Floor,
-    order       = as.list(order_),
-    commit_only = if (is.null(.commit_only)) NULL else as.list(.commit_only),
+    order       = I(as.list(order_)), # AsIs: auto_unbox would write a one-arm cascade as a scalar
+    commit_only = if (is.null(.commit_only)) NULL else I(as.list(.commit_only)),
     label       = pol_$Label,
-    arms        = .arms |>
-      dplyr::filter(.data$Arm %in% used_) |>
-      dplyr::select(Arm, ConfigName, Kind) |>
-      purrr::transpose()
+    arms        = I(
+      .arms |>
+        dplyr::filter(.data$Arm %in% used_) |>
+        dplyr::select(Arm, ConfigName, Kind) |>
+        purrr::transpose()
+    )
   )
   path_ <- fs::path(.dir, paste0(.stem, "_", .label_col, ".json"))
   jsonlite::write_json(spec_, path_, auto_unbox = TRUE, pretty = TRUE)
@@ -1231,7 +1255,7 @@ orch_save_policy <- function(.final, .arms, .label_col, .dir, .commit_only = NUL
 #' @param .carry Document-level columns to attach to the spine.
 #' @param .none Character. Abstention sentinel.
 #' @return List: LabelCol, Arms, ArmsCV, ArmsHeld, Spine, Roles, Incumbent, Terminals, Gated,
-#'   Policies, Nested, Compare, Movement, Final.
+#'   Policies, Nested, Compare, Movement, Derived, Final.
 orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
                           .extra_arms = NULL,
                           .floors = c(0, 0.70, 0.80, 0.90),
@@ -1267,11 +1291,34 @@ orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
     orch_spine_add(.arm_rows = .extra_arms, .carry = .carry)
 
   roles_ <- orch_roles(.spine = spine_, .none = .none)
+
+  # A derived arm is one built in memory rather than read from a run folder. It competes in the
+  # search on equal terms -- that is the point of building it -- but it is not a thing that exists,
+  # and two roles must never fall to it. It cannot be the INCUMBENT, because the incumbent is the
+  # status quo a routing rule has to beat and the fallback if none does, and a status quo that has to
+  # be reconstructed from two other models each time is not one. And it cannot be DEPLOYED, because
+  # the manifest has no way to express "run the broad model, then constrain the detailed one", so an
+  # artifact naming it would be one the apply stage cannot execute.
+  derived_ <- setdiff(roles_$Arm, arms_cv_$Arm)
+  roles_   <- roles_ |> dplyr::mutate(Derived = .data$Arm %in% derived_)
+
   term_  <- roles_$Arm[roles_$Role == "terminal"]
   gated_ <- roles_$Arm[roles_$Role == "gated"]
   if (length(term_) == 0L) cli::cli_abort("{(.label_col)}: no terminal arm; cannot route.")
-  inc_ <- roles_ |> dplyr::filter(.data$Role == "terminal") |>
-    dplyr::slice_max(.data$Accuracy, n = 1L, with_ties = FALSE) |> dplyr::pull(Arm)
+
+  real_term_ <- roles_ |> dplyr::filter(.data$Role == "terminal", !.data$Derived)
+  if (nrow(real_term_) == 0L) {
+    cli::cli_abort("{(.label_col)}: every terminal arm is derived; nothing deployable to fall back on.")
+  }
+  inc_ <- real_term_ |>
+    dplyr::slice_max(.data$Accuracy, n = 1L, with_ties = FALSE) |>
+    dplyr::pull(Arm)
+  if (length(derived_) > 0L) {
+    cli::cli_alert_info(
+      "{length(derived_)} derived arm{?s} in the search ({derived_}): eligible to win a fold, \
+       ineligible to be the incumbent or to be deployed."
+    )
+  }
 
   policies_ <- orch_policy_grid(
     .arms_gated = gated_,
@@ -1298,8 +1345,9 @@ orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
     Compare   = orch_compare(.spine = spine_, .policies = policies_, .tab_nested = nested_,
                              .incumbent = inc_, .lenient = .lenient, .none = .none),
     Movement  = orch_movement(.tab_nested = nested_, .spine = spine_, .incumbent = inc_),
+    Derived   = derived_,
     Final     = orch_policy_final(.spine = spine_, .policies = policies_, .tolerance = .tolerance,
-                                  .lenient = .lenient, .none = .none)
+                                  .deployable = arms_cv_$Arm, .lenient = .lenient, .none = .none)
   )
 }
 
@@ -1767,6 +1815,86 @@ orch_report_agreement_sets <- function(.tab, .default = NULL) {
   invisible(.tab)
 }
 
+#' Resolve one task's arms to the artifacts that would run them
+#'
+#' Per task, not once for the study, because 03B crowns a different configuration for each: the
+#' detailed task deploys one context length and the broad task another, so a single arm list pins the
+#' wrong checkpoint for two tasks out of three and the apply stage discovers it by finding no
+#' predictions for a terminal it was told to use.
+#'
+#' Availability is the honest part. 03C publishes a keyword table for the detailed taxonomy only, so
+#' the lexical arm has runs for every task and an artifact for one. That is reported as unavailable
+#' rather than assumed present, and the consequence -- a task with a single deployable arm cannot
+#' support a concurrence flag, because there is nobody to concur with -- follows from the table
+#' instead of surprising someone later.
+#'
+#' @param .res One orch_run_task() output.
+#' @param .dir_bert,.dir_kw,.dir_llm Output directories of 03B, 03C and 03D.
+#' @param .kw_stems Named character vector, task to published lexicon stem. A task absent from it has
+#'   no published keyword table and its lexical arm is marked unavailable.
+#' @return Tibble: LabelCol, Arm, Kind, Path, Params.
+orch_artifacts <- function(.res, .dir_bert, .dir_kw, .dir_llm, .kw_stems) {
+  if (FALSE) {
+    .res       <- res_det
+    .dir_bert  <- .dir_bert
+    .kw_stems  <- c(ClassDetailed = "keyword_table_detailed")
+  }
+  .res$ArmsCV |>
+    dplyr::transmute(
+      LabelCol = .res$LabelCol,
+      Arm,
+      ConfigName,
+      MacroF1,
+      Kind = dplyr::case_when(
+        grepl("^keyword-", .data$Kind) ~ "keyword",
+        grepl("^llm-", .data$Kind)     ~ "llm",
+        TRUE                           ~ "transformer"
+      )
+    ) |>
+    # One seat per method family, the same independence rule the voting set uses, with the
+    # transformer seat pinned to the arm that actually shipped this task's label. slice_max rather
+    # than slice(1): taking the first row would inherit whatever order the inventory happened to
+    # arrive in, which is a sort key away from silently pinning a different checkpoint.
+    dplyr::slice_max(.data$MacroF1, n = 1L, by = Kind, with_ties = FALSE) |>
+    dplyr::mutate(
+      Arm = dplyr::if_else(.data$Kind == "transformer", .res$Incumbent, .data$Arm),
+      ConfigName = purrr::map2_chr(.data$Kind, .data$Arm, function(.k, .a) {
+        hit_ <- .res$Arms$ConfigName[.res$Arms$Arm == .a]
+        if (length(hit_) == 0L) NA_character_ else hit_[[1]]
+      }),
+      Path = purrr::pmap_chr(
+        list(.data$Kind, .data$ConfigName, .data$LabelCol),
+        function(.k, .c, .t) {
+          switch(.k,
+            transformer = as.character(fs::path(.dir_bert, "model_final",
+                                                paste0(.c, "__FINAL"), "model")),
+            keyword = if (.t %in% names(.kw_stems)) {
+              as.character(fs::path(.dir_kw, "table", paste0(.kw_stems[[.t]], ".parquet")))
+            } else {
+              NA_character_
+            },
+            llm = as.character(fs::path(.dir_llm, "runs")),
+            NA_character_
+          )
+        }
+      ),
+      Params = purrr::pmap(
+        list(.data$Kind, .data$ConfigName, .data$LabelCol),
+        function(.k, .c, .t) {
+          switch(.k,
+            transformer = list(config_name = .c, label_col = .t),
+            keyword     = list(config_name = .c, source = "text"),
+            llm         = list(config_name = .c,
+                               note = "prompt recipe is stored in the run config.json"),
+            list()
+          )
+        }
+      )
+    ) |>
+    dplyr::filter(!is.na(.data$Path)) |>
+    dplyr::select(LabelCol, Arm, Kind, ConfigName, Path, Params)
+}
+
 #' Write the single file 03F reads
 #'
 #' Pins every decision this document reached, resolved to artifacts that exist. What a downstream
@@ -1808,8 +1936,19 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
     dplyr::mutate(Exists = fs::file_exists(.data$Path) | fs::dir_exists(.data$Path))
   found_ |>
     dplyr::mutate(Path = fs::path_rel(.data$Path, here::here())) |>
-    dplyr::select(Arm, Kind, Exists, Path) |>
-    clf_say_table(.title = "Artifacts backing each arm")
+    dplyr::select(LabelCol, Arm, Kind, Exists, Path) |>
+    clf_say_table(.title = "Artifacts backing each arm, per task")
+
+  thin_ <- found_ |>
+    dplyr::filter(.data$Exists, .data$Kind %in% .default_kinds) |>
+    dplyr::count(LabelCol, name = "nEnabled") |>
+    dplyr::filter(.data$nEnabled < 2L)
+  if (nrow(thin_) > 0L) {
+    cli::cli_alert_warning(
+      "{nrow(thin_)} task{?s} deploy a single arm ({thin_$LabelCol}): a concurrence flag needs \
+       somebody to concur with, so those tasks ship a label without one."
+    )
+  }
   if (any(!found_$Exists)) {
     cli::cli_alert_warning(
       "Missing on disk: {found_$Arm[!found_$Exists]}. Marked unavailable in the manifest rather \\
@@ -1817,29 +1956,39 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
     )
   }
 
-  arms_ <- purrr::map(seq_len(nrow(found_)), function(.i) {
-    r_ <- found_[.i, ]
-    list(
-      arm       = r_$Arm,
-      kind      = r_$Kind,
-      artifact  = as.character(fs::path_rel(r_$Path, here::here())),
-      available = unname(r_$Exists),
-      enabled   = r_$Kind %in% .default_kinds,
-      params    = if ("Params" %in% names(r_)) r_$Params[[1]] else NULL
-    )
-  })
+  arm_block_ <- function(.tab) {
+    purrr::map(seq_len(nrow(.tab)), function(.i) {
+      r_ <- .tab[.i, ]
+      list(
+        arm       = r_$Arm,
+        kind      = r_$Kind,
+        artifact  = as.character(fs::path_rel(r_$Path, here::here())),
+        available = unname(r_$Exists),
+        enabled   = r_$Kind %in% .default_kinds && isTRUE(r_$Exists),
+        params    = if ("Params" %in% names(r_)) r_$Params[[1]] else NULL
+      )
+    })
+  }
 
   tasks_ <- purrr::map(.results, function(.r) {
-    pol_ <- .r$Final$Policy
-    cmp_ <- .r$Compare
+    pol_  <- .r$Final$Policy
+    cmp_  <- .r$Compare
+    # Arms belong to the task, not to the study. Each task crowned its own configuration, so a
+    # single global list pins the wrong checkpoint for every task but one.
+    mine_ <- found_ |> dplyr::filter(.data$LabelCol == .r$LabelCol)
     list(
       label_col = .r$LabelCol,
       incumbent = .r$Incumbent,
+      # I() marks this AsIs, which is what stops auto_unbox writing a one-element array as a bare
+      # object. Two of the three tasks deploy a single arm, so without it their arms field reads
+      # back as the arm itself rather than as a list holding it, and iterating it yields the arm's
+      # FIELD NAMES instead of arm records -- quietly, producing no rows rather than an error.
+      arms      = I(arm_block_(.tab = mine_)),
       policy    = list(
         family   = pol_$Family,
         terminal = pol_$Terminal,
         floor    = pol_$Floor,
-        order    = as.list(pol_$Order[[1]]),
+        order    = I(as.list(pol_$Order[[1]])), # AsIs: a one-arm cascade must stay an array
         label    = pol_$Label
       ),
       validated = list(
@@ -1861,9 +2010,11 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
       n_folds    = dplyr::n_distinct(.tab_prep$Fold)
     ),
     tasks      = tasks_,
-    arms       = arms_,
     confidence = list(
-      sets        = purrr::map(.sets, as.list),
+      # Estimated on one task. A tier means "the arms concurred", and only a task with more than one
+      # deployable arm has anything to concur about.
+      label_col   = .results[[1]]$LabelCol,
+      sets        = purrr::map(.sets, \(.x) I(as.list(.x))), # AsIs, for the same reason
       default_set = .default_set,
       reliability = "confidence_flag.parquet",
       note        = paste(

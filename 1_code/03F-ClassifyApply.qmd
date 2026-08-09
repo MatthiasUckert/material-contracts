@@ -107,22 +107,35 @@ one a run is using.
 
 .lP <- list(
   Input = list(
-    # fs::path, not utils_file_path: the project helper creates what it names, and a corpus file
-    # whose directory was conjured into existence would make the fallback below unreachable.
-    Manifest = fs::path(.dir_orch, "deployment", "manifest.json"), # written by 03E
-    Prepared = fs::path(.dir_prep, "prepared.parquet"),            # labelled sample
-    Corpus   = fs::path(.dir_prep, "corpus.parquet")               # documents to label
+    # fs::path, not utils_file_path: the project helper creates what it names, and a corpus tree
+    # conjured into existence would report itself present while holding nothing.
+    Manifest  = fs::path(.dir_orch, "deployment", "manifest.json"), # written by 03E
+    Prepared  = fs::path(.dir_prep, "prepared.parquet"),            # labelled sample
+    # The same parsed-contract tree 03A drew the labelled sample from, restricted to Exhibit 10.
+    DirCorpus = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/Exhibit10/",
+    MetaData  = "../pMatDisc/2_output/01-GetEDGAR/Output/FullMetaData.parquet" # filer titles
+  ),
+  Cache = list(
+    CorpusFiles = utils_file_path(.dir_main, "Cache", "CorpusFiles.parquet") # DocID to Path index
   ),
   Output = list(
     Labels = utils_file_path(.dir_main, "labels") # the released labels
   ),
   Engine = list(
-    Python = "~/.venvs/contracts-engine/bin/python",   # the environment 03B trains in
-    Script = here::here("1_code", "_Engines", "bert_classify.py")
+    # The same interpreter and the same engine directory 03B trains through. here::here rather than
+    # a tilde path: system2 does not expand ~, so a tilde reaches the shell literally and fails with
+    # exit 127 four hours into a corpus pass.
+    Python = here::here("contracts-engine", ".venv", "bin", "python"),
+    Script = here::here("contracts-engine", "classify_apply.py") # companion to classify_train.py
   ),
   Param = list(
-    BatchSize = 32L,   # documents per forward pass
-    ChunkSize = 50000L # documents per output file; a corpus pass should not be one write
+    BatchSize = 32L,    # documents per forward pass
+    ChunkSize = 5000L, # documents per output file; a corpus pass should not be one write
+    IndexRerun = FALSE, # TRUE re-walks the tree; FALSE reuses the cached index
+    # The switch that decides whether this document is a rehearsal or the release. An integer draws
+    # that many documents at random from the whole tree and writes them to a separate directory; NULL
+    # labels the corpus. Set an integer, read the numbers, then set NULL.
+    Limit = 100000L
   )
 )
 ```
@@ -141,24 +154,40 @@ Read that block before anything else. Every line of it is a decision someone mad
 and a run applying the wrong quarter's configuration should be visible in the first screen of output
 rather than in the released labels.
 
+The corpus is an index here, not a table. The labelled sample fits in memory and the corpus does not:
+1.1 million contracts of full text is hundreds of gigabytes, so what is held throughout is one row
+per document with its path and filer title, and text is read one chunk at a time and discarded. Any
+code that treats corpus text as a column runs out of memory somewhere past the first hundred
+thousand documents.
+
 ```{r}
 #| label: load-documents
 tab_prep <- arrow::read_parquet(file = .lP$Input$Prepared)
 
-# The labelled sample stands in for the corpus until the full extract is wired in, so this document
-# renders end to end from the first day rather than waiting on the upstream join. Every number below
-# is therefore a rehearsal, and the switch to the corpus changes one path.
-tab_docs <- if (fs::file_exists(.lP$Input$Corpus)) {
-  arrow::read_parquet(file = .lP$Input$Corpus)
-} else {
-  cli::cli_alert_warning(
-    "No corpus extract at {.lP$Input$Corpus}; rehearsing on the labelled sample instead."
-  )
-  tab_prep |> dplyr::select(DocID, Text, dplyr::any_of("DocDesc"))
-}
+tab_index <- mc_corpus_index(
+  .dir_corpus = .lP$Input$DirCorpus,     # the parsed-contract tree, Exhibit 10 only
+  .path_meta  = .lP$Input$MetaData,      # supplies DocDesc, the filer's own title
+  .path_cache = .lP$Cache$CorpusFiles,   # walking a million files is cached, not repeated
+  .rerun      = .lP$Param$IndexRerun,    # TRUE after new contracts have been parsed
+  .limit      = .lP$Param$Limit,         # NULL labels the corpus; an integer rehearses
+  .seed       = 42L,                     # a limited run draws the same documents each time
+  .tab_prep   = tab_prep                 # flags documents the model was trained on
+)
 
-cli::cli_alert_info("{nrow(tab_docs)} document{?s} to label.")
+.dir_labels <- mc_labels_dir(.dir = .lP$Output$Labels, .limit = .lP$Param$Limit)
+
+tab_index |>
+  dplyr::summarise(
+    Documents = dplyr::n(),
+    InSample  = sum(InSample),
+    WithDesc  = sum(!is.na(DocDesc))
+  ) |>
+  clf_say_table(.title = paste0("Corpus to label -> ", fs::path_rel(.dir_labels, here::here())))
 ```
+
+`InSample` marks documents the transformer was trained on. They are still part of the corpus and
+still get labels, but anyone measuring accuracy on them would be measuring training accuracy, so the
+flag travels with the release rather than the documents being quietly dropped.
 
 # A rehearsal on one chunk
 
@@ -169,7 +198,7 @@ or that the keyword lexicon has a column the applier does not expect.
 ```{r}
 #| label: rehearse-chunk
 labelled_head <- mc_classify(
-  .docs       = dplyr::slice_head(tab_docs, n = 200L), # one chunk
+  .docs       = mc_read_chunk(dplyr::slice_head(tab_index, n = 200L)), # text read here, not held
   .manifest   = man,                                   # every default comes from here
   .tasks      = "ClassDetailed",                       # one task for the rehearsal
   .arms       = NULL,                                  # NULL takes the manifest's enabled set
@@ -204,22 +233,30 @@ resume rather than begin again.
 
 ```{r}
 #| label: apply-corpus
-fs::dir_create(.lP$Output$Labels)
+fs::dir_create(.dir_labels)
 
 chunks_ <- split(
-  tab_docs,
-  ceiling(seq_len(nrow(tab_docs)) / .lP$Param$ChunkSize)
+  tab_index,
+  ceiling(seq_len(nrow(tab_index)) / .lP$Param$ChunkSize)
 )
-cli::cli_alert_info("{length(chunks_)} chunk{?s} of up to {.lP$Param$ChunkSize} documents.")
+cli::cli_alert_info("{length(chunks_)} chunk{?s} of up to {(.lP$Param$ChunkSize)} documents.")
 
 purrr::iwalk(chunks_, function(.chunk, .i) {
-  path_ <- fs::path(.lP$Output$Labels, sprintf("labels_%04d.parquet", as.integer(.i)))
+  path_ <- fs::path(.dir_labels, sprintf("labels_%04d.parquet", as.integer(.i)))
   if (fs::file_exists(path_)) {
-    cli::cli_alert_info("Chunk {.i}: already written, skipping.")
+    cli::cli_alert_info("Chunk {(.i)}: already written, skipping.")
+    return(invisible(NULL))
+  }
+  # Text enters memory here and leaves when the chunk is written. Reading the whole corpus first
+  # would be simpler to write and impossible to run.
+  t0_ <- Sys.time()
+  docs_ <- mc_read_chunk(.chunk = .chunk)
+  if (nrow(docs_) == 0L) {
+    cli::cli_alert_warning("Chunk {(.i)}: no readable documents; nothing written.")
     return(invisible(NULL))
   }
   out_ <- mc_classify(
-    .docs       = .chunk,             # this chunk
+    .docs       = docs_,              # this chunk, text and all
     .manifest   = man,                # every default comes from here
     .tasks      = NULL,               # NULL labels every task the manifest carries
     .tab_prep   = tab_prep,           # only used if the generative arm runs
@@ -227,16 +264,40 @@ purrr::iwalk(chunks_, function(.chunk, .i) {
     .script     = .lP$Engine$Script,  # inference script
     .batch_size = .lP$Param$BatchSize # documents per forward pass
   )
-  arrow::write_parquet(out_, path_)
-  cli::cli_alert_success("Chunk {.i}: {nrow(out_)} row{?s} written.")
+  arrow::write_parquet(
+    out_ |> dplyr::left_join(.chunk |> dplyr::select(DocID, InSample), by = dplyr::join_by(DocID)),
+    path_
+  )
+  # Beside the labels, not inside them: the duration belongs to the chunk, and a resumed run keeps
+  # the timings it already paid for.
+  mc_write_timing(
+    .dir     = .dir_labels,                          # same directory as the labels
+    .chunk   = .i,                                   # chunk index
+    .n_docs  = dplyr::n_distinct(out_$DocID),        # documents actually labelled
+    .seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs")),
+    .n_tasks = dplyr::n_distinct(out_$Task)          # a chunk costs one pass per task
+  )
+  cli::cli_alert_success("Chunk {(.i)}: {nrow(out_)} row{?s} written.")
 })
 ```
+
+```{r}
+#| label: apply-throughput
+mc_report_throughput(
+  .dir      = .dir_labels,     # where the timings were written
+  .n_corpus = nrow(tab_index), # documents a full pass would cover
+  .n_tasks  = 3L               # tasks a full pass would label
+)
+```
+
+Set `Limit` to `NULL` once that projection is acceptable. The rate is measured on this machine under
+this configuration, so it is the only figure worth planning a night around.
 
 # Results
 
 ```{r}
 #| label: results-summary
-tab_labels <- fs::dir_ls(.lP$Output$Labels, glob = "*.parquet") |>
+tab_labels <- fs::dir_ls(.dir_labels, glob = "*.parquet") |>
   purrr::map(arrow::read_parquet) |>
   purrr::list_rbind()
 
@@ -245,27 +306,35 @@ tab_labels |>
   clf_say_table(.title = "Documents labelled, per task")
 ```
 
+The corpus will not look like the labelled sample, and it should not: the sample was drawn to support
+estimation, with thin categories deliberately over-represented so they could be learnt at all. A gap
+is expected. What a gap cannot distinguish on its own is whether it comes from that sampling design
+or from the model drifting toward frequent categories on documents unlike anything it trained on --
+and those have very different consequences for the released labels.
+
+The confidence tiers separate the two. If documents the arms agreed on look like the labelled sample
+while the ones they disagreed on carry the skew, the drift sits on uncertain documents and the flag
+is already isolating it. If every tier is skewed alike, the difference is composition, the labels are
+unaffected, and what carries the sample's composition is the reliability estimate rather than the
+classifier.
+
 ```{r}
 #| label: results-distribution
-tab_labels |>
-  dplyr::filter(Task == "ClassDetailed") |>
-  dplyr::count(Label, name = "nDocs", sort = TRUE) |>
-  dplyr::mutate(Share = clf_pct(nDocs / sum(nDocs))) |>
-  clf_say_table(.title = "Category distribution across the corpus")
-```
+dist_det <- mc_distribution(
+  .tab_labels = tab_labels,     # the corpus pass
+  .tab_prep   = tab_prep,       # the labelled sample
+  .label_col  = "ClassDetailed" # the only task carrying a flag
+)
 
-The corpus distribution against the labelled sample's is the first thing worth checking, and it is a
-validity check rather than a curiosity. The labelled sample was drawn to be representative; a
-category that is common in the corpus and rare in the sample, or the reverse, is either a sampling
-artifact worth documenting or a model failing systematically outside the distribution it was trained
-on. Which of the two it is cannot be settled here, but a large gap is a reason to look.
+mc_report_distribution(.tab = dist_det)
+```
 
 ```{r}
 #| label: results-confidence
 tab_labels |>
-  dplyr::filter(Task == "ClassDetailed") |>
-  dplyr::count(VotingSet, Tier, name = "nDocs") |>
-  dplyr::mutate(Share = clf_pct(nDocs / sum(nDocs))) |>
+  dplyr::filter(!is.na(Tier)) |>
+  dplyr::count(Task, VotingSet, Tier, name = "nDocs") |>
+  dplyr::mutate(Share = clf_pct(nDocs / sum(nDocs)), .by = Task) |>
   clf_say_table(.title = "Confidence tiers across the corpus")
 ```
 
@@ -283,8 +352,9 @@ existence test cannot.
 ```{r}
 #| label: validation-roundtrip
 round_trip <- mc_classify(
-  .docs     = tab_prep |> dplyr::select(DocID, Text, dplyr::any_of("DocDesc")) |>
-    dplyr::slice_head(n = 1000L),
+  .docs     = tab_prep |>
+    dplyr::select(DocID, Text, dplyr::any_of("DocDesc")) |>
+    dplyr::slice_head(n = 1000L), # the labelled sample already carries its text
   .manifest = man,                # the deployed configuration
   .tasks    = "ClassDetailed",    # the headline task
   .tab_prep = tab_prep,           # only used if the generative arm runs
@@ -323,6 +393,11 @@ mc_report_run(.tab = tab_labels)
 The released dataset is these labels plus the manifest that produced them. Both have to be archived
 together: labels without the manifest cannot be reproduced, and the manifest without the labels is a
 recipe nobody ran.
+
+Set `Limit` to `NULL` once the rehearsal reads sensibly. A limited run writes to `labels_preview`
+and a corpus pass to `labels`, so the two never mix and neither resumes from the other -- chunk one
+of a two-thousand-document rehearsal holds different documents from chunk one of the full pass, and
+the skip-if-present rule could not tell them apart if they shared a directory.
 
 Two things remain open and belong in the paper rather than in code. Whether the generative arm is
 worth enabling for the release is a cost decision that 03E's voting-set comparison answers

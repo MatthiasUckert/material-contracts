@@ -136,14 +136,29 @@ need either the redaction cross-check or hand labels.
 
 ```{r}
 #| label: configure-paths
+# The bundle root, and the folder each reading session wrote to. Two sessions have run; the first
+# was moved aside before the second was built, so the names differ on disk.
+.DIR_COWORK  <- fs::path("/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts",
+                         "MatContractData")
+.FOLDER_RUN1 <- "EntitiesClaude_run1"   # <- the backup of the first session
+.FOLDER_RUN2 <- "EntitiesClaude"        # <- the second session
+
 .lP <- list(
   Input = list(
     Text    = "2_output/04A-EntityExtract/sample_text.parquet",
     Anchors = "2_output/04A-EntityExtract/sample_anchors.parquet",
     Store   = "2_output/04A-EntityExtract/Store/EntityCandidates.duckdb",
-    # Written by 04B-CoWorkCompile.R from the reading session's responses.
-    Rules   = fs::path("/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts",
-                       "MatContractData", "EntitiesClaude", "compiled", "entity_rules.parquet")
+    # Written by 04B-CoWorkCompile.R from each reading session's responses. Both are scored:
+    # the sessions read different documents, so their union covers more vocabulary than either,
+    # and Source keeps the recurrence question answerable afterwards.
+    #
+    # SET .FOLDER_RUN1 BELOW to whatever the first bundle was renamed to. Getting it wrong is not
+    # fatal and not silent -- ent_read_rules() reports the file as missing -- but the run scores
+    # only the session it found, and the rules the other one validated never reach 04C.
+    Rules   = c(
+      run1 = fs::path(.DIR_COWORK, .FOLDER_RUN1, "compiled", "entity_rules.parquet"),
+      run2 = fs::path(.DIR_COWORK, .FOLDER_RUN2, "compiled", "entity_rules.parquet")
+    )
   ),
   Output = list(
     Hits   = utils_file_path(.dir_main, "anchor_hits.parquet"),    # per-span anchor labels
@@ -161,7 +176,7 @@ need either the redaction cross-check or hand labels.
     CostTol        = 0.15,   # relative cost gap treated as a tie between engines
     HeadChars      = c(1500L, 3000L, 5000L, 10000L, 20000L),
     TailChars      = c(0L, 2000L, 5000L),
-    CapChars       = 3000L   # the cap written into the policy artifact; must be in HeadChars
+    CapChars       = 3000L   # retained for reference; the artifact takes its window from .WINDOW
   )
 )
 
@@ -220,6 +235,40 @@ need either the redaction cross-check or hand labels.
   "INDEMNIFICATION", "ASSIGNMENT", "SEVERABILITY", "ENTIRE AGREEMENT", "WITNESS WHEREOF",
   "PURCHASE PRICE", "RENT", "PAYMENT", "COMPENSATION", "LICENSE FEES", "INITIAL PAYMENT",
   "LENGTH OF THE TERM", "BROKERS COMMISSION"
+)
+
+# Which of the redaction roles the surviving punctuation can speak to. A removed party name and a
+# deleted clause body leave nothing behind that identifies them, so they are absent here and are
+# reported as unmeasured rather than scored against a signal that cannot see them.
+.REDACT_SHAPE <- tibble::tribble(
+  ~Role,                ~Shape,
+  "royalty_rate",       "ShapeRate",     # a percent sign survived the gap
+  "aggregate_amount",   "ShapeValue",    # a currency symbol did
+  "milestone_payment",  "ShapeValue",
+  "unit_price",         "ShapeUnit",     # "per share", "per barrel"
+  "term_length",        "ShapePeriod"    # "days", "months"
+)
+
+# Engines for the labels the anchor cannot rank. Money has no external record of a contract's value
+# and redaction has no ground truth at all, so neither can be chosen on recall -- but both must be
+# NAMED, or 04C joins its candidate set against a policy with a hole in it and drops the label
+# without saying so. LexNLP fires on money in under a fifth of documents, which leaves the
+# transformer; redaction has one extractor.
+.DEFAULT_ENGINE <- c(MONEY = "spacy:en_core_web_trf", REDACT = "paper:redaction-v1")
+
+# The window each label is read under. ORG and GPE are set from the character grid below. DATE is
+# NOT, and the reason matters: the date anchor is the contract's own date, which sits in the
+# preamble, so the grid measures how well a window finds a START and is silent about an END. A term
+# clause sits thousands of characters later, and a head-only window returned an expiry date for 22
+# of 4,398 documents. The tail here is a declared correction to a measurement that could not see
+# the quantity it was being used to choose.
+.WINDOW <- tibble::tribble(
+  ~Label,   ~CapChars, ~TailChars, ~WindowBasis,
+  "ORG",        3000L,         0L, "measured: 91.7% document recall, 4.8% of characters",
+  "DATE",       3000L,      5000L, "declared: the anchor is a start date and cannot see expiry",
+  "GPE",        3000L,      5000L, "measured: 80.2% against 53.7% for a prefix of the same size",
+  "MONEY",      3000L,      5000L, "declared: no anchor",
+  "REDACT",     3000L,      5000L, "declared: no anchor"
 )
 
 fs::file_exists(c(.lP$Input$Text, .lP$Input$Anchors, .lP$Input$Store, .lP$Input$Rules))
@@ -290,7 +339,13 @@ hundreds of times over.
 
 ```{r}
 #| label: score-rules
-tab_rules <- arrow::read_parquet(.lP$Input$Rules)
+tab_rules <- ent_read_rules(.paths = .lP$Input$Rules)
+
+clf_say_table(
+  .tab = tab_rules |> dplyr::count(.data$Source, .data$Label, name = "N") |>
+    tidyr::pivot_wider(names_from = Label, values_from = N, values_fill = 0L),
+  .title = "Rules by session"
+)
 
 tab_scores <- ent_rule_scores(
   .con       = con,
@@ -341,6 +396,53 @@ tab_redact <- ent_redaction_check(
 
 ent_report_redaction(.tab = tab_redact)
 ```
+
+```{r}
+#| label: check-redaction-shape
+tab_shape <- ent_redaction_shape(
+  .con       = con,
+  .rules     = tab_rules,        # the redaction cues, whatever session proposed them
+  .shape_map = .REDACT_SHAPE     # which roles the surviving punctuation can speak to
+)
+
+ent_report_redaction_shape(.tab = tab_shape)
+```
+
+The second table is the stronger of the two and it comes from the redaction unit. Where a marker
+replaced a value, the currency symbol before it usually survived; where it replaced a rate, the
+percent sign after it did; where it replaced a period or a unit price, the noun following did. Those
+characters are not a phrase, so agreeing with a phrase cue is genuine corroboration rather than the
+same evidence counted twice.
+
+## Which money engine reaches a withheld amount
+
+Money is the one label with no anchor, so its engine went into the policy as a declared default.
+Cross-engine agreement narrows the question but does not settle it: the regex arm and the
+transformer overlap at Jaccard 0.77, the highest cross-family pair in the store, and agreement on
+what both find says nothing about what only one of them can.
+
+A redaction marker is where an amount used to be. Whether an engine proposes a span there is a
+capability rather than a tuned score, and it is the case that matters most, because a figure is
+withheld precisely when it is commercially material.
+
+```{r}
+#| label: classify-redaction-sites
+ent_redaction_sites(.con = con, .path_text = .lP$Input$Text)
+
+tab_reach <- ent_redaction_reach(
+  .con  = con,
+  .near = 3L      # a span touching the marker or its currency symbol counts as reaching it
+)
+
+ent_report_redaction_reach(.tab = tab_reach)
+```
+
+The site classes are read off the characters either side of the marker, not from any engine's
+output, so the definition does not presuppose the answer. Read the two differently. On
+`after_currency` the regex arm has a pattern written for that shape and a transformer has nothing to
+tag -- the number it would recognise is the thing that was removed -- so a difference is expected
+and its size is the result. On `before_unit` neither engine has any reason to fire, and a low figure
+for both bounds what is recoverable at all rather than separating them.
 
 This validates six cues, not sixty-four, and the honest position on the rest is unchanged. It is
 worth having for a second reason: the reading session observed that redacted figures are
@@ -393,7 +495,8 @@ tab_wchar <- ent_window_chars(
   .con       = con,
   .path_text = .lP$Input$Text,
   .head      = .lP$Params$HeadChars,   # character budgets from the front
-  .tail      = .lP$Params$TailChars    # and from the back; 0 is the plain prefix window
+  .tail      = .lP$Params$TailChars,   # and from the back; 0 is the plain prefix window
+  .policy    = NULL                    # every engine pooled, which is the optimistic reading
 )
 
 ent_report_window_chars(.tab = tab_wchar)
@@ -402,6 +505,10 @@ ent_report_window_chars(.tab = tab_wchar)
 Three columns because a cap is three trade-offs at once. `DocRecall` is what it buys, `SpansKept` is
 what 04D must then resolve, and `CharsKept` is what 04E must read -- the only one of the three that
 maps to wall-clock time.
+
+The table above pools every engine, so a document counts as recovered when ANY of eight found the
+anchor inside the window. One of them will run, and what that one achieves is measured below --
+after the engine has been chosen, because it cannot be measured before.
 
 # Policy
 
@@ -418,14 +525,34 @@ difference.
 #| label: choose-engines
 tab_policy <- ent_choose_engines(
   .tab        = tab_eng,
+  .defaults   = .DEFAULT_ENGINE,       # labels the anchor cannot rank still need an engine
   .recall_tol = .lP$Params$RecallTol,
   .cost_tol   = .lP$Params$CostTol
-)
+) |>
+  dplyr::left_join(.WINDOW, by = dplyr::join_by(Label))
 
 ent_report_policy(.tab = tab_policy)
 ```
 
-Money is absent from that table and should be. With no anchor there is no recall to rank on, so its
+## What the chosen engines achieve
+
+The grid above the policy pools every engine. This one restricts to the engine each label will
+actually run, which is the number the corpus pass delivers and the number the artifact carries.
+
+```{r}
+#| label: measure-window-deployed
+tab_wdeploy <- ent_window_chars(
+  .con       = con,
+  .path_text = .lP$Input$Text,
+  .head      = .lP$Params$HeadChars,
+  .tail      = .lP$Params$TailChars,
+  .policy    = dplyr::select(tab_policy, Label, Combo)   # one engine per label
+)
+
+ent_report_window_chars(.tab = tab_wdeploy)
+```
+
+Money is absent from the policy table above and should be. With no anchor there is no recall to rank on, so its
 engine is a stated default rather than a measured choice, and 04E should carry it as such.
 
 # Sections
@@ -565,20 +692,19 @@ arrow::write_parquet(tab_kept, .lP$Output$Kept)
 # reads a decision instead of re-deriving one.
 tab_policy_out <- tab_policy |>
   dplyr::left_join(
-    tab_wchar |>
-      dplyr::filter(.data$Head == .lP$Params$CapChars, .data$Tail == 0L) |>
-      dplyr::select(Label, DocRecallAtCap = DocRecall, SpansKeptAtCap = SpansKept,
-                    CharsKeptAtCap = CharsKept),
-    by = dplyr::join_by(Label)
-  ) |>
-  dplyr::mutate(CapChars = .lP$Params$CapChars, TailChars = 0L)
+    tab_wdeploy |>
+      dplyr::select(Label, Head, Tail, DocRecallAtCap = DocRecall,
+                    SpansKeptAtCap = SpansKept, CharsKeptAtCap = CharsKept),
+    by = dplyr::join_by(Label, CapChars == Head, TailChars == Tail)
+  )
 
 arrow::write_parquet(tab_policy_out, .lP$Output$Policy)
 clf_say_table(
   .tab = tab_policy_out |>
     dplyr::mutate(dplyr::across(c(Recall, DocRecallAtCap, SpansKeptAtCap, CharsKeptAtCap),
                                 \(.x) clf_pct(.x))) |>
-    dplyr::select(Label, Combo, CapChars, Recall, DocRecallAtCap, SpansKeptAtCap, CharsKeptAtCap),
+    dplyr::select(Label, Combo, Basis, CapChars, TailChars, Recall, DocRecallAtCap,
+                  SpansKeptAtCap, CharsKeptAtCap),
   .title = "Extraction policy for 04E"
 )
 
@@ -690,7 +816,9 @@ ent_report_all(
   .tab_sections = tab_sections,
   .tab_wchar    = tab_wchar,
   .tab_policy   = tab_policy,
-  .tab_redact   = tab_redact
+  .tab_redact   = tab_redact,
+  .tab_shape    = tab_shape,
+  .tab_reach    = tab_reach
 )
 ```
 
