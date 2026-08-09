@@ -1,36 +1,67 @@
-# 03D-ClassifyLLM: a local language model as a third arm (llm_*) -------------------------------------------------------
+# 03D-ClassifyLLM: zero-shot and few-shot contract classification with a local LLM (llm_*) ----
 #
-# WHAT THIS FILE DOES
-# Classifies contracts by asking a locally hosted language model, over a grid that varies the model,
-# how much taxonomy documentation it is shown, how many worked examples it is given, how much of the
-# document it reads, and whether it is permitted to decline. Answers are constrained to the label set
-# by a response schema, cached per document and configuration, and written into the same run-folder
-# schema the transformer and keyword arms use, so one leaderboard ranks all three.
+# WHAT THIS STAGE IS
+# A third classification arm, estimated on the same documents and the same folds as the transformer
+# (03B) and the keyword table (03C), and written into the SAME run-folder schema so the shared
+# leaderboard ranks it beside them and the orchestrator can route to it without special-casing.
 #
-# THREE TIERS, AND WHY THEY ARE KEPT APART
-#   blind      the prompt was written without reading any labelled document; scores every fold
-#   crossfold  worked examples drawn from the folds the model is not being scored on
-#   tuned      anything developed with folds one to four in view, scored only on the fifth
-# A tuned score is not an estimate of what a new prompt would achieve, and pooling the tiers would
-# make every swept axis a proxy for that gap, since a tuned prompt carries the richest settings by
-# construction. Every leaderboard and marginal below therefore reports tier explicitly.
+# It exists because a reader of this paper will ask why a fine-tuned encoder was necessary when an
+# open-weight instruction model can be pointed at a contract and asked. The answer should be a number
+# on identical folds, not an assertion.
 #
-# ABSTENTION
-# Where the schema permits it the model may decline, emitting LLM_NONE. That is the same sentinel the
-# keyword arm uses and it is handled by the same abstention-aware scoring layer: declining costs
-# recall and protects precision. Coverage is consequently a reported dimension rather than an
-# afterthought, and the coverage-against-precision figure is the one that distinguishes a cautious
-# configuration from an accurate one.
+# THE CONTAMINATION THIS FILE IS BUILT TO AVOID
+# A prompt is not a fixed object. It is written by a person, and a person who iterates it against the
+# documents the transformer got wrong has fitted the prompt to the labels as surely as gradient
+# descent would have -- more efficiently, in fact, because errors are concentrated exactly where the
+# taxonomy is ambiguous. Reporting such a prompt's score on the whole sample is leakage, and the
+# router downstream cannot detect it: nested selection protects the choice of ROUTING RULE, not the
+# provenance of an arm.
 #
-# WHAT IS NOT HERE
-# Sample construction, folds, the scoring layer and the category vocabulary: those are 03A, which the
-# runbook sources first, so this arm is scored by identical code on identical splits. The transformer
-# predictions this arm is measured against come from 03B. The look of any figure or table is
-# _Commons/_Plots.R and _Commons/_Tables.R; nothing below sets a colour, a font or a height.
+# So arms are separated by what their author was allowed to see, and the separation is carried in the
+# data rather than in a promise:
+#
+#   Tier    Development                                   Folds       Status
+#   blind   Written from the taxonomy alone. No           1-5         enters the nested search
+#           prediction, no error list, no document read
+#           with its label.
+#   tuned   Iterated against folds 1-4, including their   5 only      bounded check
+#           errors.
+#
+# A blind prompt has no training of any kind, so every fold is held out and one pass covers the
+# sample. A tuned prompt has seen four folds, so the fifth is its only honest test -- the identical
+# discipline 03C applies to the generated keyword list, for the identical reason.
+#
+# FOLDS FOR A MODEL THAT DOES NOT TRAIN
+# A blind arm's per-fold metrics are a partition of one pass, not five independent estimates. They
+# are still worth writing: they give the fold-to-fold spread that every comparison in this study is
+# expressed in, and they make the run schema identical to the trained arms'. They are NOT a basis for
+# selecting among prompts, which is why prompt selection is confined to the tuned tier and reported
+# as such.
+#
+# ABSTENTION IS A SWEPT AXIS, NOT A DETAIL
+# A model allowed to answer "unsure" becomes an ABSTAINING arm, which is what the orchestrator's
+# cascade is built around: it can commit where it is confident and leave the rest to the transformer.
+# A model forced to choose is a terminal arm competing head-on. These are different objects with
+# different uses, so both are estimated and the difference is reported.
+#
+# COST AND IDEMPOTENCE
+# One local generation per document is seconds, and the sample is 4,400 documents, so a single cell
+# is hours. Every answer is therefore cached on a hash of everything that determines it -- document,
+# prompt, model, window, schema -- and a cell already complete is skipped. The first render is long;
+# every later one is seconds and reproduces identical output. That is what makes an always-executing
+# document affordable here, and it is the same bargain 03B and 03C strike with their sweeps.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
-# locals; if (FALSE) dev blocks; pure ASCII; parenthesised cli interpolation.
+# locals; .data$ for existing columns, bare CamelCase for new; if (FALSE) dev blocks; cli/fs/here;
+# pure ASCII; stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
 
+if (FALSE) {
+  .tab_prep  <- arrow::read_parquet(.lP$Input$Prepared)
+  .label_col <- "ClassDetailed"
+  .model     <- "qwen3:32b"
+}
+
+# Shared with 03C and 03D: the abstention sentinel the scoring layer already understands.
 LLM_NONE <- "(none)"
 
 # The token the model is told to emit when it declines. Kept distinct from the sentinel so a genuine
@@ -38,7 +69,7 @@ LLM_NONE <- "(none)"
 LLM_UNSURE <- "UNSURE"
 
 
-# 1. The taxonomy the model is shown -----------------------------------------------------------------------------------
+# 1. The taxonomy the model is shown -------------------------------------------------------------
 # The label set comes from the data rather than from a constant, so a taxonomy revision cannot leave
 # the prompt describing categories that no longer exist. Definitions are optional and supplied by the
 # document, because what the model was told is exactly the sort of thing a referee wants to read.
@@ -86,7 +117,7 @@ llm_render_labels <- function(.labels, .definitions = NULL, .guidance = c("label
 }
 
 
-# 2. Prompts -----------------------------------------------------------------------------------------------------------
+# 2. Prompts ---------------------------------------------------------------------------------------
 # A prompt is a swept level, so it is built by a function from named parts rather than pasted at the
 # call site. Every part that varies is an argument, and the assembled text is stored with the run, so
 # a result can always be traced to the exact words that produced it.
@@ -193,7 +224,7 @@ llm_examples <- function(.tab_prep, .label_col = "ClassDetailed", .folds = 1:4, 
 }
 
 
-# 3. Transport ---------------------------------------------------------------------------------------------------------
+# 3. Transport -------------------------------------------------------------------------------------
 # One request, one answer, no retries beyond the transport's own. Caching is the caller's job, which
 # keeps this function testable without a filesystem and keeps the cache key in one place.
 
@@ -413,7 +444,7 @@ llm_call <- function(.prompt, .labels, .model = "qwen3:32b", .allow_abstain = FA
 }
 
 
-# 4. One configuration over a document set -----------------------------------------------------------------------------
+# 4. One configuration over a document set ---------------------------------------------------------
 
 #' Canonical configuration name
 #'
@@ -601,7 +632,7 @@ llm_report_budget <- function(.grid, .tab_prep, .task_lines, .definitions = NULL
     purrr::list_rbind()
 
   cli::cli_h2("Context budget per configuration")
-  tbl_say(.tab = out_)
+  clf_say_table(.tab = out_)
   cli::cli_text("")
   over_ <- out_ |> dplyr::filter(is.na(.data$NumCtx))
   if (nrow(over_) > 0L) {
@@ -738,7 +769,7 @@ llm_classify <- function(.tab, .label_col, .labels, .labels_block, .task_line, .
 }
 
 
-# 5. Run folders in the shared schema ----------------------------------------------------------------------------------
+# 5. Run folders in the shared schema --------------------------------------------------------------
 
 #' Write one LLM run in the schema 03B and 03C use
 #'
@@ -834,7 +865,7 @@ llm_write_run <- function(.runs_root, .config_name, .run_name, .pred, .spec, .pr
 }
 
 
-# 6. The sweep ---------------------------------------------------------------------------------------------------------
+# 6. The sweep -------------------------------------------------------------------------------------
 
 #' Build the configuration grid
 #'
@@ -1132,7 +1163,7 @@ llm_sweep <- function(.grid, ...) {
 }
 
 
-# 7. Cost, before it is spent ------------------------------------------------------------------------------------------
+# 7. Cost, before it is spent ----------------------------------------------------------------------
 
 #' Time one configuration on a handful of documents and project the sweep
 #'
@@ -1216,7 +1247,7 @@ llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, 
     SecsPerDoc   = round(rate_, 2),
     ProjectedHrs = round(calls_ * rate_ / 3600, 1)
   )
-  tbl_say(.tab = out_)
+  clf_say_table(.tab = out_)
   cli::cli_text("")
   cli::cli_alert_info(
     "Every answer is cached, so an interrupted sweep resumes and a re-render costs a directory \\
@@ -1227,7 +1258,7 @@ llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, 
 }
 
 
-# 8. Reporting ---------------------------------------------------------------------------------------------------------
+# 8. Reporting -------------------------------------------------------------------------------------
 
 #' Leaderboard across LLM configurations for one task
 #'
@@ -1266,15 +1297,15 @@ llm_report_leaderboard <- function(.tab_overall, .label_col = "ClassDetailed", .
     dplyr::slice_head(n = .n, by = Tier) |>
     dplyr::mutate(
       Model        = sub("^llm-", "", .data$Model),
-      Coverage     = tbl_pct(.data$Coverage),
-      SelPrecision = tbl_pct(.data$SelPrecision),
-      Accuracy     = tbl_pct(.data$Accuracy),
+      Coverage     = clf_pct(.data$Coverage),
+      SelPrecision = clf_pct(.data$SelPrecision),
+      Accuracy     = clf_pct(.data$Accuracy),
       MacroF1      = sprintf("%.3f +/- %.3f", .data$MacroF1, .data$SdMacroF1)
     ) |>
     dplyr::select(Tier, Model, Guidance, Shots, Window = NChars, Abstain = AllowAbstain,
                   dplyr::any_of("Think"), Folds = nFolds, Coverage, SelPrecision, Accuracy,
                   MacroF1) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
   if ("Limit" %in% names(.tab_overall) && any(!is.na(.tab_overall$Limit))) {
     cli::cli_alert_warning(
@@ -1298,7 +1329,7 @@ llm_report_leaderboard <- function(.tab_overall, .label_col = "ClassDetailed", .
       )
     } else {
       cli::cli_alert_info(
-        "Configurations offering the refusal token declined on {tbl_pct(1 - cov_)} of documents on \\
+        "Configurations offering the refusal token declined on {clf_pct(1 - cov_)} of documents on \\
          average, so the arm can be gated: it commits where it is confident and leaves the rest."
       )
     }
@@ -1390,11 +1421,11 @@ llm_report_effect <- function(.tab_overall, .axis, .label_col = "ClassDetailed")
     dplyr::filter(.data$Tier %in% keep_) |>
     dplyr::arrange(.data$Tier, dplyr::desc(.data$MacroF1)) |>
     dplyr::mutate(
-      Coverage = tbl_pct(.data$Coverage),
+      Coverage = clf_pct(.data$Coverage),
       MacroF1  = sprintf("%.3f +/- %.3f", .data$MacroF1, .data$SdMacroF1),
       SdMacroF1 = NULL
     ) |>
-    tbl_say(.title = paste0("Marginal effect of ", .axis, ", within tier"))
+    clf_say_table(.title = paste0("Marginal effect of ", .axis, ", within tier"))
 
   if (length(skip_) > 0L) {
     cli::cli_alert_info(
@@ -1461,12 +1492,12 @@ llm_report_head_to_head <- function(.tab_overall, .label_col = "ClassDetailed",
   cli::cli_h2("Best of each method: {(.label_col)} (LLM tier{?s}: {(.tier)})")
   out_ |>
     dplyr::mutate(
-      Coverage = tbl_pct(.data$Coverage),
-      Accuracy = tbl_pct(.data$Accuracy),
+      Coverage = clf_pct(.data$Coverage),
+      Accuracy = clf_pct(.data$Accuracy),
       MacroF1  = sprintf("%.3f", .data$MacroF1)
     ) |>
     dplyr::select(Method, nFolds, nDocs, Coverage, Accuracy, MacroF1, ConfigName) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
   if (dplyr::n_distinct(out_$nFolds) > 1L) {
     cli::cli_alert_warning(
@@ -1526,11 +1557,11 @@ llm_report_disagreement <- function(.pred_llm, .pred_bert, .none = LLM_NONE) {
   cli::cli_h2("LLM against the transformer, document by document")
   out_ |>
     dplyr::mutate(
-      Share     = tbl_pct(.data$Share),
-      LlmRight  = tbl_pct(.data$LlmRight),
-      BertRight = tbl_pct(.data$BertRight)
+      Share     = clf_pct(.data$Share),
+      LlmRight  = clf_pct(.data$LlmRight),
+      BertRight = clf_pct(.data$BertRight)
     ) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
   cli::cli_alert_info(
     "The Disagree row is the only place routing can change anything. If the transformer is right \\
@@ -1563,102 +1594,49 @@ llm_report_all <- function(.tab_overall, .pred_llm, .pred_bert, .label_col = "Cl
 }
 
 
-# 9. Figures -------------------------------------------------------------------------------------------------------------
-# The look comes entirely from _Commons/_Plots.R. What these functions own is the mapping from a swept
-# tibble to a figure shape, which is the part that has to know what the numbers mean.
-#
-# ONE RULE GOVERNS BOTH FIGURES: a configuration is the four-way combination of model, tier, guidance
-# and abstention permission, and every one of those four must reach the page. Collapsing any of them
-# does not merge two views of one thing, it averages two different things -- and pooling the tier in
-# particular contradicts the reason the tiers exist, since a tuned prompt read four of the five folds
-# and its score answers a different question from a blind one's.
+# 9. Figures ---------------------------------------------------------------------------------------
 
-#' Number of bars the leaderboard will draw
+#' Coverage against selective precision, one point per configuration
 #'
-#' Figure height is chosen from the ladder by row count, and a leaderboard's row count is only known
-#' once the sweep has run. Deriving it here rather than fixing a number in the chunk option keeps a
-#' partially-swept grid from rendering three bars at the height reserved for twelve.
+#' The plot that separates a cautious configuration from an accurate one. A point high and to the
+#' right dominates; a point high and to the left is precise only because it declined most of the
+#' corpus, which is a usable property for a routing arm and a poor one for a standalone classifier.
 #'
-#' @param .tab_overall Bound per-fold metrics from clf_load_overall().
-#' @param .label_col Character. Task the leaderboard covers.
-#' @param .n Integer. Cap the leaderboard applies.
-#' @return Integer, at least one.
-llm_n_configs <- function(.tab_overall, .label_col = "ClassDetailed", .n = 12L) {
-  if (FALSE) {
-    .tab_overall <- tab_overall
-    .label_col   <- "ClassDetailed"
-    .n           <- 12L
-  }
-  n_ <- .tab_overall |>
-    dplyr::filter(.data$LabelCol == .label_col, !.data$Smoke, grepl("^llm-", .data$Model)) |>
-    dplyr::distinct(.data$Model, .data$Tier, .data$Guidance, .data$AllowAbstain) |>
-    nrow()
-  max(1L, min(as.integer(.n), n_))
-}
-
-#' Coverage against precision on committed documents
-#'
-#' The figure that separates a cautious configuration from an accurate one. A point high and to the
-#' right dominates. A point high and to the left is precise only because it declined most of the
-#' corpus, which is a usable property in a cascade and a poor one standing alone.
-#'
-#' Every axis of the grid is encoded: tier by shape, prompt design by colour, model by panel. That is
-#' three aesthetics for what could be drawn as one cloud of points, and the alternative is worse --
-#' averaging a blind configuration together with a tuned one produces a point describing neither, and
-#' the reader has no way to see that it happened.
-#'
-#' Both axes run the full zero to one rather than zooming to the points, because "to the left" is the
-#' whole reading and it only means anything against the absolute scale: a cluster occupying the top
-#' right corner is itself the result.
-#'
-#' @param .tab_overall Bound per-fold metrics from clf_load_overall().
-#' @param .label_col Character. Task to plot.
+#' @param .tab_overall Bound per-fold metrics.
+#' @param .label_col Task.
 #' @return A ggplot.
 llm_plot_coverage <- function(.tab_overall, .label_col = "ClassDetailed") {
   if (FALSE) {
     .tab_overall <- tab_overall
     .label_col   <- "ClassDetailed"
   }
-  .tab_overall |>
+  dat_ <- .tab_overall |>
     dplyr::filter(.data$LabelCol == .label_col, !.data$Smoke, grepl("^llm-", .data$Model)) |>
     dplyr::summarise(
       Coverage     = mean(.data$Coverage),
       SelPrecision = mean(.data$SelPrecision, na.rm = TRUE),
-      .by = c(Model, Tier, Guidance, AllowAbstain)
+      .by = c(Model, Guidance, AllowAbstain)
     ) |>
-    dplyr::mutate(
-      Model  = sub("^llm-", "", .data$Model),
-      Prompt = paste0(.data$Guidance, dplyr::if_else(.data$AllowAbstain, " +abstain", ""))
-    ) |>
-    ggplot2::ggplot(ggplot2::aes(
-      x = .data$Coverage, y = .data$SelPrecision,
-      colour = .data$Prompt, shape = .data$Tier
-    )) +
-    ggplot2::geom_point(size = 2.4) +
-    ggplot2::facet_wrap(ggplot2::vars(Model)) +
-    plot_scale_colour_cat(name = "Prompt") +
-    ggplot2::scale_x_continuous(limits = c(0, 1), labels = scales::label_percent()) +
-    ggplot2::scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
-    ggplot2::labs(x = "Coverage", y = "Precision on committed documents", shape = "Tier") +
-    plot_theme(.grid = "both", .legend = "bottom")
+    dplyr::mutate(Model = sub("^llm-", "", .data$Model))
+
+  p_ <- dat_ |>
+    ggplot2::ggplot(ggplot2::aes(x = Coverage, y = SelPrecision, shape = Model, color = Guidance)) +
+    ggplot2::geom_point(size = 2.5) +
+    ggplot2::scale_x_continuous(limits = c(0, 1)) +
+    ggplot2::scale_y_continuous(limits = c(0, 1)) +
+    ggplot2::scale_color_grey(start = 0.1, end = 0.6) +
+    ggplot2::labs(x = "Coverage", y = "Precision on committed documents")
+  clf_apply_theme(.plot = p_)
 }
 
-#' Macro-F1 by configuration, with the tuned tier drawn hollow
+#' Macro-F1 by configuration, blind and tuned distinguished
 #'
-#' The bar label names all four axes of the grid. That is verbose, and the alternative is silent
-#' overplotting: two configurations sharing a label share a bar position, and geom_col draws them on
-#' top of one another with their value labels superimposed, so three configurations render as one bar
-#' carrying three illegible numbers.
+#' Tuned bars are drawn hollow: their prompt was written against four of the five folds, so their
+#' score is not an estimate of what a new prompt would achieve.
 #'
-#' Fill repeats the tier distinction because it is the one that decides whether a bar can be read at
-#' face value. A tuned prompt was written against four of the five folds, so its score is not an
-#' estimate of what a new prompt would achieve; drawing it hollow keeps it on the same axis as the
-#' honest estimates without inviting the comparison. This is why the figure is not built on the shared
-#' ranked-bar primitive, which draws a single ink by design.
-#'
-#' @param .tab_overall Bound per-fold metrics from clf_load_overall().
-#' @param .label_col Character. Task to plot.
-#' @param .n Integer. Configurations to show.
+#' @param .tab_overall Bound per-fold metrics.
+#' @param .label_col Task.
+#' @param .n Configurations to show.
 #' @return A ggplot.
 llm_plot_leaderboard <- function(.tab_overall, .label_col = "ClassDetailed", .n = 12L) {
   if (FALSE) {
@@ -1666,34 +1644,27 @@ llm_plot_leaderboard <- function(.tab_overall, .label_col = "ClassDetailed", .n 
     .label_col   <- "ClassDetailed"
     .n           <- 12L
   }
-  .tab_overall |>
+  dat_ <- .tab_overall |>
     dplyr::filter(.data$LabelCol == .label_col, !.data$Smoke, grepl("^llm-", .data$Model)) |>
     dplyr::summarise(MacroF1 = mean(.data$F1_macro), .by = c(Model, Tier, Guidance, AllowAbstain)) |>
-    dplyr::slice_max(.data$MacroF1, n = .n, with_ties = FALSE) |>
+    dplyr::slice_max(.data$MacroF1, n = .n) |>
     dplyr::mutate(
-      Label = paste0(
-        sub("^llm-", "", .data$Model), " ", .data$Guidance,
-        dplyr::if_else(.data$AllowAbstain, " +abstain", ""), " [", .data$Tier, "]"
-      ),
-      Estimate = dplyr::if_else(.data$Tier == "tuned", "Tuned on folds 1-4", "Blind or cross-fold"),
-      Label    = forcats::fct_reorder(.data$Label, .data$MacroF1)
-    ) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$MacroF1, y = .data$Label, fill = .data$Estimate)) +
-    ggplot2::geom_col(width = 0.7, colour = .plot_ink, linewidth = 0.3) +
-    ggplot2::geom_text(
-      ggplot2::aes(label = sprintf("%.3f", .data$MacroF1)),
-      hjust = -0.18, size = (.plot_base - 3) / ggplot2::.pt, family = .plot_font
-    ) +
-    ggplot2::scale_fill_manual(
-      values = c(`Blind or cross-fold` = .plot_ink, `Tuned on folds 1-4` = "#FFFFFF"),
-      name   = NULL
-    ) +
-    ggplot2::scale_x_continuous(
-      limits = c(0, 1.08), breaks = seq(0, 1, by = 0.25),
-      expand = ggplot2::expansion(mult = c(0, 0))
-    ) +
-    ggplot2::labs(x = "Macro-F1", y = NULL) +
-    plot_theme(.grid = "none", .legend = "bottom")
+      Label = paste0(sub("^llm-", "", .data$Model), " ", .data$Guidance,
+                     dplyr::if_else(.data$AllowAbstain, " +abstain", "")),
+      Blind = .data$Tier == "blind"
+    )
+
+  p_ <- dat_ |>
+    dplyr::mutate(Label = forcats::fct_reorder(.data$Label, .data$MacroF1)) |>
+    ggplot2::ggplot(ggplot2::aes(x = Label, y = MacroF1, fill = Blind)) +
+    ggplot2::geom_col(width = 0.7, color = "grey20") +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.3f", MacroF1)), hjust = -0.15, size = 3) +
+    ggplot2::scale_fill_manual(values = c(`TRUE` = "grey30", `FALSE` = "white"),
+                               labels = c(`TRUE` = "Blind", `FALSE` = "Tuned on folds 1-4")) +
+    ggplot2::scale_y_continuous(limits = c(0, 1.08), expand = ggplot2::expansion(mult = c(0, 0))) +
+    ggplot2::coord_flip() +
+    ggplot2::labs(x = NULL, y = "Macro-F1", fill = NULL)
+  clf_apply_theme(.plot = p_)
 }
 
 # Local null-coalescing helper (base R gained %||% in 4.4; this keeps the file self-contained).

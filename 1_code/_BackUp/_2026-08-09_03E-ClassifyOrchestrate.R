@@ -1,32 +1,63 @@
-# 03E-ClassifyOrchestrate: routing among the classification arms (orch_*) ----------------------------------------------
+# 03D-ClassifyOrchestrate: routing among classification arms (orch_*) ----
 #
-# WHAT THIS FILE DOES
-# Four arms now label the same documents on the same folds: a transformer, a keyword table, a local
-# language model, and whatever derived combinations of those the search constructs. This file asks
-# whether committing to one of them conditionally -- routing a document to a second arm when the
-# first is unsure -- beats committing to the best single arm outright, and answers it with a
-# procedure whose result can be obtained by running the procedure.
+# WHAT THIS STAGE IS
+# 03B and 03C each produced out-of-fold predictions on the IDENTICAL folds dealt in 03A. This file
+# asks, for each of the three tasks, whether a rule routing between them beats the transformer on its
+# own -- and answers in a form a referee can accept: the rule is CHOSEN inside the folds, not across
+# them.
 #
-# THE DISTINCTION THE WHOLE DOCUMENT TURNS ON
-# A policy selected on the documents it is then scored on is not an estimate of anything. Selection
-# and scoring are therefore nested: a policy is crowned on four folds and scored on the fifth, five
-# times over. The in-sample number is still computed and still reported, because a reader will want
-# to know the size of the gap, but it is drawn hollow in every figure and labelled as unobtainable.
-# Fill in this document means "a number you could actually get".
+# WHY NESTED SELECTION IS THE WHOLE DESIGN
+# Enumerating routing rules on the pooled predictions and reporting the best one selects and
+# evaluates on the same documents. With a few dozen candidate rules separated by a fraction of a
+# percentage point, the winner of that search is partly a winner by luck. So the rule is ranked on
+# four folds and applied to the fifth, rotating. What is reported is the performance of the
+# PROCEDURE. The in-sample best is reported beside it, because the gap between them measures the
+# selection effect directly.
 #
-# THE ROUTING NULL IS STRUCTURALLY STRONG
-# The gate fires where the second arm is confident, and the second arm is confident where the first
-# already is. Cascade gains are therefore elusive by construction rather than by accident, and a
-# result showing no gain is a finding about the arms rather than a failure of the search.
+# TOLERANCE, AND WHY IT IS NOT OPTIONAL
+# A strict argmax over policies will crown a rule that leads by the fourth decimal on a dozen
+# documents. That is not a preference for routing, it is a rounding artifact, and left unchecked it
+# makes the fold-level winner change for no reason and writes a deployment artifact that contradicts
+# the document's own conclusion. Every ranking here therefore resolves through orch_pick_policy():
+# among policies within .tolerance of the best, take the one that ROUTES THE FEWEST DOCUMENTS. The
+# incumbent routes none, so it wins every tie by construction, and routing has to earn its place by a
+# margin the sample can actually measure. 03C's kw_choose_config() applies the same principle to
+# precision; this is that convention carried across.
 #
-# WHAT IS NOT HERE
-# The arms themselves: 03A owns the folds, the scoring layer and the category vocabulary; 03B, 03C
-# and 03D own the transformer, the keyword table and the language model. This document reads their
-# run folders and never retrains anything. The look of any figure or table is _Commons/_Plots.R and
-# _Commons/_Tables.R; nothing below sets a colour, a font or a height.
+# THE BINARY ASYMMETRY (why amendment needed a decision, not a workaround)
+# For AmendType the keyword engine mines the positive class only and assigns "Original" wherever no
+# amendment term fired. That label is the ABSENCE of evidence wearing the name of a class: coverage
+# reads as 100%, the arm looks like a terminal, and the cascade space collapses to "pick one method".
+# 03C states the asymmetry in its own bundle script -- "Original is defined by the ABSENCE of
+# amendment language". So .commit_only names the labels that count as commitments: "Amended" for
+# amendment, everything for the categorical tasks. The keyword arm then commits where a term fired
+# and abstains otherwise, and the routing question becomes the real one: if an amendment term fires,
+# call it amended, else ask the transformer. 03B predicts this fails, because "amended and restated"
+# titles genuine originals. It is now testable rather than assumed.
+#
+# ARM AVAILABILITY IS NOT UNIFORM
+# Mined keyword arms exist on all five folds. Arms scored from a written term list exist on the
+# held-out fold only, because the reading session that produced the list read folds 1-4 WITH their
+# labels. They cannot enter a five-fold nested search without contaminating four of the rankings, so
+# orch_arms() reports fold availability and the restriction is applied in the qmd where a reader can
+# see it.
+#
+# VOCABULARY (one place; do not drift)
+#   Arm        One source of per-document predictions scored on the shared folds. It either COMMITS
+#              to a label or ABSTAINS ("(none)").
+#   Terminal   An arm that commits on every document, so it can end a cascade.
+#   Cascade    An ordered list of abstaining arms, each gated by a score floor, ending in a terminal.
+#   Policy     A cascade plus the family governing whether commitments are honoured.
+#   Family     "cascade"  -- honour every commitment clearing the floor.
+#              "perclass" -- honour a commitment only for classes where that arm beat the terminal on
+#                            the TRAINING folds. Deployable, since it uses training labels only.
+#
+# Everything here is a pure consumer of what 03A, 03B and 03C wrote. No training, no engine spawn, no
+# cached reads: the searches are joins over a few thousand rows and complete in seconds.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
-# locals; if (FALSE) dev blocks; pure ASCII; parenthesised cli interpolation.
+# locals; .data$ for existing columns, bare CamelCase for new; if (FALSE) dev blocks; cli/fs/here;
+# pure ASCII; stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
 
 if (FALSE) {
   .runs_roots <- c(.lP$Runs$Bert, .lP$Runs$Kw)
@@ -34,30 +65,12 @@ if (FALSE) {
   .tab_prep   <- arrow::read_parquet(.lP$Input$Prepared)
 }
 
-# The abstention sentinel, shared with the keyword and language-model arms. An arm that declines emits
-# it; the scoring layer drops it from the class set and reports coverage instead.
+# The abstention sentinel. 03C defines the same constant; repeating it means 03D's functions carry a
+# working default even when only 03A has been sourced ahead of them.
 ORCH_NONE <- "(none)"
 
 
-# 0. Vocabulary ----------------------------------------------------------------------------------------------------------
-# One vocabulary this document owns, registered with the design layer the same way 03A registers the
-# taxonomy. Agreement tiers are ordered by how much evidence stands behind a label, strongest first,
-# because that is the order a reader scans them in and the order in which their accuracies should
-# decline. The order was previously written out at each of the two places the tier is constructed;
-# stating it once removes the possibility of the figure and the flag disagreeing about what "sole"
-# ranks above.
-
-.orch_tiers <- c("unanimous", "majority", "sole", "split")
-
-plot_register_levels(
-  .key     = "AgreementTier",
-  .levels  = .orch_tiers,
-  .short   = NULL,
-  .colours = plot_pal_seq(length(.orch_tiers), .rev = TRUE)
-)
-
-
-# 1. Arm naming --------------------------------------------------------------------------------------------------------
+# 1. Arm naming ------------------------------------------------------------------------------------
 # Run identifiers are eighty characters because they must be unique on disk. A name has a different
 # job: it must be readable in a console table and in a policy label, and it must still separate two
 # arms that differ. Fixed truncation cannot do both -- an earlier version cut the identifier at a
@@ -135,57 +148,7 @@ orch_compact <- function(.x) {
 }
 
 
-# 2. Arm inventory -----------------------------------------------------------------------------------------------------
-
-#' Every arm's out-of-fold predictions, read from the run tree in one pass
-#'
-#' The shared pooling helper reads every predictions file under the roots and then keeps the rows of
-#' one configuration. Called once that is the cheapest thing that works; called once per arm it reads
-#' the whole tree once per arm, and binds several hundred thousand rows only to discard all but a few
-#' thousand of them. With a few hundred runs on disk and a handful of arms that is the dominant cost
-#' of this document -- minutes of file reading to assemble a table that fits in memory many times
-#' over.
-#'
-#' This reads each file exactly once and filters it as it goes, so the cost is linear in the number of
-#' runs rather than in runs times arms, and nothing is ever bound that will not be kept.
-#'
-#' @param .runs_roots Character vector of run directories.
-#' @param .config_names Character vector of ConfigName strings to retain.
-#' @return Long tibble of predictions for those configurations only.
-orch_predictions <- function(.runs_roots, .config_names) {
-  if (FALSE) {
-    .runs_roots   <- c(.lP$Runs$Bert, .lP$Runs$Kw)
-    .config_names <- res_det$ArmsCV$ConfigName
-  }
-  paths_ <- .runs_roots |>
-    purrr::map(\(.r) if (fs::dir_exists(.r)) {
-      fs::dir_ls(.r, recurse = TRUE, glob = "*predictions.parquet")
-    } else {
-      character(0)
-    }) |>
-    purrr::list_c()
-  paths_ <- paths_[!grepl("_smoke", paths_)]
-  if (length(paths_) == 0L) cli::cli_abort("No predictions.parquet under {(.runs_roots)}")
-
-  want_ <- unique(.config_names)
-  out_  <- purrr::map(paths_, function(.p) {
-    tab_ <- arrow::read_parquet(.p)
-    tab_[tab_$ConfigName %in% want_, , drop = FALSE]
-  }) |>
-    purrr::list_rbind()
-
-  got_  <- unique(out_$ConfigName)
-  miss_ <- setdiff(want_, got_)
-  if (length(miss_) > 0L) {
-    cli::cli_alert_warning("No predictions found for {length(miss_)} configuration{?s}: {miss_}")
-  }
-  cli::cli_alert_info(
-    "Read {length(paths_)} prediction file{?s} once; kept {nrow(out_)} row{?s} across \\
-     {length(got_)} configuration{?s}."
-  )
-  out_
-}
-
+# 2. Arm inventory ---------------------------------------------------------------------------------
 
 #' Inventory the arms available for one task
 #'
@@ -264,22 +227,18 @@ orch_arms <- function(.runs_roots, .label_col = "ClassDetailed", .none = ORCH_NO
     )
   }
 
-  # Coverage and precision for every surviving configuration, from one pass over the run tree rather
-  # than one pass per configuration. Reading per configuration is what the shared pooling helper does,
-  # and at this many runs it turns a few seconds of file access into minutes of it.
-  stats_ <- orch_predictions(.runs_roots = .runs_roots, .config_names = best_$ConfigName) |>
-    dplyr::mutate(Hit = .data$PredLabel != .none) |>
-    dplyr::summarise(
-      nDocs        = dplyr::n(),
-      Coverage     = mean(.data$Hit),
-      SelPrecision = if (any(.data$Hit)) {
-        mean(.data$PredLabel[.data$Hit] == .data$TrueLabel[.data$Hit])
-      } else {
-        NA_real_
-      },
-      Accuracy     = mean(.data$PredLabel == .data$TrueLabel),
-      .by = ConfigName
+  stats_ <- purrr::map(best_$ConfigName, function(.cfg) {
+    pred_ <- clf_pool_predictions(.runs_roots = .runs_roots, .config_name = .cfg)
+    hit_  <- pred_$PredLabel != .none
+    tibble::tibble(
+      ConfigName   = .cfg,
+      nDocs        = nrow(pred_),
+      Coverage     = mean(hit_),
+      SelPrecision = if (any(hit_)) mean(pred_$PredLabel[hit_] == pred_$TrueLabel[hit_]) else NA_real_,
+      Accuracy     = mean(pred_$PredLabel == pred_$TrueLabel)
     )
+  }) |>
+    purrr::list_rbind()
 
   best_ |>
     dplyr::left_join(stats_, by = dplyr::join_by(ConfigName)) |>
@@ -316,13 +275,13 @@ orch_report_arms <- function(.tab, .n_folds = 5L, .label_col = "ClassDetailed") 
   cli::cli_h2("Arms available: {(.label_col)}")
   .tab |>
     dplyr::mutate(
-      Coverage     = tbl_pct(.data$Coverage),
-      SelPrecision = tbl_pct(.data$SelPrecision),
+      Coverage     = clf_pct(.data$Coverage),
+      SelPrecision = clf_pct(.data$SelPrecision),
       MacroF1      = sprintf("%.3f", .data$MacroF1)
     ) |>
     dplyr::select(Arm, dplyr::any_of("Origin"), nConfigs, Folds, nDocs, Coverage, SelPrecision,
                   MacroF1) |>
-    tbl_say()
+    clf_say_table()
 
   n_ok_ <- sum(.tab$nFolds >= .n_folds)
   cli::cli_text("")
@@ -338,7 +297,7 @@ orch_report_arms <- function(.tab, .n_folds = 5L, .label_col = "ClassDetailed") 
 }
 
 
-# 3. The routing spine -------------------------------------------------------------------------------------------------
+# 3. The routing spine -----------------------------------------------------------------------------
 
 #' Assemble the long routing spine: one row per document and arm
 #'
@@ -363,20 +322,6 @@ orch_report_arms <- function(.tab, .n_folds = 5L, .label_col = "ClassDetailed") 
 #' @param .carry Document-level columns to attach for downstream scoring slices.
 #' @param .none Character. Abstention sentinel.
 #' @return Tibble: DocID, Fold, TrueLabel, [carried columns], Arm, Pred, Score.
-#' The routing spine: every arm's prediction for every document, in long form
-#'
-#' One row per document per arm, carrying the arm's label, its confidence and whether it committed.
-#' This is the table every policy is fitted and scored against, so it is built once per task and never
-#' rebuilt.
-#'
-#' @param .runs_roots Character vector of run directories.
-#' @param .arms Arm inventory from orch_arms(), already restricted to arms with full fold coverage.
-#' @param .tab_prep Prepared sample, supplying the columns the robustness slices carry.
-#' @param .commit_only Character vector or NULL. Restrict a lexical arm to committing on these
-#'   categories only.
-#' @param .carry Character vector of prepared-sample columns to attach.
-#' @param .none Character. Abstention sentinel.
-#' @return Long tibble: DocID, Fold, TrueLabel, carried columns, Arm, Pred, Score.
 orch_spine <- function(.runs_roots, .arms, .tab_prep, .commit_only = NULL,
                        .carry = c("ClassDetailed2", "LabelRound"), .none = ORCH_NONE) {
   if (FALSE) {
@@ -387,35 +332,30 @@ orch_spine <- function(.runs_roots, .arms, .tab_prep, .commit_only = NULL,
     .carry       <- c("ClassDetailed2", "LabelRound")
     .none        <- ORCH_NONE
   }
-  # ConfigName is unique within the arm inventory: orch_arms() keeps one configuration per arm name,
-  # so this join attaches exactly one arm and one kind to each prediction row.
-  key_ <- .arms |> dplyr::select(ConfigName, Arm, Kind)
-
-  out_ <- orch_predictions(.runs_roots = .runs_roots, .config_names = key_$ConfigName) |>
-    dplyr::inner_join(key_, by = dplyr::join_by(ConfigName)) |>
-    dplyr::transmute(
-      DocID,
-      Fold  = as.integer(.data$Fold),
-      TrueLabel,
-      Arm   = .data$Arm,
-      Kind  = .data$Kind,
-      Pred  = .data$PredLabel,
-      Score = dplyr::coalesce(as.numeric(.data$Score), 0)
-    )
-
-  if (!is.null(.commit_only)) {
-    out_ <- out_ |>
-      dplyr::mutate(
-        Pred = dplyr::if_else(
-          grepl("^keyword-", .data$Kind) & !.data$Pred %in% .commit_only, .none, .data$Pred
+  out_ <- purrr::pmap(
+    .l = list(.arms$Arm, .arms$ConfigName, .arms$Kind),
+    .f = function(.arm, .cfg, .kind) {
+      tab_ <- clf_pool_predictions(.runs_roots = .runs_roots, .config_name = .cfg) |>
+        dplyr::transmute(
+          DocID,
+          Fold  = as.integer(.data$Fold),
+          TrueLabel,
+          Arm   = .arm,
+          Pred  = .data$PredLabel,
+          Score = dplyr::coalesce(as.numeric(.data$Score), 0)
         )
-      )
-  }
+      if (!is.null(.commit_only) && grepl("^keyword-", .kind)) {
+        tab_ <- tab_ |>
+          dplyr::mutate(Pred = dplyr::if_else(.data$Pred %in% .commit_only, .data$Pred, .none))
+      }
+      tab_
+    }
+  ) |>
+    purrr::list_rbind()
 
   doc_ <- .tab_prep |> dplyr::select(DocID, dplyr::any_of(.carry))
 
   out_ |>
-    dplyr::select(-Kind) |>
     dplyr::left_join(doc_, by = dplyr::join_by(DocID)) |>
     dplyr::relocate(DocID, Fold, TrueLabel, dplyr::any_of(.carry), Arm, Pred, Score)
 }
@@ -484,9 +424,9 @@ orch_report_spine <- function(.spine, .none = ORCH_NONE) {
 
   cli::cli_h2("Routing spine")
   out_ |>
-    dplyr::mutate(Coverage = tbl_pct(.data$Coverage), Accuracy = tbl_pct(.data$Accuracy)) |>
+    dplyr::mutate(Coverage = clf_pct(.data$Coverage), Accuracy = clf_pct(.data$Accuracy)) |>
     dplyr::select(Arm, Role, nRows, nDocs, nFolds, Coverage, Accuracy) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
   cli::cli_alert_info(
     "Every arm should reach {n_docs_} documents once. nRows above nDocs means one arm name covers \\
@@ -499,7 +439,7 @@ orch_report_spine <- function(.spine, .none = ORCH_NONE) {
 }
 
 
-# 4. Derived arms ------------------------------------------------------------------------------------------------------
+# 4. Derived arms ----------------------------------------------------------------------------------
 # Arms built in R from what the transformer already predicted. Each encodes a structural claim about
 # the taxonomy and is scored by exactly the same code as an arm read off disk, so it wins a fold on
 # its merits or it does not.
@@ -555,14 +495,14 @@ orch_report_hierarchy <- function(.tab) {
   if (FALSE) .tab <- hier_err
   cli::cli_h2("Where detailed errors fall")
   .tab |>
-    dplyr::mutate(Share = tbl_pct(.data$Share)) |>
-    tbl_say()
+    dplyr::mutate(Share = clf_pct(.data$Share)) |>
+    clf_say_table()
   cli::cli_text("")
   reach_ <- .tab$Share[.tab$Outcome == "Wrong, different broad parent"]
   reach_ <- if (length(reach_) == 0L) 0 else reach_
   cli::cli_alert_info(
     "Only the crossing row is reachable by a broad-level constraint, and only where the broad model \\
-     is right. It bounds the constrained arm's possible gain at {tbl_pct(reach_)} of documents, \\
+     is right. It bounds the constrained arm's possible gain at {clf_pct(reach_)} of documents, \\
      against which the broad model's own error rate must be set."
   )
   invisible(.tab)
@@ -650,7 +590,7 @@ orch_arm_rollup <- function(.pred_detailed, .tab_prep, .arm = "bert-rollup") {
 }
 
 
-# 5. The policy space --------------------------------------------------------------------------------------------------
+# 5. The policy space ------------------------------------------------------------------------------
 
 #' All permutations of a short character vector
 #'
@@ -763,7 +703,7 @@ orch_policy_grid <- function(.arms_gated, .terminals, .floors = c(0, 0.70, 0.80,
 }
 
 
-# 6. Fitting and applying a policy -------------------------------------------------------------------------------------
+# 6. Fitting and applying a policy -----------------------------------------------------------------
 
 #' Fit the per-class gate for one policy on the training folds
 #'
@@ -778,136 +718,34 @@ orch_policy_grid <- function(.arms_gated, .terminals, .floors = c(0, 0.70, 0.80,
 #' @param .policy One row of orch_policy_grid().
 #' @param .none Character. Abstention sentinel.
 #' @return Tibble: Arm, Class, nDocs, ArmPrecision, TerminalAccuracy, Keep.
-#' Cache key for one arm-or-terminal and one score floor
-#'
-#' Floors are doubles, so the key is formatted rather than pasted: the default conversion of 0.7 and
-#' the value stored in the grid must produce the same string or a lookup silently misses and the
-#' caller falls back to recomputing, which would be slow and correct rather than fast and correct.
-#'
-#' @param .a Character. Arm or terminal name.
-#' @param .floor Numeric. Score floor.
-#' @return Character key.
-#' @keywords internal
-orch_policy_key <- function(.a, .floor) {
-  if (FALSE) {
-    .a     <- "legal-bert"
-    .floor <- 0.90
-  }
-  paste0(.a, "||", formatC(.floor, format = "g", digits = 10))
-}
-
-#' Precomputed per-class keep decisions, for every terminal and floor at once
-#'
-#' The keep decision for an arm and a category compares that arm's precision, among the documents it
-#' commits on above the floor, against the terminal's accuracy on those same documents. Nothing in
-#' that comparison depends on which other arms a policy happens to list, or in what order: it is a
-#' function of the arm, the category, the terminal and the floor alone.
-#'
-#' The unfactored version recomputes it inside every policy, which at a few hundred policies over five
-#' folds and three tasks is the same table built thousands of times. Computing it once per terminal
-#' and floor, over every arm, and subsetting per policy is exactly equivalent -- filtering rows by arm
-#' before or after a per-arm summarise gives the same rows -- and does the work fifty times less
-#' often.
-#'
-#' @param .spine The spine the decision is fitted on.
-#' @param .terminals Character vector of terminal arms appearing in the policy grid.
-#' @param .floors Numeric vector of score floors appearing in the policy grid.
-#' @param .none Character. Abstention sentinel.
-#' @return Named list of tibbles, keyed by terminal and floor.
-orch_fit_cache <- function(.spine, .terminals, .floors, .none = ORCH_NONE) {
-  if (FALSE) {
-    .spine     <- dplyr::filter(spine_det, Fold != 1L)
-    .terminals <- unique(policies_det$Terminal)
-    .floors    <- unique(policies_det$Floor)
-    .none      <- ORCH_NONE
-  }
-  grid_ <- tidyr::expand_grid(Terminal = .terminals, Floor = .floors)
-
-  purrr::pmap(grid_, function(Terminal, Floor) {
-    term_ <- .spine |>
-      dplyr::filter(.data$Arm == Terminal) |>
-      dplyr::select(DocID, TermPred = .data$Pred)
-
-    .spine |>
-      dplyr::filter(.data$Pred != .none, .data$Score >= Floor) |>
-      dplyr::inner_join(term_, by = dplyr::join_by(DocID)) |>
-      # .by is tidyselect and cannot rename, so the grouping column is created before the summarise
-      dplyr::mutate(Class = .data$Pred) |>
-      dplyr::summarise(
-        nDocs            = dplyr::n(),
-        ArmPrecision     = mean(.data$Pred == .data$TrueLabel),
-        TerminalAccuracy = mean(.data$TermPred == .data$TrueLabel),
-        .by = c(Arm, Class)
-      ) |>
-      dplyr::mutate(Keep = .data$ArmPrecision > .data$TerminalAccuracy) |>
-      dplyr::arrange(.data$Arm, dplyr::desc(.data$nDocs))
-  }) |>
-    purrr::set_names(orch_policy_key(grid_$Terminal, grid_$Floor))
-}
-
-#' Precomputed candidate rows, for every arm and floor at once
-#'
-#' A cascade step asks one question of the spine: which documents did this arm commit on, above this
-#' floor, and what did it say. The answer depends on the arm and the floor and on nothing else, so it
-#' is shared by every policy that names them. Scanning the whole spine for it inside each policy makes
-#' the cost grow with the size of the search rather than with the size of the data.
-#'
-#' @param .spine The spine the candidates are drawn from.
-#' @param .floors Numeric vector of score floors appearing in the policy grid.
-#' @param .none Character. Abstention sentinel.
-#' @return Named list of two-column tibbles, keyed by arm and floor.
-orch_cand_cache <- function(.spine, .floors, .none = ORCH_NONE) {
-  if (FALSE) {
-    .spine  <- dplyr::filter(spine_det, Fold == 1L)
-    .floors <- unique(policies_det$Floor)
-    .none   <- ORCH_NONE
-  }
-  arms_ <- unique(.spine$Arm)
-  grid_ <- tidyr::expand_grid(Arm = arms_, Floor = .floors)
-
-  purrr::pmap(grid_, function(Arm, Floor) {
-    .spine |>
-      dplyr::filter(.data$Arm == !!Arm, .data$Pred != .none, .data$Score >= Floor) |>
-      dplyr::select(DocID, ArmPred = .data$Pred)
-  }) |>
-    purrr::set_names(orch_policy_key(grid_$Arm, grid_$Floor))
-}
-
-#' Per-class keep decisions for one policy
-#'
-#' Which categories an arm is allowed to override the terminal on: those where the arm is more precise
-#' than the terminal is accurate, on the documents the arm commits to. Only the perclass family gates
-#' this way; a plain cascade lets a committing arm override everywhere.
-#'
-#' @param .spine The spine the decision is fitted on.
-#' @param .policy One row of the policy grid.
-#' @param .none Character. Abstention sentinel.
-#' @param .cache Optional output of orch_fit_cache(). Supplied, the table is looked up rather than
-#'   recomputed; absent, it is computed for this policy alone. The two paths return the same rows.
-#' @return Tibble: DocID, Fold, TrueLabel, carried columns, PredLabel, DecidedBy.
-#' @return Tibble: Arm, Class, nDocs, ArmPrecision, TerminalAccuracy, Keep.
-orch_policy_fit <- function(.spine, .policy, .none = ORCH_NONE, .cache = NULL) {
+orch_policy_fit <- function(.spine, .policy, .none = ORCH_NONE) {
   if (FALSE) {
     .spine  <- dplyr::filter(spine_det, Fold != 1L)
     .policy <- policies_det[10, ]
     .none   <- ORCH_NONE
-    .cache  <- NULL
   }
   order_ <- .policy$Order[[1]]
   empty_ <- tibble::tibble(Arm = character(), Class = character(), nDocs = integer(),
                            ArmPrecision = numeric(), TerminalAccuracy = numeric(), Keep = logical())
   if (.policy$Family != "perclass" || length(order_) == 0L) return(empty_)
 
-  all_ <- if (!is.null(.cache)) {
-    .cache[[orch_policy_key(.policy$Terminal, .policy$Floor)]]
-  } else {
-    orch_fit_cache(
-      .spine = .spine, .terminals = .policy$Terminal, .floors = .policy$Floor, .none = .none
-    )[[1]]
-  }
-  if (is.null(all_)) return(empty_)
+  term_ <- .spine |>
+    dplyr::filter(.data$Arm == .policy$Terminal) |>
+    dplyr::select(DocID, TermPred = .data$Pred)
 
-  all_ |> dplyr::filter(.data$Arm %in% order_)
+  .spine |>
+    dplyr::filter(.data$Arm %in% order_, .data$Pred != .none, .data$Score >= .policy$Floor) |>
+    dplyr::inner_join(term_, by = dplyr::join_by(DocID)) |>
+    # .by is tidyselect and cannot rename, so the grouping column is created before the summarise
+    dplyr::mutate(Class = .data$Pred) |>
+    dplyr::summarise(
+      nDocs            = dplyr::n(),
+      ArmPrecision     = mean(.data$Pred == .data$TrueLabel),
+      TerminalAccuracy = mean(.data$TermPred == .data$TrueLabel),
+      .by = c(Arm, Class)
+    ) |>
+    dplyr::mutate(Keep = .data$ArmPrecision > .data$TerminalAccuracy) |>
+    dplyr::arrange(.data$Arm, dplyr::desc(.data$nDocs))
 }
 
 #' Apply a fitted policy to a set of spine rows
@@ -920,17 +758,13 @@ orch_policy_fit <- function(.spine, .policy, .none = ORCH_NONE, .cache = NULL) {
 #' @param .policy One row of orch_policy_grid().
 #' @param .fit Output of orch_policy_fit() for the same policy.
 #' @param .none Character. Abstention sentinel.
-#' @param .cache Optional output of orch_cand_cache() built from these same rows. Supplied, each
-#'   cascade step is a lookup rather than a scan of the whole spine; absent, it filters as before.
-#'   The two paths return identical rows.
 #' @return Predictions tibble: DocID, Fold, TrueLabel, PredLabel, DecidedBy (+ carried columns).
-orch_policy_apply <- function(.spine, .policy, .fit = NULL, .none = ORCH_NONE, .cache = NULL) {
+orch_policy_apply <- function(.spine, .policy, .fit = NULL, .none = ORCH_NONE) {
   if (FALSE) {
     .spine  <- dplyr::filter(spine_det, Fold == 1L)
     .policy <- policies_det[10, ]
     .fit    <- orch_policy_fit(dplyr::filter(spine_det, Fold != 1L), policies_det[10, ])
     .none   <- ORCH_NONE
-    .cache  <- NULL
   }
   order_ <- .policy$Order[[1]]
 
@@ -948,14 +782,9 @@ orch_policy_apply <- function(.spine, .policy, .fit = NULL, .none = ORCH_NONE, .
   # Walk the cascade backwards so each earlier arm overwrites what the later ones decided.
   # Overwriting in reverse priority is equivalent to first-match-wins and needs no accumulator.
   for (arm_ in rev(order_)) {
-    cand_ <- if (!is.null(.cache)) {
-      .cache[[orch_policy_key(arm_, .policy$Floor)]]
-    } else {
-      .spine |>
-        dplyr::filter(.data$Arm == arm_, .data$Pred != .none, .data$Score >= .policy$Floor) |>
-        dplyr::select(DocID, ArmPred = .data$Pred)
-    }
-    if (is.null(cand_)) next
+    cand_ <- .spine |>
+      dplyr::filter(.data$Arm == arm_, .data$Pred != .none, .data$Score >= .policy$Floor) |>
+      dplyr::select(DocID, ArmPred = .data$Pred)
 
     if (identical(.policy$Family, "perclass")) {
       allow_ <- if (is.null(keep_)) {
@@ -978,7 +807,7 @@ orch_policy_apply <- function(.spine, .policy, .fit = NULL, .none = ORCH_NONE, .
 }
 
 
-# 7. Ranking and nested selection --------------------------------------------------------------------------------------
+# 7. Ranking and nested selection ------------------------------------------------------------------
 
 #' Score every policy on one set of spine rows
 #' @param .spine Rows to score on.
@@ -997,22 +826,10 @@ orch_score_policies <- function(.spine, .policies, .spine_fit = NULL, .lenient =
   }
   fit_on_ <- if (is.null(.spine_fit)) .spine else .spine_fit
 
-  # Both tables every policy needs depend only on the terminal, the arm and the floor, never on the
-  # ordering. Building them once here is what keeps the cost of the search proportional to the data
-  # rather than to the number of orderings the grid happens to enumerate.
-  cache_fit_  <- orch_fit_cache(
-    .spine = fit_on_, .terminals = unique(.policies$Terminal),
-    .floors = unique(.policies$Floor), .none = .none
-  )
-  cache_cand_ <- orch_cand_cache(
-    .spine = .spine, .floors = unique(.policies$Floor), .none = .none
-  )
-
   purrr::map(seq_len(nrow(.policies)), function(.i) {
     pol_  <- .policies[.i, ]
-    fit_  <- orch_policy_fit(.spine = fit_on_, .policy = pol_, .none = .none, .cache = cache_fit_)
-    pred_ <- orch_policy_apply(.spine = .spine, .policy = pol_, .fit = fit_, .none = .none,
-                               .cache = cache_cand_)
+    fit_  <- orch_policy_fit(.spine = fit_on_, .policy = pol_, .none = .none)
+    pred_ <- orch_policy_apply(.spine = .spine, .policy = pol_, .fit = fit_, .none = .none)
     sc_   <- clf_scores(.tab_pred = pred_, .lenient = .lenient, .none = .none)
     tibble::tibble(
       PolicyID = pol_$PolicyID,
@@ -1065,215 +882,33 @@ orch_pick_policy <- function(.rank, .tolerance = 0.005) {
 #' @param .lenient Logical. Lenient scoring inside the selection.
 #' @param .none Character. Abstention sentinel.
 #' @return Tibble of pooled held-out predictions plus WinnerID, WinnerLabel, WinnerTerminal.
-#' Start worker processes and load this pipeline into each of them
-#'
-#' The nested loop is five independent problems: crown a policy on four folds, score it on the fifth,
-#' and never let the two touch. Nothing crosses between folds, so they can run at once, and on a
-#' search of a few thousand policies that is most of the wall clock.
-#'
-#' Workers are separate R sessions and inherit nothing, so the libraries this pipeline is built from
-#' are sourced into each one. The paths are an argument rather than a constant because the runbook
-#' already resolves them through the shared helper, and restating a path convention here would be a
-#' second place for it to drift.
-#'
-#' Failure to start workers is reported and the search continues on one core. A slow document is a
-#' nuisance; one that silently produced its numbers a different way would be worse.
-#'
-#' ORDER MATTERS AND SO DOES COMPLETENESS. The libraries have top-level side effects: the sample
-#' script registers its taxonomy with the figure layer and aliases the table helpers, both at source
-#' time. Sourcing it into a worker that lacks those layers throws part-way through the file, and every
-#' function defined below that point silently does not exist. The failure then surfaces much later, as
-#' a fold reporting that some function it needs cannot be found. The probe below exists so that it
-#' surfaces here instead.
-#'
-#' @param .sources Character vector of absolute paths to source into each worker, in dependency order.
-#' @param .workers Integer or NULL. Worker count; NULL leaves two cores for the session.
-#' @param .needs Character vector of functions the fold loop calls in the worker. Their presence is
-#'   what the setup is checked against, because a worker that started is not the same as one that can
-#'   run the job.
-#' @return Invisibly the number of workers started, zero if none.
-orch_daemons <- function(.sources, .workers = NULL,
-                         .needs = c("orch_score_policies", "orch_pick_policy",
-                                    "orch_policy_fit", "orch_policy_apply", "clf_scores")) {
-  if (FALSE) {
-    .sources <- c(
-      here::here("1_code", "_Commons", "_Plots.R"),
-      here::here("1_code", "_Commons", "_Tables.R"),
-      purrr::map_chr(c("03A-ClassifyPrepare", "03E-ClassifyOrchestrate"),
-                     \(.s) init_create_script_fun(here::here(), .s))
-    )
-    .workers <- NULL
-    .needs   <- "orch_score_policies"
-  }
-  miss_ <- .sources[!fs::file_exists(.sources)]
-  if (length(miss_) > 0L) cli::cli_abort("Cannot source into workers, missing: {miss_}")
-  if (is.null(.workers)) .workers <- as.integer(max(1L, parallel::detectCores() - 2L))
-  if (.workers <= 1L) {
-    cli::cli_alert_info("One core available; the fold loop runs serially.")
-    return(invisible(0L))
-  }
-
-  ok_ <- tryCatch({
-    mirai::daemons(.workers)
-    mirai::everywhere(
-      { for (.p in .srcs) source(.p, encoding = "UTF-8") },
-      .args = list(.srcs = as.character(.sources))
-    )
-    TRUE
-  }, error = function(e) {
-    cli::cli_alert_warning("Could not start workers ({conditionMessage(e)}); running serially.")
-    FALSE
-  })
-
-  if (!ok_) {
-    try(mirai::daemons(0L), silent = TRUE)
-    return(invisible(0L))
-  }
-
-  # everywhere() dispatches asynchronously, so a source that failed in a worker does not raise here.
-  # Ask the workers directly whether they can do the job, rather than assuming that starting implies
-  # readiness.
-  probe_ <- tryCatch(
-    mirai::mirai_map(
-      .x    = seq_len(.workers),
-      .f    = function(.i, .needs) {
-        gone_ <- .needs[!vapply(.needs, exists, logical(1), mode = "function")]
-        if (length(gone_) == 0L) "" else paste(gone_, collapse = ", ")
-      },
-      .args = list(.needs = .needs)
-    )[],
-    error = function(e) list(conditionMessage(e))
-  )
-  bad_ <- unique(unlist(probe_))
-  bad_ <- bad_[nzchar(bad_)]
-
-  if (length(bad_) > 0L) {
-    cli::cli_alert_danger(
-      "Workers started but cannot run the fold loop; missing there: {bad_}."
-    )
-    cli::cli_alert_warning(
-      "This means a library failed to source in the worker, usually because {.arg .sources} is \\
-       incomplete or out of dependency order. Falling back to one core; the numbers are unaffected."
-    )
-    try(mirai::daemons(0L), silent = TRUE)
-    return(invisible(0L))
-  }
-
-  cli::cli_alert_success("{(.workers)} worker{?s} ready; the fold loop runs in parallel.")
-  invisible(as.integer(.workers))
-}
-
-#' Are workers currently available
-#'
-#' @return Logical scalar.
-#' @keywords internal
-orch_parallel <- function() {
-  if (FALSE) NULL
-  tryCatch(
-    isTRUE(requireNamespace("mirai", quietly = TRUE)) && mirai::status()$connections > 0L,
-    error = function(e) FALSE
-  )
-}
-
-#' One fold of the nested loop: crown on the rest, score on this one
-#'
-#' Written as a standalone function taking everything it needs, rather than as a closure over the
-#' enclosing environment, because it has to run in a worker process that shares nothing with the
-#' session. The serial and parallel paths call exactly this, so the two cannot diverge.
-#'
-#' @param .k Integer. The held-out fold.
-#' @param .spine The full routing spine.
-#' @param .policies The policy grid.
-#' @param .tolerance Numeric. Macro-F1 band treated as a tie.
-#' @param .lenient Logical. Lenient scoring.
-#' @param .none Character. Abstention sentinel.
-#' @return Predictions for the held-out fold, tagged with the winning policy.
-orch_fold <- function(.k, .spine, .policies, .tolerance, .lenient, .none) {
-  if (FALSE) {
-    .k         <- 1L
-    .spine     <- spine_det
-    .policies  <- policies_det
-    .tolerance <- 0.005
-    .lenient   <- FALSE
-    .none      <- ORCH_NONE
-  }
-  train_ <- .spine |> dplyr::filter(.data$Fold != .k)
-  test_  <- .spine |> dplyr::filter(.data$Fold == .k)
-
-  rank_ <- orch_score_policies(.spine = train_, .policies = .policies, .lenient = .lenient,
-                               .none = .none)
-  win_  <- .policies |>
-    dplyr::filter(.data$PolicyID == orch_pick_policy(.rank = rank_, .tolerance = .tolerance)$PolicyID)
-
-  # The winner is fitted on the training folds and applied to the held-out one, so the two caches are
-  # built from different spines. Conflating them is exactly the leak the nesting exists to prevent,
-  # which is why they are named apart rather than shared.
-  fit_ <- orch_policy_fit(
-    .spine = train_, .policy = win_, .none = .none,
-    .cache = orch_fit_cache(.spine = train_, .terminals = win_$Terminal,
-                            .floors = win_$Floor, .none = .none)
-  )
-
-  orch_policy_apply(
-    .spine = test_, .policy = win_, .fit = fit_, .none = .none,
-    .cache = orch_cand_cache(.spine = test_, .floors = win_$Floor, .none = .none)
-  ) |>
-    dplyr::mutate(WinnerID = win_$PolicyID, WinnerLabel = win_$Label,
-                  WinnerTerminal = win_$Terminal)
-}
-
-#' Nested cross-validated selection of a routing policy
-#'
-#' For each fold in turn, every policy is fitted and ranked on the other folds, the winner is applied
-#' to the held-out fold, and the held-out predictions are pooled. No document contributes to choosing
-#' the policy that labels it, so the pooled score estimates what a reader running this selection would
-#' obtain rather than what the best rule scored on the data that chose it.
-#'
-#' Folds run on workers when any are available and serially otherwise. Both paths call the same
-#' per-fold function, so the result does not depend on which one ran.
-#'
-#' @param .spine Routing spine, restricted to arms present on every fold.
-#' @param .policies Output of orch_policy_grid().
-#' @param .tolerance Macro-F1 band treated as indistinguishable when crowning a fold winner.
-#' @param .lenient Logical. Lenient scoring inside the selection.
-#' @param .none Character. Abstention sentinel.
-#' @return Tibble of pooled held-out predictions plus WinnerID, WinnerLabel, WinnerTerminal.
 orch_select_nested <- function(.spine, .policies, .tolerance = 0.005, .lenient = FALSE,
                                .none = ORCH_NONE) {
   if (FALSE) {
     .spine     <- spine_det
     .policies  <- policies_det
     .tolerance <- 0.005
-    .lenient   <- FALSE
-    .none      <- ORCH_NONE
   }
   folds_ <- sort(unique(.spine$Fold))
-  par_   <- orch_parallel()
   cli::cli_alert_info(
-    "Nested selection: {nrow(.policies)} polic{?y/ies} ranked within each of {length(folds_)} \\
-     fold{?s}{if (par_) ', in parallel' else ''}"
+    "Nested selection: {nrow(.policies)} polic{?y/ies} ranked within each of {length(folds_)} fold{?s}"
   )
 
-  out_ <- if (par_) {
-    mirai::mirai_map(
-      .x    = folds_,
-      .f    = orch_fold,
-      .args = list(.spine = .spine, .policies = .policies, .tolerance = .tolerance,
-                   .lenient = .lenient, .none = .none)
-    )[.progress]
-  } else {
-    purrr::map(
-      folds_, orch_fold,
-      .spine = .spine, .policies = .policies, .tolerance = .tolerance,
-      .lenient = .lenient, .none = .none, .progress = "folds"
-    )
-  }
+  purrr::map(folds_, function(.k) {
+    train_ <- .spine |> dplyr::filter(.data$Fold != .k)
+    test_  <- .spine |> dplyr::filter(.data$Fold == .k)
 
-  bad_ <- purrr::map_lgl(out_, \(.r) inherits(.r, "miraiError") || inherits(.r, "errorValue"))
-  if (any(bad_)) {
-    cli::cli_abort("Fold {folds_[bad_]} failed in a worker: {as.character(out_[bad_][[1]])}")
-  }
-  purrr::list_rbind(out_)
+    rank_ <- orch_score_policies(.spine = train_, .policies = .policies, .lenient = .lenient,
+                                 .none = .none)
+    win_  <- .policies |>
+      dplyr::filter(.data$PolicyID == orch_pick_policy(.rank = rank_, .tolerance = .tolerance)$PolicyID)
+    fit_  <- orch_policy_fit(.spine = train_, .policy = win_, .none = .none)
+
+    orch_policy_apply(.spine = test_, .policy = win_, .fit = fit_, .none = .none) |>
+      dplyr::mutate(WinnerID = win_$PolicyID, WinnerLabel = win_$Label,
+                    WinnerTerminal = win_$Terminal)
+  }, .progress = "folds") |>
+    purrr::list_rbind()
 }
 
 #' Report which policy won in each fold, and what it actually did
@@ -1300,9 +935,9 @@ orch_report_stability <- function(.tab_nested) {
   counts_ <- per_fold_ |> dplyr::count(.data$Winner, name = "Folds", sort = TRUE)
 
   cli::cli_h2("Which policy won, fold by fold")
-  per_fold_ |> tbl_say()
+  per_fold_ |> clf_say_table()
   cli::cli_text("")
-  counts_ |> tbl_say(.title = "Distinct winners")
+  counts_ |> clf_say_table(.title = "Distinct winners")
   cli::cli_text("")
 
   n_inert_ <- sum(per_fold_$nRouted == 0L)
@@ -1326,7 +961,7 @@ orch_report_stability <- function(.tab_nested) {
 }
 
 
-# 8. The headline comparison -------------------------------------------------------------------------------------------
+# 8. The headline comparison -----------------------------------------------------------------------
 
 #' Compare the incumbent, the other terminals, the in-sample best and the nested procedure
 #'
@@ -1409,12 +1044,12 @@ orch_report_compare <- function(.tab, .title = "Routing against the incumbent") 
   cli::cli_h2("{(.title)}")
   .tab |>
     dplyr::mutate(
-      Accuracy     = tbl_pct(.data$Accuracy),
+      Accuracy     = clf_pct(.data$Accuracy),
       MacroF1      = sprintf("%.3f", .data$MacroF1),
       DeltaMacroF1 = sprintf("%+.3f", .data$DeltaMacroF1)
     ) |>
     dplyr::select(Strategy, Honest, Accuracy, MacroF1, DeltaMacroF1, Note) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
 
   best_ <- .tab$MacroF1[!.tab$Honest][1]
@@ -1469,8 +1104,8 @@ orch_report_movement <- function(.tab) {
   if (FALSE) .tab <- res_det$Movement
   cli::cli_h2("What routing changed")
   .tab |>
-    dplyr::mutate(Share = tbl_pct(.data$Share)) |>
-    tbl_say()
+    dplyr::mutate(Share = clf_pct(.data$Share)) |>
+    clf_say_table()
   cli::cli_text("")
   fixed_ <- sum(.tab$nDocs[.tab$Movement == "Moved, now correct"])
   broke_ <- sum(.tab$nDocs[.tab$Movement == "Moved, broke a correct label"])
@@ -1487,7 +1122,7 @@ orch_report_movement <- function(.tab) {
 }
 
 
-# 9. Deployment --------------------------------------------------------------------------------------------------------
+# 9. Deployment ------------------------------------------------------------------------------------
 
 #' Choose the policy to deploy, fitted on every fold
 #'
@@ -1598,7 +1233,7 @@ orch_save_policy <- function(.final, .arms, .label_col, .dir, .commit_only = NUL
 }
 
 
-# 10. One task, end to end ---------------------------------------------------------------------------------------------
+# 10. One task, end to end -------------------------------------------------------------------------
 
 #' Run the whole routing analysis for one task
 #'
@@ -1774,7 +1409,7 @@ orch_report_verdicts <- function(.tab) {
       DeltaMacroF1 = sprintf("%+.3f", .data$DeltaMacroF1)
     ) |>
     dplyr::select(LabelCol, Incumbent, IncumbentF1, NestedF1, DeltaMacroF1, Moved, Deployed) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
   cli::cli_alert_info(
     "Moved counts documents the nested procedure labelled differently from the incumbent. Zero \\
@@ -1784,7 +1419,7 @@ orch_report_verdicts <- function(.tab) {
 }
 
 
-# 11. Agreement as a shipped confidence flag ---------------------------------------------------------------------------
+# 11. Agreement as a shipped confidence flag -------------------------------------------------------
 # Everything above asks which single label to ship. This section asks a different question, and for a
 # reader of the released dataset a more useful one: HOW MUCH TO TRUST each label individually.
 #
@@ -1856,14 +1491,14 @@ orch_agreement_pattern <- function(.spine, .tab_pred, .arms, .none = ORCH_NONE) 
         .data$nConcur > .data$nDissent          ~ "majority",
         TRUE                                    ~ "split"
       ),
-      Tier = factor(.data$Tier, levels = .orch_tiers)
+      Tier = factor(.data$Tier, levels = c("unanimous", "majority", "sole", "split"))
     ) |>
     # Documents no permitted arm committed on still need a row, or the flag would be missing rather
     # than low and a downstream join would silently drop them.
     dplyr::right_join(ship_ |> dplyr::select(DocID), by = dplyr::join_by(DocID)) |>
     tidyr::replace_na(list(nCommit = 0L, nConcur = 0L, nDissent = 0L)) |>
     dplyr::mutate(Tier = factor(dplyr::coalesce(as.character(.data$Tier), "sole"),
-                                levels = .orch_tiers))
+                                levels = c("unanimous", "majority", "sole", "split")))
 }
 
 #' Estimate how reliable each agreement tier is
@@ -1917,20 +1552,20 @@ orch_report_agreement <- function(.tab, .arms) {
   cli::cli_h2("Agreement tiers, voting arms: {toString(.arms)}")
   .tab |>
     dplyr::mutate(
-      Share       = tbl_pct(.data$Share),
-      Accuracy    = tbl_pct(.data$Accuracy),
-      CumShare    = tbl_pct(.data$CumShare),
-      CumAccuracy = tbl_pct(.data$CumAccuracy),
+      Share       = clf_pct(.data$Share),
+      Accuracy    = clf_pct(.data$Accuracy),
+      CumShare    = clf_pct(.data$CumShare),
+      CumAccuracy = clf_pct(.data$CumAccuracy),
       ErrorRate   = NULL
     ) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
 
   una_ <- .tab |> dplyr::filter(.data$Tier == "unanimous")
   if (nrow(una_) == 1L) {
     cli::cli_alert_info(
-      "Where every voting arm concurred -- {tbl_pct(una_$Share)} of documents -- the shipped label \\
-       is still wrong {tbl_pct(una_$ErrorRate)} of the time. That residual is the flag's ceiling: \\
+      "Where every voting arm concurred -- {clf_pct(una_$Share)} of documents -- the shipped label \\
+       is still wrong {clf_pct(una_$ErrorRate)} of the time. That residual is the flag's ceiling: \\
        independent methods making the SAME mistake is the failure a concurrence flag cannot see."
     )
   }
@@ -1992,10 +1627,10 @@ orch_report_agreement_vs_prob <- function(.tab) {
   if (FALSE) .tab <- agree_prob_det
   cli::cli_h2("Agreement within transformer-confidence bands")
   .tab |>
-    dplyr::mutate(Cell = paste0(tbl_pct(.data$Accuracy), " (", .data$nDocs, ")")) |>
+    dplyr::mutate(Cell = paste0(clf_pct(.data$Accuracy), " (", .data$nDocs, ")")) |>
     dplyr::select(ProbBand, Tier, Cell) |>
     tidyr::pivot_wider(names_from = Tier, values_from = Cell, values_fill = "-") |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
   cli::cli_alert_info(
     "Band 1 is the least confident quarter, band {max(.tab$ProbBand)} the most. Read ACROSS a row: \\
@@ -2050,52 +1685,28 @@ orch_save_confidence <- function(.agreement, .arms, .label_col, .dir, .stem = "c
 
 #' Accuracy by agreement tier, with the share each tier covers
 #'
-#' Both numbers in one frame, because either alone misleads: a tier can be almost perfectly accurate
-#' and still cover too little of the corpus to be worth conditioning on. Accuracy is the bar height,
-#' coverage the bar shading, and the printed label carries the document count so the reader is never
-#' asked to judge a share from a shade alone.
-#'
-#' The accuracy axis is fixed at zero to one rather than zoomed to the tiers. These bars are read
-#' against the per-category figures and against the arms' own accuracies, and a zoomed axis would turn
-#' a two-point spread into an apparently decisive one.
+#' Both numbers in one frame, because either alone is misleading: a tier can be almost perfectly
+#' accurate and cover too little of the corpus to be worth conditioning on.
 #'
 #' @param .tab Output of orch_agreement().
-#' @param .key Character. Registered vocabulary ordering the tiers.
 #' @return A ggplot.
-orch_plot_agreement <- function(.tab, .key = "AgreementTier") {
-  if (FALSE) {
-    .tab <- agree_det
-    .key <- "AgreementTier"
-  }
-  .tab |>
-    dplyr::mutate(Tier = plot_factor(.data$Tier, .key = .key)) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Tier, y = .data$Accuracy)) +
-    ggplot2::geom_col(
-      ggplot2::aes(alpha = .data$Share),
-      width = 0.7, fill = .plot_ink, colour = .plot_ink, linewidth = 0.3
-    ) +
+orch_plot_agreement <- function(.tab) {
+  if (FALSE) .tab <- agree_det
+  p_ <- .tab |>
+    ggplot2::ggplot(ggplot2::aes(x = Tier, y = Accuracy)) +
+    ggplot2::geom_col(ggplot2::aes(alpha = Share), width = 0.7, fill = "grey30", color = "grey20") +
     ggplot2::geom_text(
-      ggplot2::aes(label = paste0(scales::label_percent(accuracy = 0.1)(.data$Accuracy),
-                                  "\nn = ", scales::label_comma()(.data$nDocs))),
-      vjust = -0.35, size = (.plot_base - 3) / ggplot2::.pt, family = .plot_font
+      ggplot2::aes(label = paste0(sprintf("%.1f%%", 100 * Accuracy), "\n n=", nDocs)),
+      vjust = -0.3, size = 3
     ) +
-    ggplot2::scale_alpha_continuous(
-      range = c(0.30, 1), limits = c(0, 1), labels = scales::label_percent(), name = "Share of corpus"
-    ) +
-    # drop = FALSE keeps every registered tier on the axis. A tier no document reached is a finding
-    # about the arms -- with four of them committing on a categorical task, no document is decided by
-    # a single arm -- and dropping it turns that into a silent absence the reader cannot see.
-    ggplot2::scale_x_discrete(drop = FALSE) +
-    ggplot2::scale_y_continuous(
-      limits = c(0, 1.14), breaks = seq(0, 1, by = 0.25),
-      labels = scales::label_percent(), expand = ggplot2::expansion(mult = c(0, 0))
-    ) +
-    ggplot2::labs(x = NULL, y = "Accuracy of the shipped label") +
-    plot_theme(.grid = "y", .legend = "right")
+    ggplot2::scale_alpha_continuous(range = c(0.35, 1), labels = scales::percent) +
+    ggplot2::scale_y_continuous(limits = c(0, 1.12), expand = ggplot2::expansion(mult = c(0, 0))) +
+    ggplot2::labs(x = NULL, y = "Accuracy of the shipped label", alpha = "Share of corpus")
+  clf_apply_theme(.plot = p_)
 }
 
 
-# 12. The deployment manifest ------------------------------------------------------------------------------------------
+# 12. The deployment manifest ----------------------------------------------------------------------
 # Everything above concludes; this section writes those conclusions down in a form another process can
 # execute. The distinction matters because the artifacts written so far name CONFIGURATIONS, and a
 # configuration is not a model: `ClassDetailed__nlpaueb-legal-bert...__L256_E6...` identifies a recipe
@@ -2174,14 +1785,14 @@ orch_report_agreement_sets <- function(.tab, .default = NULL) {
   cli::cli_h2("Confidence flag under each voting set")
   .tab |>
     dplyr::mutate(
-      Share       = tbl_pct(.data$Share),
-      Accuracy    = tbl_pct(.data$Accuracy),
-      CumShare    = tbl_pct(.data$CumShare),
-      CumAccuracy = tbl_pct(.data$CumAccuracy),
+      Share       = clf_pct(.data$Share),
+      Accuracy    = clf_pct(.data$Accuracy),
+      CumShare    = clf_pct(.data$CumShare),
+      CumAccuracy = clf_pct(.data$CumAccuracy),
       ErrorRate   = NULL
     ) |>
     dplyr::select(SetName, Tier, nDocs, Share, Accuracy, CumShare, CumAccuracy) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
 
   top_ <- .tab |>
@@ -2189,8 +1800,8 @@ orch_report_agreement_sets <- function(.tab, .default = NULL) {
     dplyr::select(SetName, Arms, Share, Accuracy)
   if (nrow(top_) > 0L) {
     top_ |>
-      dplyr::mutate(Share = tbl_pct(.data$Share), Accuracy = tbl_pct(.data$Accuracy)) |>
-      tbl_say(.title = "Top tier, set by set")
+      dplyr::mutate(Share = clf_pct(.data$Share), Accuracy = clf_pct(.data$Accuracy)) |>
+      clf_say_table(.title = "Top tier, set by set")
     cli::cli_text("")
     cli::cli_alert_info(
       "A set earns its cost by covering MORE of the corpus at a HIGHER accuracy in this row. A set \\
@@ -2326,7 +1937,7 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
   found_ |>
     dplyr::mutate(Path = fs::path_rel(.data$Path, here::here())) |>
     dplyr::select(LabelCol, Arm, Kind, Exists, Path) |>
-    tbl_say(.title = "Artifacts backing each arm, per task")
+    clf_say_table(.title = "Artifacts backing each arm, per task")
 
   thin_ <- found_ |>
     dplyr::filter(.data$Exists, .data$Kind %in% .default_kinds) |>
@@ -2426,95 +2037,49 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
 }
 
 
-# 13. Figures ------------------------------------------------------------------------------------------------------------
-# The look comes entirely from _Commons/_Plots.R. What these functions own is the mapping from a
-# result object to a figure shape.
-#
-# FILL MEANS OBTAINABLE. Both bar figures below reserve fill for one distinction: whether the number
-# could be reproduced by running the procedure. A policy selected and scored on the same documents is
-# drawn hollow, because a reader comparing bar lengths would otherwise conclude that routing beat the
-# incumbent by a margin nobody can obtain. That is the single misreading this document exists to
-# prevent, so it is encoded rather than left to the caption.
+# 13. Figures --------------------------------------------------------------------------------------
 
 #' Macro-F1 by strategy, with the incumbent marked
 #'
-#' The dashed line is the single arm the routing has to beat. Bars are on a fixed zero-to-one axis so
-#' the three tasks can be read against each other and against the arms' own leaderboards; the
-#' differences the search is chasing are small, and an axis zoomed to them would make a fourth-decimal
-#' gap look like a result.
+#' The in-sample bar is drawn hollow because it is not a number anyone can obtain by running the
+#' procedure. Filling it like the others would invite the misreading this document exists to prevent.
 #'
 #' @param .compare Output of orch_compare().
 #' @return A ggplot.
 orch_plot_compare <- function(.compare) {
   if (FALSE) .compare <- res_det$Compare
   base_ <- .compare$MacroF1[grepl("(incumbent)", .compare$Strategy, fixed = TRUE)][1]
-
-  .compare |>
-    dplyr::mutate(
-      Strategy = forcats::fct_reorder(.data$Strategy, .data$MacroF1),
-      Estimate = dplyr::if_else(.data$Honest, "Obtainable", "Selected in sample")
-    ) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$MacroF1, y = .data$Strategy, fill = .data$Estimate)) +
-    ggplot2::geom_col(width = 0.7, colour = .plot_ink, linewidth = 0.3) +
-    ggplot2::geom_vline(
-      xintercept = base_, linetype = 2, linewidth = 0.3, colour = .plot_ref
-    ) +
-    ggplot2::geom_text(
-      ggplot2::aes(label = sprintf("%.3f", .data$MacroF1)),
-      hjust = -0.18, size = (.plot_base - 3) / ggplot2::.pt, family = .plot_font
-    ) +
+  p_ <- .compare |>
+    dplyr::mutate(Strategy = forcats::fct_reorder(.data$Strategy, .data$MacroF1)) |>
+    ggplot2::ggplot(ggplot2::aes(x = Strategy, y = MacroF1, fill = Honest)) +
+    ggplot2::geom_col(width = 0.7, color = "grey20") +
+    ggplot2::geom_hline(yintercept = base_, linetype = "dashed", color = "grey40") +
+    ggplot2::geom_text(ggplot2::aes(label = sprintf("%.3f", MacroF1)), hjust = -0.15, size = 3) +
     ggplot2::scale_fill_manual(
-      values = c(Obtainable = .plot_ink, `Selected in sample` = "#FFFFFF"), name = NULL
+      values = c(`TRUE` = "grey30", `FALSE` = "white"),
+      labels = c(`TRUE` = "Obtainable", `FALSE` = "Selected in sample")
     ) +
-    ggplot2::scale_x_continuous(
-      limits = c(0, 1.08), breaks = seq(0, 1, by = 0.25),
-      expand = ggplot2::expansion(mult = c(0, 0))
-    ) +
-    ggplot2::labs(x = "Macro-F1 (pooled out-of-fold)", y = NULL) +
-    plot_theme(.grid = "none", .legend = "bottom")
+    ggplot2::scale_y_continuous(limits = c(0, 1.08), expand = ggplot2::expansion(mult = c(0, 0))) +
+    ggplot2::coord_flip() +
+    ggplot2::labs(x = NULL, y = "Macro-F1 (pooled out-of-fold)", fill = NULL)
+  clf_apply_theme(.plot = p_)
 }
 
 #' Documents the crowned policy moved, per held-out fold
 #'
-#' The honest picture of stability, and the figure most likely to contradict the winner names in the
-#' tables above. A fold routing nothing ran the incumbent whatever its winning policy was called, so
-#' bars rather than names are what a reader should count. Every fold appears even at zero: an absent
-#' bar and a zero bar mean opposite things, and only one of them is true here.
+#' The honest picture of stability. A fold routing nothing ran the incumbent whatever its winner was
+#' called, so bars rather than winner names are what a reader should count.
 #'
 #' @param .tab_nested Output of orch_select_nested().
 #' @return A ggplot.
 orch_plot_stability <- function(.tab_nested) {
   if (FALSE) .tab_nested <- res_det$Nested
-
-  dat_ <- .tab_nested |>
+  p_ <- .tab_nested |>
     dplyr::summarise(nRouted = sum(.data$DecidedBy != .data$WinnerTerminal), .by = Fold) |>
-    tidyr::complete(Fold = sort(unique(.tab_nested$Fold)), fill = list(nRouted = 0L)) |>
-    dplyr::mutate(Fold = factor(.data$Fold))
-
-  # Documents are counted, so the axis takes whole numbers. Left to pick its own breaks a continuous
-  # scale lands on fifths, and the all-zero case -- the expected outcome here rather than an anomaly --
-  # renders an axis reading 0.00 to 0.15 for a quantity that cannot be fractional. The ceiling is at
-  # least one, so a figure where nothing routed still has an axis to be flat against.
-  top_  <- max(1L, max(dat_$nRouted, 0L))
-  step_ <- max(1L, ceiling(top_ / 4))
-
-  dat_ |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Fold, y = .data$nRouted)) +
-    ggplot2::geom_col(width = 0.6, fill = .plot_ink) +
-    ggplot2::geom_text(
-      ggplot2::aes(label = scales::label_comma()(.data$nRouted)),
-      vjust = -0.45, size = (.plot_base - 3) / ggplot2::.pt, family = .plot_font
-    ) +
-    ggplot2::scale_y_continuous(
-      breaks = seq(0L, top_, by = step_),
-      limits = c(0, top_ * 1.18),
-      labels = scales::label_comma(),
-      expand = ggplot2::expansion(mult = c(0, 0))
-    ) +
-    # "Documents routed away from the terminal" is thirty-nine characters, and rotated onto a panel
-    # 2.4 inches tall it runs off both ends. Width is fixed and height comes from the row count, so a
-    # label that does not fit is shortened rather than accommodated; the caption carries what the
-    # short form drops.
-    ggplot2::labs(x = "Held-out fold", y = "Documents routed") +
-    plot_theme(.grid = "y", .legend = "none")
+    ggplot2::ggplot(ggplot2::aes(x = factor(Fold), y = nRouted)) +
+    ggplot2::geom_col(width = 0.6, fill = "grey30", color = "grey20") +
+    ggplot2::geom_text(ggplot2::aes(label = nRouted), vjust = -0.5, size = 3) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.15))) +
+    ggplot2::labs(x = "Held-out fold", y = "Documents routed away from the terminal")
+  clf_apply_theme(.plot = p_)
 }

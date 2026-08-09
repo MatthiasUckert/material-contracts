@@ -4,25 +4,16 @@ author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
 
-```{r}
-#| label: setup
-#| include: false
-#| purl: false
+```{r setup, include=FALSE, purl=FALSE}
 knitr::opts_knit$set(root.dir = here::here())
 
 # message = TRUE is required: cli writes through the message stream under knitr, so suppressing
 # messages would discard this document's entire output. comment = "" removes the "##" prefix from
-# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
-# once in _quarto.yml, and overriding it per document is how two documents came to render at more
-# than twice the width of the rest.
-knitr::opts_chunk$set(
-  root.dir = here::here(),
-  message  = TRUE,
-  warning  = FALSE,
-  comment  = ""
-)
+# console blocks so they can be copied verbatim.
+knitr::opts_chunk$set(root.dir = here::here(), message = TRUE, warning = FALSE, comment = "")
 
-options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+# Plain ASCII console output; no ANSI colour codes.
+options(cli.num_colors = 1, cli.width = 120)
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -30,19 +21,13 @@ options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste a
   rstudioapi::getActiveDocumentContext()[["path"]]
 }
 .name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
 ```
 
-```{r}
-#| label: setup-sources
-#| echo: false
+```{r echo=FALSE}
 source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
-
-# The shared design layer. _Plots.R owns every figure's look and holds the level registry this
-# document populates; _Tables.R owns every table's. Both are sourced before this document's own
-# library, which registers the taxonomy against them when it loads.
-source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
-source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
@@ -66,11 +51,11 @@ the cross-validation fold it belongs to.
 
 Nothing is estimated here. The document makes three decisions and reports them:
 
-1. **Which documents are eligible.** A label alone is not sufficient; the document also needs readable text on disk.
-Every exclusion is reported with its reason.
+1. **Which documents are eligible.** A label alone is not sufficient; the document also needs readable text on
+disk. Every exclusion is reported with its reason.
 2. **What the labels are.** Three tasks, all predicted from the same text.
-3. **Which fold each document belongs to.** Dealt once, here, so that every method evaluated downstream is scored on
-identical splits.
+3. **Which fold each document belongs to.** Dealt once, here, so that every method evaluated downstream is
+scored on identical splits.
 
 ## The three tasks
 
@@ -85,10 +70,10 @@ has exactly one broad parent. The amendment label is orthogonal to both.
 
 ## Why folds are dealt here
 
-Fold assignment belongs upstream of every method that uses it. Four classifiers are evaluated in this pipeline -- a
-transformer, a keyword miner, a local language model, and a router combining them -- and comparing them is only
-meaningful if each is scored on the same held-out documents. If each dealt its own folds, a difference between methods
-could not be distinguished from a difference between splits.
+Fold assignment belongs upstream of every method that uses it. Three classifiers are evaluated in this pipeline -- a
+transformer, a keyword miner, and a router combining them -- and comparing them is only meaningful if each is scored on
+the same held-out documents. If each dealt its own folds, a difference between methods could not be distinguished from a
+difference between splits.
 
 Folds are stratified on the detailed taxonomy, which is the finest partition, so stratification there also balances the
 coarser one. The rarest detailed category is therefore the binding constraint on how thin a fold can become.
@@ -103,18 +88,9 @@ taxonomic ambiguity rather than of model error.
 The primary is not an arbitrary pick between two equivalent answers. Every dual-classified document was reviewed by hand
 and the intended primary recorded, so the ordering carries information.
 
-## The shared vocabulary
-
-This document also fixes the order and the display labels of the categories, registering them with the figure design
-layer so that every figure produced anywhere in the pipeline draws them the same way. The order is taxonomic rather than
-by frequency: ordering by size would put a different category first in every figure, which is exactly what makes two
-panels incomparable, and taxonomic order additionally places siblings adjacent, so a confusion matrix shows errors that
-stay inside a broad parent next to the diagonal and errors that cross one as a jump away from it.
-
 # Configuration
 
 ```{r}
-#| label: config
 .lP <- list(
   Input = list(
     # The reconciled label spine. Read as CSV rather than Parquet because the current export was
@@ -127,16 +103,11 @@ stay inside a broad parent next to the diagonal and errors that cross one as a j
     ContractFiles = utils_file_path(.dir_main, "Cache", "ContractFiles.parquet")   # DocID to Path index
   ),
   Output = list(
-    Prepared = utils_file_path(.dir_main, "prepared.parquet"),                     # the one downstream input
-    Figures  = utils_file_path(.dir_main, "Figures")                               # figure files for the manuscript
+    Prepared = utils_file_path(.dir_main, "prepared.parquet")                      # the one downstream input
   ),
   Runs = list(
     Bert = here::here("2_output", "03B-ClassifyTrainBERT", "runs"),                # consumers of this output
     Kw   = here::here("2_output", "03C-ClassifyTrainKeyword", "runs")
-  ),
-  Param = list(
-    Folds = 5L,     # cross-validation folds, shared by every method
-    Seed  = 42L     # fixes the fold deal; constant across the whole study
   )
 )
 
@@ -150,14 +121,13 @@ the path is declared.
 
 Three sources join on `DocID`:
 
-- **The label spine** supplies the taxonomy (`DocClassFinal1`, `DocClassFinal2`), the amendment flag, and `Provenance`,
-which records which labelling round each label came from.
-- **The metadata** supplies `DocDesc`, the filer's own title for the exhibit, and `DocName`, the filename. Both are
-inputs to the keyword classifier only; the transformer ignores them.
+- **The label spine** supplies the taxonomy (`DocClassFinal1`, `DocClassFinal2`), the amendment flag, and
+`Provenance`, which records which labelling round each label came from.
+- **The metadata** supplies `DocDesc`, the filer's own title for the exhibit, and `DocName`, the filename.
+Both are inputs to the keyword classifier only; the transformer ignores them.
 - **The parsed-contract tree** supplies `Path`, locating each document's text on disk.
 
 ```{r}
-#| label: load-inputs
 # Walk the parsed-contract tree once and cache the DocID -> Path index. .rerun = FALSE reuses the
 # cache; set it to TRUE after new contracts have been parsed.
 fils_contract <- utils_list_project_files(
@@ -200,9 +170,8 @@ Coverage of each join, before any filtering. A shortfall here is a join failure;
 separately, so the two cannot be confused.
 
 ```{r}
-#| label: report-raw-input
 cli::cli_h2("Raw input")
-tbl_say(
+clf_say_table(
   .tab = tibble::tibble(
     Source = c(
       "Label rows read",
@@ -222,63 +191,53 @@ tbl_say(
 
 # Construction
 
-`clf_prepare_sample()` applies four gates in order -- a usable class label, a file path, a file that exists, and text
-that is non-empty -- then deals the folds. It narrates each gate as it runs, so an unexpected exclusion is visible
-immediately rather than surfacing as a row-count mismatch three scripts later.
+`clf_prepare_sample()` applies four gates in order -- a usable class label, a file path, a file that exists, and text that
+is non-empty -- then deals the folds. It narrates each gate as it runs, so an unexpected exclusion is visible immediately
+rather than surfacing as a row-count mismatch three scripts later.
 
 ```{r}
-#| label: build-sample
 tab_prep <- clf_prepare_sample(
-  .tab_input = fils_class_sample,     # joined labels, metadata and paths
-  .round     = NULL,                  # NULL keeps both labelling rounds; see Robustness below
-  .k         = .lP$Param$Folds,       # number of cross-validation folds
-  .seed      = .lP$Param$Seed         # fixes the fold deal, so the splits are reproducible
+  .tab_input = fils_class_sample,   # joined labels, metadata and paths
+  .round     = NULL,                # NULL keeps both labelling rounds; see Robustness below
+  .k         = 5L,                  # number of cross-validation folds
+  .seed      = 42L                  # fixes the fold deal, so the splits are reproducible
+)
+```
+
+```{r}
+clf_write_prepared(
+  .tab      = tab_prep,             # the prepared sample
+  .path_out = .lP$Output$Prepared   # the single file every downstream method reads
 )
 ```
 
 Training on both labelling rounds combined, rather than on the manually-checked round alone, is the most consequential
-choice made in this document. The second round is enriched for the categories the current taxonomy introduced and is
-small; the first round supplies the volume the common categories need. Restricting to the second alone produces a
-classifier that fails on everything except the rare categories.
-
-# Validation
-
-The registered vocabulary and the labels actually present must agree. They are declared in different places -- the
-vocabulary at the top of this document's library, the labels in an external reconciliation -- so a category added to the
-spine would otherwise surface much later, as a figure aborting mid-render in a downstream document.
-
-Prediction before running it: every label in the sample is registered, and no registered category is unused. An
-*unknown* count above zero means the taxonomy has gained a category and the vocabulary block needs it added. An *unused*
-count above zero on the full sample means the reverse -- a category the taxonomy declares that no document carries.
-
-```{r}
-#| label: validate-vocabulary
-clf_report_vocabulary(.tab = tab_prep)
-```
+choice made in this document. The second round is enriched for the categories introduced by the current taxonomy and is
+small; the first round supplies the volume the common categories need. Restricting to the second alone was tried and
+produces a classifier that fails on everything except the rare categories.
 
 # Results
 
-One call prints the full picture: intake, tasks, category distributions, dual labels, fold balance, document length, and
+One call prints the full picture: intake, tasks, class distributions, dual labels, fold balance, document length, and
 missingness. This is the block to copy when something needs checking.
 
 ```{r}
-#| label: report-sample
 clf_report_sample(.tab = tab_prep)
 ```
 
 ## How to read it
 
-**Intake.** Every document that left the sample, and at which gate. A drop at *Has a class label* is expected and
-reflects documents the reconciliation could not resolve. A drop at *Has a contract file path* or *File exists on disk* is
-a join or path failure, not a labelling one, and is worth stopping for.
+**Intake.** Every document that left the sample, and at which gate. A drop at *Has a class label* is expected and reflects
+documents the reconciliation could not resolve. A drop at *Has a contract file path* or *File exists on disk* is a join or
+path failure, not a labelling one, and is worth stopping for.
 
 **Tasks.** How many documents each task trains on and how many categories it must separate. Documents unlabelled for one
 task are dropped by that task's trainer only; they still count for the others. The smallest category matters
-disproportionately because the headline metric is macro-F1, which averages per-category F1 with equal weight regardless
-of size.
+disproportionately because the headline metric is macro-F1, which averages per-category F1 with equal weight regardless of
+size.
 
-**Category distribution.** Split by labelling round. Categories that exist only in the current taxonomy can by
-construction appear only in the second round.
+**Class distribution.** Split by labelling round. Categories that exist only in the current taxonomy can by construction
+appear only in the second round.
 
 **Dual-class.** How many documents span two categories, and which pairs. Direction is meaningful: the primary was chosen
 by review, so a pair running heavily one way reflects a consistent rule the reviewer applied.
@@ -287,8 +246,8 @@ by review, so a pair running heavily one way reflects a consistent rule the revi
 recall for it undefined and makes macro-F1 unstable, so the smallest rows are the ones to watch.
 
 **Document length.** Most contracts overflow both the 256- and 512-token windows, so a transformer reads only the opening
-pages. That is the premise the pipeline rests on: contract type is legible from the title and preamble. It is also why
-the sweep in 03B tests both window sizes rather than assuming the longer is better.
+pages. That is the premise the pipeline rests on: contract type is legible from the title and preamble. It is also why the
+sweep in 03B tests both window sizes rather than assuming the longer is better.
 
 **Missing data.** Two kinds of missingness, and distinguishing them is the point. `ClassDetailed2` missing means the
 document has a single category, which is a definition rather than a gap. `DocDesc` empty means the filer supplied no
@@ -303,29 +262,15 @@ they matter depends not on how many there are but on where they fall: a few doze
 harmless, whereas the same number concentrated in the smallest category would be a material share of it.
 
 ```{r}
-#| label: robust-short-docs
 tab_prep |>
   dplyr::mutate(Words = stringi::stri_count_regex(.data$Text, "\\S+")) |>
   dplyr::filter(.data$Words < 50) |>
   dplyr::count(.data$ClassDetailed, name = "Docs", sort = TRUE) |>
-  tbl_say(.title = "Documents under 50 words, by category")
+  clf_say_table(.title = "Documents under 50 words, by category")
 ```
 
 **Fold stability.** Folds are dealt from a fixed seed, so they are reproducible, but reproducibility is not the same as
-balance. The fold report above gives the realised counts; the figure in the Overview gives the same numbers as
-within-category shares, which is where an uneven deal is actually visible.
-
-# Deployment
-
-One file, read by everything downstream.
-
-```{r}
-#| label: deploy-prepared
-clf_write_prepared(
-  .tab      = tab_prep,             # the prepared sample
-  .path_out = .lP$Output$Prepared   # the single file every downstream method reads
-)
-```
+balance. The fold report above shows the realised counts; what matters is that no category disappears from any fold.
 
 # Overview
 
@@ -333,25 +278,15 @@ The sample as it will be consumed downstream. Nothing here is new; the figures s
 reported.
 
 ```{r}
-#| label: overview-tasks
 clf_report_tasks(.tab = tab_prep)
 ```
-
-## Category distribution
-
-Categories appear in taxonomic order rather than by size, which is the order every figure in this pipeline uses. The
-imbalance is still legible from the bar lengths, and reading it against 03B's per-category F1 is now a matter of
-comparing two panels row by row.
 
 ::: {.panel-tabset}
 
 ## Detailed
 
 ```{r}
-#| label: fig-distribution-detailed
-#| fig-height: !expr plot_height(12)
-#| fig-cap: "Category distribution, detailed taxonomy. Categories are in taxonomic order, so
-#|   siblings under the same broad parent are adjacent."
+#| fig-cap: "Category distribution, detailed taxonomy (12 categories)."
 clf_plot_class_distribution(
   .tab        = tab_prep,           # prepared sample
   .level      = "ClassDetailed",    # taxonomy to plot
@@ -362,9 +297,8 @@ clf_plot_class_distribution(
 ## Broad
 
 ```{r}
-#| label: fig-distribution-broad
-#| fig-height: !expr plot_height(7)
-#| fig-cap: "Category distribution, broad taxonomy."
+#| fig-cap: "Category distribution, broad taxonomy (7 categories)."
+#| fig-height: 3.2
 clf_plot_class_distribution(
   .tab        = tab_prep,        # prepared sample
   .level      = "ClassBroad",    # taxonomy to plot
@@ -375,13 +309,12 @@ clf_plot_class_distribution(
 ## Amendment
 
 ```{r}
-#| label: fig-distribution-amendment
-#| fig-height: !expr plot_height(2)
-#| fig-cap: "Category distribution, amendment task."
+#| fig-cap: "Category distribution, amendment task (2 categories)."
+#| fig-height: 2.2
 clf_plot_class_distribution(
   .tab        = tab_prep,       # prepared sample
   .level      = "AmendType",    # task to plot
-  .include_na = FALSE           # an unlabelled amendment flag would appear in the missingness table
+  .include_na = TRUE            # TRUE would surface any document lacking an amendment label
 )
 ```
 
@@ -392,50 +325,18 @@ times as many documents as the smallest. This is why macro-F1 is the headline me
 is dominated by the three largest categories, and a classifier that ignored the rarest ones entirely would still score
 well on it.
 
-## Where the labels came from
-
-```{r}
-#| label: fig-round-composition
-#| fig-height: !expr plot_height(12)
-#| fig-cap: "Composition of each category by labelling round. Round 1 is the automated
-#|   carry-forward from the earlier taxonomy; Round 2 is the manual pass."
-clf_plot_round_composition(
-  .tab   = tab_prep,           # prepared sample
-  .level = "ClassDetailed",    # taxonomy to plot
-  .share = TRUE                # per-category composition; FALSE would show raw counts
-)
-```
-
-The categories the current taxonomy introduced can only be second-round, and appear here as solid bars. Everything else
-is a mixture, and the mixing ratio is what the targeted re-labelling produced: the manual pass was aimed at the
-categories that changed, not spread evenly across the sample.
-
-## Fold balance
-
-```{r}
-#| label: fig-fold-balance
-#| fig-height: !expr plot_height(12)
-#| fig-cap: "Share of each category falling in each fold. Rows sum to one, so an even deal is a
-#|   uniform row; the smallest categories are where unevenness matters."
-clf_plot_fold_balance(
-  .tab   = tab_prep,          # prepared sample
-  .level = "ClassDetailed"    # the taxonomy the folds were stratified on
-)
-```
-
-The fill scale is anchored at twice the expected share, so a perfectly even deal sits at the exact middle of the ramp and
-a uniform figure is the correct reading rather than an absence of one. Stratification is on this taxonomy, so uniformity
-is expected by construction; what the figure rules out is the failure it cannot rule in. A category with too few
-documents to divide evenly across five folds would show as a pale cell, and that is what makes its per-fold recall
-undefined and macro-F1 unstable downstream. Nothing here is pale.
-
 # Next
 
 `prepared.parquet` is the single input to everything that follows. **03B** fine-tunes transformer encoders on it, **03C**
-mines a keyword classifier on the same folds, **03D** tests a local language model as a third arm, and **03E** tests
-whether routing between them improves on any one alone. **03F** applies the deployed policy to the full corpus. All of
-them source this document's function file, so the folds, the scoring code and the category vocabulary they share cannot
-drift apart.
+mines a keyword classifier on the same folds, and **03D** tests whether routing between the two improves on either alone.
+All three source this document's function file, so the folds and the scoring code they share cannot drift apart. **03E**
+applies the deployed models to the full corpus.
+
+Beyond building the sample, this file holds the **shared scoring layer** every method reports through: `clf_scores()`,
+`clf_perclass()` and `clf_confusion()` for metrics, abstention-aware so a classifier that declines to predict is scored
+correctly; `clf_load_overall()`, `clf_leaderboard()` and `clf_effect()` for ranking configurations; and the `clf_plot_*()`
+figures. Keeping them here rather than in each method's own file is what guarantees the three methods are compared by
+identical code.
 
 Two directories must be cleared whenever this document is re-run against a changed label spine, because **neither fails
 loudly**: `2_output/_cache/`, since `clf_cache()` keys on a name rather than on the data behind it, and

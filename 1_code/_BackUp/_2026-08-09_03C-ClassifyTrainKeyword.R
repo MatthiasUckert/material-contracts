@@ -1,46 +1,33 @@
-# 03C-ClassifyTrainKeyword: the keyword table (kw_*) -------------------------------------------------------------------
+# 03C-ClassifyTrainKeyword.R -- library for the keyword table
 #
-# WHAT THIS FILE DOES
 # The deliverable of this stage is an artifact rather than a model: a short, ranked, human-readable
-# table of terms per contract type that can be applied to EDGAR without a GPU, carrying a stated
+# table of terms per contract type that can be applied to EDGAR without a GPU, with a stated
 # precision and a stated coverage. Every design decision below follows from that goal, and where a
-# choice would have gone the other way had the goal been accuracy, the roxygen says so.
+# choice would differ had the goal been accuracy, the roxygen says so.
 #
 # THE SEAM
-# Mining is expensive, selection is cheap. The Python engine tokenises the sample and writes
-# per-term-per-category statistics plus incidence; every floor, the greedy rule, the decision rule and
-# the thresholds live here in R. That split keeps the mining grid at a few hundred cells while leaving
-# the selection sweep interactive, and it keeps the engine task-agnostic: the amendment decision rule
-# is a decision, so it belongs on the R side.
+# Mining is expensive, selection is cheap. contracts-engine/keyword_train.py tokenises the sample and
+# writes per-(term, class) statistics plus incidence; every floor, the greedy rule, the decision rule
+# and the thresholds live here. That split keeps the mining grid at a few hundred cells while leaving
+# the selection sweep interactive, and it makes the engine task-agnostic: the amendment decision rule
+# is a decision, so it lives in R.
 #
 # POWER
-# The Wilson 95 percent lower bound on a term's training precision. Bounded in [0, 1] and monotone in
-# both precision and evidence: a term seen twice in two documents scores 0.342, one seen 190 times in
-# 200 scores 0.910, where raw precision would rank the first ahead of the second. Power is the sort
-# key of the published table and the evidence gate at scoring time. It is NOT the precision gate.
+# Wilson 95% lower bound on training precision. Bounded in [0, 1], monotone in both precision and
+# evidence: a term seen 2 times in 2 documents scores 0.342, one seen 190 times in 200 scores 0.910,
+# where raw precision ranks the first ahead of the second. Power is the sort key of the published
+# table and the evidence gate at scoring time. It is NOT the precision gate -- see kw_select.
 #
-# ABSTENTION
-# Unlike the transformer, this classifier declines to label a document no term reaches, emitting the
-# sentinel KW_NONE. That is the mechanism by which a stated precision is possible at all, and it is
-# why the shared scoring layer is abstention-aware: an abstained document is a false negative for its
-# true category and a false positive for nothing, so abstaining costs recall and protects precision.
-# The sentinel is not a category, so figures pass it as an extra level rather than registering it.
-#
-# WHAT IS NOT HERE
-# Sample construction, the scoring layer and the category vocabulary: those are 03A, which the runbook
-# sources first, so this arm and the transformer arm are scored by identical code on identical folds.
-# The look of any figure or table: that is _Commons/_Plots.R and _Commons/_Tables.R. Nothing below
-# sets a colour, a font or a height.
-#
-# House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
-# locals; if (FALSE) dev blocks; pure ASCII; parenthesised cli interpolation.
+# Sources 03A for the shared layer (clf_scores, clf_perclass, clf_confusion, clf_leaderboard,
+# clf_say_table, clf_pct, clf_apply_theme). Run folders are written in the same schema the BERT
+# trainer uses, so those functions consume keyword runs without special-casing.
 
 KW_NONE <- "(none)"
 
 `%||%` <- function(.x, .y) if (is.null(.x)) .y else .x
 
 
-# 1. Engine seam: mining commands, the sweep, and the index ------------------------------------------------------------
+# 1. Engine seam: mining commands, the sweep, and the index --------------------------------------
 
 #' Build the argument vector for one mining cell
 #'
@@ -327,7 +314,7 @@ kw_load_mine <- function(.mine_dir) {
 }
 
 
-# 2. Selection: from candidate statistics to a lexicon -----------------------------------------------------------------
+# 2. Selection: from candidate statistics to a lexicon -------------------------------------------
 
 #' Select a minimal non-redundant lexicon from one mine
 #'
@@ -510,7 +497,7 @@ kw_select_grid <- function(.min_precision = 0.95,
 }
 
 
-# 3. Decision: turning a lexicon into labels ---------------------------------------------------------------------------
+# 3. Decision: turning a lexicon into labels -----------------------------------------------------
 
 #' Term hits on the held-out fold, independent of the threshold
 #'
@@ -629,7 +616,7 @@ kw_decide <- function(.hits, .mine,
 }
 
 
-# 4. Evaluation: one cell, and the sweeps over cells -------------------------------------------------------------------
+# 4. Evaluation: one cell, and the sweeps over cells ---------------------------------------------
 
 #' Canonical configuration name
 #'
@@ -948,7 +935,7 @@ kw_sweep_selection <- function(.mine_index, .grid_sel, .tau = 0.70, .runs_root =
 }
 
 
-# 5. Operating point ---------------------------------------------------------------------------------------------------
+# 5. Operating point -----------------------------------------------------------------------------
 
 #' Precision and coverage across the threshold
 #'
@@ -1059,7 +1046,7 @@ kw_operating_point <- function(.curve, .target_precision = 0.95, .tolerance = 0.
 }
 
 
-# 6. The published table -----------------------------------------------------------------------------------------------
+# 6. The published table -------------------------------------------------------------------------
 
 #' Fold stability of a selection
 #'
@@ -1152,7 +1139,7 @@ kw_save_lexicon <- function(.tab, .dir, .stem = "keyword_table") {
 }
 
 
-# 7. The generated arm -------------------------------------------------------------------------------------------------
+# 7. The generated arm ---------------------------------------------------------------------------
 
 #' Score a supplied term list on named folds
 #'
@@ -1283,7 +1270,7 @@ kw_terms_union <- function(.lexicon, .terms_file, .path_out) {
 }
 
 
-# 8. Compute: summaries for reporting ----------------------------------------------------------------------------------
+# 8. Compute: summaries for reporting ------------------------------------------------------------
 
 #' Summarise performance across the mining axes
 #'
@@ -1379,14 +1366,14 @@ kw_choose_config <- function(.tab, .tolerance = 0.01, .min_coverage = 0.25, .pre
   if (!pub_) {
     if (!.fallback) {
       cli::cli_alert_warning(
-        "No configuration reaches {tbl_pct(.min_coverage)} coverage and .fallback is FALSE; \\
+        "No configuration reaches {clf_pct(.min_coverage)} coverage and .fallback is FALSE; \\
          returning nothing."
       )
       return(.tab[0, ] |> dplyr::mutate(Publishable = logical()))
     }
     cli::cli_alert_warning(
-      "No configuration reaches {tbl_pct(.min_coverage)} coverage (best is \\
-       {tbl_pct(max(.tab$mCoverage))}). Returning the best anyway, flagged not publishable -- it is \\
+      "No configuration reaches {clf_pct(.min_coverage)} coverage (best is \\
+       {clf_pct(max(.tab$mCoverage))}). Returning the best anyway, flagged not publishable -- it is \\
        still a usable routing arm."
     )
   }
@@ -1450,7 +1437,7 @@ kw_summarise_arms <- function(.tabs) {
 }
 
 
-# 9. Report ------------------------------------------------------------------------------------------------------------
+# 9. Report --------------------------------------------------------------------------------------
 
 #' Report the mining axes
 #'
@@ -1468,13 +1455,13 @@ kw_report_mines <- function(.tab, .label_col = "ClassDetailed") {
   out_ |>
     dplyr::mutate(
       Window    = dplyr::if_else(.data$NWords == 0L, "full", as.character(.data$NWords)),
-      Coverage  = tbl_pct(.data$mCoverage),
-      Precision = tbl_pct(.data$mPrecision),
+      Coverage  = clf_pct(.data$mCoverage),
+      Precision = clf_pct(.data$mPrecision),
       MacroF1   = sprintf("%.3f +/- %.3f", .data$mMacroF1, .data$sMacroF1)
     ) |>
     dplyr::select(Source, Stopwords, Window, NgramMax, nFolds, Terms = mTerms,
                   Classes = mClasses, Coverage, Precision, MacroF1) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_alert_info(
     "Precision is measured on the classified subset and is the number the table promises. \\
      A Classes count well below the number of categories means the threshold is removing thin \\
@@ -1501,13 +1488,13 @@ kw_report_selection <- function(.tab, .label_col = "ClassDetailed", .n = 12L) {
   out_ |>
     utils::head(n = .n) |>
     dplyr::mutate(
-      Coverage  = tbl_pct(.data$mCoverage),
-      Precision = tbl_pct(.data$mPrecision),
+      Coverage  = clf_pct(.data$mCoverage),
+      Precision = clf_pct(.data$mPrecision),
       MacroF1   = sprintf("%.3f", .data$mMacroF1)
     ) |>
     dplyr::select(MinReach, MaxTerms, nFolds, Terms = mTerms, Classes = mClasses, Coverage,
                   Precision, MacroF1) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_alert_info(
     "Marginal reach is the greedy acceptance bar: raising it shortens the list. Rows differing \\
      only in MaxTerms and returning identical numbers mean the cap is not binding."
@@ -1536,21 +1523,21 @@ kw_report_tau <- function(.curve, .target_precision = 0.95, .tolerance = 0.01, .
     dplyr::filter(dplyr::row_number() %% .every == 1L) |>
     dplyr::mutate(
       Tau          = sprintf("%.2f", .data$Tau),
-      Coverage     = tbl_pct(.data$Coverage),
-      SelPrecision = tbl_pct(.data$SelPrecision),
+      Coverage     = clf_pct(.data$Coverage),
+      SelPrecision = clf_pct(.data$SelPrecision),
       Accuracy     = sprintf("%.3f", .data$Accuracy),
       F1_macro     = sprintf("%.3f", .data$F1_macro)
     ) |>
     dplyr::select(Tau, Terms = nTerms, Classes = nClassesHit, Coverage, SelPrecision, Accuracy,
                   F1_macro) |>
-    tbl_say()
+    clf_say_table()
 
   op_ <- kw_operating_point(.curve = .curve, .target_precision = .target_precision,
                             .tolerance = .tolerance, .min_classes = .min_classes)
   cli::cli_alert_success(
     "Operating point tau = {sprintf('%.2f', op_$Tau)}: {op_$nTerms} terms across \\
-     {op_$nClassesHit} categories label {tbl_pct(op_$Coverage)} of documents at \\
-     {tbl_pct(op_$SelPrecision)} precision"
+     {op_$nClassesHit} categories label {clf_pct(op_$Coverage)} of documents at \\
+     {clf_pct(op_$SelPrecision)} precision"
   )
   cli::cli_alert_info(
     "The threshold is a floor on Power, not on precision, so quote the realised precision above \\
@@ -1579,12 +1566,12 @@ kw_report_lexicon <- function(.tab, .top = 8L) {
         Power     = sprintf("%.3f", .data$Power),
         Precision = sprintf("%.3f", .data$Precision),
         Filers    = sprintf("%d (%.2f)", .data$NFilers, .data$FilerRatio),
-        MargReach = tbl_pct(.data$MarginalReach),
-        CumReach  = tbl_pct(.data$CumReach),
+        MargReach = clf_pct(.data$MarginalReach),
+        CumReach  = clf_pct(.data$CumReach),
         Stability = paste0(.data$Folds, "/5")
       ) |>
       dplyr::select(Rank, Term, Power, Precision, HitsPos, Filers, MargReach, CumReach, Stability) |>
-      tbl_say(.title = .c)
+      clf_say_table(.title = .c)
   })
   cli::cli_alert_info(
     "Marginal reach is the share of the category a term adds beyond its predecessors; a filer ratio \\
@@ -1619,7 +1606,7 @@ kw_report_audit <- function(.tab_pred, .per_class = 2L, .wrong = FALSE) {
   out_ |>
     dplyr::mutate(Power = sprintf("%.3f", .data$Score)) |>
     dplyr::select(DocID, TrueLabel, PredLabel, Power, TopTerm) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_alert_info(
     "A term appearing repeatedly in the error block is a candidate for removal; a term appearing \\
      in both blocks is ambiguous rather than wrong."
@@ -1640,12 +1627,12 @@ kw_report_arms <- function(.tabs) {
   cli::cli_h2("Where the terms came from")
   out_ |>
     dplyr::mutate(
-      Coverage     = tbl_pct(.data$Coverage),
-      SelPrecision = tbl_pct(.data$SelPrecision),
+      Coverage     = clf_pct(.data$Coverage),
+      SelPrecision = clf_pct(.data$SelPrecision),
       F1_macro     = sprintf("%.3f", .data$F1_macro)
     ) |>
     dplyr::select(List, Terms = nTerms, Classes = nClassesHit, Coverage, SelPrecision, F1_macro) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_alert_info(
     "Read Classes first. A union matching the arms on precision while labelling more categories \\
      means the two arms recover different vocabulary; matching on all columns means one arm is \\
@@ -1689,343 +1676,17 @@ kw_report_all <- function(.perf_mines, .perf_sel, .curve, .tab_pred, .tab_lexico
 }
 
 
-#' Selection floors for one task, chosen once and reused across its windows
-#'
-#' The floors govern how long a list may grow and how much marginal reach a term must add. Neither is
-#' a property of how much text the miner read, so they are settled once per task and held while the
-#' window varies. Sweeping them again per window would treat a question about list length as though
-#' it depended on truncation, and would multiply the selection sweep by the size of the window axis
-#' for an answer that does not move.
-#'
-#' @param .perf_sel Selection sweep across every task.
-#' @param .label_col Character. Task.
-#' @param .tolerance Numeric. Precision band treated as indistinguishable.
-#' @param .min_coverage Numeric. Coverage below which a configuration is not publishable.
-#' @return One-row tibble of floors.
-kw_task_floors <- function(.perf_sel, .label_col, .tolerance = 0.01, .min_coverage = 0.25) {
-  if (FALSE) {
-    .perf_sel     <- perf_sel
-    .label_col    <- "ClassDetailed"
-    .tolerance    <- 0.01
-    .min_coverage <- 0.25
-  }
-  kw_summarise_selection(.tab = .perf_sel, .label_col = .label_col) |>
-    kw_choose_config(
-      .tolerance    = .tolerance,
-      .min_coverage = .min_coverage,
-      .prefer       = NULL,
-      .fallback     = TRUE
-    )
-}
-
-#' Publish one table: one task, one truncation window
-#'
-#' Every window is published, not only the crowned one. The window is the keyword arm's cost knob and
-#' its coverage knob at once -- a shorter window is cheaper to apply and more precise, a longer one
-#' labels more -- so which window to ship is a decision worth leaving open until someone has the
-#' throughput figures. Publishing them all costs a threshold curve each and a few kilobytes of
-#' parquet, which is nothing against the alternative of re-mining to change one's mind.
-#'
-#' The n-gram order, stopword regime and text source are held at the values this task's mining sweep
-#' crowned. Those are not deployment knobs: nobody applying a published table chooses to read the
-#' filer's title instead of the contract, or to match two-word phrases instead of three. They were
-#' settled on the evidence and stay settled.
-#'
-#' @param .label_col Character. Task to publish.
-#' @param .n_words Integer. Truncation window in words; 0 reads the whole document.
-#' @param .idx_mine Full mining index, including the all-data mine at fold zero.
-#' @param .cfg_mine Crowned mining configuration per task and source.
-#' @param .floors One-row tibble from kw_task_floors().
-#' @param .target_precision Numeric. The promise this task makes.
-#' @param .min_classes Integer. Categories the table must reach before a threshold is acceptable.
-#' @param .taus Numeric vector of evidence thresholds to trace.
-#' @param .tolerance Numeric. Precision band treated as indistinguishable.
-#' @param .min_folds Integer. Fold agreement required of a published term.
-#' @param .source Character. Text field the arm reads.
-#' @return List: LabelCol, NWords, Floors, Curve, Operating, Lexicon.
-kw_publish_lexicon <- function(.label_col, .n_words, .idx_mine, .cfg_mine, .floors,
-                               .target_precision, .min_classes,
-                               .taus = seq(0.40, 0.96, by = 0.02), .tolerance = 0.01,
-                               .min_folds = 3L, .source = "text") {
-  if (FALSE) {
-    .label_col        <- "ClassDetailed"
-    .n_words          <- 512L
-    .idx_mine         <- idx_mine
-    .cfg_mine         <- cfg_mine
-    .floors           <- kw_task_floors(perf_sel, "ClassDetailed")
-    .target_precision <- 0.95
-    .min_classes      <- 9L
-    .taus             <- seq(0.40, 0.96, by = 0.02)
-    .tolerance        <- 0.01
-    .min_folds        <- 3L
-    .source           <- "text"
-  }
-  cfg_ <- .cfg_mine |> dplyr::filter(.data$LabelCol == .label_col, .data$Source == .source)
-  if (nrow(cfg_) == 0L) {
-    cli::cli_abort("No crowned mining configuration for {(.label_col)} on {(.source)}.")
-  }
-
-  cells_ <- .idx_mine |>
-    dplyr::filter(
-      .data$LabelCol  == .label_col,
-      .data$Source    == .source,
-      .data$NWords    == .n_words,
-      .data$NgramMax  == cfg_$NgramMax[[1]],
-      .data$Stopwords == cfg_$Stopwords[[1]]
-    )
-  dirs_    <- cells_ |> dplyr::filter(.data$Fold > 0L) |> dplyr::pull(MineDir)
-  dir_all_ <- cells_ |> dplyr::filter(.data$Fold == 0L) |> dplyr::pull(MineDir)
-  if (length(dirs_) == 0L || length(dir_all_) == 0L) {
-    cli::cli_abort("No mines for {(.label_col)} at window {(.n_words)} on {(.source)}.")
-  }
-
-  curve_ <- kw_tau_curve(
-    .mine_dirs     = dirs_,
-    .taus          = .taus,
-    .min_precision = .target_precision,
-    .min_hits      = .floors$MinHits,
-    .min_tot       = .floors$MinTot,
-    .min_reach     = .floors$MinReach,
-    .max_terms     = .floors$MaxTerms
-  )
-
-  op_ <- kw_operating_point(
-    .curve            = curve_,
-    .target_precision = .target_precision,
-    .tolerance        = .tolerance,
-    .min_classes      = .min_classes
-  )
-
-  # The all-data mine holds nothing out, which is what makes the fold-agreement filter legitimate
-  # against it and illegitimate against any single fold mine.
-  lex_ <- kw_lexicon_final(
-    .mine_dir_all    = dir_all_,
-    .mine_dirs_folds = dirs_,
-    .tau             = op_$Tau,
-    .min_folds       = .min_folds,
-    .min_precision   = .target_precision,
-    .min_hits        = .floors$MinHits,
-    .min_tot         = .floors$MinTot,
-    .min_reach       = .floors$MinReach,
-    .max_terms       = .floors$MaxTerms
-  )
-
-  list(
-    LabelCol = .label_col, NWords = as.integer(.n_words), Source = .source,
-    NgramMax = cfg_$NgramMax[[1]], Stopwords = cfg_$Stopwords[[1]],
-    Promised = .target_precision, Floors = .floors,
-    Curve = curve_, Operating = op_, Lexicon = lex_
-  )
-}
-
-#' Choose the window a task ships by default
-#'
-#' The mining sweep crowns a cell by how it scored at a threshold held common across the sweep, which
-#' is the right way to compare windows on equal terms and the wrong way to choose an artifact. Each
-#' published table stands at its own operating point -- a short window holds precision at a lower
-#' evidence bar than a long one, so judging it at the long window's threshold understates it -- and on
-#' this sample the two questions give different answers for every task.
-#'
-#' So the default is chosen from the catalogue rather than inherited from the sweep, in three steps:
-#'
-#'   1. KEEP WHAT HOLDS THE PROMISE. Realised precision within tolerance of the target, the same test
-#'      that chose the threshold. This rarely excludes anything; it is a guard against publishing a
-#'      table that does not keep its word rather than the criterion that decides.
-#'   2. MOST CATEGORIES. A table covering ten of twelve categories is a different artifact from one
-#'      covering five, and no amount of coverage compensates: the categories it omits cannot be
-#'      labelled by it at all.
-#'   3. MOST COVERAGE, THEN SHORTEST WINDOW. Among equally broad tables, prefer the one that declines
-#'      least; among equally broad and equally covering tables, prefer the one that reads least text,
-#'      because applying it over a corpus is what the window costs.
-#'
-#' Breadth is counted on the PUBLISHED file rather than on the threshold curve. The curve's count is
-#' estimated before the fold-agreement filter, and that filter can remove the last surviving term for
-#' a category -- so the two differ, and only one of them describes what a reader would receive.
-#'
-#' @param .tab Catalogue rows for every window of every task.
-#' @param .tolerance Numeric. Precision band treated as indistinguishable.
-#' @return .tab with a logical Default column.
-kw_default_window <- function(.tab, .tolerance = 0.01) {
-  if (FALSE) {
-    .tab       <- catalogue
-    .tolerance <- 0.01
-  }
-  picked_ <- .tab |>
-    dplyr::mutate(Holds = .data$Realised >= .data$Promised - .tolerance) |>
-    # A task where no window holds its promise still needs a default, or the deployment stage has
-    # nothing to apply. Falling back to every window keeps the ranking meaningful and the shortfall
-    # visible in the Realised column rather than hidden behind a missing row.
-    dplyr::mutate(Holds = if (any(.data$Holds)) .data$Holds else TRUE, .by = Task) |>
-    dplyr::filter(.data$Holds) |>
-    # A window of zero words means the miner read the whole document, so it is the LONGEST window
-    # wearing the smallest number. Sorting on the raw column would make the tiebreak that exists to
-    # prefer cheap tables pick the most expensive one, and it would do so only where every other
-    # column ties -- which is exactly where nobody would look.
-    dplyr::mutate(Cost = dplyr::if_else(.data$NWords == 0L, Inf, as.numeric(.data$NWords))) |>
-    dplyr::arrange(.data$Task, dplyr::desc(.data$Categories), dplyr::desc(.data$Coverage),
-                   .data$Cost) |>
-    dplyr::slice_head(n = 1L, by = Task) |>
-    dplyr::transmute(Task, ChosenWords = .data$NWords)
-
-  .tab |>
-    dplyr::left_join(picked_, by = dplyr::join_by(Task)) |>
-    dplyr::mutate(Default = .data$NWords == .data$ChosenWords, ChosenWords = NULL)
-}
-
-#' The published catalogue, one row per table, with the default marked
-#'
-#' What a reader needs in order to override the default with their eyes open: every window's
-#' threshold, what it promised and realised, how much of the corpus it labels, how many categories it
-#' reaches and how many terms it carries. The default is marked rather than being the only row,
-#' because a window winning by a margin smaller than the sample can measure is a reason to prefer the
-#' cheaper one, and only a table showing both makes that judgement possible.
-#'
-#' @param .pubs List of kw_publish_lexicon() results.
-#' @param .tolerance Numeric. Precision band treated as indistinguishable when choosing the default.
-#' @return Invisibly the catalogue tibble.
-kw_catalogue <- function(.pubs, .tolerance = 0.01) {
-  if (FALSE) {
-    .pubs      <- pubs
-    .tolerance <- 0.01
-  }
-  purrr::map(.pubs, function(.p) {
-    tibble::tibble(
-      Task       = .p$LabelCol,
-      NWords     = .p$NWords,
-      Tau        = .p$Operating$Tau,
-      Promised   = .p$Promised,
-      Realised   = .p$Operating$SelPrecision,
-      Coverage   = .p$Operating$Coverage,
-      Reached    = .p$Operating$nClassesHit,
-      Terms      = nrow(.p$Lexicon),
-      Categories = dplyr::n_distinct(.p$Lexicon$Class)
-    )
-  }) |>
-    purrr::list_rbind() |>
-    kw_default_window(.tolerance = .tolerance) |>
-    dplyr::arrange(.data$Task, .data$NWords)
-}
-
-#' Print the catalogue
-#'
-#' @param .tab Output of kw_catalogue().
-#' @return Invisibly .tab.
-kw_report_catalogue <- function(.tab) {
-  if (FALSE) .tab <- catalogue
-  cli::cli_h2("Published tables")
-  .tab |>
-    dplyr::mutate(
-      Window   = dplyr::if_else(.data$NWords == 0L, "full", as.character(.data$NWords)),
-      Tau      = sprintf("%.2f", .data$Tau),
-      Promised = tbl_pct(.data$Promised),
-      Realised = tbl_pct(.data$Realised),
-      Coverage = tbl_pct(.data$Coverage),
-      Default  = dplyr::if_else(.data$Default, "<-", "")
-    ) |>
-    dplyr::select(Task, Window, Default, Tau, Promised, Realised, Coverage, Reached, Terms,
-                  Categories) |>
-    tbl_say()
-  cli::cli_text("")
-  cli::cli_alert_info(
-    "Coverage is the share of documents the table labels at all; Reached is how many categories it \\
-     ever assigns. A table holds its promise by declining, so the two are read together."
-  )
-  cli::cli_alert_info(
-    "The arrow marks the widest table that holds its promise, breaking ties on coverage and then on \\
-     the shorter window. It is chosen from this table rather than inherited from the mining sweep, \\
-     which ranks windows at a common threshold and so understates the short ones."
-  )
-  cli::cli_alert_info(
-    "Where Categories is below Reached, the fold-agreement filter removed the last surviving term \\
-     for a category. Reached describes the procedure; Categories describes the file."
-  )
-  invisible(.tab)
-}
-
-#' The published table a task ships by default
-#'
-#' Reads the choice from the catalogue rather than remaking it, so the marked row and the table the
-#' rest of this document reports on cannot disagree. Looked up by task and window carried inside each
-#' entry, never by position: the catalogue is sorted for reading and the entries are built in plan
-#' order, so an index taken from one and applied to the other silently returns a different task's
-#' table -- which is not an error anywhere, because a lexicon is a lexicon whatever categories it
-#' holds.
-#'
-#' @param .pubs List of kw_publish_lexicon() results.
-#' @param .catalogue Output of kw_catalogue(), which carries the Default column.
-#' @param .label_col Character. Task.
-#' @return One element of .pubs.
-kw_default_pub <- function(.pubs, .catalogue, .label_col) {
-  if (FALSE) {
-    .pubs      <- pubs
-    .catalogue <- catalogue
-    .label_col <- "ClassDetailed"
-  }
-  win_ <- .catalogue |>
-    dplyr::filter(.data$Task == .label_col, .data$Default) |>
-    dplyr::pull(NWords)
-  if (length(win_) != 1L) {
-    cli::cli_abort("Expected one default window for {.val {(.label_col)}}, found {length(win_)}.")
-  }
-
-  hit_ <- purrr::detect(
-    .x = .pubs,
-    .f = function(.p) identical(.p$LabelCol, .label_col) && identical(.p$NWords, as.integer(win_))
-  )
-  if (is.null(hit_)) {
-    cli::cli_abort("No published table for {.val {(.label_col)}} at window {win_}.")
-  }
-  hit_
-}
-
-#' File stem for one published table
-#'
-#' Named by task and window rather than by an index, because the deployment stage reads these files
-#' by name and a positional convention shared between two stages is one that will eventually be
-#' renumbered in one place and not the other.
-#'
-#' @param .label_col Character. Task.
-#' @param .n_words Integer. Truncation window; 0 reads the whole document.
-#' @return Character stem.
-kw_table_stem <- function(.label_col, .n_words) {
-  if (FALSE) {
-    .label_col <- "ClassDetailed"
-    .n_words   <- 512L
-  }
-  task_ <- switch(.label_col,
-    ClassDetailed = "detailed",
-    ClassBroad    = "broad",
-    AmendType     = "amendment",
-    tolower(.label_col)
-  )
-  win_ <- if (as.integer(.n_words) == 0L) "full" else as.character(as.integer(.n_words))
-  paste0("keyword_table_", task_, "_W", win_)
-}
-
-
-# 10. Figures ----------------------------------------------------------------------------------------------------------
-# The look comes entirely from _Commons/_Plots.R. What these functions own is the mapping from a
-# swept tibble to a figure shape, which is the part that has to know what the numbers mean.
+# 10. Figures ------------------------------------------------------------------------------------
 
 #' Performance against the truncation window
 #'
 #' The reference line marks the window the transformer reads. Anything to its right is signal no
-#' transformer in this study can see, so a curve still rising there would locate information the whole
-#' pipeline currently discards -- which is a claim about the corpus, not about this classifier.
+#' transformer in this study can see, so a curve still rising there would locate information the
+#' whole pipeline currently discards.
 #'
-#' Three panels rather than three figures, because the three metrics move against each other: a window
-#' that raises precision by narrowing what the miner sees will lower coverage at the same time, and
-#' reading that trade-off requires them side by side on a shared horizontal axis.
-#'
-#' The vertical scale is free per panel, and deliberately so. What is shared between the metrics is
-#' the window, not the level: precision sits near ninety percent while coverage sits near sixty, so a
-#' common vertical axis would compress precision's whole range into a line thinner than the marker and
-#' the panel would show nothing. The axis label on each panel states its own range, and no comparison
-#' this figure invites is a comparison of levels across panels.
-#'
-#' @param .tab Output of kw_sweep_mines().
-#' @param .label_col Character. Task to plot.
-#' @param .window_ref Integer. Reference window in words, drawn recessive behind the curves.
+#' @param .tab Output of kw_sweep_mines.
+#' @param .label_col Task to plot.
+#' @param .window_ref Reference window in words.
 #' @return A ggplot.
 kw_plot_window <- function(.tab, .label_col = "ClassDetailed", .window_ref = 512L) {
   if (FALSE) {
@@ -2041,99 +1702,63 @@ kw_plot_window <- function(.tab, .label_col = "ClassDetailed", .window_ref = 512
       Coverage  = mean(.data$Coverage),
       .by = c(NWords, NgramMax, Stopwords)
     ) |>
-    # A window of zero means the miner read the whole document. Plotted on a log axis it needs a
-    # finite position, so it is placed one doubling beyond the largest real window and labelled for
-    # what it is rather than for the number standing in for it.
     dplyr::mutate(Window = dplyr::if_else(.data$NWords == 0L, 4096L, .data$NWords)) |>
-    tidyr::pivot_longer(
-      cols      = c(MacroF1, Precision, Coverage),
-      names_to  = "Metric",
-      values_to = "Value"
-    )
+    tidyr::pivot_longer(cols = c(MacroF1, Precision, Coverage), names_to = "Metric",
+                        values_to = "Value")
 
-  dat_ |>
-    ggplot2::ggplot(ggplot2::aes(
-      x = .data$Window, y = .data$Value,
-      colour = .data$Stopwords, linetype = factor(.data$NgramMax)
-    )) +
-    ggplot2::geom_vline(xintercept = .window_ref, linewidth = 0.3, linetype = 2, colour = .plot_ref) +
+  p_ <- dat_ |>
+    ggplot2::ggplot(ggplot2::aes(x = Window, y = Value, colour = Stopwords,
+                                 linetype = factor(NgramMax))) +
+    ggplot2::geom_vline(xintercept = .window_ref, linewidth = 0.3, colour = "grey60") +
     ggplot2::geom_line(linewidth = 0.5) +
-    ggplot2::geom_point(size = 1.4) +
-    ggplot2::facet_wrap(ggplot2::vars(Metric), nrow = 1L, scales = "free_y") +
-    plot_scale_colour_cat(name = "Stopwords") +
-    ggplot2::scale_x_continuous(
-      transform = "log2",
-      breaks    = c(256, 512, 1024, 2048, 4096),
-      labels    = c("256", "512", "1024", "2048", "full")
-    ) +
-    ggplot2::scale_y_continuous(labels = scales::label_percent()) +
-    ggplot2::labs(x = "Word window", y = NULL, linetype = "n-gram max") +
-    plot_theme(.grid = "y", .legend = "bottom")
+    ggplot2::geom_point(size = 1.5) +
+    ggplot2::facet_wrap(ggplot2::vars(Metric), nrow = 1L) +
+    ggplot2::scale_x_continuous(transform = "log2", breaks = c(256, 512, 1024, 2048, 4096),
+                                labels = c("256", "512", "1024", "2048", "full")) +
+    ggplot2::scale_y_continuous(labels = scales::percent) +
+    ggplot2::labs(x = "Word window", y = NULL, colour = "Stopwords", linetype = "n-gram max")
+  clf_apply_theme(p_)
 }
 
-#' Precision bought by declining to label
+#' Precision against coverage across the threshold
 #'
-#' Each point is one evidence threshold. Moving up the curve raises the threshold, which discards the
-#' documents whose only supporting term was weak and so raises precision on what remains. Point area
-#' is the number of categories the table still reaches, which is the constraint that stops the curve
-#' being read as free: a very precise table that has dropped half the taxonomy is not a better table.
-#'
-#' @param .curve Output of kw_tau_curve().
-#' @param .target_precision Numeric. The promise, drawn as a reference line.
+#' @param .curve Output of kw_tau_curve.
+#' @param .target_precision Reference line.
 #' @return A ggplot.
 kw_plot_tau <- function(.curve, .target_precision = 0.95) {
   if (FALSE) {
     .curve            <- curve_detailed
     .target_precision <- 0.95
   }
-  .curve |>
+  p_ <- .curve |>
     dplyr::filter(!is.na(.data$SelPrecision), .data$Coverage > 0) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Coverage, y = .data$SelPrecision)) +
-    ggplot2::geom_hline(
-      yintercept = .target_precision, linewidth = 0.3, linetype = 2, colour = .plot_ref
-    ) +
-    ggplot2::geom_line(linewidth = 0.4, colour = .plot_ref) +
-    ggplot2::geom_point(ggplot2::aes(size = .data$nClassesHit), colour = .plot_ink, alpha = 0.8) +
-    ggplot2::scale_size_area(max_size = 4) +
-    ggplot2::scale_x_continuous(labels = scales::label_percent()) +
-    ggplot2::scale_y_continuous(labels = scales::label_percent()) +
-    ggplot2::labs(
-      x = "Coverage", y = "Precision on the classified subset", size = "Categories reached"
-    ) +
-    plot_theme(.grid = "both", .legend = "right")
+    ggplot2::ggplot(ggplot2::aes(x = Coverage, y = SelPrecision)) +
+    ggplot2::geom_hline(yintercept = .target_precision, linewidth = 0.3, linetype = "dashed",
+                        colour = "grey50") +
+    ggplot2::geom_line(linewidth = 0.4, colour = "grey30") +
+    ggplot2::geom_point(ggplot2::aes(size = nClassesHit), colour = "grey20", alpha = 0.7) +
+    ggplot2::scale_x_continuous(labels = scales::percent) +
+    ggplot2::scale_y_continuous(labels = scales::percent) +
+    ggplot2::labs(x = "Coverage", y = "Precision on the classified subset", size = "Categories")
+  clf_apply_theme(p_)
 }
 
 #' Reach accumulated by successive terms within each category
 #'
-#' How quickly a category is covered, and where a list stops earning its length. A curve that flattens
-#' after four terms says the fifth is decoration; one still climbing at the last term says the list was
-#' truncated before the category was covered.
+#' Shows how quickly a category is covered and where a list stops earning its length.
 #'
-#' Panels follow the registered taxonomic order rather than the alphabet, so this figure can be read
-#' against the confusion matrix and the per-category scores without re-establishing which panel is
-#' which. Every registered category gets a panel even when the published table holds no term for it:
-#' an empty panel is the statement that the mining found nothing publishable for that category, and
-#' dropping it would remove from the figure precisely the categories a reader most needs warning
-#' about.
-#'
-#' @param .tab Output of kw_lexicon_final().
-#' @param .key Character. Registered vocabulary ordering and labelling the panels.
+#' @param .tab Output of kw_lexicon_final.
 #' @return A ggplot.
-kw_plot_reach <- function(.tab, .key = "ClassDetailed") {
+kw_plot_reach <- function(.tab) {
   if (FALSE) {
     .tab <- tab_keywords
-    .key <- "ClassDetailed"
   }
-  .tab |>
-    dplyr::mutate(Panel = plot_factor(.data$Class, .key = .key, .short = TRUE)) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Rank, y = .data$CumReach, group = .data$Panel)) +
-    ggplot2::geom_step(linewidth = 0.4, colour = .plot_ink) +
-    ggplot2::geom_point(size = 1.0, colour = .plot_ink) +
-    ggplot2::facet_wrap(ggplot2::vars(Panel), ncol = 4L, drop = FALSE) +
-    # Rank counts terms, so the axis takes whole numbers. The default continuous breaks land on
-    # halves, which reads as though a term could be the two-and-a-halfth in its list.
-    ggplot2::scale_x_continuous(breaks = \(.x) unique(round(scales::breaks_pretty(4)(.x)))) +
-    ggplot2::scale_y_continuous(labels = scales::label_percent()) +
-    ggplot2::labs(x = "Term rank within category", y = "Cumulative share of category reached") +
-    plot_theme(.grid = "y", .legend = "none")
+  p_ <- .tab |>
+    ggplot2::ggplot(ggplot2::aes(x = Rank, y = CumReach, group = Class)) +
+    ggplot2::geom_step(linewidth = 0.4, colour = "grey30") +
+    ggplot2::geom_point(size = 1.2, colour = "grey20") +
+    ggplot2::facet_wrap(ggplot2::vars(Class), ncol = 4L, labeller = ggplot2::label_wrap_gen(24)) +
+    ggplot2::scale_y_continuous(labels = scales::percent) +
+    ggplot2::labs(x = "Term rank within category", y = "Cumulative share of category reached")
+  clf_apply_theme(p_)
 }

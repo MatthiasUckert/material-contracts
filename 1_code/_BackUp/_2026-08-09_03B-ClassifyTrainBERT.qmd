@@ -10,14 +10,16 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| purl: false
 knitr::opts_knit$set(root.dir = here::here())
 
-# Figure geometry is NOT set here -- it is declared once in _quarto.yml, and restating it per
-# document is what let two documents drift to more than twice the width of the rest.
 knitr::opts_chunk$set(
-  root.dir = here::here(),
-  message  = TRUE,       # mandatory: cli writes through the message stream under knitr, so
-                         # message = FALSE would discard this document's entire output
-  warning  = FALSE,
-  comment  = ""          # drops the "##" prefix, so console blocks copy verbatim
+  root.dir  = here::here(),
+  message   = TRUE,       # mandatory: cli writes through the message stream under knitr, so
+                          # message = FALSE would discard this document's entire output
+  warning   = FALSE,
+  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
+  fig.width = 7.5,        # fixed for every figure; only height varies, and only with row count
+  fig.align = "center",
+  dpi       = 200,
+  out.width = "100%"
 )
 
 options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
@@ -28,22 +30,18 @@ options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste a
   rstudioapi::getActiveDocumentContext()[["path"]]
 }
 .name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
 ```
 
 ```{r}
-#| label: setup-sources
+#| label: load-libraries
 #| echo: false
 source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 
-# The shared design layer, sourced before anything that draws or prints.
-source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
-source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
-
-# 03A owns sample construction, the shared scoring layer, and the category vocabulary. Sourcing it
-# here is what makes this document comparable with the keyword classifier, the language model and the
-# router: identical scoring code on identical folds, and the same twelve categories drawn in the same
-# order in every figure.
+# 03A owns sample construction and the shared scoring layer (clf_*). Sourcing it first means this
+# document inherits identical scoring code to the keyword classifier (03C) and the router (03D).
 source(
   file     = init_create_script_fun(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare"),
   encoding = "UTF-8"
@@ -51,14 +49,14 @@ source(
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
-  .dir_here    = here::here(),    # project root
-  .name_script = .name_script     # this document's name; the output directory is derived from it
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script # this document's name; the output directory is derived from it
 ))
 
 cat("Function File: ")
 (.path_fun <- init_create_script_fun(
-  .dir_here    = here::here(),    # project root
-  .name_script = .name_script     # resolves to 1_code/03B-ClassifyTrainBERT.R
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script # resolves to 1_code/03B-ClassifyTrainBERT.R
 ))
 source(file = .path_fun, encoding = "UTF-8")
 ```
@@ -102,19 +100,14 @@ by manual review rather than by list order, so it is not an arbitrary choice bet
 
 ## Reproducibility
 
-Every chunk in this document executes and no result is read from cache. This is affordable because training is
-idempotent: `bert_sweep()` inspects the run directory, trains only configurations whose metrics are absent, and skips the
-rest. The first execution trains the full grid; subsequent executions complete in seconds and reproduce identical output.
+Every chunk in this document executes; no evaluation is disabled and no result is read from cache. This is affordable
+because training is idempotent: `bert_sweep()` inspects the run directory, trains only configurations whose metrics are
+absent, and skips the rest. The first execution trains the full grid; subsequent executions complete in seconds and
+reproduce identical output.
 
-There is one deliberate exception. `RunRemaining` in the configuration below gates the two steps that spend GPU time, so
-the document can be rendered while the sweep is still in progress. That convenience is also the failure mode the
-no-caching rule exists to prevent -- a partially estimated grid still yields a leaderboard, a marginal-effect table and a
-crowned configuration, all of which look entirely normal. The Sweep coverage section immediately after training therefore
-reports what the results rest on, and both gated steps announce the skip rather than passing over it quietly.
-
-Two further consequences follow, and both are deliberate. Deleting the run directory forces a complete retrain. Changing
-the labelled sample without deleting it produces stale results silently, because run identity is derived from
-hyperparameters alone and carries no fingerprint of the data.
+Two consequences follow, and both are deliberate. Deleting the run directory forces a complete retrain. Changing the
+labelled sample without deleting it produces stale results silently, because run identity is derived from hyperparameters
+alone and carries no fingerprint of the data.
 
 Sections up to the Overview report in plain text only. All figures are collected in the Overview at the end, so that the
 argument can be followed linearly and the evidence inspected as a whole.
@@ -141,15 +134,7 @@ argument can be followed linearly and the evidence inspected as a whole.
   ),
   Engine = list(
     Python = here::here("contracts-engine", ".venv", "bin", "python"), # training environment
-    Script = here::here("contracts-engine", "classify_train.py")       # training entry point
-  ),
-  Param = list(
-    # The two GPU-spending steps in this document -- the sweep and the final fits -- are gated on
-    # this one flag. TRUE is the only setting under which the document's own claims about its design
-    # are true. FALSE renders against whatever runs already exist, which is useful while the sweep is
-    # still running or while the document itself is being edited, and is reported as a failure state
-    # everywhere it has consequences.
-    RunRemaining = TRUE
+    Script = here::here("contracts-engine", "classify_train.py") # training entry point
   )
 )
 ```
@@ -243,33 +228,14 @@ not deleted; they remain in the leaderboard as evidence for the two exclusions a
 ```{r}
 #| label: sweep-execute
 bert_sweep(
-  .path_data     = .lP$Input$Prepared,        # prepared sample written by 03A
-  .grid          = grid_all,                  # configurations to train
-  .runs_root     = .lP$Runs$Bert,             # destination for run folders
-  .text_col      = "Text",                    # column holding the document text
-  .batch_size    = 32L,                       # held fixed across the study; not a swept axis
-  .seed          = 42L,                       # initialisation and shuffling seed
-  .overwrite     = FALSE,                     # FALSE skips configurations already present on disk
-  .run_remaining = .lP$Param$RunRemaining,    # FALSE reports the plan and trains nothing
-  .verbose       = FALSE                      # stream per-epoch training loss to the console
-)
-```
-
-## Sweep coverage
-
-Everything below is computed on the runs that exist, which is the same thing as the planned grid only when the sweep has
-finished. Two properties are reported, and the second is the binding one: a configuration counts as estimated only when
-all five of its folds are present, and the completed configurations must still form a full crossing of the swept axes for
-the marginal-effect table to mean what it claims.
-
-```{r}
-#| label: report-coverage
-bert_report_coverage(
-  .grid       = grid_all,        # the design this document sets out to estimate
-  .runs_root  = .lP$Runs$Bert,   # what actually exists
-  .text_col   = "Text",          # must match the sweep call above
-  .batch_size = 32L,             # must match the sweep call above
-  .seed       = 42L              # must match the sweep call above
+  .path_data  = .lP$Input$Prepared, # prepared sample written by 03A
+  .grid       = grid_all, # configurations to train
+  .runs_root  = .lP$Runs$Bert, # destination for run folders
+  .text_col   = "Text", # column holding the document text
+  .batch_size = 32L, # held fixed across the study; not a swept axis
+  .seed       = 42L, # initialisation and shuffling seed
+  .overwrite  = FALSE, # FALSE skips configurations already present on disk
+  .verbose    = FALSE # stream per-epoch training loss to the console
 )
 ```
 
@@ -305,9 +271,6 @@ clf_report_effects(
   .axes        = c("Model", "MaxLen", "Epochs", "ClassWeights", "LR") # axes to marginalise over
 )
 ```
-
-The marginal-effect table is only interpretable on a fully crossed design, which is what the coverage report above
-establishes; on a partial sweep it compares levels estimated against different sets of the other axes.
 
 Differences between the leading configurations are smaller than the spread across folds within any one of them, which is
 the signature of a performance plateau rather than a sharp optimum. The marginal-effect table separates the axes that
@@ -433,7 +396,7 @@ clf_report_perclass(
 
 ```{r}
 #| label: results-amendment-confusion
-tbl_say(
+clf_say_table(
   .tab   = clf_confusion(.tab_pred = pred_amend), # true category by predicted category, as counts
   .title = "Amendment -- confusion matrix" # heading
 )
@@ -481,7 +444,7 @@ dplyr::bind_rows(
     dplyr::mutate(Approach = "Broad model, direct", .before = 1)
 ) |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
-  tbl_say(.title = "Two routes to the broad taxonomy, both scored at the broad level")
+  clf_say_table(.title = "Two routes to the broad taxonomy, both scored at the broad level")
 ```
 
 The two routes are equivalent in accuracy, so the choice between them rests on internal consistency. **The published broad
@@ -510,7 +473,7 @@ dplyr::bind_rows(
     dplyr::mutate(Labels = "Round 2 only", .before = 1)
 ) |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
-  tbl_say(.title = "Performance by label provenance, detailed taxonomy")
+  clf_say_table(.title = "Performance by label provenance, detailed taxonomy")
 ```
 
 Macro-F1 is lower on the second round alone. This reflects the composition of that subset rather than a failure to
@@ -535,7 +498,7 @@ class_det <- bert_classification(
 
 bert_calibration_metrics(.tab_class = class_det) |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 4))) |>
-  tbl_say(.title = "Calibration summary (lower is better for ECE, MCE and Brier)")
+  clf_say_table(.title = "Calibration summary (lower is better for ECE, MCE and Brier)")
 ```
 
 ```{r}
@@ -545,14 +508,14 @@ bert_calibration(
   .n_bins    = 10L # equal-width confidence bins
 ) |>
   dplyr::mutate(dplyr::across(c(MeanConf, Accuracy, Gap), ~ round(.x, 3))) |>
-  tbl_say(.title = "Reliability: stated confidence against observed accuracy")
+  clf_say_table(.title = "Reliability: stated confidence against observed accuracy")
 ```
 
 ```{r}
 #| label: calibration-margin-table
 bert_margin_summary(.tab_class = class_det) |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
-  tbl_say(.title = "Decision margin between the top two categories, by outcome")
+  clf_say_table(.title = "Decision margin between the top two categories, by outcome")
 ```
 
 ```{r}
@@ -562,7 +525,7 @@ bert_confidence_accuracy(
   .thresholds = seq(0, 0.95, by = 0.05) # confidence floors to evaluate
 ) |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
-  tbl_say(.title = "Confidence floor against retained sample size and accuracy")
+  clf_say_table(.title = "Confidence floor against retained sample size and accuracy")
 ```
 
 The probabilities are usable but should be read against the reliability table rather than at face value. Confidence is
@@ -586,15 +549,14 @@ and length the configuration is still the one cross-validation selected under th
 ```{r}
 #| label: deploy-final-models
 bert_fit_final_all(
-  .path_data     = .lP$Input$Prepared,                            # prepared sample
-  .tab_overall   = tab_overall,                                   # bound per-fold metrics
-  .model_dir     = .lP$Output$ModelFinal,                         # destination for the models
-  .label_cols    = c("ClassDetailed", "ClassBroad", "AmendType"), # tasks to deploy
-  .max_lens      = c(256L, 512L),                                 # context lengths to deploy at
-  .batch_size    = 32L,                                           # as used throughout
-  .overwrite     = FALSE,                                         # FALSE skips existing models
-  .run_remaining = .lP$Param$RunRemaining,                        # FALSE reports the plan and fits nothing
-  .verbose       = TRUE                                           # stream per-epoch training loss
+  .path_data   = .lP$Input$Prepared, # prepared sample
+  .tab_overall = tab_overall, # bound per-fold metrics
+  .model_dir   = .lP$Output$ModelFinal, # destination for the models
+  .label_cols  = c("ClassDetailed", "ClassBroad", "AmendType"), # tasks to deploy
+  .max_lens    = c(256L, 512L), # context lengths to deploy at
+  .batch_size  = 32L, # as used throughout
+  .overwrite   = FALSE, # FALSE skips existing models
+  .verbose     = TRUE # stream per-epoch training loss
 )
 ```
 
@@ -664,10 +626,8 @@ table above shows why: the axes that could be tuned have already been driven to 
 
 ```{r}
 #| label: fig-leaderboard-detailed
-#| fig-height: !expr plot_height(15)
-#| fig-cap: "Cross-validated macro-F1 by configuration, detailed taxonomy. Intervals are one
-#|   fold-level standard deviation. The axis is zoomed to the estimates, so the visible spread is
-#|   smaller than it looks; the three panels here are not on a common scale."
+#| fig-height: 4.6
+#| fig-cap: "Cross-validated macro-F1 by configuration, detailed taxonomy. Intervals are one fold-level SD."
 clf_plot_leaderboard(
   .tab_overall = tab_overall, # bound per-fold metrics
   .label_col   = "ClassDetailed", # task to plot
@@ -679,8 +639,8 @@ clf_plot_leaderboard(
 
 ```{r}
 #| label: fig-leaderboard-broad
-#| fig-height: !expr plot_height(15)
-#| fig-cap: "Cross-validated macro-F1 by configuration, broad taxonomy. Axis zoomed as above."
+#| fig-height: 4.6
+#| fig-cap: "Cross-validated macro-F1 by configuration, broad taxonomy."
 clf_plot_leaderboard(
   .tab_overall = tab_overall, # bound per-fold metrics
   .label_col   = "ClassBroad", # task to plot
@@ -692,8 +652,8 @@ clf_plot_leaderboard(
 
 ```{r}
 #| label: fig-leaderboard-amendment
-#| fig-height: !expr plot_height(10)
-#| fig-cap: "Cross-validated macro-F1 by configuration, amendment task. Axis zoomed as above."
+#| fig-height: 4.6
+#| fig-cap: "Cross-validated macro-F1 by configuration, amendment task."
 clf_plot_leaderboard(
   .tab_overall = tab_overall, # bound per-fold metrics
   .label_col   = "AmendType", # task to plot
@@ -711,9 +671,8 @@ clf_plot_leaderboard(
 
 ```{r}
 #| label: fig-perclass-detailed
-#| fig-height: !expr plot_height(12)
-#| fig-cap: "Per-category F1, detailed taxonomy. All three panels share a fixed zero-to-one axis, so
-#|   bar lengths are comparable across tasks."
+#| fig-height: 4.6
+#| fig-cap: "Per-category F1, detailed taxonomy."
 clf_plot_perclass(.tab_pred = pred_det)
 ```
 
@@ -721,18 +680,18 @@ clf_plot_perclass(.tab_pred = pred_det)
 
 ```{r}
 #| label: fig-perclass-broad
-#| fig-height: !expr plot_height(7)
+#| fig-height: 3.4
 #| fig-cap: "Per-category F1, broad taxonomy."
-clf_plot_perclass(.tab_pred = pred_broad, .key = "ClassBroad")
+clf_plot_perclass(.tab_pred = pred_broad)
 ```
 
 ### Amendment
 
 ```{r}
 #| label: fig-perclass-amendment
-#| fig-height: !expr plot_height(2)
+#| fig-height: 2.4
 #| fig-cap: "Per-category F1, amendment task."
-clf_plot_perclass(.tab_pred = pred_amend, .key = "AmendType")
+clf_plot_perclass(.tab_pred = pred_amend)
 ```
 
 :::
@@ -749,15 +708,11 @@ remains is taxonomic ambiguity, not indiscriminate confusion.
 
 ```{r}
 #| label: fig-confusion-detailed
-#| fig-height: !expr plot_height(12, .square = TRUE)
-#| fig-cap: "Confusion matrix, detailed taxonomy, row-normalised. Rows are true categories, columns
-#|   predicted, both in taxonomic order, so errors that stay within a broad parent sit next to the
-#|   diagonal and errors that cross one sit away from it."
+#| fig-height: 5.2
+#| fig-cap: "Confusion matrix, detailed taxonomy, row-normalised. Rows are true categories, columns predicted."
 clf_plot_confusion(
-  .tab_pred  = pred_det,      # pooled out-of-fold predictions
-  .normalize = TRUE,          # normalise within true category, so each row sums to one
-  .limits    = c(0, 1),       # fixed, so all three panels share one fill scale
-  .label_min = 0.005          # a cell below half a percent is drawn but not labelled
+  .tab_pred  = pred_det, # pooled out-of-fold predictions
+  .normalize = TRUE # normalise within true category, so each row sums to one
 )
 ```
 
@@ -765,14 +720,11 @@ clf_plot_confusion(
 
 ```{r}
 #| label: fig-confusion-broad
-#| fig-height: !expr plot_height(7)
+#| fig-height: 3.4
 #| fig-cap: "Confusion matrix, broad taxonomy, row-normalised."
 clf_plot_confusion(
-  .tab_pred  = pred_broad,    # pooled out-of-fold predictions
-  .key       = "ClassBroad",  # orders both axes by the registered broad vocabulary
-  .normalize = TRUE,          # normalise within true category, so each row sums to one
-  .limits    = c(0, 1),       # same fill scale as the detailed panel
-  .label_min = 0.005          # a cell below half a percent is drawn but not labelled
+  .tab_pred  = pred_broad, # pooled out-of-fold predictions
+  .normalize = TRUE # normalise within true category, so each row sums to one
 )
 ```
 
@@ -780,14 +732,11 @@ clf_plot_confusion(
 
 ```{r}
 #| label: fig-confusion-amendment
-#| fig-height: !expr plot_height(2)
+#| fig-height: 2.4
 #| fig-cap: "Confusion matrix, amendment task, row-normalised."
 clf_plot_confusion(
-  .tab_pred  = pred_amend,    # pooled out-of-fold predictions
-  .key       = "AmendType",   # orders both axes by the registered amendment vocabulary
-  .normalize = TRUE,          # normalise within true category, so each row sums to one
-  .limits    = c(0, 1),       # same fill scale as the panels above
-  .angle     = 0              # two short labels; no rotation needed
+  .tab_pred  = pred_amend, # pooled out-of-fold predictions
+  .normalize = TRUE # normalise within true category, so each row sums to one
 )
 ```
 
@@ -807,7 +756,7 @@ wanted.
 
 ```{r}
 #| label: fig-reliability-detailed
-#| fig-height: !expr plot_height(7)
+#| fig-height: 3.4
 #| fig-cap: "Reliability diagram. The diagonal is perfect calibration; points are sized by documents per bin."
 bert_plot_reliability(.tab_class = class_det)
 ```
@@ -816,7 +765,7 @@ bert_plot_reliability(.tab_class = class_det)
 
 ```{r}
 #| label: fig-margin-detailed
-#| fig-height: !expr plot_height(7)
+#| fig-height: 3.4
 #| fig-cap: "Distribution of the decision margin for correct and incorrect predictions."
 bert_plot_margin(.tab_class = class_det)
 ```
@@ -825,7 +774,7 @@ bert_plot_margin(.tab_class = class_det)
 
 ```{r}
 #| label: fig-risk-coverage-detailed
-#| fig-height: !expr plot_height(7)
+#| fig-height: 3.4
 #| fig-cap: "Risk-coverage curve: accuracy on the retained subset as a rising confidence floor reduces coverage."
 bert_plot_risk_coverage(.tab_class = class_det)
 ```

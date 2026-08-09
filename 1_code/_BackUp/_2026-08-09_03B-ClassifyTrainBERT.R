@@ -1,37 +1,38 @@
-# 03B-ClassifyTrainBERT: the transformer trainer wrapper (bert_*) ------------------------------------------------------
+# 03B-ClassifyTrainBERT: the BERT trainer wrapper (bert_*) ----
+# Re-homes the proven BERT pipeline into the 03A-consuming layout. This file is
+# ONLY the trainer wrapper: it deals fold ids to the contracts-engine Python
+# trainer (classify_train.py) across the CLI + parquet seam and lets the engine
+# write the self-describing run folders. Everything else -- prep, scoring,
+# leaderboards, pooling, plots, the disk cache -- lives in 03A-ClassifyPrepare.R,
+# which the 03B runbook sources, so the splits and the scoring layer never drift.
 #
-# WHAT THIS FILE DOES
-# Deals fold ids to the contracts-engine Python trainer across a command-line and parquet seam, and
-# lets the engine write self-describing run folders. This file is ONLY the trainer wrapper plus the
-# reporting that is specific to a transformer -- calibration, decision margin, risk-coverage. Sample
-# construction, the scoring layer, leaderboards and pooling live in 03A-ClassifyPrepare.R, which the
-# runbook sources first, so the splits and the scoring code never drift between methods.
+# Division of labour (unchanged seam):
+#   - R stamps config and dispatches one fold per call; never reads model internals.
+#   - Python trains, evaluates out-of-fold, and writes predictions.parquet,
+#     probabilities.parquet, metrics_overall.parquet, metrics_perclass.parquet,
+#     train_log.parquet, config.json, and run.log into runs/<ConfigName>_F<fold>.
+#   - Idempotency is the engine's: a run whose metrics_overall.parquet exists is
+#     skipped (use .overwrite to force). So a sweep is safely re-runnable and a
+#     warm runs tree costs nothing but a process spawn per fold.
 #
-# DIVISION OF LABOUR ACROSS THE SEAM
-#   R stamps a configuration and dispatches one fold per call, and never reads model internals.
-#   Python trains, evaluates out-of-fold, and writes predictions, probabilities, per-fold and
-#   per-class metrics, a training log, the config and a run log into runs/<ConfigName>_F<fold>.
-#   Idempotency is the engine's: a run whose metrics already exist is skipped unless forced. A sweep
-#   is therefore safely re-runnable and a warm runs tree costs one process spawn per fold.
+# Console contract: the engine streams its per-fold detail (device, the epoch
+# logs, library warnings) into the run's run.log and keeps stdout to a [run] /
+# [done] pair. bert_train captures that stdout and emits exactly ONE cli line per
+# run -- success with acc / macro-F1, or a cached-skip note -- so a 320-run serial
+# sweep reads as a tidy progress strip. stderr is inherited, so a Python traceback
+# still surfaces immediately.
 #
-# CONSOLE CONTRACT
-# The engine streams its per-fold detail into the run log and keeps stdout to a [run] / [done] pair.
-# bert_train captures that and emits exactly one cli line per run, so a several-hundred-run serial
-# sweep reads as a tidy progress strip. stderr is inherited, so a Python traceback still surfaces
-# immediately.
+# Serial by design: training is MPS-bound on the M3 Ultra; concurrent jobs contend
+# for the one GPU, so bert_sweep walks the grid serially (no mirai). This is the
+# one structural difference from 03C's kw_sweep, which is CPU-bound and parallel.
 #
-# SERIAL BY DESIGN
-# Training is GPU-bound; concurrent jobs contend for the one device rather than overlapping, so the
-# sweep walks the grid one run at a time. This is the one structural difference from the keyword
-# sweep in 03C, which is CPU-bound and parallel.
+# Tasks all reuse this one harness via --label-col:
+#   ClassDetailed (12) / ClassBroad (7) / AmendType (Original vs Amended). The
+#   amendment NA-label-drop already lives in the trainer, so AmendType trains clean.
 #
-# WHAT IS NOT HERE
-# The look of any figure or table: that is _Commons/_Plots.R and _Commons/_Tables.R. Nothing below
-# sets a colour, a font or a height. The category vocabulary is registered by 03A, so every figure
-# here draws the twelve categories in the same order as every other document in the pipeline.
-#
-# House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
-# locals; if (FALSE) dev blocks; pure ASCII; parenthesised cli interpolation.
+# House style: native pipe; explicit package::function; dot-prefixed args;
+# underscore-suffixed locals; if (FALSE) dev blocks; cli/fs/here; pure ASCII;
+# {(.arg)} parens in cli interpolation.
 
 if (FALSE) {
   .path_data <- .lP$Input$Prepared
@@ -41,7 +42,7 @@ if (FALSE) {
 }
 
 
-# Train one fold -------------------------------------------------------------------------------------------------------
+# Train one fold ----------------------------------------------------------
 
 #' Train one fold by invoking the contracts-engine Python trainer
 #'
@@ -161,7 +162,7 @@ bert_train <- function(.path_data,
 }
 
 
-# Cross-validate one configuration -------------------------------------------------------------------------------------
+# Cross-validate one configuration ----------------------------------------
 
 #' Run k-fold CV for one configuration (loops bert_train over folds)
 #'
@@ -182,7 +183,7 @@ bert_cv <- function(.path_data, .label_col = "ClassDetailed", .folds = 1:5, ...)
 }
 
 
-# Sweep a grid (serial) ------------------------------------------------------------------------------------------------
+# Sweep a grid (serial) ---------------------------------------------------
 
 #' Stable run key for matching grid rows against finished runs
 #'
@@ -199,18 +200,6 @@ bert_cv <- function(.path_data, .label_col = "ClassDetailed", .folds = 1:5, ...)
 #' @keywords internal
 bert_run_key <- function(.label_col, .model, .text_col, .max_len, .epochs,
                          .batch_size, .lr, .class_weights, .seed, .fold) {
-  if (FALSE) {
-    .label_col     <- "ClassDetailed"
-    .model         <- "nlpaueb/legal-bert-base-uncased"
-    .text_col      <- "Text"
-    .max_len       <- 256L
-    .epochs        <- 6
-    .batch_size    <- 32L
-    .lr            <- 2e-5
-    .class_weights <- TRUE
-    .seed          <- 42L
-    .fold          <- 1L
-  }
   paste(
     .label_col,
     .model,
@@ -276,17 +265,6 @@ bert_done_keys <- function(.runs_roots) {
 #' @param .batch_size Batch size (held fixed across the grid).
 #' @param .seed RNG seed (held fixed across the grid; must match bert_train).
 #' @param .overwrite Logical. Retrain every row, ignoring what is already on disk.
-#' @param .run_remaining Logical. TRUE trains the outstanding rows. FALSE performs the scan and the
-#'   pre-flight report, then stops without training anything, so the document can be rendered against
-#'   whatever is already on disk.
-#'
-#'   This is a deliberate hole in the rule that every chunk executes, and it is dangerous for exactly
-#'   the reason that rule exists: a half-swept grid produces a leaderboard, a marginal-effect table,
-#'   a crowned configuration and a deployed model, all of which look entirely normal and none of
-#'   which describe the design the document says was estimated. It is therefore loud -- the skip is
-#'   reported as a failure state rather than a note, and bert_report_coverage() should be called
-#'   afterwards to establish what the results actually rest on. Set it FALSE to iterate on the
-#'   document; set it TRUE before believing any number in the output.
 #' @param .verbose Logical. Stream each run's live training output (passed to
 #'   bert_train); note it interleaves with the progress bar, so it is mainly for
 #'   debugging a single run rather than a full sweep.
@@ -298,7 +276,6 @@ bert_sweep <- function(.path_data, .grid,
                        .batch_size = 32L,
                        .seed = 42L,
                        .overwrite = FALSE,
-                       .run_remaining = TRUE,
                        .verbose = FALSE,
                        ...) {
   if (FALSE) {
@@ -307,9 +284,8 @@ bert_sweep <- function(.path_data, .grid,
       model = "nlpaueb/legal-bert-base-uncased", label_col = "ClassDetailed",
       lr = 2e-5, max_len = 512L, epochs = 6, class_weights = FALSE, fold = 1:5
     )
-    .runs_root     <- .lP$Runs$Bert
-    .overwrite     <- FALSE
-    .run_remaining <- TRUE
+    .runs_root <- .lP$Runs$Bert
+    .overwrite <- FALSE
   }
 
   need_ <- c("model", "label_col", "lr", "max_len", "epochs", "class_weights", "fold")
@@ -345,19 +321,6 @@ bert_sweep <- function(.path_data, .grid,
 
   if (n_todo_ == 0L) {
     cli::cli_alert_success("Nothing to do -- all {n_all_} run(s) already on disk.")
-    return(invisible(grid_))
-  }
-
-  if (!.run_remaining) {
-    cli::cli_alert_danger(
-      "TRAINING SKIPPED: {n_todo_} of {n_all_} run{?s} outstanding and {.arg .run_remaining} is FALSE."
-    )
-    cli::cli_alert_warning(
-      "Every result below this point -- the leaderboard, the marginal effects, the crowned \\
-       configuration, the deployed model -- is computed on the {n_done_} run{?s} that happen to be \\
-       on disk, not on the design this document describes. Treat nothing as final until the sweep \\
-       has completed."
-    )
     return(invisible(grid_))
   }
 
@@ -424,7 +387,7 @@ bert_sweep <- function(.path_data, .grid,
 }
 
 
-# Deploy: crowned config + final all-data fit --------------------------------------------------------------------------
+# Deploy: crowned config + final all-data fit -----------------------------
 
 #' Read the crowned (top macro-F1) configuration's hyperparameters
 #'
@@ -447,15 +410,6 @@ bert_crowned_config <- function(.tab_overall, .label_col = "ClassDetailed", .max
     .max_len     <- NULL
   }
   cand_ <- .tab_overall |> dplyr::filter(.data$LabelCol == .label_col)
-  # An empty candidate set is the normal state of a partially completed sweep, and it must fail with
-  # a sentence rather than propagate an empty ConfigName into a filter that then silently matches
-  # nothing and returns a zero-row prediction table.
-  if (nrow(cand_) == 0L) {
-    cli::cli_abort(c(
-      "No completed runs for {.val {(.label_col)}}.",
-      "i" = "The sweep has not produced any {(.label_col)} run yet, so no configuration can be crowned."
-    ))
-  }
   if (!is.null(.max_len)) {
     cand_ <- cand_ |> dplyr::filter(as.integer(.data$MaxLen) == as.integer(.max_len))
     if (nrow(cand_) == 0L) {
@@ -550,7 +504,7 @@ bert_fit_final <- function(.path_data, .config,
 }
 
 
-# Saved classification (per-doc predictions + full probability vector) -------------------------------------------------
+# Saved classification (per-doc predictions + full probability vector) -----
 
 #' Pool out-of-fold class probabilities for one configuration (long form)
 #'
@@ -562,10 +516,6 @@ bert_fit_final <- function(.path_data, .config,
 #' @param .config_name ConfigName string.
 #' @return Long tibble: ConfigName, DocID, Class, Prob.
 bert_pool_probabilities <- function(.runs_roots, .config_name) {
-  if (FALSE) {
-    .runs_roots  <- .lP$Runs$Bert
-    .config_name <- best_det_
-  }
   paths_ <- .runs_roots |>
     purrr::map(\(.r) fs::dir_ls(.r, recurse = TRUE, glob = "*probabilities.parquet")) |>
     purrr::list_c()
@@ -652,13 +602,6 @@ bert_classification <- function(.runs_roots, .config_name, .tab_prep = NULL) {
 #' @return Invisibly the output directory.
 bert_save_classification <- function(.tab, .dir, .stem = "crowned_classification",
                                      .csv = TRUE, .dta = FALSE) {
-  if (FALSE) {
-    .tab  <- class_det
-    .dir  <- .lP$Output$Classification
-    .stem <- "crowned_classification"
-    .csv  <- TRUE
-    .dta  <- FALSE
-  }
   fs::dir_create(.dir)
   pq_ <- fs::path(.dir, paste0(.stem, ".parquet"))
   arrow::write_parquet(.tab, pq_)
@@ -686,7 +629,7 @@ bert_save_classification <- function(.tab, .dir, .stem = "crowned_classification
 }
 
 
-# Confidence / calibration overviews -----------------------------------------------------------------------------------
+# Confidence / calibration overviews --------------------------------------
 # All read the per-doc classification table (bert_classification). "Is BERT's 80%
 # confidence right 80% of the time?" is calibration; "first vs second guess" is the
 # margin; "at what confidence is it right" is the risk-coverage (selective) curve.
@@ -702,10 +645,6 @@ bert_save_classification <- function(.tab, .dir, .stem = "crowned_classification
 #' @param .n_bins Integer. Number of equal-width confidence bins.
 #' @return Tibble: Bin, NDocs, MeanConf, Accuracy, Gap.
 bert_calibration <- function(.tab_class, .n_bins = 10L) {
-  if (FALSE) {
-    .tab_class <- class_det
-    .n_bins    <- 10L
-  }
   brks_ <- seq(0, 1, length.out = .n_bins + 1L)
   .tab_class |>
     dplyr::mutate(Bin = cut(.data$Top1Prob, breaks = brks_, include.lowest = TRUE)) |>
@@ -730,10 +669,6 @@ bert_calibration <- function(.tab_class, .n_bins = 10L) {
 #' @param .n_bins Integer. Bins for ECE / MCE.
 #' @return One-row tibble: NBins, ECE, MCE, Brier, MeanConf, Accuracy.
 bert_calibration_metrics <- function(.tab_class, .n_bins = 10L) {
-  if (FALSE) {
-    .tab_class <- class_det
-    .n_bins    <- 10L
-  }
   bins_ <- bert_calibration(.tab_class, .n_bins)
   n_    <- nrow(.tab_class)
   ece_  <- sum(bins_$NDocs / n_ * abs(bins_$Accuracy - bins_$MeanConf))
@@ -755,34 +690,22 @@ bert_calibration_metrics <- function(.tab_class, .n_bins = 10L) {
   )
 }
 
-#' Reliability diagram: stated confidence against observed accuracy
-#'
-#' The dashed diagonal is perfect calibration. A point below it is a bin the model was more confident
-#' about than it deserved. Point area is the number of documents in the bin, because a large gap in a
-#' bin holding twenty documents says much less than a small gap in one holding two thousand, and
-#' plotting the gaps at equal size would invite reading the sparse tail as the headline.
-#'
-#' Gridlines are on here, unlike most figures in the project: the whole reading of this figure is
-#' vertical distance from a diagonal, and judging that by eye against a bare panel is guesswork.
-#'
-#' @param .tab_class Per-document classification from bert_classification().
-#' @param .n_bins Integer. Number of equal-width confidence bins.
+#' Reliability diagram (confidence vs accuracy; dashed = perfect calibration)
+#' @param .tab_class Per-doc classification.
+#' @param .n_bins Integer. Confidence bins.
 #' @return A ggplot.
 bert_plot_reliability <- function(.tab_class, .n_bins = 10L) {
-  if (FALSE) {
-    .tab_class <- class_det
-    .n_bins    <- 10L
-  }
-  bert_calibration(.tab_class, .n_bins) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$MeanConf, y = .data$Accuracy)) +
-    ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, linewidth = 0.3, colour = .plot_ref) +
-    ggplot2::geom_line(linewidth = 0.4, colour = .plot_ink) +
-    ggplot2::geom_point(ggplot2::aes(size = .data$NDocs), colour = .plot_ink) +
-    ggplot2::scale_size_area(max_size = 4, guide = "none") +
-    ggplot2::scale_x_continuous(limits = c(0, 1), labels = scales::label_percent()) +
-    ggplot2::scale_y_continuous(limits = c(0, 1), labels = scales::label_percent()) +
-    ggplot2::labs(x = "Mean predicted confidence", y = "Observed accuracy") +
-    plot_theme(.grid = "both", .legend = "none")
+  bins_ <- bert_calibration(.tab_class, .n_bins)
+  p_ <- bins_ |>
+    ggplot2::ggplot(ggplot2::aes(x = MeanConf, y = Accuracy)) +
+    ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey60") +
+    ggplot2::geom_line(linewidth = 0.4) +
+    ggplot2::geom_point(ggplot2::aes(size = NDocs)) +
+    ggplot2::scale_x_continuous(limits = c(0, 1)) +
+    ggplot2::scale_y_continuous(limits = c(0, 1)) +
+    ggplot2::scale_size_continuous(guide = "none") +
+    ggplot2::labs(x = "Mean predicted confidence", y = "Empirical accuracy")
+  clf_apply_theme(p_)
 }
 
 #' Decision margin (top-1 minus top-2) summarised by outcome
@@ -794,7 +717,6 @@ bert_plot_reliability <- function(.tab_class, .n_bins = 10L) {
 #' @param .tab_class Per-doc classification (needs Margin, Top1Prob, Correct).
 #' @return Tibble: Correct, NDocs, MeanMargin, MedianMargin, MeanTop1.
 bert_margin_summary <- function(.tab_class) {
-  if (FALSE) .tab_class <- class_det
   .tab_class |>
     dplyr::summarise(
       NDocs        = dplyr::n(),
@@ -806,35 +728,18 @@ bert_margin_summary <- function(.tab_class) {
     dplyr::arrange(dplyr::desc(.data$Correct))
 }
 
-#' Margin distribution for correct against incorrect predictions
-#'
-#' If the two distributions separate, the margin is a usable confidence signal and a reject option or
-#' a routing rule can be built on it. If they overlap, the model is as decisive when it is wrong as
-#' when it is right, and no threshold on the margin will buy accuracy.
-#'
-#' Each density is scaled to its own peak rather than plotted at its natural height. Both already
-#' integrate to one, so the correct group -- being far more concentrated -- peaks around twenty times
-#' higher than the incorrect one and flattens it into an invisible smear along the axis. That hides
-#' precisely what the figure is asked to show. Scaling costs the relative frequency of the two
-#' groups, which the accuracy figure reports anyway, and buys the comparison of shapes that is the
-#' actual question.
-#'
-#' @param .tab_class Per-document classification from bert_classification().
+#' Margin distribution for correct vs incorrect predictions
+#' @param .tab_class Per-doc classification.
 #' @return A ggplot.
 bert_plot_margin <- function(.tab_class) {
-  if (FALSE) .tab_class <- class_det
-  .tab_class |>
+  p_ <- .tab_class |>
     dplyr::mutate(Outcome = dplyr::if_else(.data$Correct, "Correct", "Incorrect")) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Margin, fill = .data$Outcome)) +
-    ggplot2::geom_density(
-      mapping = ggplot2::aes(y = ggplot2::after_stat(scaled)),
-      alpha   = 0.6, colour = NA
-    ) +
-    plot_scale_fill_cat(name = NULL) +
+    ggplot2::ggplot(ggplot2::aes(x = Margin, fill = Outcome)) +
+    ggplot2::geom_density(alpha = 0.5, color = NA) +
+    ggplot2::scale_fill_manual(values = c(Correct = "grey30", Incorrect = "grey75")) +
     ggplot2::scale_x_continuous(limits = c(0, 1)) +
-    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05))) +
-    ggplot2::labs(x = "Top-1 minus top-2 probability", y = "Density, each group scaled to its peak") +
-    plot_theme(.grid = "y", .legend = "bottom")
+    ggplot2::labs(x = "Top-1 minus top-2 probability (margin)", y = "Density", fill = NULL)
+  clf_apply_theme(p_)
 }
 
 #' Risk-coverage: accuracy on the kept subset at rising confidence floors
@@ -848,10 +753,6 @@ bert_plot_margin <- function(.tab_class) {
 #' @param .thresholds Numeric vector of confidence floors.
 #' @return Tibble: Threshold, Coverage, NKept, Accuracy.
 bert_confidence_accuracy <- function(.tab_class, .thresholds = seq(0, 0.95, by = 0.05)) {
-  if (FALSE) {
-    .tab_class  <- class_det
-    .thresholds <- seq(0, 0.95, by = 0.05)
-  }
   n_ <- nrow(.tab_class)
   purrr::map(.thresholds, function(t_) {
     kept_ <- .tab_class |> dplyr::filter(.data$Top1Prob >= t_)
@@ -865,34 +766,24 @@ bert_confidence_accuracy <- function(.tab_class, .thresholds = seq(0, 0.95, by =
     purrr::list_rbind()
 }
 
-#' Risk-coverage curve: accuracy on the retained subset against coverage
-#'
-#' Read right to left: the rightmost point keeps every document, and moving left raises the
-#' confidence floor and discards the documents below it. A curve that climbs steeply as coverage
-#' falls means errors are concentrated among the documents the model was least sure about, which is
-#' the condition under which a confidence threshold is worth applying at all.
-#'
-#' @param .tab_class Per-document classification from bert_classification().
+#' Risk-coverage curve (accuracy on kept vs coverage)
+#' @param .tab_class Per-doc classification.
 #' @param .thresholds Numeric vector of confidence floors.
 #' @return A ggplot.
 bert_plot_risk_coverage <- function(.tab_class, .thresholds = seq(0, 0.95, by = 0.05)) {
-  if (FALSE) {
-    .tab_class  <- class_det
-    .thresholds <- seq(0, 0.95, by = 0.05)
-  }
-  bert_confidence_accuracy(.tab_class, .thresholds) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Coverage, y = .data$Accuracy)) +
-    ggplot2::geom_line(linewidth = 0.4, colour = .plot_ref) +
-    ggplot2::geom_point(ggplot2::aes(colour = .data$Threshold), size = 1.9) +
-    plot_scale_colour_grad(name = "Min confidence", labels = scales::label_percent()) +
-    ggplot2::scale_x_continuous(limits = c(0, 1), labels = scales::label_percent()) +
-    ggplot2::scale_y_continuous(labels = scales::label_percent()) +
-    ggplot2::labs(x = "Coverage (share of documents kept)", y = "Accuracy on the kept subset") +
-    plot_theme(.grid = "both", .legend = "right")
+  rc_ <- bert_confidence_accuracy(.tab_class, .thresholds)
+  p_ <- rc_ |>
+    ggplot2::ggplot(ggplot2::aes(x = Coverage, y = Accuracy)) +
+    ggplot2::geom_line(linewidth = 0.4) +
+    ggplot2::geom_point(ggplot2::aes(color = Threshold), size = 1.8) +
+    ggplot2::scale_color_gradient(low = "grey75", high = "grey15") +
+    ggplot2::scale_x_continuous(limits = c(0, 1)) +
+    ggplot2::labs(x = "Coverage (share of docs kept)", y = "Accuracy on kept", color = "Min conf")
+  clf_apply_theme(p_)
 }
 
 
-# Grid construction ----------------------------------------------------------------------------------------------------
+# Grid construction ---------------------------------------------------------
 
 #' Summarise a sweep grid, and project how long it will take
 #'
@@ -998,7 +889,7 @@ bert_report_grid <- function(.grid, .tab_overall = NULL,
         })
       )
   }
-  tbl_say(.tab = show_)
+  clf_say_table(.tab = show_)
   cli::cli_text("")
 
   cli::cli_alert_info(
@@ -1017,190 +908,7 @@ bert_report_grid <- function(.grid, .tab_overall = NULL,
   invisible(out_)
 }
 
-#' What the reported results actually rest on
-#'
-#' A sweep that is complete needs no such statement; a sweep that is not makes every table after it
-#' conditional on which runs happened to finish, and nothing in a leaderboard reveals that. This
-#' reports two different things, and the second matters more than the first.
-#'
-#' COMPLETENESS is how much of the planned grid exists. A configuration counts as complete only when
-#' every one of its folds is on disk, because a mean over three folds and a mean over five are not
-#' the same estimate and the leaderboard does not distinguish them.
-#'
-#' BALANCE is whether the completed configurations still form a full crossing of the swept axes. This
-#' is the assumption the marginal-effect table rests on: an axis level that has so far been estimated
-#' only alongside the settings that happen to run fastest will look strong because of where it sits
-#' rather than because of what it does. A partial sweep breaks balance long before it breaks
-#' completeness, so a grid can be most of the way finished and still not support the effects table.
-#'
-#' @param .grid The planned sweep grid, as passed to bert_sweep().
-#' @param .runs_root Directory holding the run folders.
-#' @param .axes Character vector of grid columns that are swept axes.
-#' @param .text_col,.batch_size,.seed The constants entering a run key. These must match the values
-#'   given to bert_sweep(), or this describes a different sweep from the one that ran.
-#' @return Invisibly a per-task tibble: planned, complete, partial and not-started configurations,
-#'   plus whether the completed subset is still fully crossed.
-bert_report_coverage <- function(.grid,
-                                 .runs_root  = here::here("2_output", "03B-ClassifyTrainBERT", "runs"),
-                                 .axes       = c("model", "lr", "max_len", "epochs", "class_weights"),
-                                 .text_col   = "Text",
-                                 .batch_size = 32L,
-                                 .seed       = 42L) {
-  if (FALSE) {
-    .grid       <- grid_all
-    .runs_root  <- .lP$Runs$Bert
-    .axes       <- c("model", "lr", "max_len", "epochs", "class_weights")
-    .text_col   <- "Text"
-    .batch_size <- 32L
-    .seed       <- 42L
-  }
-  axes_ <- .axes[.axes %in% names(.grid)]
-
-  # Reuse the sweep's own matching rule rather than reconstructing it. A second, independent rule
-  # would eventually disagree with the first, and this report would then describe a different sweep.
-  done_keys_ <- bert_done_keys(.runs_root)
-
-  grid_ <- .grid |>
-    dplyr::mutate(
-      RowKey = bert_run_key(
-        .label_col = .data$label_col, .model = .data$model, .text_col = .text_col,
-        .max_len = .data$max_len, .epochs = .data$epochs, .batch_size = .batch_size,
-        .lr = .data$lr, .class_weights = .data$class_weights, .seed = .seed, .fold = .data$fold
-      ),
-      ConfigKey = bert_run_key(
-        .label_col = .data$label_col, .model = .data$model, .text_col = .text_col,
-        .max_len = .data$max_len, .epochs = .data$epochs, .batch_size = .batch_size,
-        .lr = .data$lr, .class_weights = .data$class_weights, .seed = .seed, .fold = 0L
-      ),
-      Done = .data$RowKey %in% done_keys_
-    )
-
-  cfg_ <- grid_ |>
-    dplyr::summarise(
-      Folds     = dplyr::n(),
-      FoldsDone = sum(.data$Done),
-      .by = dplyr::all_of(c("label_col", "ConfigKey", axes_))
-    ) |>
-    dplyr::mutate(
-      State = dplyr::case_when(
-        .data$FoldsDone == .data$Folds ~ "Complete",
-        .data$FoldsDone > 0L           ~ "Partial",
-        TRUE                           ~ "NotStarted"
-      )
-    )
-
-  # Balance among the COMPLETE configurations, in two parts, because a single logical answer is not
-  # enough to act on.
-  #
-  # CROSSED asks whether the completed configurations form a full factorial over the levels that
-  # survive. If they do, the axes that remain can still be compared like for like.
-  #
-  # LOST asks which axes have fewer levels completed than planned. This is the failure the first test
-  # cannot see: a task whose sweep has finished only one encoder is perfectly crossed over everything
-  # else and will report Crossed = TRUE, while the encoder comparison the document is partly written
-  # to make has silently disappeared from the design.
-  axis_ <- purrr::map(axes_, \(.a) {
-    cfg_ |>
-      dplyr::summarise(
-        Planned   = dplyr::n_distinct(.data[[.a]]),
-        Estimated = dplyr::n_distinct(.data[[.a]][.data$State == "Complete"]),
-        .by = label_col
-      ) |>
-      dplyr::mutate(Axis = .a)
-  }) |>
-    purrr::list_rbind()
-
-  bal_ <- cfg_ |>
-    dplyr::filter(.data$State == "Complete") |>
-    dplyr::group_by(.data$label_col) |>
-    dplyr::group_modify(\(.d, .k) {
-      levels_ <- purrr::map_int(axes_, \(.a) dplyr::n_distinct(.d[[.a]]))
-      tibble::tibble(Crossed = nrow(.d) == prod(levels_))
-    }) |>
-    dplyr::ungroup()
-
-  lost_ <- axis_ |>
-    dplyr::summarise(
-      Lost = paste(.data$Axis[.data$Estimated < .data$Planned], collapse = ", "),
-      .by = label_col
-    )
-
-  out_ <- cfg_ |>
-    dplyr::summarise(
-      Planned    = dplyr::n(),
-      Complete   = sum(.data$State == "Complete"),
-      Partial    = sum(.data$State == "Partial"),
-      NotStarted = sum(.data$State == "NotStarted"),
-      .by = label_col
-    ) |>
-    dplyr::left_join(bal_,  by = dplyr::join_by(label_col)) |>
-    dplyr::left_join(lost_, by = dplyr::join_by(label_col)) |>
-    dplyr::mutate(
-      Crossed = dplyr::coalesce(.data$Crossed, FALSE),
-      Lost    = dplyr::coalesce(.data$Lost, "")
-    ) |>
-    dplyr::arrange(.data$label_col)
-
-  # Runs on disk that the planned grid does not contain. They are legitimate -- superseded levels are
-  # kept rather than deleted, as evidence for why they were dropped -- but they enter the leaderboard
-  # and the marginal-effect table, so a reader deciding what those tables rest on needs the count.
-  extra_ <- length(setdiff(done_keys_, grid_$RowKey))
-
-  cli::cli_h2("What these results rest on")
-  tbl_say(.tab = out_)
-  cli::cli_text("")
-
-  if (all(out_$Complete == out_$Planned)) {
-    cli::cli_alert_success(
-      "The planned grid is fully estimated. Every table below describes the design this document sets out."
-    )
-  } else {
-    cli::cli_alert_danger(
-      "{sum(out_$Planned - out_$Complete)} of {sum(out_$Planned)} configuration{?s} {?is/are} not \\
-       fully estimated. Scores below are computed on the completed subset."
-    )
-    uncrossed_ <- out_$label_col[!out_$Crossed]
-    if (length(uncrossed_) > 0L) {
-      cli::cli_alert_danger(
-        "Not a full crossing for {uncrossed_}. The marginal-effect table cannot be read for \\
-         {?that task/those tasks}: an axis level estimated against only some settings of the others \\
-         reflects where it sits, not what it does."
-      )
-    }
-    lost_any_ <- out_ |> dplyr::filter(.data$Lost != "")
-    if (nrow(lost_any_) > 0L) {
-      purrr::pwalk(
-        dplyr::select(lost_any_, label_col, Lost),
-        \(label_col, Lost) cli::cli_alert_danger(
-          "{label_col}: no completed run yet varies {Lost}. That comparison is absent from the design, \\
-           not weak in it."
-        )
-      )
-    }
-    if (length(uncrossed_) == 0L && nrow(lost_any_) == 0L) {
-      cli::cli_alert_info(
-        "The completed subset is still fully crossed over every planned level, so the \\
-         marginal-effect table remains a like-for-like comparison."
-      )
-    }
-  }
-
-  if (extra_ > 0L) {
-    cli::cli_alert_warning(
-      "{extra_} run{?s} on disk {?is/are} outside the planned grid. {?It/They} still enter{?s/} the \\
-       leaderboard and the marginal-effect table, which therefore describe a wider design than the \\
-       one summarised above."
-    )
-  }
-  cli::cli_alert_info(
-    "Complete means every fold of that configuration is on disk. A configuration counted as Partial \\
-     still contributes to the leaderboard, but on fewer folds than the rest."
-  )
-  invisible(out_)
-}
-
-
-# Configuration selection ----------------------------------------------------------------------------------------------
+# Configuration selection ---------------------------------------------------
 
 #' Name of the best-scoring configuration for one task
 #'
@@ -1232,11 +940,6 @@ bert_best_config <- function(.tab_overall, .label_col = "ClassDetailed") {
 #' @param .label_col Task to pool: "ClassDetailed", "ClassBroad" or "AmendType".
 #' @return Tibble of pooled out-of-fold predictions: DocID, TrueLabel, PredLabel, ConfigName, Fold.
 bert_best_predictions <- function(.tab_overall, .runs_roots, .label_col = "ClassDetailed") {
-  if (FALSE) {
-    .tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
-    .runs_roots  <- .lP$Runs$Bert
-    .label_col   <- "ClassDetailed"
-  }
   clf_pool_predictions(
     .runs_roots  = .runs_roots,
     .config_name = bert_best_config(.tab_overall = .tab_overall, .label_col = .label_col)
@@ -1244,7 +947,7 @@ bert_best_predictions <- function(.tab_overall, .runs_roots, .label_col = "Class
 }
 
 
-# Taxonomy consistency -------------------------------------------------------------------------------------------------
+# Taxonomy consistency ------------------------------------------------------
 
 #' Agreement between the two contract-type models across taxonomy levels
 #'
@@ -1292,19 +995,15 @@ bert_hierarchy_agreement <- function(.tab_pred_detailed, .tab_pred_broad, .tab_p
 #' @param .n Integer. Number of disagreeing category pairs to list.
 #' @return Invisibly the disagreement pair table.
 bert_report_hierarchy <- function(.tab_agree, .n = 10L) {
-  if (FALSE) {
-    .tab_agree <- agree_
-    .n         <- 10L
-  }
   n_    <- nrow(.tab_agree)
   dis_  <- .tab_agree |> dplyr::filter(!.data$Agree)
 
   cli::cli_h2("Taxonomy consistency -- detailed rolled up vs broad direct")
-  tbl_say(
+  clf_say_table(
     .tab = tibble::tibble(
       Outcome = c("Agree", "Disagree"),
       Docs    = c(n_ - nrow(dis_), nrow(dis_)),
-      Share   = tbl_pct(c((n_ - nrow(dis_)) / n_, nrow(dis_) / n_))
+      Share   = clf_pct(c((n_ - nrow(dis_)) / n_, nrow(dis_) / n_))
     )
   )
 
@@ -1315,7 +1014,7 @@ bert_report_hierarchy <- function(.tab_agree, .n = 10L) {
 
   # Where they disagree, which one was right? This decides which to publish.
   cli::cli_text("")
-  tbl_say(
+  clf_say_table(
     .tab = tibble::tibble(
       Verdict = c("Rolled-up detailed correct", "Broad direct correct", "Both wrong"),
       Docs    = c(
@@ -1324,7 +1023,7 @@ bert_report_hierarchy <- function(.tab_agree, .n = 10L) {
         sum(!dis_$RolledCorrect & !dis_$BroadCorrect)
       )
     ) |>
-      dplyr::mutate(Share = tbl_pct(.data$Docs / nrow(dis_))),
+      dplyr::mutate(Share = clf_pct(.data$Docs / nrow(dis_))),
     .title = "Adjudicating the disagreements"
   )
 
@@ -1333,7 +1032,7 @@ bert_report_hierarchy <- function(.tab_agree, .n = 10L) {
     dplyr::arrange(dplyr::desc(.data$Docs))
 
   cli::cli_text("")
-  tbl_say(
+  clf_say_table(
     .tab   = utils::head(pairs_, .n),
     .title = paste0("Where they part company (top ", min(.n, nrow(pairs_)), " of ", nrow(pairs_), ")")
   )
@@ -1346,7 +1045,7 @@ bert_report_hierarchy <- function(.tab_agree, .n = 10L) {
 }
 
 
-# Cross-task overview --------------------------------------------------------------------------------------------------
+# Cross-task overview -------------------------------------------------------
 
 #' Headline result for all three tasks, side by side
 #'
@@ -1386,7 +1085,7 @@ bert_report_summary <- function(.tab_overall, .runs_roots,
     purrr::list_rbind()
 
   cli::cli_h2("Headline results")
-  tbl_say(.tab = out_)
+  clf_say_table(.tab = out_)
   cli::cli_text("")
   cli::cli_alert_info(
     "All figures are pooled out-of-fold: every document is scored by a model that did not train on it."
@@ -1402,11 +1101,6 @@ bert_report_summary <- function(.tab_overall, .runs_roots,
 #' @return Invisibly the stacked per-class tibble.
 bert_report_perclass_all <- function(.tab_overall, .runs_roots,
                                      .label_cols = c("ClassDetailed", "ClassBroad", "AmendType")) {
-  if (FALSE) {
-    .tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
-    .runs_roots  <- .lP$Runs$Bert
-    .label_cols  <- c("ClassDetailed", "ClassBroad", "AmendType")
-  }
   out_ <- purrr::map(.label_cols, \(.task) {
     clf_pool_predictions(
       .runs_roots  = .runs_roots,
@@ -1420,7 +1114,7 @@ bert_report_perclass_all <- function(.tab_overall, .runs_roots,
   cli::cli_h2("Per-class scores, all tasks")
   out_ |>
     dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
-    tbl_say()
+    clf_say_table()
   cli::cli_text("")
   cli::cli_alert_info(
     "Macro-F1 is the unweighted mean of the F1 column within each task, so the smallest categories \\
@@ -1430,7 +1124,7 @@ bert_report_perclass_all <- function(.tab_overall, .runs_roots,
 }
 
 
-# Deploy: fit every task at every context length -----------------------------------------------------------------------
+# Deploy: fit every task at every context length ----------------------------
 
 #' Refit the best configuration of each task at each context length
 #'
@@ -1449,63 +1143,24 @@ bert_report_perclass_all <- function(.tab_overall, .runs_roots,
 #' @param .max_lens Integer vector of context lengths to fit at.
 #' @param .batch_size Integer. Training batch size.
 #' @param .overwrite Logical. Refit even where a model for that configuration already exists.
-#' @param .run_remaining Logical. TRUE fits the models. FALSE reports what would be fitted and stops.
-#'   Fitting on all data is the second thing in this document that spends GPU time, so rendering
-#'   against a partial sweep means turning this off as well as the sweep itself. A model deployed
-#'   from an incomplete sweep is a model whose configuration was crowned by a design that was never
-#'   estimated, which is worse than no model, so the skip is reported as a failure state.
 #' @param .verbose Logical. Stream per-epoch training loss to the console.
-#' @return Invisibly a tibble of the configurations fitted: Task, MaxLen, Config, MacroF1.
+#' @return Invisibly a tibble of the configurations fitted: Task, MaxLen, ConfigName, MacroF1.
 bert_fit_final_all <- function(.path_data, .tab_overall, .model_dir,
                                .label_cols = c("ClassDetailed", "ClassBroad", "AmendType"),
                                .max_lens   = c(256L, 512L),
-                               .batch_size = 32L, .overwrite = FALSE,
-                               .run_remaining = TRUE, .verbose = TRUE) {
+                               .batch_size = 32L, .overwrite = FALSE, .verbose = TRUE) {
   if (FALSE) {
-    .path_data     <- .lP$Input$Prepared
-    .tab_overall   <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
-    .model_dir     <- .lP$Output$ModelFinal
-    .label_cols    <- c("ClassDetailed", "ClassBroad", "AmendType")
-    .max_lens      <- c(256L, 512L)
-    .run_remaining <- TRUE
+    .path_data   <- .lP$Input$Prepared
+    .tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
+    .model_dir   <- .lP$Output$ModelFinal
+    .label_cols  <- c("ClassDetailed", "ClassBroad", "AmendType")
+    .max_lens    <- c(256L, 512L)
   }
   plan_ <- tidyr::expand_grid(Task = .label_cols, MaxLen = as.integer(.max_lens))
 
-  # A task-and-length combination with no completed run cannot be crowned. On a finished sweep every
-  # combination is present and this drops nothing; on a partial one it is the difference between
-  # deploying what exists and aborting the document.
-  plan_ <- plan_ |>
-    dplyr::mutate(
-      Runs = purrr::map2_int(.data$Task, .data$MaxLen, \(.t, .m) {
-        sum(.tab_overall$LabelCol == .t & as.integer(.tab_overall$MaxLen) == .m)
-      })
-    )
-  absent_ <- plan_ |> dplyr::filter(.data$Runs == 0L)
-  plan_   <- plan_ |> dplyr::filter(.data$Runs > 0L)
+  cli::cli_h2("Deploying {nrow(plan_)} model{?s}: {length(.label_cols)} task{?s} x {length(.max_lens)} context length{?s}")
 
-  if (nrow(absent_) > 0L) {
-    cli::cli_alert_warning(
-      "No completed runs for {nrow(absent_)} task-length combination{?s}: \\
-       {paste(absent_$Task, absent_$MaxLen, sep = '/', collapse = ', ')}. Skipped."
-    )
-  }
-  if (nrow(plan_) == 0L) {
-    cli::cli_alert_danger("Nothing deployable: the sweep has produced no runs at any requested length.")
-    return(invisible(NULL))
-  }
-
-  cli::cli_h2(
-    "Deploying {nrow(plan_)} model{?s}: {dplyr::n_distinct(plan_$Task)} task{?s} \\
-     x {dplyr::n_distinct(plan_$MaxLen)} context length{?s}"
-  )
-
-  if (!.run_remaining) {
-    cli::cli_alert_danger("DEPLOYMENT SKIPPED: {.arg .run_remaining} is FALSE. No model was fitted.")
-    tbl_say(.tab = dplyr::select(plan_, Task, MaxLen, Runs), .title = "Would have been fitted")
-    return(invisible(NULL))
-  }
-
-  out_ <- purrr::pmap(dplyr::select(plan_, Task, MaxLen), \(Task, MaxLen) {
+  out_ <- purrr::pmap(plan_, \(Task, MaxLen) {
     cfg_ <- bert_crowned_config(.tab_overall = .tab_overall, .label_col = Task, .max_len = MaxLen)
     board_ <- .tab_overall |>
       dplyr::filter(.data$LabelCol == Task) |>
@@ -1531,7 +1186,7 @@ bert_fit_final_all <- function(.path_data, .tab_overall, .model_dir,
     purrr::list_rbind()
 
   cli::cli_text("")
-  tbl_say(.tab = out_, .title = "Deployed models")
+  clf_say_table(.tab = out_, .title = "Deployed models")
   cli::cli_text("")
   cli::cli_alert_info(
     "MacroF1 is the cross-validated score of that configuration, so the accuracy cost of the shorter \\

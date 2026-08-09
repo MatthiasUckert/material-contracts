@@ -1,5 +1,5 @@
 ---
-title: "Contract Classification -- Routing Between the Arms (03E)"
+title: "Contract Classification -- Routing Between the Arms (03D)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -10,13 +10,16 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| purl: false
 knitr::opts_knit$set(root.dir = here::here())
 
-# Figure geometry is NOT set here -- it is declared once in _quarto.yml.
 knitr::opts_chunk$set(
-  root.dir = here::here(),
-  message  = TRUE,       # mandatory: cli writes through the message stream under knitr, so
-                         # message = FALSE would discard this document's entire output
-  warning  = FALSE,
-  comment  = ""          # drops the "##" prefix, so console blocks copy verbatim
+  root.dir  = here::here(),
+  message   = TRUE,       # mandatory: cli writes through the message stream under knitr, so
+                          # message = FALSE would discard this document's entire output
+  warning   = FALSE,
+  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
+  fig.width = 7.5,        # fixed for every figure; only height varies, and only with row count
+  fig.align = "center",
+  dpi       = 200,
+  out.width = "100%"
 )
 
 options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
@@ -27,25 +30,22 @@ options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste a
   rstudioapi::getActiveDocumentContext()[["path"]]
 }
 .name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
 ```
 
 ```{r}
-#| label: setup-sources
+#| label: load-libraries
 #| echo: false
 source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 
-# The shared design layer, sourced before anything that draws or prints.
-source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
-source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
-
-# This document consumes the whole stack. 03A owns the folds, the shared scoring layer and the
-# category vocabulary; 03B, 03C and 03D own the arms whose run folders are read here. Sourcing all
-# four means every arm is scored by identical code on identical splits and drawn with identical
-# category order, which is the only reason their numbers and their figures belong in one table.
+# This document consumes the whole stack. 03A owns the folds and the shared scoring layer, 03B the
+# transformer predictions and the per-document probability vectors, 03C the keyword runs. Sourcing
+# all three means every number below is produced by the same scoring code that produced theirs;
+# nothing here is re-estimated.
 purrr::walk(
-  .x = c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword",
-         "03D-ClassifyLLM"),
+  .x = c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword"),
   .f = function(.s) {
     source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
            encoding = "UTF-8")
@@ -54,37 +54,16 @@ purrr::walk(
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
-  .dir_here    = here::here(),   # project root
-  .name_script = .name_script    # this document's name; the output directory is derived from it
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
 ))
 
 cat("Function File: ")
 (.path_fun <- init_create_script_fun(
-  .dir_here    = here::here(),   # project root
-  .name_script = .name_script    # resolves to 1_code/03E-ClassifyOrchestrate.R
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/03D-ClassifyOrchestrate.R
 ))
 source(file = .path_fun, encoding = "UTF-8")
-
-# The policy search is five independent problems, one per fold, and nothing crosses between them.
-# Workers are separate R sessions that inherit nothing, so the libraries the fold loop needs are
-# sourced into each, IN DEPENDENCY ORDER: the design layers first, because the sample script registers
-# its taxonomy and aliases the table helpers at source time and throws part-way through the file
-# without them.
-#
-# Only the two libraries the fold loop actually calls are sent. The transformer, keyword and language
-# model scripts are what produced the run folders this document reads; none of their functions runs
-# inside a fold, and sourcing them into a worker would add failure surface for nothing.
-.workers <- orch_daemons(
-  .sources = c(
-    here::here("1_code", "_Commons", "_Plots.R"),    # registry, consumed by 03A at source time
-    here::here("1_code", "_Commons", "_Tables.R"),   # tbl_* helpers, aliased by 03A at source time
-    purrr::map_chr(
-      .x = c("03A-ClassifyPrepare", "03E-ClassifyOrchestrate"),   # scoring layer, then routing
-      .f = \(.s) init_create_script_fun(.dir_here = here::here(), .name_script = .s)
-    )
-  ),
-  .workers = NULL   # NULL leaves two cores for this session
-)
 ```
 
 # Purpose
@@ -177,8 +156,8 @@ fold they are entitled to.
     Deploy = utils_file_path(.dir_main, "deployment") # the manifest 03F reads
   ),
   Param = list(
-    Floors    = c(0, 0.70, 0.80, 0.90),   # score floors crossed into the policy grid
-    MaxDepth  = 2L,                       # longest cascade of abstaining arms
+    Floors    = c(0, 0.70, 0.80, 0.90), # score floors crossed into the policy grid
+    MaxDepth  = 2L,                     # longest cascade of abstaining arms
     Families  = c("cascade", "perclass"), # gating families searched
     Folds     = 5L,                     # folds an arm must cover to enter the nested search
     Holdout   = 5L,                     # the fold a written term list never read
@@ -223,12 +202,12 @@ tibble::tibble(
   Found = fs::dir_exists(c(.lP$Runs$Bert, .lP$Runs$Kw, .lP$Runs$Llm))
 ) |>
   dplyr::mutate(Path = fs::path_rel(Path, here::here())) |>
-  tbl_say(.title = "Runs roots feeding this document")
+  clf_say_table(.title = "Runs roots feeding this document")
 
 if (length(.dir_runs) == 0L) cli::cli_abort("No runs on disk; run 03B before this document")
 ```
 
-# The arms
+# The hierarchy
 
 The broad taxonomy is a strict roll-up of the detailed one, so each level could in principle
 constrain the other. 03B already guarantees a *consistent* published hierarchy by deriving the broad
@@ -292,7 +271,7 @@ arm_rollup <- orch_arm_rollup(
 )
 ```
 
-# The search
+# Selection
 
 Each task is run end to end by the same call. The rules a reader would want to check are named
 arguments rather than constants inside the function: how many folds an arm must cover, which labels
@@ -475,13 +454,13 @@ orch_report_movement(.tab = res_amend$Movement)
 
 ```{r}
 #| label: results-amendment-confusion
-tbl_say(
+clf_say_table(
   .tab   = clf_confusion(.tab_pred = res_amend$Nested), # routed labels against the truth
   .title = "Amendment -- confusion after routing"       # heading
 )
 ```
 
-## Agreement, and the flag that ships with the data
+# Agreement, and the flag that ships with the data
 
 Everything above decides which single label to release. This section asks the question a user of the
 released dataset actually faces, and which nothing so far answers: **how much to trust the label in
@@ -555,8 +534,8 @@ seats_ |>
     res_det$Roles |> dplyr::select(Arm, Role, Derived, Coverage, Accuracy),
     by = dplyr::join_by(Arm)
   ) |>
-  dplyr::mutate(Coverage = tbl_pct(Coverage), Accuracy = tbl_pct(Accuracy)) |>
-  tbl_say(.title = "Arms permitted to vote on the confidence flag")
+  dplyr::mutate(Coverage = clf_pct(Coverage), Accuracy = clf_pct(Accuracy)) |>
+  clf_say_table(.title = "Arms permitted to vote on the confidence flag")
 ```
 
 Derived arms are excluded by construction, since `ArmsCV` holds only arms read from run folders and
@@ -647,6 +626,72 @@ The generative arm is pinned in the manifest but **not enabled by default**. A c
 three-family flag asks for it and pays for it; a caller who does not gets the cheaper flag with
 reliability numbers that describe the vote they actually ran.
 
+# The deployment manifest
+
+The artifacts written above name configurations, and a configuration is not a model. A string like
+`ClassDetailed__nlpaueb-legal-bert...__L256_E6...` identifies a recipe that was cross-validated, not
+a directory holding weights. A downstream stage handed only that string would have to reconstruct the
+path from a naming convention -- and a convention shared between training and inference is one that
+will eventually be changed in one place and not the other.
+
+So the manifest resolves every arm to a concrete artifact, records the parameters it was validated
+under and what it scored, and states which arms are on by default. It is the single file 03F reads
+and the single thing that must be archived alongside the released labels for anyone to reproduce
+them.
+
+Paths come from each upstream stage's own helpers rather than from a convention restated here, which
+is the same rule that keeps the run roots from drifting.
+
+```{r}
+#| label: deploy-artifacts
+# Which lexicons 03C actually published. It writes a keyword table for the detailed taxonomy only,
+# so the lexical arm has runs for every task and a shippable artifact for one. Stating that here
+# rather than inferring it downstream is what turns a missing file into a reported gap.
+.kw_stems <- c(ClassDetailed = "keyword_table_detailed")
+
+tab_artifacts <- purrr::map(
+  .x = list(res_det, res_broad, res_amend),
+  .f = function(.r) {
+    orch_artifacts(
+      .res      = .r,          # one task's arms and incumbent
+      .dir_bert = .dir_bert,   # 03B's output root
+      .dir_kw   = .dir_kw,     # 03C's output root
+      .dir_llm  = .dir_llm,    # 03D's output root
+      .kw_stems = .kw_stems    # which tasks have a published lexicon
+    )
+  }
+) |>
+  purrr::list_rbind()
+
+tab_artifacts |>
+  dplyr::mutate(Path = fs::path_rel(Path, here::here())) |>
+  dplyr::select(LabelCol, Arm, Kind, Path) |>
+  clf_say_table(.title = "Artifacts to pin, per task")
+```
+
+Each task crowned its own configuration, so each pins its own checkpoint. A single global arm list
+would name the detailed task's model for all three, and the apply stage would discover it by finding
+no predictions for a terminal it had been told to use.
+
+```{r}
+#| label: deploy-save-manifest
+orch_save_manifest(
+  .results      = list(res_det, res_broad, res_amend), # every task's policy and validated score
+  .artifacts    = tab_artifacts,                       # arm to artifact, verified on disk
+  .agreement    = agree_sets,                          # reliability under every voting set
+  .sets         = sets_voting,                         # the sets themselves
+  .default_set  = .lP$Param$DefaultVoteSet,            # what a caller gets unless they ask
+  .default_kinds = .lP$Param$DefaultKinds,             # kinds enabled without being asked for
+  .dir          = .lP$Output$Deploy,                   # the directory 03F reads
+  .tab_prep     = tab_prep                             # provenance: sample size and fold count
+)
+```
+
+03F reads `manifest.json` and nothing else. Every default it applies is a value recorded here, so a
+caller who overrides one is visibly departing from a validated configuration rather than quietly
+choosing a different one.
+
+
 # Validation
 
 The routed labels must not contradict each other across taxonomy levels in a released dataset. Rolling
@@ -674,7 +719,7 @@ dplyr::bind_rows(
     dplyr::mutate(Route = "Transformer broad, direct", .before = 1)
 ) |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
-  tbl_say(.title = "Four routes to the broad taxonomy, all scored at the broad level")
+  clf_say_table(.title = "Four routes to the broad taxonomy, all scored at the broad level")
 ```
 
 Four routes converging within noise is the substantive finding, not a null: it says the two taxonomy
@@ -732,9 +777,9 @@ dplyr::bind_rows(
     orch_pick_policy(.tolerance = .lP$Param$Tolerance) |>
     dplyr::mutate(Arms = "Mined plus curated", .before = 1)
 ) |>
-  dplyr::mutate(Accuracy = tbl_pct(Accuracy), MacroF1 = sprintf("%.3f", MacroF1)) |>
+  dplyr::mutate(Accuracy = clf_pct(Accuracy), MacroF1 = sprintf("%.3f", MacroF1)) |>
   dplyr::select(Arms, Label, Accuracy, MacroF1, nRouted) |>
-  tbl_say(.title = "Holdout fold: does hand curation change the best cascade?")
+  clf_say_table(.title = "Holdout fold: does hand curation change the best cascade?")
 ```
 
 With no fold-restricted arms on disk, the two rows are identical by construction and the check is
@@ -756,7 +801,7 @@ dplyr::bind_rows(
     dplyr::mutate(Scoring = "Lenient", .before = 1)
 ) |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
-  tbl_say(.title = "Routed detailed procedure under strict and lenient scoring")
+  clf_say_table(.title = "Routed detailed procedure under strict and lenient scoring")
 ```
 
 ## Label provenance
@@ -781,7 +826,7 @@ purrr::map(
   purrr::list_rbind() |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
   dplyr::select(LabelCol, Labels, Accuracy, F1_macro, N) |>
-  tbl_say(.title = "Routed procedures by label provenance")
+  clf_say_table(.title = "Routed procedures by label provenance")
 ```
 
 # Deployment
@@ -800,7 +845,7 @@ purrr::map(list(res_det, res_broad, res_amend), function(.r) {
   )
 }) |>
   purrr::list_rbind() |>
-  tbl_say(.title = "Derived arms: in the search, out of the deployment")
+  clf_say_table(.title = "Derived arms: in the search, out of the deployment")
 ```
 
 A derived arm competes on equal terms and can win a fold on its merits, which is why it is built at
@@ -821,9 +866,9 @@ purrr::map(
   }
 ) |>
   purrr::list_rbind() |>
-  dplyr::mutate(Accuracy = tbl_pct(Accuracy), MacroF1 = sprintf("%.3f", MacroF1)) |>
+  dplyr::mutate(Accuracy = clf_pct(Accuracy), MacroF1 = sprintf("%.3f", MacroF1)) |>
   dplyr::select(LabelCol, Label, Accuracy, MacroF1, nRouted) |>
-  tbl_say(.title = "All-fold leaderboards, top five per task")
+  clf_say_table(.title = "All-fold leaderboards, top five per task")
 ```
 
 ```{r}
@@ -863,83 +908,6 @@ on a corpus that has no labels to estimate it from.
 03F reads these files and applies them. It makes no routing decision of its own: an apply script that
 re-derived a policy would be free to re-derive it differently, and the released labels would then
 depend on which script last ran.
-
-## The manifest
-
-The artifacts written above name configurations, and a configuration is not a model. A string like
-`ClassDetailed__nlpaueb-legal-bert...__L256_E6...` identifies a recipe that was cross-validated, not
-a directory holding weights. A downstream stage handed only that string would have to reconstruct the
-path from a naming convention -- and a convention shared between training and inference is one that
-will eventually be changed in one place and not the other.
-
-So the manifest resolves every arm to a concrete artifact, records the parameters it was validated
-under and what it scored, and states which arms are on by default. It is the single file 03F reads
-and the single thing that must be archived alongside the released labels for anyone to reproduce
-them.
-
-Paths come from each upstream stage's own helpers rather than from a convention restated here, which
-is the same rule that keeps the run roots from drifting.
-
-```{r}
-#| label: deploy-artifacts
-# Which lexicons 03C published, one per task. Stating the stems here rather than deriving them from
-# the task name is deliberate: 03C names these files and this stage reads them, and a convention
-# shared between two stages is one that will eventually be changed in one place and not the other.
-# A stem naming a file that is not there becomes a reported gap rather than a silent absence.
-.kw_stems <- c(
-  ClassDetailed = "keyword_table_detailed",
-  ClassBroad    = "keyword_table_broad",
-  AmendType     = "keyword_table_amendment"
-)
-
-tab_artifacts <- purrr::map(
-  .x = list(res_det, res_broad, res_amend),
-  .f = function(.r) {
-    orch_artifacts(
-      .res      = .r,          # one task's arms and incumbent
-      .dir_bert = .dir_bert,   # 03B's output root
-      .dir_kw   = .dir_kw,     # 03C's output root
-      .dir_llm  = .dir_llm,    # 03D's output root
-      .kw_stems = .kw_stems    # which tasks have a published lexicon
-    )
-  }
-) |>
-  purrr::list_rbind()
-
-tab_artifacts |>
-  dplyr::mutate(Path = fs::path_rel(Path, here::here())) |>
-  dplyr::select(LabelCol, Arm, Kind, Path) |>
-  tbl_say(.title = "Artifacts to pin, per task")
-```
-
-Each task crowned its own configuration, so each pins its own checkpoint. A single global arm list
-would name the detailed task's model for all three, and the apply stage would discover it by finding
-no predictions for a terminal it had been told to use.
-
-```{r}
-#| label: deploy-save-manifest
-orch_save_manifest(
-  .results      = list(res_det, res_broad, res_amend), # every task's policy and validated score
-  .artifacts    = tab_artifacts,                       # arm to artifact, verified on disk
-  .agreement    = agree_sets,                          # reliability under every voting set
-  .sets         = sets_voting,                         # the sets themselves
-  .default_set  = .lP$Param$DefaultVoteSet,            # what a caller gets unless they ask
-  .default_kinds = .lP$Param$DefaultKinds,             # kinds enabled without being asked for
-  .dir          = .lP$Output$Deploy,                   # the directory 03F reads
-  .tab_prep     = tab_prep                             # provenance: sample size and fold count
-)
-```
-
-03F reads `manifest.json` and nothing else. Every default it applies is a value recorded here, so a
-caller who overrides one is visibly departing from a validated configuration rather than quietly
-choosing a different one.
-
-```{r}
-#| label: stop-workers
-# The last policy search has run; the figures below need no workers. Stopping them here rather than
-# leaving them to the session keeps a rendered document from holding processes open afterwards.
-mirai::daemons(0L)
-```
 
 # Overview
 
@@ -983,7 +951,7 @@ orch_report_all(.res = res_amend, .n_folds = .lP$Param$Folds)
 
 ```{r}
 #| label: fig-compare-detailed
-#| fig-height: !expr plot_height(nrow(res_det$Compare))
+#| fig-height: 3.4
 #| fig-cap: "Macro-F1 by strategy, detailed taxonomy. The dashed line is the incumbent; the hollow
 #|   bar was selected and scored on the same documents and is not obtainable by running the procedure."
 orch_plot_compare(.compare = res_det$Compare)
@@ -993,8 +961,8 @@ orch_plot_compare(.compare = res_det$Compare)
 
 ```{r}
 #| label: fig-compare-broad
-#| fig-height: !expr plot_height(nrow(res_broad$Compare))
-#| fig-cap: "Macro-F1 by strategy, broad taxonomy. Same fixed axis as the panel above."
+#| fig-height: 3.4
+#| fig-cap: "Macro-F1 by strategy, broad taxonomy."
 orch_plot_compare(.compare = res_broad$Compare)
 ```
 
@@ -1002,8 +970,8 @@ orch_plot_compare(.compare = res_broad$Compare)
 
 ```{r}
 #| label: fig-compare-amendment
-#| fig-height: !expr plot_height(nrow(res_amend$Compare))
-#| fig-cap: "Macro-F1 by strategy, amendment task. Same fixed axis as the panels above."
+#| fig-height: 2.4
+#| fig-cap: "Macro-F1 by strategy, amendment task."
 orch_plot_compare(.compare = res_amend$Compare)
 ```
 
@@ -1017,7 +985,7 @@ orch_plot_compare(.compare = res_amend$Compare)
 
 ```{r}
 #| label: fig-stability-detailed
-#| fig-height: !expr plot_height(3)
+#| fig-height: 2.4
 #| fig-cap: "Documents the crowned policy moved away from the terminal, per held-out fold. A fold at
 #|   zero ran the incumbent whatever its winning policy was called."
 orch_plot_stability(.tab_nested = res_det$Nested)
@@ -1027,7 +995,7 @@ orch_plot_stability(.tab_nested = res_det$Nested)
 
 ```{r}
 #| label: fig-stability-broad
-#| fig-height: !expr plot_height(3)
+#| fig-height: 2.4
 #| fig-cap: "Documents routed per held-out fold, broad taxonomy."
 orch_plot_stability(.tab_nested = res_broad$Nested)
 ```
@@ -1036,7 +1004,7 @@ orch_plot_stability(.tab_nested = res_broad$Nested)
 
 ```{r}
 #| label: fig-stability-amendment
-#| fig-height: !expr plot_height(3)
+#| fig-height: 2.4
 #| fig-cap: "Documents routed per held-out fold, amendment task."
 orch_plot_stability(.tab_nested = res_amend$Nested)
 ```
@@ -1047,7 +1015,7 @@ orch_plot_stability(.tab_nested = res_amend$Nested)
 
 ```{r}
 #| label: fig-agreement-tiers
-#| fig-height: !expr plot_height(7)
+#| fig-height: 3.0
 #| fig-cap: "Accuracy of the shipped label by agreement tier, detailed taxonomy. Bar shading is the
 #|   share of the corpus each tier covers: a tier can be near-perfect and still too small to use."
 orch_plot_agreement(.tab = agree_det)
@@ -1061,7 +1029,7 @@ orch_plot_agreement(.tab = agree_det)
 
 ```{r}
 #| label: fig-perclass-detailed
-#| fig-height: !expr plot_height(12)
+#| fig-height: 4.6
 #| fig-cap: "Per-category F1 for the routed procedure, detailed taxonomy."
 clf_plot_perclass(.tab_pred = res_det$Nested)
 ```
@@ -1070,18 +1038,18 @@ clf_plot_perclass(.tab_pred = res_det$Nested)
 
 ```{r}
 #| label: fig-perclass-broad
-#| fig-height: !expr plot_height(7)
+#| fig-height: 3.4
 #| fig-cap: "Per-category F1 for the routed procedure, broad taxonomy."
-clf_plot_perclass(.tab_pred = res_broad$Nested, .key = "ClassBroad")
+clf_plot_perclass(.tab_pred = res_broad$Nested)
 ```
 
 ### Amendment
 
 ```{r}
 #| label: fig-perclass-amendment
-#| fig-height: !expr plot_height(2)
+#| fig-height: 2.4
 #| fig-cap: "Per-category F1 for the routed procedure, amendment task."
-clf_plot_perclass(.tab_pred = res_amend$Nested, .key = "AmendType")
+clf_plot_perclass(.tab_pred = res_amend$Nested)
 ```
 
 :::

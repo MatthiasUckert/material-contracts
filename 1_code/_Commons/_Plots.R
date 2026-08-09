@@ -289,6 +289,16 @@ plot_scale_fill_grad <- function(...) {
   ggplot2::scale_fill_gradient(low = "#FFFFFF", high = "#002147", ...)
 }
 
+#' Continuous colour: white to the darkest house blue
+#'
+#' The colour twin of plot_scale_fill_grad, for points and lines carrying a magnitude.
+#'
+#' @param ... Passed to ggplot2::scale_colour_gradient().
+#' @return A ggplot2 scale.
+plot_scale_colour_grad <- function(...) {
+  ggplot2::scale_colour_gradient(low = "#bfd7ed", high = "#002147", ...)
+}
+
 #' Percent axis with no wasted expansion
 #' @param .accuracy Numeric. Rounding for the tick labels.
 #' @param .expand Numeric length-two. Multiplicative expansion, lower then upper.
@@ -439,13 +449,24 @@ plot_factor <- function(.x, .key, .short = FALSE, .extra = NULL, .rev = FALSE) {
     .rev   <- FALSE
   }
   entry_  <- plot_entry(.key)
-  levels_ <- c(entry_$Levels, .extra)
-  labels_ <- c(if (.short) entry_$Short else entry_$Levels, .extra)
 
-  seen_    <- setdiff(unique(as.character(.x)), c(levels_, NA_character_))
-  if (length(seen_) > 0L) {
+  # A sentinel is appended only when the data actually contains it. Registered categories are always
+  # kept, because a category the model never predicted should still show as an empty column and that
+  # emptiness is a finding. A sentinel is different: it is not a category, and a method that never
+  # abstains would otherwise be drawn with a phantom row and column labelled "(none)" that no
+  # document could ever occupy.
+  seen_extra_ <- intersect(.extra, unique(as.character(.x)))
+  levels_ <- c(entry_$Levels, seen_extra_)
+  labels_ <- c(if (.short) entry_$Short else entry_$Levels, seen_extra_)
+
+  unknown_ <- setdiff(unique(as.character(.x)), c(levels_, NA_character_))
+  if (length(unknown_) > 0L) {
+    # The count leads the sentence rather than a bare "Value{?s}". A pluralisation marker takes its
+    # quantity from an interpolation, and with none before it and two after, cli cannot tell which
+    # of them to count -- so the abort itself fails, and the message naming the real problem is the
+    # one thing the reader never sees.
     cli::cli_abort(c(
-      "Value{?s} not registered under {.val {(.key)}}: {seen_}.",
+      "{length(unknown_)} value{?s} not registered under {.val {(.key)}}: {unknown_}.",
       "i" = "Register them, or pass them through {.arg .extra} if they are sentinels."
     ))
   }
@@ -558,10 +579,17 @@ plot_wrap <- function(.x, .width = 24L) {
 #' @param .accuracy Numeric or NULL. Rounding for the value labels. NULL prints whole numbers with
 #'   comma grouping and everything else to two decimals.
 #' @param .pct Logical. Treat the value as a proportion: percent axis and percent labels.
+#' @param .limits Numeric length-two or NULL. Fix the value axis. Supply this whenever several
+#'   figures show the same bounded metric -- per-category F1 across three tasks, say. Left to
+#'   auto-scale, each panel fits its own data and three panels that look alike are on three different
+#'   axes, which is the specific misreading these figures exist to prevent.
+#' @param .extra Character vector or NULL. Levels drawn after the registered ones, for sentinels a
+#'   vocabulary does not contain. Requires .key.
 #' @param .desc Logical. Largest bar at the top. Ignored when .key is supplied.
 #' @return A ggplot.
 plot_bar_ranked <- function(.tab, .cat, .val, .key = NULL, .short = FALSE, .label = TRUE,
-                            .accuracy = NULL, .pct = FALSE, .desc = TRUE) {
+                            .accuracy = NULL, .pct = FALSE, .limits = NULL, .extra = NULL,
+                            .desc = TRUE) {
   if (FALSE) {
     .tab      <- tibble::tibble(Class = c("Leases", "Licenses", "Other"), N = c(303L, 210L, 88L))
     .cat      <- "Class"
@@ -571,6 +599,8 @@ plot_bar_ranked <- function(.tab, .cat, .val, .key = NULL, .short = FALSE, .labe
     .label    <- TRUE
     .accuracy <- NULL
     .pct      <- FALSE
+    .limits   <- NULL
+    .extra    <- NULL
     .desc     <- TRUE
   }
   dat_ <- .tab |>
@@ -579,7 +609,7 @@ plot_bar_ranked <- function(.tab, .cat, .val, .key = NULL, .short = FALSE, .labe
       PlotCat = if (is.null(.key)) {
         forcats::fct_reorder(as.character(.data[[.cat]]), .data$PlotVal, .desc = !.desc)
       } else {
-        plot_factor(.data[[.cat]], .key = .key, .short = .short, .rev = TRUE)
+        plot_factor(.data[[.cat]], .key = .key, .short = .short, .extra = .extra, .rev = TRUE)
       }
     )
 
@@ -602,8 +632,26 @@ plot_bar_ranked <- function(.tab, .cat, .val, .key = NULL, .short = FALSE, .labe
     )
   }
 
+  # A fixed limit and the label headroom fight each other: the expansion that leaves room for a value
+  # label past the end of a bar would push the axis beyond an explicit upper bound. Where limits are
+  # given, the headroom is folded into the upper limit instead, so the label still fits and the axis
+  # still matches its sibling panels.
+  scale_ <- if (!is.null(.limits)) {
+    pad_ <- if (.label) 0.08 * diff(.limits) else 0
+    ggplot2::scale_x_continuous(
+      limits = c(.limits[[1]], .limits[[2]] + pad_),
+      breaks = scales::breaks_pretty(n = 5)(.limits),
+      labels = if (.pct) scales::label_percent() else scales::label_comma(),
+      expand = ggplot2::expansion(mult = c(0, 0))
+    )
+  } else if (.pct) {
+    plot_scale_x_pct(.expand = c(0, 0.12))
+  } else {
+    plot_scale_x_count()
+  }
+
   p_ +
-    (if (.pct) plot_scale_x_pct(.expand = c(0, 0.12)) else plot_scale_x_count()) +
+    scale_ +
     ggplot2::labs(x = NULL, y = NULL) +
     plot_theme(.grid = "none", .legend = "none")
 }
@@ -624,9 +672,21 @@ plot_bar_ranked <- function(.tab, .cat, .val, .key = NULL, .short = FALSE, .labe
 #' @param .pct Logical. Treat the value as a proportion.
 #' @param .accuracy Numeric. Rounding for the cell labels.
 #' @param .angle Numeric. Rotation of the horizontal axis labels.
+#' @param .extra Character vector or NULL. Levels drawn after the registered ones on whichever axes
+#'   are keyed, for sentinels a vocabulary does not contain. A method that can abstain predicts one,
+#'   and the column showing which true categories it abstained on is exactly what the figure is for.
+#' @param .limits Numeric length-two or NULL. Fix the fill scale. Supply this for any quantity with a
+#'   meaningful absolute scale -- a share, an accuracy, an agreement rate. Left to auto-scale, the
+#'   ramp is stretched across whatever range the data happens to occupy, so a near-constant quantity
+#'   renders its rounding noise as strong visual structure, and two panels that should be compared
+#'   end up on two different scales while looking alike.
+#' @param .label_min Numeric or NULL. Suppress the printed value on cells below this. A sparse matrix
+#'   is mostly zeros, and printing every one of them buries the handful of cells that carry the
+#'   result under a field of noughts. The cell is still drawn and still shaded; only its label goes.
 #' @return A ggplot.
 plot_heatmap <- function(.tab, .x, .y, .fill, .key_x = NULL, .key_y = NULL, .short = FALSE,
-                         .label = TRUE, .pct = FALSE, .accuracy = 0.01, .angle = 40) {
+                         .label = TRUE, .pct = FALSE, .accuracy = 0.01, .angle = 40,
+                         .extra = NULL, .limits = NULL, .label_min = NULL) {
   if (FALSE) {
     .tab      <- tibble::tibble(Pred = c("A", "B"), True = c("A", "A"), Share = c(0.9, 0.1))
     .x        <- "Pred"
@@ -639,15 +699,18 @@ plot_heatmap <- function(.tab, .x, .y, .fill, .key_x = NULL, .key_y = NULL, .sho
     .pct      <- TRUE
     .accuracy <- 0.01
     .angle    <- 40
+    .extra     <- NULL
+    .limits    <- NULL
+    .label_min <- NULL
   }
   dat_ <- .tab |>
     dplyr::mutate(
       PlotFill = as.numeric(.data[[.fill]]),
       PlotX    = if (is.null(.key_x)) factor(as.character(.data[[.x]])) else {
-        plot_factor(.data[[.x]], .key = .key_x, .short = .short)
+        plot_factor(.data[[.x]], .key = .key_x, .short = .short, .extra = .extra)
       },
       PlotY    = if (is.null(.key_y)) factor(as.character(.data[[.y]])) else {
-        plot_factor(.data[[.y]], .key = .key_y, .short = .short)
+        plot_factor(.data[[.y]], .key = .key_y, .short = .short, .extra = .extra)
       }
     )
 
@@ -658,24 +721,35 @@ plot_heatmap <- function(.tab, .x, .y, .fill, .key_x = NULL, .key_y = NULL, .sho
   }
 
   # Text on a filled tile has to survive both ends of the ramp, so it flips to white on the dark
-  # half rather than sitting in one colour that is unreadable somewhere.
-  mid_ <- mean(range(dat_$PlotFill, na.rm = TRUE))
+  # half rather than sitting in one colour that is unreadable somewhere. The threshold is the midpoint
+  # of the SCALE, not of the data: with fixed limits the data may occupy a narrow band well away from
+  # the middle, and splitting on the data's own midpoint would flip the text inside a uniform block.
+  span_ <- if (is.null(.limits)) range(dat_$PlotFill, na.rm = TRUE) else .limits
+  mid_  <- mean(span_)
 
   p_ <- dat_ |>
     ggplot2::ggplot(ggplot2::aes(x = .data$PlotX, y = .data$PlotY, fill = .data$PlotFill)) +
     ggplot2::geom_tile(colour = "white", linewidth = 0.4)
 
   if (.label) {
+    lab_ <- dat_
+    if (!is.null(.label_min)) lab_ <- dplyr::filter(lab_, .data$PlotFill >= .label_min)
     p_ <- p_ + ggplot2::geom_text(
-      ggplot2::aes(label = fmt_(.data$PlotFill), colour = .data$PlotFill > mid_),
-      size = (.plot_base - 3) / ggplot2::.pt, family = .plot_font, show.legend = FALSE
+      data    = lab_,
+      mapping = ggplot2::aes(label = fmt_(.data$PlotFill), colour = .data$PlotFill > mid_),
+      size    = (.plot_base - 3) / ggplot2::.pt, family = .plot_font, show.legend = FALSE
     ) +
       ggplot2::scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black"), guide = "none")
   }
 
   p_ +
-    plot_scale_fill_grad(labels = fmt_, name = NULL) +
-    ggplot2::scale_y_discrete(limits = rev) +
+    plot_scale_fill_grad(labels = fmt_, name = NULL, limits = .limits) +
+    # drop = FALSE keeps every registered level on the axis even when nothing lands on it. A category
+    # a classifier never predicts would otherwise lose its column, and the matrix would quietly stop
+    # being square -- hiding the very fact that the category is never chosen. Where an axis is not
+    # keyed, its factor carries only observed levels, so this changes nothing.
+    ggplot2::scale_x_discrete(drop = FALSE) +
+    ggplot2::scale_y_discrete(limits = rev, drop = FALSE) +
     ggplot2::labs(x = NULL, y = NULL) +
     plot_theme(.grid = "none", .legend = "right") +
     ggplot2::theme(
@@ -697,10 +771,14 @@ plot_heatmap <- function(.tab, .x, .y, .fill, .key_x = NULL, .key_y = NULL, .sho
 #' @param .hi Character or NULL. Column holding the upper bound.
 #' @param .key Character or NULL. Registration key ordering the items; NULL orders by estimate.
 #' @param .ref Numeric or NULL. Vertical reference line, drawn recessive behind the points.
+#' @param .limits Numeric length-two or NULL. Fix the value axis. Left NULL the axis zooms to the
+#'   estimates, which is usually what a ranking figure wants -- the differences it exists to show are
+#'   often smaller than the metric's full range. Supply limits when several panels of the same metric
+#'   must be compared against each other rather than read one at a time.
 #' @param .desc Logical. Largest estimate at the top. Ignored when .key is supplied.
 #' @return A ggplot.
 plot_points_ci <- function(.tab, .cat, .val, .lo = NULL, .hi = NULL, .key = NULL,
-                           .ref = NULL, .desc = TRUE) {
+                           .ref = NULL, .limits = NULL, .desc = TRUE) {
   if (FALSE) {
     .tab  <- tibble::tibble(Config = c("a", "b"), F1 = c(0.88, 0.81), Lo = c(0.85, 0.78),
                             Hi = c(0.91, 0.84))
@@ -708,9 +786,10 @@ plot_points_ci <- function(.tab, .cat, .val, .lo = NULL, .hi = NULL, .key = NULL
     .val  <- "F1"
     .lo   <- "Lo"
     .hi   <- "Hi"
-    .key  <- NULL
-    .ref  <- NULL
-    .desc <- TRUE
+    .key    <- NULL
+    .ref    <- NULL
+    .limits <- NULL
+    .desc   <- TRUE
   }
   dat_ <- .tab |>
     dplyr::mutate(
@@ -732,8 +811,17 @@ plot_points_ci <- function(.tab, .cat, .val, .lo = NULL, .hi = NULL, .key = NULL
       orientation = "y", width = 0.22, linewidth = 0.3, colour = .plot_ink
     )
   }
+  p_ <- p_ + ggplot2::geom_point(size = 1.9, colour = .plot_ink)
+  # Expansion is set explicitly rather than left to the default. A ranking figure zooms hard, so five
+  # percent of a range a few hundredths wide is a few thousandths of headroom, and the outermost
+  # interval caps end up flush against the panel edge looking clipped.
+  p_ <- p_ + if (is.null(.limits)) {
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = 0.07))
+  } else {
+    ggplot2::scale_x_continuous(limits = .limits)
+  }
+
   p_ +
-    ggplot2::geom_point(size = 1.9, colour = .plot_ink) +
     ggplot2::labs(x = NULL, y = NULL) +
     plot_theme(.grid = "x", .legend = "none")
 }
@@ -783,7 +871,16 @@ plot_bar_stacked <- function(.tab, .cat, .val, .fill, .key = NULL, .key_fill = N
 
   p_ <- dat_ |>
     ggplot2::ggplot(ggplot2::aes(x = .data$PlotVal, y = .data$PlotCat, fill = .data$PlotFill)) +
-    ggplot2::geom_col(position = if (.share) "fill" else "stack", width = 0.7)
+    ggplot2::geom_col(
+      position = if (.share) {
+        # reverse = TRUE so the first level draws leftmost. Without it ggplot stacks in reverse
+        # factor order while the legend lists forward order, and the two disagree on the page.
+        ggplot2::position_fill(reverse = TRUE)
+      } else {
+        ggplot2::position_stack(reverse = TRUE)
+      },
+      width = 0.7
+    )
 
   scale_ <- if (is.null(.key_fill)) {
     plot_scale_fill_cat(name = NULL)

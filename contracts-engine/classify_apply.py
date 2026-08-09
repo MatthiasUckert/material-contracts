@@ -19,6 +19,14 @@ from_pretrained, so they are written into the checkpoint's config.json and trave
 Reconstructing them here from a labelled sample would be a second source of truth, and the two would
 eventually disagree about which integer means which category -- silently, since the outputs would
 still be valid category names.
+
+TWO GUESSES, NOT ONE
+The softmax over every category is computed whatever we keep, so keeping the runner-up costs nothing
+but two columns. It answers the question a released label raises most often -- if not this category,
+then which -- and it does so without the alternative, --save-probs, which writes one column per
+category and turns a corpus-scale table into a wide one for the sake of a single number. Where a task
+has only two categories the runner-up is simply the other one, and its probability is one minus the
+first; the columns are still written, so downstream code needs no special case.
 """
 
 from __future__ import annotations
@@ -88,6 +96,8 @@ def main() -> None:
     n = len(texts)
     top_idx: list[int] = []
     top_prob: list[float] = []
+    second_idx: list[int] = []
+    second_prob: list[float] = []
     all_probs: list[torch.Tensor] = []
 
     t0 = time.time()
@@ -101,9 +111,21 @@ def main() -> None:
             enc = {k: v.to(device) for k, v in enc.items()}
             logits = model(**enc).logits
             probs = torch.softmax(logits, dim=-1).detach().to("cpu")
-            best = probs.argmax(dim=-1)
-            top_idx.extend(best.tolist())
-            top_prob.extend(probs.gather(1, best.unsqueeze(1)).squeeze(1).tolist())
+            # topk rather than argmax: the same single pass over the probabilities yields the
+            # runner-up, and k is clamped because a binary head has no third place to ask for.
+            k = min(2, probs.shape[1])
+            vals, idxs = probs.topk(k, dim=-1)
+            top_idx.extend(idxs[:, 0].tolist())
+            top_prob.extend(vals[:, 0].tolist())
+            if k > 1:
+                second_idx.extend(idxs[:, 1].tolist())
+                second_prob.extend(vals[:, 1].tolist())
+            else:
+                # A single-category head has no runner-up. -1 is carried rather than a label so the
+                # frame below can distinguish "no second category exists" from "the second category
+                # is named None", which a null string could not.
+                second_idx.extend([-1] * probs.shape[0])
+                second_prob.extend([float("nan")] * probs.shape[0])
             if args.save_probs:
                 all_probs.append(probs)
             if args.verbose and (start // args.batch_size) % 50 == 0:
@@ -111,8 +133,13 @@ def main() -> None:
 
     out = pd.DataFrame({
         args.id_col: df[args.id_col].tolist(),
+        # PredLabel and Top1Prob keep the names they have always had, so a parquet written by an
+        # earlier version still reads. Top2 is added beside them rather than renaming the first pair
+        # into a symmetric scheme, which would break every reader for a cosmetic gain.
         "PredLabel": [id2label[i] for i in top_idx],
         "Top1Prob": top_prob,
+        "Top2Label": [id2label[i] if i >= 0 else None for i in second_idx],
+        "Top2Prob": second_prob,
     })
     if args.save_probs:
         wide = pd.DataFrame(torch.cat(all_probs).numpy(), columns=labels_sorted)

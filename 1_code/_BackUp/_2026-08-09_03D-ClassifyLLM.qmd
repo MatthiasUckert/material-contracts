@@ -10,13 +10,16 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| purl: false
 knitr::opts_knit$set(root.dir = here::here())
 
-# Figure geometry is NOT set here -- it is declared once in _quarto.yml.
 knitr::opts_chunk$set(
-  root.dir = here::here(),
-  message  = TRUE,       # mandatory: cli writes through the message stream under knitr, so
-                         # message = FALSE would discard this document's entire output
-  warning  = FALSE,
-  comment  = ""          # drops the "##" prefix, so console blocks copy verbatim
+  root.dir  = here::here(),
+  message   = TRUE,       # mandatory: cli writes through the message stream under knitr, so
+                          # message = FALSE would discard this document's entire output
+  warning   = FALSE,
+  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
+  fig.width = 7.5,        # fixed for every figure; only height varies, and only with row count
+  fig.align = "center",
+  dpi       = 200,
+  out.width = "100%"
 )
 
 options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
@@ -27,22 +30,19 @@ options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste a
   rstudioapi::getActiveDocumentContext()[["path"]]
 }
 .name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
 ```
 
 ```{r}
-#| label: setup-sources
+#| label: load-libraries
 #| echo: false
 source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 
-# The shared design layer, sourced before anything that draws or prints.
-source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
-source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
-
-# 03A owns the folds, the shared scoring layer and the category vocabulary; 03B supplies the
-# transformer predictions this arm is measured against. Sourcing both means the language model is
-# scored by the same code on the same splits and drawn with the same category order, which is the
-# only reason its numbers and its figures can sit beside the other arms'.
+# 03A owns the folds and the shared scoring layer; 03B supplies the transformer predictions this
+# stage is measured against. Sourcing both means the LLM arm is scored by the same code on the same
+# splits, which is the only reason its numbers can sit in the same table.
 purrr::walk(
   .x = c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT"),
   .f = function(.s) {
@@ -53,14 +53,14 @@ purrr::walk(
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
-  .dir_here    = here::here(),   # project root
-  .name_script = .name_script    # this document's name; the output directory is derived from it
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
 ))
 
 cat("Function File: ")
 (.path_fun <- init_create_script_fun(
-  .dir_here    = here::here(),   # project root
-  .name_script = .name_script    # resolves to 1_code/03D-ClassifyLLM.R
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/03D-ClassifyLLM.R
 ))
 source(file = .path_fun, encoding = "UTF-8")
 ```
@@ -312,7 +312,7 @@ grid_blind <- llm_grid(
 
 grid_blind |>
   dplyr::select(Model, Guidance, Window = NChars, Abstain = AllowAbstain, Think) |>
-  tbl_say(.title = paste0("Blind grid: ", nrow(grid_blind), " configurations"))
+  clf_say_table(.title = paste0("Blind grid: ", nrow(grid_blind), " configurations"))
 ```
 
 A missing model is the failure worth catching first. Ollama answers every request for an unpulled tag
@@ -408,7 +408,7 @@ grid_cross <- llm_grid(
 
 grid_cross |>
   dplyr::select(Model, Guidance, Shots, Window = NChars, Abstain = AllowAbstain, Think) |>
-  tbl_say(.title = paste0("Cross-fold grid: ", nrow(grid_cross), " configurations"))
+  clf_say_table(.title = paste0("Cross-fold grid: ", nrow(grid_cross), " configurations"))
 ```
 
 ```{r}
@@ -625,11 +625,11 @@ clf_load_overall(.runs_roots = .dir_runs) |>
   dplyr::arrange(dplyr::desc(MacroF1)) |>
   dplyr::mutate(
     Model    = sub("^llm-", "", Model),
-    Coverage = tbl_pct(Coverage),
-    Accuracy = tbl_pct(Accuracy),
+    Coverage = clf_pct(Coverage),
+    Accuracy = clf_pct(Accuracy),
     MacroF1  = sprintf("%.3f", MacroF1)
   ) |>
-  tbl_say(.title = "Blind against tuned, on the holdout fold only")
+  clf_say_table(.title = "Blind against tuned, on the holdout fold only")
 ```
 
 Both tiers are compared on the same fold-five documents, which is the only comparison available: a
@@ -656,7 +656,7 @@ dplyr::bind_rows(
     dplyr::mutate(Labels = "Round 2 only", .before = 1)
 ) |>
   dplyr::mutate(dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))) |>
-  tbl_say(.title = "Leading LLM configuration by label provenance")
+  clf_say_table(.title = "Leading LLM configuration by label provenance")
 ```
 
 # Deployment
@@ -672,7 +672,7 @@ fs::dir_ls(.dir_runs, type = "directory") |>
   tibble::tibble(Run = _) |>
   dplyr::mutate(ConfigName = sub("_F\\d+$", "", Run)) |>
   dplyr::count(ConfigName, name = "Folds") |>
-  tbl_say(.title = "Runs written, available to the orchestrator")
+  clf_say_table(.title = "Runs written, available to the orchestrator")
 ```
 
 # Overview
@@ -691,10 +691,9 @@ llm_report_all(
 
 ```{r}
 #| label: fig-llm-leaderboard
-#| fig-height: !expr plot_height(llm_n_configs(tab_overall, "ClassDetailed", 12L))
+#| fig-height: 4.6
 #| fig-cap: "Macro-F1 by configuration. Hollow bars are tuned prompts, written against four of the
-#|   five folds, so their score does not estimate what a new prompt would achieve. The axis is fixed
-#|   at zero to one, so this panel is comparable with the other arms."
+#|   five folds, so their score does not estimate what a new prompt would achieve."
 llm_plot_leaderboard(
   .tab_overall = tab_overall,     # bound per-fold metrics
   .label_col   = "ClassDetailed", # task
@@ -704,53 +703,22 @@ llm_plot_leaderboard(
 
 ```{r}
 #| label: fig-llm-coverage
-#| fig-height: !expr plot_height(7)
+#| fig-height: 3.4
 #| fig-cap: "Coverage against precision on committed documents. A point high and to the left is
 #|   precise only because it declined most of the corpus, which is useful in a cascade and poor
-#|   standing alone."
+#|   standalone."
 llm_plot_coverage(
   .tab_overall = tab_overall,     # bound per-fold metrics
   .label_col   = "ClassDetailed"  # task
 )
 ```
 
-::: {.panel-tabset}
-
-## Per category
-
 ```{r}
 #| label: fig-llm-perclass
-#| fig-height: !expr plot_height(12)
-#| fig-cap: "Per-category F1 for the leading full-coverage configuration, detailed taxonomy. The axis
-#|   matches the transformer and keyword figures, so the three arms compare bar for bar."
+#| fig-height: 4.6
+#| fig-cap: "Per-category F1 for the leading LLM configuration, detailed taxonomy."
 clf_plot_perclass(.tab_pred = pred_llm)
 ```
-
-Whether this arm reaches the thin categories the transformer struggles with is the one result that
-would make it worth routing to regardless of its aggregate score. Read this panel against the same
-figure in 03B and 03C: the categories are in the same order and on the same axis in all three.
-
-## Where it abstains
-
-```{r}
-#| label: fig-llm-confusion
-#| fig-height: !expr plot_height(12, .square = TRUE)
-#| fig-cap: "Confusion matrix for the leading full-coverage configuration, row-normalised. Where the
-#|   schema permitted declining, the rightmost column carries the share of each category the model
-#|   refused to commit on."
-clf_plot_confusion(
-  .tab_pred  = pred_llm,      # leading full-coverage configuration, pooled across every fold
-  .normalize = TRUE,          # each row sums to one, so any abstention share is directly readable
-  .limits    = c(0, 1),       # same fill scale as the transformer and keyword matrices
-  .label_min = 0.005          # a cell below half a percent is drawn but not labelled
-)
-```
-
-The three arms now carry the same matrix in the same orientation with the same fill scale. Reading
-them together is what the routing question in 03E turns on: a cell where this arm is strong and the
-transformer weak is the only place a cascade can gain anything.
-
-:::
 
 # Next
 

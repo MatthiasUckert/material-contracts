@@ -1,17 +1,16 @@
 # _quarto.yml
 project:
-  # Run every document's code from the PROJECT ROOT (not the .qmd's own folder),
-  # so repo-root-relative paths like source("1_code/_Initialize.R") and here::here()
-  # resolve the same way they do interactively in RStudio. Without this Quarto
-  # defaults to execute-dir: file (the .qmd's directory) and those paths break.
+  # Run every document's code from the PROJECT ROOT (not the .qmd's own folder), so repo-root-relative
+  # paths like source("1_code/_Commons/_Initialize.R") and here::here() resolve the same way they do
+  # interactively in RStudio. Without this Quarto defaults to execute-dir: file (the .qmd's directory)
+  # and those paths break.
   execute-dir: project
 
-  # Rendered HTML/PDF land here (mirroring the input path, e.g.
-  # 1_code/03A-ClassifyPrepare.qmd -> _rendered/1_code/03A-ClassifyPrepare.html).
-  # R-side artifacts (parquet, runs) are written directly by arrow/fs under
-  # 2_output/ and are NOT affected by this. Change "_rendered" to taste.
-  # Note: `quarto render` with no args now renders the WHOLE project; use
-  # `quarto render <file.qmd>` to render a single document.
+  # Rendered HTML/PDF land here, mirroring the input path, e.g.
+  # 1_code/03A-ClassifyPrepare.qmd -> _rendered/1_code/03A-ClassifyPrepare.html.
+  # R-side artifacts (parquet, runs) are written directly by arrow/fs under 2_output/ and are NOT
+  # affected by this. Note: `quarto render` with no argument renders the WHOLE project; use
+  # `quarto render <file.qmd>` for a single document.
   output-dir: _rendered
 
 format:
@@ -26,34 +25,52 @@ format:
     code-line-numbers: true
     code-copy: true
     self-contained: true
-    fig-align: center
-    fig-format: svg
-    fig-width: 16
-    fig-height: 7
-    out-width: "100%"
     mainfont: "Times New Roman"
     fontfamily: "serif"
     css: _styles.css
     theme:
       - none
 
+    # FIGURE GEOMETRY -- declared once, here, for every document in the project.
+    #
+    # Width is fixed and never varies. A figure that appears to need a wider canvas almost always
+    # needs shorter labels instead: identifiers built for uniqueness run to eighty characters and
+    # will consume any width they are given. _Plots.R supplies plot_wrap() and the level registry's
+    # short labels for exactly this.
+    #
+    # Height varies with row count, chosen from the ladder in plot_height() rather than typed by
+    # hand. The default below is the ladder's middle rung, so a chunk that forgets to set a height
+    # still lands on the ladder instead of at some arbitrary value.
+    #
+    # This was previously restated in every document's setup chunk. Ten copies of one setting is how
+    # two documents came to render at more than twice the width of the other eight, with no error and
+    # no visible symptom beyond axis text at half size. It is declared once now, and setup chunks
+    # must not override it.
+    fig-align: center
+    fig-width: 7.5
+    fig-height: 3.4
+    out-width: "100%"
+
   pdf:
-    # PDF prerequisites: `quarto install tinytex` (or a system TeX). xelatex is
-    # required for the Times New Roman system font. CSS does NOT apply to PDF --
-    # the fixed-left TOC and _styles1.css are HTML-only; PDF is styled here.
-    echo: false        # no code in the PDF -- results-only (HTML keeps folded code)
+    echo: false        # results only in the PDF; the HTML keeps folded code
     pdf-engine: xelatex
     mainfont: "Times New Roman"
     toc: true
     toc-depth: 4
-    fig-align: center
-    fig-width: 8         # narrower than HTML's 16 so figures fit the page
-    fig-height: 4.5
-    fig-dpi: 300         # crisp raster (ragg_png) embedding
     code-overflow: wrap
     geometry: margin=1in
     colorlinks: true
+    fig-align: center
+    fig-width: 7.5     # identical to HTML, so a figure is the same object in both
+    fig-height: 3.4
+    fig-dpi: 300
 
 knitr:
   opts_chunk:
+    # ragg rasterises text with the actual system font, so what the HTML shows is what the font
+    # resolution really produced. An SVG device would defer that to whatever the reader's browser has
+    # installed and could silently substitute a different face for Times -- the failure _Plots.R now
+    # warns about at source time. Vector figures for the manuscript come from plot_save(), which
+    # writes a real PDF, so nothing is lost by rasterising here.
     dev: "ragg_png"
+    dpi: 200
