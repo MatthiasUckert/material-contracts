@@ -441,7 +441,7 @@ ner_redaction <- function(
 }
 
 # Run extract_moneyregex.py over parquet input(s); returns the output path. A rule arm for the one
-# label that never had a measured engine (Engine = "paper", Model = "moneyregex-v1", Label =
+# label that never had a measured engine (Engine = "paper", Model = "moneyregex-v2", Label =
 # "MONEY", LabelRaw = the form matched: symbol_amount / symbol_redact / symbol_bare / euro_letter /
 # amount_word / words_only). Money is the only reason a transformer sits in the deployed policy, and
 # the resolver already filters that transformer's spans to those carrying a currency marker -- so a
@@ -515,7 +515,7 @@ ner_moneyregex <- function(
   if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_moneyregex.py failed (status {status_}).")
   
   elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("moneyregex [moneyregex-v1] done in {elapsed_}s -> {.path {(.output)}}")
+  if (!.quiet) cli::cli_alert_success("moneyregex [moneyregex-v2] done in {elapsed_}s -> {.path {(.output)}}")
   return(invisible(.output))
 }
 
@@ -531,7 +531,7 @@ ner_moneyregex <- function(
 #   "paper:dateregex-v1"   -- paper date regexes (Engine "paper", Label DATE)
 #   "paper:gazetteer-v1"   -- paper place gazetteer (Engine "paper", Label GPE)
 #   "paper:redaction-v1"   -- paper redaction indicators (Engine "paper", Label REDACT)
-#   "paper:moneyregex-v1"  -- paper monetary patterns (Engine "paper", Label MONEY)
+#   "paper:moneyregex-v2"  -- paper monetary patterns (Engine "paper", Label MONEY)
 # The "paper" engine groups the paper's own ported extractors (provenance axis
 # for the head-to-head: paper vs spacy vs lexnlp), separated by Model. The token
 # is the combo's identity everywhere: ner_arg keys, staging names, runs ledger.
@@ -604,7 +604,7 @@ ner_run <- function(
     "paper:dateregex-v1" = "DATE",
     "paper:gazetteer-v1" = "GPE",
     "paper:redaction-v1" = "REDACT",
-    "paper:moneyregex-v1" = "MONEY"
+    "paper:moneyregex-v2" = "MONEY"
   )
   
   # Parse .run tokens ("engine" or "engine:model") into the combo grid. Model =
@@ -626,10 +626,10 @@ ner_run <- function(
       tibble::tibble(Engine = "lexnlp", Model = "lexnlp", ModelArg = "lexnlp")
     } else { # paper
       if (length(parts_) < 2L) {
-        cli::cli_abort("paper needs a model: {.val {(.tok)}} -> one of dateregex-v1|gazetteer-v1|redaction-v1|moneyregex-v1")
+        cli::cli_abort("paper needs a model: {.val {(.tok)}} -> one of dateregex-v1|gazetteer-v1|redaction-v1|moneyregex-v2")
       }
       model_ <- parts_[2]
-      if (!model_ %in% c("dateregex-v1", "gazetteer-v1", "redaction-v1", "moneyregex-v1")) {
+      if (!model_ %in% c("dateregex-v1", "gazetteer-v1", "redaction-v1", "moneyregex-v2")) {
         cli::cli_abort("Unknown paper model {.val {model_}}; expected dateregex-v1|gazetteer-v1|redaction-v1|moneyregex-v1.")
       }
       tibble::tibble(Engine = "paper", Model = model_, ModelArg = model_)
@@ -726,7 +726,7 @@ ner_run <- function(
           .id_col = .id_col, .text_col = .text_col,
           .labels = labels_, .max_chars = .max_chars, .quiet = .quiet
         )
-      } else if (engine_ == "paper" && model_ == "moneyregex-v1") {
+      } else if (engine_ == "paper" && model_ == "moneyregex-v2") {
         ner_moneyregex(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,

@@ -39,6 +39,13 @@ established a paragraph earlier and never repeated. The first looks rare -- a re
 session observed that word forms almost always sit beside the digit form in parentheses --
 and the second is a relation, not a pattern. Neither is claimed to be handled.
 
+WHAT IT DELIBERATELY DOES NOT MATCH
+A currency name with no figure attached. The transformer tags "U.S. Dollars", "Dollars"
+and "the Dollar" as money roughly seven hundred times across the sample, and none of them
+is an amount -- "payable in U.S. Dollars" states a denomination. Requiring a figure is what
+separates the two, and it is why this arm returns fewer spans than the transformer while
+covering more of the cases that carry a number.
+
 THIS IS A CANDIDATE FOR MEASUREMENT, NOT A REPLACEMENT
 Swapping one declared engine for another is not an improvement in evidence. What this arm
 makes possible is a comparison: cross-engine agreement, the shape checks in 04B, and how
@@ -65,18 +72,37 @@ import pyarrow.dataset as pads
 from tqdm import tqdm
 
 ENGINE = "paper"
-MODEL = "moneyregex-v1"   # identifies THIS pattern set; bump on any rule change
+MODEL = "moneyregex-v2"   # identifies THIS pattern set; bump on any rule change
 LABEL = "MONEY"
 COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
 
 # Symbols that survive HTML-to-text conversion, and the national prefixes that precede them.
 # R$ and US$ both end in the dollar sign, so the prefix is optional rather than enumerated twice.
-CUR_SYM = "[$\u00a3\u20ac\u00a5]"
+# \u0080 is the euro sign mangled by a cp1252 round trip, which is how it survives conversion in a
+# fair number of these filings: 42 spans across 24 documents that a proper euro class never sees.
+CUR_SYM = "[$\u00a3\u20ac\u00a5\u0080]"
 PREFIX = r"(?:US|R|C|A|HK|S|NZ)?"
 
-# Grouped thousands, or a decimal, or a bare integer. The grouped form is listed first so that
-# "1,500,000" is taken whole rather than as "1" followed by the rest.
-NUM = r"\d{1,3}(?:[,.]\d{3})+(?:\.\d+)?|\d+\.\d+|\d+"
+# Whitespace between a currency marker and its figure is routine in converted filings, so the gap
+# is up to three characters rather than one. A single optional space misses "$  5,000" outright,
+# and 579 of the 2,125 currency-adjacent redaction sites carry whitespace before the marker.
+#
+# ISO codes and spelt currency names, both with and without a space before the figure. Contracts
+# with a foreign counterparty write "EUR 11,848,000" and "RMB10,000,000" and nothing else, so a
+# symbol-only arm returns no money at all for them -- the gap is small in total volume and total
+# for the documents it affects.
+ISO = r"(?:USD|EUR|GBP|CHF|JPY|CAD|AUD|CNY|RMB|HKD|SGD|NZD|SEK|NOK|DKK)"
+CUR_NAME = r"(?:euros?|dollars?|pounds?|renminbi|yen)"
+
+# Separators must be CONSISTENT. Allowing either as a group separator lets a comma-grouped figure
+# run past its own decimal point into the next number: "$9,752,233.001.857" was captured whole,
+# 71 times, and parses to nothing. Commas group with a dot decimal, dots group with a comma
+# decimal, and the two are never mixed.
+NUM = (
+    r"\d{1,3}(?:,\d{3})+(?:\.\d+)?"     # 1,234,567.89   US convention
+    r"|\d{1,3}(?:\.\d{3})+(?:,\d+)?"     # 1.234.567,89   European convention
+    r"|\d+\.\d+|\d+"
+)
 
 # Numerals as words. "and" is NOT in this list: a pattern admitting it would match "and Dollars"
 # in ordinary running text, which occurs constantly and is not an amount.
@@ -90,9 +116,14 @@ CUR_WORD = r"(?:dollars?|euros?|pounds?)"
 # Order matters only for reporting; overlaps are resolved by length in find_amounts().
 PATTERNS = [
     # $5,000,000  US$10,000  R$1.500.000  EUR185,000,000  $0.001
-    ("symbol_amount", rf"{PREFIX}{CUR_SYM}\s?(?:{NUM})"),
-    # $[***]  $TBD  $____  -- the amount was withheld and the symbol survived
-    ("symbol_redact", rf"{PREFIX}{CUR_SYM}\s?(?:\[[^\]]{{0,40}}\]|TBD|_{{2,}})"),
+    ("symbol_amount", rf"{PREFIX}{CUR_SYM}\s{{0,3}}(?:{NUM})"),
+    # EUR 11,848,000  USD9,750,000  RMB10,000,000
+    ("iso_amount", rf"(?<![A-Za-z]){ISO}\s{{0,3}}(?:{NUM})"),
+    # Euro 6.667.856,00 -- the name spelt out, and European separators with it
+    ("name_amount", rf"(?<![A-Za-z]){CUR_NAME}\s{{0,3}}(?:{NUM})"),
+    # $[***]  $**  $TBD  $____  -- the amount was withheld and the symbol survived. Bare asterisks
+    # are included because a redaction is not always bracketed: "$**" occurs 43 times.
+    ("symbol_redact", rf"{PREFIX}{CUR_SYM}\s{{0,3}}(?:\[[^\]]{{0,40}}\]|\*{{1,6}}|TBD|_{{2,}})"),
     # "a minimum market price of $ per share" -- withheld with nothing at all left behind
     ("symbol_bare", rf"{PREFIX}{CUR_SYM}(?=\s+per\b)"),
     # A euro amount whose symbol became a capital E in conversion. Grouped thousands are required:

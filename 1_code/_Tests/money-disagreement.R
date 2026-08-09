@@ -56,7 +56,7 @@ DBI::dbGetQuery(con, paste0(
   "  FROM s.candidates r JOIN txt t USING (DocID) ",
   "  WHERE r.Label = 'REDACT' AND r.Start IS NOT NULL ",
   "    AND regexp_matches(substring(t.TextRaw, greatest(1, r.Start - 2), least(3, r.Start)), ",
-  "                       '[$]\\\\s*$')) ",
+  "                       '[$\u00a3\u00a5\u20ac]\\s*$')) ",
   "SELECT regexp_replace(s.After, '[0-9]+', 'N', 'g') AS AfterShape, COUNT(*) AS N, ",
   "       any_value(s.Before || ' <<>> ' || s.After) AS Example ",
   "FROM site s WHERE NOT EXISTS (SELECT 1 FROM m WHERE m.Combo = '", .rgx, "' ",
