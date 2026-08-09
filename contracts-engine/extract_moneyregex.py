@@ -72,7 +72,7 @@ import pyarrow.dataset as pads
 from tqdm import tqdm
 
 ENGINE = "paper"
-MODEL = "moneyregex-v2"   # identifies THIS pattern set; bump on any rule change
+MODEL = "moneyregex-v4"   # identifies THIS pattern set; bump on any rule change
 LABEL = "MONEY"
 COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
 
@@ -81,7 +81,8 @@ COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Mod
 # \u0080 is the euro sign mangled by a cp1252 round trip, which is how it survives conversion in a
 # fair number of these filings: 42 spans across 24 documents that a proper euro class never sees.
 CUR_SYM = "[$\u00a3\u20ac\u00a5\u0080]"
-PREFIX = r"(?:US|R|C|A|HK|S|NZ)?"
+# U.S.$10,000,000 occurs with the stops in place; a prefix without them misses it.
+PREFIX = r"(?:U\.?S\.?|R|C|A|HK|S|NZ)?"
 
 # Whitespace between a currency marker and its figure is routine in converted filings, so the gap
 # is up to three characters rather than one. A single optional space misses "$  5,000" outright,
@@ -92,7 +93,11 @@ PREFIX = r"(?:US|R|C|A|HK|S|NZ)?"
 # symbol-only arm returns no money at all for them -- the gap is small in total volume and total
 # for the documents it affects.
 ISO = r"(?:USD|EUR|GBP|CHF|JPY|CAD|AUD|CNY|RMB|HKD|SGD|NZD|SEK|NOK|DKK)"
-CUR_NAME = r"(?:euros?|dollars?|pounds?|renminbi|yen)"
+# Names that precede their figure. Dollar and pound are deliberately absent: English writes the
+# number first ("5,000,000 Dollars", handled by amount_word), and a name-then-number rule on
+# "dollar" matched a loan-servicing data dictionary 123 times across two documents -- field specs
+# reading "No commas(,) or dollar signs", not amounts. Euro, renminbi and yen do occur this way.
+CUR_NAME = r"(?:euros?|renminbi|yen)"
 
 # Separators must be CONSISTENT. Allowing either as a group separator lets a comma-grouped figure
 # run past its own decimal point into the next number: "$9,752,233.001.857" was captured whole,
@@ -117,13 +122,27 @@ CUR_WORD = r"(?:dollars?|euros?|pounds?)"
 PATTERNS = [
     # $5,000,000  US$10,000  R$1.500.000  EUR185,000,000  $0.001
     ("symbol_amount", rf"{PREFIX}{CUR_SYM}\s{{0,3}}(?:{NUM})"),
+    # $30 million, $25.0 million. The figure alone parses to thirty, so the scale word has to be
+    # inside the span or the amount is out by six orders of magnitude. Listed before the plain
+    # symbol form because overlaps resolve longest-first and this one must win.
+    ("symbol_scaled",
+     rf"{PREFIX}{CUR_SYM}\s{{0,3}}\d+(?:\.\d+)?\s?(?:million|billion|thousand|trillion)\b"),
     # EUR 11,848,000  USD9,750,000  RMB10,000,000
     ("iso_amount", rf"(?<![A-Za-z]){ISO}\s{{0,3}}(?:{NUM})"),
     # Euro 6.667.856,00 -- the name spelt out, and European separators with it
     ("name_amount", rf"(?<![A-Za-z]){CUR_NAME}\s{{0,3}}(?:{NUM})"),
     # $[***]  $**  $TBD  $____  -- the amount was withheld and the symbol survived. Bare asterisks
     # are included because a redaction is not always bracketed: "$**" occurs 43 times.
-    ("symbol_redact", rf"{PREFIX}{CUR_SYM}\s{{0,3}}(?:\[[^\]]{{0,40}}\]|\*{{1,6}}|TBD|_{{2,}})"),
+    # The bracket content excludes BOTH brackets. Excluding only the closing one lets an unclosed
+    # "$[" run forward to the next "]" belonging to a different marker, which in testing produced
+    # a span of twenty-two characters of prose between two redactions.
+    ("symbol_redact",
+     rf"{PREFIX}{CUR_SYM}\s{{0,3}}(?:\[[^\[\]\n]{{0,40}}\]|\*{{1,6}}|TBD|_{{2,}})"),
+    # A table cell truncated at conversion leaves "$[" with no closing bracket, 69 times across 34
+    # documents. The content is restricted to whitespace and asterisks rather than made optional:
+    # an unbounded run to the next space swallowed forty characters of ordinary prose in testing.
+    # Listed after the closed form so that longest-first still prefers "$[***]" over "$[***".
+    ("symbol_redact_open", rf"{PREFIX}{CUR_SYM}\s{{0,3}}\[[\s*]{{0,6}}"),
     # "a minimum market price of $ per share" -- withheld with nothing at all left behind
     ("symbol_bare", rf"{PREFIX}{CUR_SYM}(?=\s+per\b)"),
     # A euro amount whose symbol became a capital E in conversion. Grouped thousands are required:

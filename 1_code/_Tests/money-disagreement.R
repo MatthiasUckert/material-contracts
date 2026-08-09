@@ -6,7 +6,7 @@
 
 .path_text  <- here::here("2_output", "04A-EntityExtract", "sample_text.parquet")
 .path_store <- here::here("2_output", "04A-EntityExtract", "Store", "EntityCandidates.duckdb")
-.rgx        <- "paper:moneyregex-v1"
+.rgx        <- "paper:moneyregex-v4"
 .trf        <- "spacy:en_core_web_trf"
 
 con <- DBI::dbConnect(duckdb::duckdb())
@@ -20,6 +20,18 @@ DBI::dbExecute(con, paste0(
   "  CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END AS Combo ",
   "FROM s.candidates WHERE Label = 'MONEY' AND Start IS NOT NULL"
 ))
+
+# A named combo the store does not hold makes both comparisons meaningless without failing: one
+# side of the difference is empty, so the first block lists everything the other engine found and
+# the second returns nothing at all. Both look like results.
+have_ <- DBI::dbGetQuery(con, "SELECT DISTINCT Combo FROM m ORDER BY Combo")$Combo
+cli::cli_alert_info("Money combos in the store: {have_}")
+miss_ <- setdiff(c(.rgx, .trf), have_)
+if (length(miss_) > 0L) {
+  cli::cli_abort(c("Combo not in the store: {miss_}",
+                   "i" = "Available: {have_}",
+                   "i" = "Set .rgx / .trf to match, or re-run 04A for the missing engine."))
+}
 
 # Digits collapse to N so that "$5,000,000" and "$250,000" land in one row. Without it every
 # amount is its own shape and the table is a list rather than a diagnosis.
@@ -81,3 +93,41 @@ DBI::dbGetQuery(con, paste0(
   tibble::as_tibble() |> print(n = 25)
 
 DBI::dbDisconnect(con, shutdown = TRUE)
+
+
+# Does the regex REACH a before_unit redaction, or merely sit near one? -------------------
+# The reach test in 04B counts a site as covered when a money span falls within three
+# characters, which a neighbouring amount satisfies without the marker itself being found.
+# Overlap is the stricter question and the one the number should be read as.
+
+CUR <- paste0("[", intToUtf8(c(0x24, 0xA3, 0xA5, 0x20AC)), "]")
+
+DBI::dbExecute(con, paste0(
+  "CREATE OR REPLACE TABLE site AS ",
+  "SELECT r.DocID, r.Start, r.Stop, ",
+  "  CASE WHEN regexp_matches(substring(t.TextRaw, greatest(1, r.Start - 2), ",
+  "                           least(3, r.Start)), '", CUR, "\\s*$') THEN 'after_currency' ",
+  "       WHEN regexp_matches(substring(t.TextRaw, r.Stop + 1, 14), ",
+  "            '^\\s*(%|per\\s+[a-z]|(business |calendar )?(day|month|year|week)s?)') ",
+  "         THEN 'before_unit' ELSE 'other' END AS Site ",
+  "FROM s.candidates r JOIN txt t USING (DocID) ",
+  "WHERE r.Label = 'REDACT' AND r.Start IS NOT NULL"
+))
+
+cli::cli_h2("Reach against mere adjacency, by site class")
+DBI::dbGetQuery(con, paste0(
+  "SELECT s.Site, COUNT(DISTINCT s.DocID || ':' || s.Start) AS NSites, ",
+  "  COUNT(DISTINCT CASE WHEN m.DocID IS NOT NULL ",
+  "        THEN s.DocID || ':' || s.Start END) AS NNearby, ",
+  "  COUNT(DISTINCT CASE WHEN m.Start <= s.Start AND m.Stop >= s.Start ",
+  "        THEN s.DocID || ':' || s.Start END) AS NOverlapping ",
+  "FROM site s LEFT JOIN m ON m.DocID = s.DocID AND m.Combo = '", .rgx, "' ",
+  "  AND m.Stop >= s.Start - 3 AND m.Start <= s.Stop + 3 ",
+  "GROUP BY s.Site ORDER BY s.Site"
+)) |>
+  tibble::as_tibble() |>
+  dplyr::mutate(
+    PctNearby      = NNearby / NSites,
+    PctOverlapping = NOverlapping / NSites
+  ) |>
+  print(n = 10)
