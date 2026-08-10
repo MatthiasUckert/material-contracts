@@ -85,38 +85,23 @@ import pandas as pd
 import sklearn
 from sklearn.feature_extraction.text import CountVectorizer, ENGLISH_STOP_WORDS
 
+# The tokenisation lives in one place now, because it is half of what a published table's precision
+# is a property of. Mining defined it and application re-implemented it, and the two disagreed.
+from keyword_text import (
+    DOMAIN_STOPWORDS,
+    SW_TAG,
+    build_vectorizer,
+    canonical_terms,
+    ngram_max,
+    resolve_stopwords,
+    truncate_words,
+)
+
 # A custom token_pattern paired with a stop_words list triggers a benign sklearn
 # UserWarning; we pass stop_words=None, but keep the filter for safety.
 warnings.filterwarnings("ignore", message=".*stop_words may be inconsistent.*")
 
 Z_95 = 1.959963984540054      # two-sided 95% normal quantile
-
-# SEC / EDGAR filing boilerplate that survives the alpha token filter but carries
-# no class signal. Deliberately EXCLUDES amend/restated: those are the amendment
-# task's entire signal.
-DOMAIN_STOPWORDS = frozenset({
-    "exhibit", "exhibits", "txt", "htm", "html", "pdf", "doc", "docx",
-    "page", "pages", "dated", "form", "forms", "schedule", "schedules",
-    "annex", "appendix", "registrant", "filed", "filing",
-})
-
-# Stamped into the mine name so regimes are distinct on disk and become a
-# leaderboard axis rather than a silent setting.
-SW_TAG = {"none": "none", "english": "en", "domain": "dom", "english_domain": "endom"}
-
-
-def resolve_stopwords(choice):
-    """Map the --stopwords choice to what CountVectorizer expects."""
-    if choice == "none":
-        return None
-    if choice == "english":
-        return "english"
-    if choice == "domain":
-        return sorted(DOMAIN_STOPWORDS)
-    if choice == "english_domain":
-        return sorted(ENGLISH_STOP_WORDS | DOMAIN_STOPWORDS)
-    raise ValueError(f"unknown stopwords choice: {choice}")
-
 
 def fmt_num(x):
     xf = float(x)
@@ -137,13 +122,6 @@ def smoke_subset(df, label_col, n_per_class):
     parts = [g.sample(min(len(g), n_per_class), random_state=0)
              for _, g in df.groupby(label_col)]
     return pd.concat(parts).reset_index(drop=True)
-
-
-def truncate_words(texts, n_words):
-    """First n_words whitespace words of each text (0 = full document)."""
-    if not n_words:
-        return texts
-    return [" ".join(t.split()[:n_words]) for t in texts]
 
 
 def wilson_lower(k, n, z=Z_95):
@@ -171,25 +149,6 @@ def wilson_lower(k, n, z=Z_95):
 
 
 # Candidate statistics ----------------------------------------------------
-
-def build_vectorizer(ngram_range, min_df, max_df, min_token_len, stopwords=None,
-                     vocabulary=None):
-    """CountVectorizer with the project's alpha-only token pattern.
-
-    Numbers and punctuation never become keywords: exhibit numbers, dates and
-    dollar amounts are entity-extraction territory (the NER track), not contract
-    -type signal, and they would dominate an n-gram vocabulary.
-    """
-    return CountVectorizer(
-        lowercase=True,
-        ngram_range=ngram_range,
-        min_df=min_df if vocabulary is None else 1,
-        max_df=max_df if vocabulary is None else 1.0,
-        stop_words=stopwords if vocabulary is None else None,
-        token_pattern=rf"(?u)\b[a-zA-Z]{{{min_token_len},}}\b",
-        vocabulary=vocabulary,
-    )
-
 
 def term_statistics(present, vocab, labels, classes, n_train,
                     power_floor, max_candidates, pair_filter=None):
@@ -460,17 +419,11 @@ def main():
         # folded to that canonical shape before it becomes a vocabulary entry. Doing this makes a
         # mined list and a hand-written list matchable under one regime, which is what a union of the
         # two requires.
-        probe_ = build_vectorizer((1, 1), 1, 1.0, args.min_token_len, stopwords=stopwords)
-        tokenise_ = probe_.build_analyzer()
-
-        canon_ = {}
-        unmatchable = []
-        for raw_ in sorted(set(terms_df["Term"])):
-            toks_ = tokenise_(raw_)
-            if not toks_:
-                unmatchable.append(raw_)
-            else:
-                canon_[raw_] = " ".join(toks_)
+        canon_, unmatchable = canonical_terms(
+            terms=terms_df["Term"],
+            stopwords=stopwords,
+            min_token_len=args.min_token_len,
+        )
         if unmatchable:
             print(f"[warn  ] {len(unmatchable)} supplied term(s) survive tokenisation as nothing "
                   f"and can never fire: {unmatchable[:10]}")
@@ -484,16 +437,26 @@ def main():
         terms_df = terms_df.drop_duplicates(subset=["Class", "Term"])
 
         vocab_list = sorted(terms_df["Term"].unique().tolist())
-        max_n_ = max(len(t.split()) for t in vocab_list) if vocab_list else 1
-        ngram_range = (1, max(1, max_n_))
-        cv = build_vectorizer(ngram_range, min_df, max_df, args.min_token_len,
-                              stopwords=stopwords, vocabulary=vocab_list)
+        ngram_range = (1, ngram_max(vocab_list))
+        cv = build_vectorizer(
+            ngram_range=ngram_range,
+            min_token_len=args.min_token_len,
+            stopwords=stopwords,
+            vocabulary=vocab_list,
+            min_df=min_df,
+            max_df=max_df,
+        )
         pair_filter = (terms_df.groupby("Class")["Term"]
                        .apply(lambda s: set(s.tolist())).to_dict())
         counts = cv.transform(train_texts)
     else:
-        cv = build_vectorizer(ngram_range, min_df, max_df, args.min_token_len,
-                              stopwords=stopwords)
+        cv = build_vectorizer(
+            ngram_range=ngram_range,
+            min_token_len=args.min_token_len,
+            stopwords=stopwords,
+            min_df=min_df,
+            max_df=max_df,
+        )
         try:
             counts = cv.fit_transform(train_texts)
         except ValueError:

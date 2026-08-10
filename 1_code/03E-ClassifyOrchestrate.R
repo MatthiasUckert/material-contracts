@@ -129,7 +129,16 @@ orch_compact <- function(.x) {
   if (FALSE) .x <- c(0.05, 0.01)
   if (is.logical(.x)) return(dplyr::if_else(.x, "1", "0"))
   if (is.numeric(.x)) {
-    return(sub("\\.?0+$", "", formatC(.x, format = "f", digits = 3, drop0trailing = TRUE)))
+    # Fixed notation at three decimals renders every learning rate in the grid -- 1e-05, 2e-05,
+    # 5e-05 -- as "0", which the trailing-zero strip then reduces to "". The axis was consumed as a
+    # naming dimension and contributed nothing, so configurations differing only in learning rate
+    # collided and the positional fallback disambiguated them: the same checkpoint answered to a
+    # different name whenever the inventory changed size.
+    #
+    # Significant digits rather than decimal places, so a value survives its own magnitude. The
+    # rendering is left alone otherwise: a hyphen in an exponent is no worse than the ones already in
+    # legal-bert and kw-text, and stripping punctuation would turn a threshold of 0.62 into 062.
+    return(trimws(formatC(.x, format = "g", digits = 3)))
   }
   substr(as.character(.x), 1L, 12L)
 }
@@ -206,8 +215,10 @@ orch_predictions <- function(.runs_roots, .config_names) {
 #' @param .runs_roots Character vector of runs directories (BERT root, keyword root).
 #' @param .label_col Task to inventory.
 #' @param .none Character. Abstention sentinel.
-#' @return Tibble: Arm, ConfigName, Kind, Source, Origin, TermsFile, nConfigs, nFolds, Folds, nDocs,
-#'   Coverage, SelPrecision, Accuracy, MacroF1.
+#' @return Tibble: Arm, ConfigName, Kind, Source, Origin, TermsFile, MaxLen, the prompt axes where a
+#'   generative run is present (Tier, Guidance, Shots, NChars, AllowAbstain, Think), nConfigs, nFolds,
+#'   Folds, nDocs, Coverage, SelPrecision, Accuracy, MacroF1. Each engine's own axes are NA on the
+#'   other engines' rows.
 orch_arms <- function(.runs_roots, .label_col = "ClassDetailed", .none = ORCH_NONE) {
   if (FALSE) {
     .runs_roots <- c(.lP$Runs$Bert, .lP$Runs$Kw)
@@ -281,11 +292,107 @@ orch_arms <- function(.runs_roots, .label_col = "ClassDetailed", .none = ORCH_NO
       .by = ConfigName
     )
 
+  # The context length travels with the inventory instead of being read back out of the arm name.
+  # It is the transformer's cost knob and the one parameter inference must reproduce -- an artifact
+  # applied at a length it was not fitted under is encoded differently from its training data, and
+  # nothing about the output says so. A stage needing it would otherwise reconstruct it from a string
+  # this function assembled, which is the same round trip that once let a manifest point at a
+  # configuration nobody had fitted.
+  #
+  # Guarded the way Source and Origin are guarded above: the column exists only where a transformer
+  # run is among the roots, and an arm with no context length carries NA rather than a default that
+  # would look like a measurement. Added AFTER the arm names are built, so naming is untouched by it.
   best_ |>
+    dplyr::mutate(MaxLen = if ("MaxLen" %in% keep_) as.integer(.data$MaxLen) else NA_integer_) |>
     dplyr::left_join(stats_, by = dplyr::join_by(ConfigName)) |>
     dplyr::select(Arm, ConfigName, Kind, dplyr::any_of(c("Source", "Origin", "TermsFile")),
-                  nConfigs, nFolds, Folds, nDocs, Coverage, SelPrecision, Accuracy, MacroF1) |>
+                  MaxLen,
+                  # The generative engine's axes travel for the same reason the context length does:
+                  # they ARE that arm's artifact. A transformer is pinned by a checkpoint and a
+                  # keyword table by a file, but a prompted model has neither -- reproducing it means
+                  # reproducing the prompt, so the prompt has to be recorded where the arm is.
+                  # any_of rather than a guarded mutate, because these columns exist exactly when a
+                  # generative run is among the roots, which is exactly when anything reads them.
+                  dplyr::any_of(c("Tier", "Guidance", "Shots", "NChars", "AllowAbstain", "Think")),
+                  nConfigs, nFolds, Folds, nDocs, Coverage, SelPrecision, Accuracy,
+                  MacroF1) |>
     dplyr::arrange(dplyr::desc(.data$Coverage), dplyr::desc(.data$MacroF1))
+}
+
+#' Which method family an arm belongs to
+#'
+#' Family is a property of the engine that produced the arm, not of how well it scored. Two places
+#' need it -- the seat rule behind the confidence flag and the search restriction below -- and a
+#' second inline definition would be a second answer to the same question the first time an engine
+#' was added.
+#'
+#' @param .kind Character vector of arm Kind values.
+#' @return Character vector: lexical, generative or transformer.
+orch_family <- function(.kind) {
+  if (FALSE) .kind <- res_det$ArmsCV$Kind
+  dplyr::case_when(
+    grepl("^keyword-", .kind) ~ "lexical",
+    grepl("^llm-", .kind)     ~ "generative",
+    TRUE                      ~ "transformer"
+  )
+}
+
+#' Keep only the strongest arms of each family
+#'
+#' A DEBUGGING CONTROL, and the numbers it produces are not the ones this document describes. The
+#' policy grid is linear in the number of always-committing arms, and most of them are transformer
+#' configurations separated by a hyperparameter, so restricting the field cuts render time roughly in
+#' proportion while leaving the search structurally identical.
+#'
+#' WITHIN FAMILY, never overall. Ranked overall, the strongest arms on any task are all transformers:
+#' the abstaining arms would go, the grid would hold the terminals alone, and the routing question
+#' would disappear rather than be answered cheaply. The flag's seats would go with them.
+#'
+#' The crowned arm is kept whatever it ranks, because it is the incumbent -- the baseline routing has
+#' to beat and the fallback when nothing does. A restriction that could drop it would abort the task,
+#' and a restriction that quietly changed which arm is the baseline would be worse.
+#'
+#' What this does NOT preserve is the fold-level stability picture. Winners alternate across folds
+#' because many terminals are separated by less than the sample can measure; with fewer of them the
+#' ranking looks steadier than it is. Read stability only from an unrestricted render.
+#'
+#' @param .arms Arm inventory for one task, already filtered to the folds required.
+#' @param .top Integer or NULL. Arms to keep per family; NULL restricts nothing.
+#' @param .crowned Character or NULL. Configuration the training stage deployed, kept regardless.
+#' @return .arms, restricted.
+orch_top_per_family <- function(.arms, .top = NULL, .crowned = NULL) {
+  if (FALSE) {
+    .arms    <- arms_cv_
+    .top     <- 5L
+    .crowned <- NULL
+  }
+  if (is.null(.top) || !is.finite(.top) || nrow(.arms) == 0L) return(.arms)
+
+  keep_ <- .arms |>
+    dplyr::mutate(Family = orch_family(.kind = .data$Kind)) |>
+    dplyr::slice_max(.data$MacroF1, n = as.integer(.top), by = Family, with_ties = FALSE) |>
+    dplyr::pull(Arm)
+  if (!is.null(.crowned)) {
+    keep_ <- union(keep_, .arms$Arm[.arms$ConfigName %in% .crowned])
+  }
+
+  out_    <- .arms |> dplyr::filter(.data$Arm %in% keep_)
+  n_drop_ <- nrow(.arms) - nrow(out_)
+  if (n_drop_ == 0L) return(out_)
+
+  cli::cli_alert_danger(
+    "SEARCH RESTRICTED: top {(.top)} arm{?s} per family. {n_drop_} of {nrow(.arms)} arm{?s} dropped."
+  )
+  out_ |>
+    dplyr::mutate(Family = orch_family(.kind = .data$Kind)) |>
+    dplyr::summarise(Kept = dplyr::n(), Best = max(.data$MacroF1), .by = Family) |>
+    dplyr::mutate(Best = sprintf("%.3f", .data$Best)) |>
+    tbl_say(.title = "Arms entering the search")
+  cli::cli_alert_warning(
+    "Every routing result below is computed on this restricted field, not on the design this \\
+     document describes. Fold-level stability in particular will look steadier than it is."
+  )
+  out_
 }
 
 #' Short provenance tag for a term list, or "mined" where none was supplied
@@ -1278,23 +1385,38 @@ orch_select_nested <- function(.spine, .policies, .tolerance = 0.005, .lenient =
 
 #' Report which policy won in each fold, and what it actually did
 #'
-#' Two things are reported, because the winner's NAME overstates the instability. A cascade whose
-#' floor no document clears is the incumbent under another label, so the column that matters is how
-#' many documents the fold's winner actually moved.
+#' The winner's NAME overstates the instability, so what matters is how many documents the fold's
+#' winner actually moved. But a fold that routed nothing has NOT necessarily run the incumbent: it ran
+#' its own terminal with the cascade inert, and that terminal can be a different arm. Both states
+#' relabel nothing relative to their own terminal and they relabel differently relative to the
+#' deployed one, which is exactly how Moved is non-zero while every fold routes zero -- the finding
+#' this column exists to expose rather than to hide.
 #'
 #' @param .tab_nested Output of orch_select_nested().
+#' @param .incumbent The deployed arm, so a fold can be told apart from one that crowned another
+#'   terminal. REQUIRED: an optional argument here would let a call site omit it and report the
+#'   weaker column silently, which is the failure this argument exists to remove.
 #' @return Invisibly the per-fold winner tibble.
-orch_report_stability <- function(.tab_nested) {
-  if (FALSE) .tab_nested <- res_det$Nested
-
+orch_report_stability <- function(.tab_nested, .incumbent) {
+  if (FALSE) {
+    .tab_nested <- res_det$Nested
+    .incumbent  <- res_det$Incumbent
+  }
   per_fold_ <- .tab_nested |>
     dplyr::summarise(
-      nDocs   = dplyr::n(),
-      nRouted = sum(.data$DecidedBy != .data$WinnerTerminal),
-      Winner  = dplyr::first(.data$WinnerLabel),
+      nDocs    = dplyr::n(),
+      nRouted  = sum(.data$DecidedBy != .data$WinnerTerminal),
+      Terminal = dplyr::first(.data$WinnerTerminal),
+      Winner   = dplyr::first(.data$WinnerLabel),
       .by = Fold
     ) |>
-    dplyr::mutate(Effect = dplyr::if_else(.data$nRouted == 0L, "incumbent", "routed")) |>
+    dplyr::mutate(
+      Effect = dplyr::case_when(
+        .data$nRouted > 0L           ~ "routed",
+        .data$Terminal == .incumbent ~ "incumbent",
+        TRUE                         ~ "other terminal"
+      )
+    ) |>
     dplyr::arrange(.data$Fold)
 
   counts_ <- per_fold_ |> dplyr::count(.data$Winner, name = "Folds", sort = TRUE)
@@ -1306,10 +1428,18 @@ orch_report_stability <- function(.tab_nested) {
   cli::cli_text("")
 
   n_inert_ <- sum(per_fold_$nRouted == 0L)
+  n_other_ <- sum(per_fold_$Effect == "other terminal")
   if (n_inert_ > 0L) {
     cli::cli_alert_info(
-      "{n_inert_} of {nrow(per_fold_)} fold{?s} routed no documents at all: the crowned cascade was \\
-       the incumbent under another name. Count the Effect column, not the winner names."
+      "{n_inert_} of {nrow(per_fold_)} fold{?s} routed no documents at all, so no cascade fired. \\
+       Count the Effect column, not the winner names."
+    )
+  }
+  if (n_other_ > 0L) {
+    cli::cli_alert_warning(
+      "{n_other_} of those fold{?s} crowned a terminal OTHER than the deployed arm. That relabels \\
+       documents without any cascade firing, which is why the movement table can report a non-zero \\
+       count while every fold routed zero. Routing did nothing; the terminal changed."
     )
   }
   if (nrow(counts_) == 1L) {
@@ -1621,12 +1751,17 @@ orch_save_policy <- function(.final, .arms, .label_col, .dir, .commit_only = NUL
 #' @param .floors,.max_depth,.families Policy-space controls.
 #' @param .commit_only Labels a keyword arm may commit to, or NULL for all.
 #' @param .n_folds Folds an arm must cover to enter the nested search.
+#' @param .top_per_family Integer or NULL. Debugging control: keep only this many arms of each method
+#'   family. NULL searches every arm, which is the only setting under which this document's routing
+#'   claims are true.
 #' @param .tolerance Macro-F1 band treated as indistinguishable.
 #' @param .lenient Logical. Lenient scoring inside the selection.
 #' @param .carry Document-level columns to attach to the spine.
 #' @param .none Character. Abstention sentinel.
-#' @return List: LabelCol, Arms, ArmsCV, ArmsHeld, Spine, Roles, Incumbent, Terminals, Gated,
-#'   Policies, Nested, Compare, Movement, Derived, Final.
+#' @return List: LabelCol, Arms, ArmsCV, ArmsDeploy, ArmsHeld, Crowned, TopPerFamily, Spine, Roles,
+#'   Incumbent, Terminals, Gated, Policies, Nested, Compare, Movement, Derived, Final. ArmsCV is the
+#'   field the search ran on; ArmsDeploy is every arm that could ship, unaffected by any search
+#'   restriction.
 orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
                           .crowned = NULL,
                           .extra_arms = NULL,
@@ -1635,6 +1770,7 @@ orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
                           .families = c("cascade", "perclass"),
                           .commit_only = NULL,
                           .n_folds = 5L,
+                          .top_per_family = NULL,
                           .tolerance = 0.005,
                           .lenient = FALSE,
                           .carry = c("ClassDetailed2", "LabelRound"),
@@ -1653,6 +1789,15 @@ orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
   arms_cv_   <- arms_ |> dplyr::filter(.data$nFolds >= .n_folds)
   arms_held_ <- arms_ |> dplyr::filter(.data$nFolds <  .n_folds)
 
+  # The restriction is a SEARCH control, so the inventory the deployment catalogue reads is kept
+  # before it is applied. Restricting both would let a debugging setting decide which artifacts ship:
+  # an arm outside the top few by macro-F1 is still a model on disk that a caller may reasonably
+  # prefer, and dropping it from the manifest is not a saving, it is a different deliverable.
+  arms_deploy_ <- arms_cv_
+  arms_cv_ <- orch_top_per_family(
+    .arms = arms_cv_, .top = .top_per_family, .crowned = .crowned
+  )
+
   spine_ <- orch_spine(
     .runs_roots  = .runs_roots,
     .arms        = arms_cv_,
@@ -1662,6 +1807,35 @@ orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
     .none        = .none
   ) |>
     orch_spine_add(.arm_rows = .extra_arms, .carry = .carry)
+
+  # EVERY ARM IN THE SEARCH MUST COVER EVERY FOLD, derived arms included. A real arm is held to this
+  # by the nFolds filter above; a derived arm is bound in afterwards and was held to nothing, which is
+  # a gap rather than an exemption. The nested design applies a fold's winner to the held-out fold, so
+  # an arm crowned on the folds it happens to cover fails the moment it is applied to one it does not
+  # -- inside a worker, as an abort five levels from the cause.
+  #
+  # A derived arm inherits the coverage of everything it is built from. bert-hier reads the broad
+  # model's predictions, so while that sweep is mid-flight the derived arm exists on some folds and
+  # not others, and nothing upstream says so. Dropping it is the right response: a partial arm cannot
+  # be compared with arms estimated on the whole sample, and the search reports a clean null without
+  # it rather than a wrong number with it.
+  folds_all_ <- sort(unique(spine_$Fold))
+  short_ <- spine_ |>
+    dplyr::filter(!.data$Arm %in% arms_cv_$Arm) |>
+    dplyr::summarise(nFolds = dplyr::n_distinct(.data$Fold), .by = Arm) |>
+    dplyr::filter(.data$nFolds < length(folds_all_))
+
+  if (nrow(short_) > 0L) {
+    cli::cli_alert_danger(
+      "{(.label_col)}: {nrow(short_)} derived arm{?s} dropped for covering only some folds: \\
+       {short_$Arm} ({short_$nFolds}/{length(folds_all_)})."
+    )
+    cli::cli_alert_info(
+      "A derived arm inherits the fold coverage of the arms it is built from, so this means the \\
+       sweep behind one of them is incomplete. The search runs without it and reports what it can."
+    )
+    spine_ <- spine_ |> dplyr::filter(!.data$Arm %in% short_$Arm)
+  }
 
   roles_ <- orch_roles(.spine = spine_, .none = .none)
 
@@ -1735,7 +1909,15 @@ orch_run_task <- function(.runs_roots, .label_col, .tab_prep,
     LabelCol  = .label_col,
     Arms      = arms_,
     ArmsCV    = arms_cv_,
+    ArmsDeploy = arms_deploy_,
     ArmsHeld  = arms_held_,
+    # The crowned CONFIGURATION, not the arm named for it. Arm names are assigned relative to the
+    # inventory they were built from, so the same model carries a different name under a restricted
+    # render; a configuration name does not move.
+    Crowned   = .crowned,
+    # Travels with the result so the manifest can record it. A file produced under a restricted
+    # search that does not say so is one nobody can tell apart from the real thing later.
+    TopPerFamily = .top_per_family,
     Spine     = spine_,
     Roles     = roles_,
     Incumbent = inc_,
@@ -1767,7 +1949,7 @@ orch_report_all <- function(.res, .n_folds = 5L) {
   cli::cli_h1("Routing summary: {(.res$LabelCol)}")
   orch_report_arms(.tab = .res$Arms, .n_folds = .n_folds, .label_col = .res$LabelCol)
   orch_report_spine(.spine = .res$Spine)
-  orch_report_stability(.tab_nested = .res$Nested)
+  orch_report_stability(.tab_nested = .res$Nested, .incumbent = .res$Incumbent)
   orch_report_compare(.tab = .res$Compare,
                       .title = paste0("Routing against the incumbent: ", .res$LabelCol))
   orch_report_movement(.tab = .res$Movement)
@@ -2252,15 +2434,22 @@ orch_report_agreement_sets <- function(.tab, .default = NULL) {
 #' directory rather than assumed. Anything that does not join to this task's arm inventory is dropped:
 #' a model on disk that this task never evaluated is a leftover, not an arm.
 #'
+#' The default is marked by CONFIGURATION where one is known, and by arm name only as a fallback. An
+#' arm name is assigned relative to the inventory it was built from -- the disambiguating suffix
+#' counts position among siblings -- so the same checkpoint answers to different names in two renders
+#' whose inventories differ. A configuration name is written by the trainer and does not move.
+#'
 #' @param .arms Arm inventory for one task, from orch_arms().
 #' @param .dir_bert Output root of the training stage.
-#' @param .default Character. The arm the trainer crowned and deployed for this task.
+#' @param .default Character. The arm the trainer crowned, used when no configuration is supplied.
+#' @param .crowned Character or NULL. The crowned CONFIGURATION, preferred over .default.
 #' @return Tibble: Arm, Kind, ConfigName, MaxLen, Path, Default, MacroF1.
-orch_catalogue_bert <- function(.arms, .dir_bert, .default) {
+orch_catalogue_bert <- function(.arms, .dir_bert, .default, .crowned = NULL) {
   if (FALSE) {
-    .arms     <- res_det$ArmsCV
+    .arms     <- res_det$ArmsDeploy
     .dir_bert <- .dir_bert
     .default  <- res_det$Incumbent
+    .crowned  <- res_det$Crowned
   }
   root_ <- fs::path(.dir_bert, "model_final")
   if (!fs::dir_exists(root_)) {
@@ -2280,8 +2469,15 @@ orch_catalogue_bert <- function(.arms, .dir_bert, .default) {
     dplyr::filter(!grepl("^keyword-", .data$Kind), !grepl("^llm-", .data$Kind)) |>
     dplyr::select(Arm, ConfigName, MaxLen, MacroF1) |>
     dplyr::inner_join(found_, by = dplyr::join_by(ConfigName)) |>
-    dplyr::mutate(Kind = "transformer", MaxLen = as.integer(.data$MaxLen),
-                  Default = .data$Arm == .default) |>
+    dplyr::mutate(
+      Kind    = "transformer",
+      MaxLen  = as.integer(.data$MaxLen),
+      Default = if (!is.null(.crowned) && length(.crowned) == 1L && !is.na(.crowned)) {
+        .data$ConfigName == .crowned
+      } else {
+        .data$Arm == .default
+      }
+    ) |>
     dplyr::arrange(.data$MaxLen)
 
   if (nrow(out_) == 0L) {
@@ -2344,6 +2540,89 @@ orch_catalogue_keyword <- function(.dir_kw, .label_col, .catalogue) {
   out_ |> dplyr::select(Arm, Kind, NWords, Path, Default, Coverage, Realised)
 }
 
+#' Every deployable prompt configuration, with the best marked
+#'
+#' The generative arm is pinned like the other two even though it is not enabled by default, because
+#' a manifest that names an arm in a voting set and describes it nowhere is one the apply stage cannot
+#' execute. That defect is what this stage's redesign removed on the policy axis; leaving the
+#' generative arm uncatalogued reproduces it on the confidence axis instead.
+#'
+#' WHAT THE ARTIFACT IS. A transformer is pinned by a checkpoint and a keyword arm by a table. A
+#' prompted model has no file: reproducing it means reproducing the prompt, so what is pinned is the
+#' configuration, and the recorded path is the run tree that configuration was estimated in --
+#' provenance rather than something to load. Params therefore carries everything inference needs, and
+#' inference must read it: a prompt assembled from defaults is a different classifier from the one
+#' whose accuracy this document reports, and nothing about its output would say so.
+#'
+#' ONE VARIANT PER TIER. The tier is this arm's cost-and-quality knob, in the way the context length
+#' is the transformer's and the truncation window the keyword table's. Seeds are not a deployment
+#' choice, so where several configurations share a tier the best of them stands for it.
+#'
+#' A task with no generative run yields no rows rather than an error, so this stage keeps working
+#' while that engine covers one task and keeps working unchanged once it covers three.
+#'
+#' @param .arms Arm inventory for one task, from orch_arms().
+#' @param .dir_llm Output root of the generative stage.
+#' @return Tibble: Arm, Kind, Tier, Path, Default, MacroF1, Params. Zero rows where the task has no
+#'   generative arm.
+orch_catalogue_llm <- function(.arms, .dir_llm) {
+  if (FALSE) {
+    .arms    <- res_det$ArmsDeploy
+    .dir_llm <- .dir_llm
+  }
+  empty_ <- tibble::tibble(
+    Arm = character(), Kind = character(), Tier = character(), Path = character(),
+    Default = logical(), MacroF1 = numeric(), Params = list()
+  )
+  mine_ <- .arms |> dplyr::filter(grepl("^llm-", .data$Kind))
+  if (nrow(mine_) == 0L) return(empty_)
+
+  need_ <- c("Tier", "Shots", "NChars", "AllowAbstain")
+  miss_ <- setdiff(need_, names(mine_))
+  if (length(miss_) > 0L) {
+    cli::cli_abort(c(
+      "The arm inventory carries generative arms but not their prompt axes: {miss_}.",
+      "i" = "Pinning an arm whose prompt cannot be recorded would promise a classifier the apply \\
+             stage has no way to rebuild."
+    ))
+  }
+  root_ <- fs::path(.dir_llm, "runs")
+  if (!fs::dir_exists(root_)) {
+    cli::cli_alert_warning(
+      "Generative arms are in the search but {.path {as.character(root_)}} is gone; none pinned."
+    )
+    return(empty_)
+  }
+
+  best_ <- mine_ |>
+    dplyr::slice_max(.data$MacroF1, n = 1L, by = Tier, with_ties = FALSE) |>
+    dplyr::arrange(dplyr::desc(.data$MacroF1))
+
+  best_ |>
+    dplyr::mutate(
+      Kind    = "llm",
+      Path    = as.character(root_),
+      Default = dplyr::row_number() == 1L,
+      Params  = purrr::pmap(
+        dplyr::select(best_, dplyr::any_of(c("Kind", "Tier", "Guidance", "Shots", "NChars",
+                                             "AllowAbstain", "Think"))),
+        function(...) {
+          r_ <- list(...)
+          list(
+            model         = sub("^llm-", "", r_$Kind),
+            tier          = r_$Tier,
+            guidance      = if (is.null(r_$Guidance)) NA_character_ else r_$Guidance,
+            shots         = as.integer(r_$Shots),
+            n_chars       = as.integer(r_$NChars),
+            allow_abstain = as.logical(r_$AllowAbstain),
+            think         = if (is.null(r_$Think)) NA else as.logical(r_$Think)
+          )
+        }
+      )
+    ) |>
+    dplyr::select(Arm, Kind, Tier, Path, Default, MacroF1, Params)
+}
+
 #' Assemble the deployable catalogue for one task
 #'
 #' This stage selects nothing. It reads what the training stage crowned and what the keyword stage
@@ -2351,25 +2630,32 @@ orch_catalogue_keyword <- function(.dir_kw, .label_col, .catalogue) {
 #' decision can be made with the numbers in hand. Two stages have already answered which model is
 #' best; a third opinion here would not be more information, it would be a disagreement.
 #'
-#' @param .res One task's result from orch_run_task().
+#' @param .res One task's result from orch_run_task(). The catalogue is built from its ArmsDeploy
+#'   field rather than ArmsCV, so a restricted search cannot change which artifacts ship.
 #' @param .dir_bert Output root of the training stage.
 #' @param .dir_kw Output root of the keyword stage.
 #' @param .kw_catalogue The keyword stage's published catalogue.
-#' @return Tibble: LabelCol, Arm, Kind, Variant, Path, Default, Score, Measure, MaxLen, NWords.
-orch_artifacts <- function(.res, .dir_bert, .dir_kw, .kw_catalogue) {
+#' @param .dir_llm Output root of the generative stage. Contributes no rows for a task that engine
+#'   has not run, so a task list wider than that engine's coverage is not an error.
+#' @return Tibble: LabelCol, Arm, Kind, Variant, Path, Default, Score, Measure, MaxLen, NWords, and a
+#'   Params list column carrying what inference needs to reproduce each arm's encoding.
+orch_artifacts <- function(.res, .dir_bert, .dir_kw, .kw_catalogue, .dir_llm) {
   if (FALSE) {
     .res          <- res_det
     .dir_bert     <- .dir_bert
     .dir_kw       <- .dir_kw
     .kw_catalogue <- kw_cat
+    .dir_llm      <- .dir_llm
   }
   bert_ <- orch_catalogue_bert(
-    .arms = .res$ArmsCV, .dir_bert = .dir_bert, .default = .res$Incumbent
+    .arms = .res$ArmsDeploy, .dir_bert = .dir_bert, .default = .res$Incumbent,
+    .crowned = .res$Crowned
   ) |>
     dplyr::transmute(
       LabelCol = .res$LabelCol, Arm, Kind, Path, Default,
       Variant = paste0("L", .data$MaxLen), MaxLen = .data$MaxLen, NWords = NA_integer_,
-      Score = .data$MacroF1, Measure = "macro-F1, cross-validated"
+      Score = .data$MacroF1, Measure = "macro-F1, cross-validated",
+      Params = purrr::map(.data$MaxLen, \(.m) list(max_len = as.integer(.m)))
     )
 
   kw_ <- orch_catalogue_keyword(
@@ -2380,10 +2666,19 @@ orch_artifacts <- function(.res, .dir_bert, .dir_kw, .kw_catalogue) {
       Variant = paste0("W", dplyr::if_else(.data$NWords == 0L, "full",
                                            as.character(.data$NWords))),
       MaxLen = NA_integer_, NWords = .data$NWords,
-      Score = .data$Coverage, Measure = "coverage at the published precision"
+      Score = .data$Coverage, Measure = "coverage at the published precision",
+      Params = purrr::map(.data$NWords, \(.w) list(n_words = as.integer(.w), source = "text"))
     )
 
-  dplyr::bind_rows(bert_, kw_)
+  llm_ <- orch_catalogue_llm(.arms = .res$ArmsDeploy, .dir_llm = .dir_llm) |>
+    dplyr::transmute(
+      LabelCol = .res$LabelCol, Arm, Kind, Path, Default,
+      Variant = .data$Tier, MaxLen = NA_integer_, NWords = NA_integer_,
+      Score = .data$MacroF1, Measure = "macro-F1, cross-validated",
+      Params
+    )
+
+  dplyr::bind_rows(bert_, kw_, llm_)
 }
 
 #' Print the catalogue this stage is about to pin
@@ -2469,6 +2764,43 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
     ))
   }
 
+  # A voting set names arms; the arms block describes them. Nothing above connects the two, so a set
+  # could name an arm this manifest never pins -- which is precisely the defect this stage was
+  # rebuilt to remove, a policy naming a terminal absent from the arms list, reappearing on the
+  # confidence axis instead of the policy one. The flag is estimated on one task, so the arms it
+  # votes with must be pinned for that task.
+  flag_task_ <- .results[[1]]$LabelCol
+  orphan_    <- setdiff(unique(unlist(.sets)), found_$Arm[found_$LabelCol == flag_task_])
+  if (length(orphan_) > 0L) {
+    cli::cli_abort(c(
+      "{length(orphan_)} arm{?s} vote{?s/} in a set but {?is/are} not pinned for {(flag_task_)}: \\
+       {orphan_}.",
+      "i" = "A caller selecting that set receives an arm name with no artifact, no parameters and \\
+             no score, which the apply stage cannot execute.",
+      "i" = "Either catalogue the arm or drop the set that names it."
+    ))
+  }
+
+  # A manifest with no shippable set is a legitimate state, not a failure: the flag is a measurement
+  # this document makes, and pinning it requires every voting arm to be deployable. Where it is not,
+  # the label still ships and the flag does not, which is the honest pair. Recording NULL rather than
+  # a set name that is absent from the file is the difference between a downstream stage skipping the
+  # flag and one looking up a set that is not there.
+  set_ <- if (length(.sets) == 0L) {
+    cli::cli_alert_warning(
+      "No voting set is shippable, so this manifest pins no confidence flag. The label is unaffected \\
+       -- it comes from the policy, not from the vote."
+    )
+    NULL
+  } else if (!.default_set %in% names(.sets)) {
+    cli::cli_abort(c(
+      "The default voting set {.val {(.default_set)}} is not among the sets being pinned.",
+      "i" = "Pinned: {names(.sets)}"
+    ))
+  } else {
+    .default_set
+  }
+
   thin_ <- found_ |>
     dplyr::filter(.data$Default, .data$Kind %in% .default_kinds) |>
     dplyr::count(LabelCol, name = "nEnabled") |>
@@ -2496,11 +2828,11 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
         default  = isTRUE(r_$Default),
         enabled  = r_$Kind %in% .default_kinds,
         scored   = list(value = unname(r_$Score), measure = r_$Measure),
-        params   = switch(r_$Kind,
-          transformer = list(max_len = unname(r_$MaxLen)),
-          keyword     = list(n_words = unname(r_$NWords), source = "text"),
-          list()
-        )
+        # Read, not rebuilt. A switch here would be a second statement of what each engine's encoding
+        # is, and the two would part company the first time an engine gained an axis -- silently,
+        # because a parameter the manifest omits becomes a default at inference and a default is
+        # indistinguishable from a measurement in the output.
+        params   = if (is.null(r_$Params[[1]])) list() else r_$Params[[1]]
       )
     })
   }
@@ -2528,6 +2860,9 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
       ),
       validated = list(
         estimate     = "nested five-fold selection on the labelled sample",
+        # NULL where the search was unrestricted. Any other value means the routing numbers beside it
+        # were produced on a debugging field and are not the ones this stage's document describes.
+        top_per_family = .r$TopPerFamily,
         macro_f1     = cmp_$MacroF1[cmp_$Strategy == "Nested selection (the procedure)"][1],
         accuracy     = cmp_$Accuracy[cmp_$Strategy == "Nested selection (the procedure)"][1],
         incumbent_f1 = cmp_$MacroF1[grepl("(incumbent)", cmp_$Strategy, fixed = TRUE)][1]
@@ -2550,7 +2885,8 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
       # deployable arm has anything to concur about.
       label_col   = .results[[1]]$LabelCol,
       sets        = purrr::map(.sets, \(.x) I(as.list(.x))), # AsIs, for the same reason
-      default_set = .default_set,
+      default_set = set_,
+      shipped     = length(.sets) > 0L,
       reliability = "confidence_flag.parquet",
       note        = paste(
         "Tier is recomputed from the voting arms and needs no labels.",
@@ -2564,9 +2900,10 @@ orch_save_manifest <- function(.results, .artifacts, .agreement, .sets, .default
                        null = "null")
   arrow::write_parquet(.agreement, fs::path(.dir, "confidence_flag.parquet"))
 
+  n_kinds_ <- dplyr::n_distinct(found_$Kind[found_$Kind %in% .default_kinds])
   cli::cli_alert_success(
     "Wrote manifest for {length(tasks_)} task{?s} over {nrow(found_)} variant{?s}; \\
-     {sum(found_$Kind %in% .default_kinds)} enabled by default."
+     {sum(found_$Default)} marked default; {n_kinds_} kind{?s} enabled without being asked for."
   )
   invisible(man_)
 }

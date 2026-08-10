@@ -190,6 +190,12 @@ fold they are entitled to.
     Tolerance = 0.005,                  # macro-F1 band treated as indistinguishable
     # The generative arm is the most independent vote and the most expensive to run at corpus scale,
     # so it is pinned in the manifest and left off unless a caller asks for it.
+    # DEBUGGING CONTROL. The policy grid is linear in the number of always-committing arms and most
+    # of them are transformer configurations separated by one hyperparameter, so keeping the best few
+    # of each family cuts render time in proportion without changing the shape of the search. NULL is
+    # the only setting under which the routing claims below are true, and any other value is reported
+    # as a failure state and recorded in the manifest.
+    TopPerFamily   = NULL,
     DefaultVoteSet = "core",
     DefaultKinds   = c("transformer", "keyword")
   )
@@ -334,6 +340,7 @@ res_det <- orch_run_task(
   .label_col   = "ClassDetailed",               # task
   .tab_prep    = tab_prep,                      # prepared sample
   .crowned     = bert_crown$ConfigName[bert_crown$LabelCol == "ClassDetailed"], # 03B's deployed config
+  .top_per_family = .lP$Param$TopPerFamily, # NULL searches every arm; anything else is a debug run
   .extra_arms  = arm_hier,                      # the broad-constrained transformer
   .floors      = .lP$Param$Floors,              # score floors to cross in
   .max_depth   = .lP$Param$MaxDepth,            # longest cascade
@@ -362,7 +369,10 @@ orch_report_spine(.spine = res_det$Spine)
 
 ```{r}
 #| label: report-detailed-stability
-orch_report_stability(.tab_nested = res_det$Nested)
+orch_report_stability(
+  .tab_nested = res_det$Nested,   # every fold's winner
+  .incumbent  = res_det$Incumbent  # so a fold that crowned another terminal is not read as this one
+)
 ```
 
 ## Broad taxonomy
@@ -374,6 +384,7 @@ res_broad <- orch_run_task(
   .label_col   = "ClassBroad",                  # task
   .tab_prep    = tab_prep,                      # prepared sample
   .crowned     = bert_crown$ConfigName[bert_crown$LabelCol == "ClassBroad"], # 03B's deployed config
+  .top_per_family = .lP$Param$TopPerFamily, # NULL searches every arm; anything else is a debug run
   .extra_arms  = arm_rollup,                    # the rolled-up detailed prediction
   .floors      = .lP$Param$Floors,              # unchanged
   .max_depth   = .lP$Param$MaxDepth,            # unchanged
@@ -397,7 +408,10 @@ orch_report_arms(
 
 ```{r}
 #| label: report-broad-stability
-orch_report_stability(.tab_nested = res_broad$Nested)
+orch_report_stability(
+  .tab_nested = res_broad$Nested,   # every fold's winner
+  .incumbent  = res_broad$Incumbent  # so a fold that crowned another terminal is not read as this one
+)
 ```
 
 ## Amendment
@@ -412,6 +426,7 @@ res_amend <- orch_run_task(
   .label_col   = "AmendType",                   # task
   .tab_prep    = tab_prep,                      # prepared sample
   .crowned     = bert_crown$ConfigName[bert_crown$LabelCol == "AmendType"], # 03B's deployed config
+  .top_per_family = .lP$Param$TopPerFamily, # NULL searches every arm; anything else is a debug run
   .extra_arms  = NULL,                          # no hierarchy to exploit on a binary task
   .floors      = .lP$Param$Floors,              # unchanged
   .max_depth   = .lP$Param$MaxDepth,            # unchanged
@@ -435,7 +450,10 @@ orch_report_arms(
 
 ```{r}
 #| label: report-amendment-stability
-orch_report_stability(.tab_nested = res_amend$Nested)
+orch_report_stability(
+  .tab_nested = res_amend$Nested,   # every fold's winner
+  .incumbent  = res_amend$Incumbent  # so a fold that crowned another terminal is not read as this one
+)
 ```
 
 The coverage the keyword arm reports here is the share of documents in which an amendment term fired
@@ -560,17 +578,29 @@ carried itself into the vote as the transformer seat -- a model voting to agree 
 ```{r}
 #| label: agreement-voting-arms
 seats_ <- res_det$ArmsCV |>
-  dplyr::mutate(
-    Family = dplyr::case_when(
-      grepl("^keyword-", Kind) ~ "lexical",
-      grepl("^llm-", Kind)     ~ "generative",
-      TRUE                     ~ "transformer"
-    )
-  ) |>
+  dplyr::mutate(Family = orch_family(.kind = Kind)) |>
   dplyr::slice_max(MacroF1, n = 1L, by = Family, with_ties = FALSE) |>
   dplyr::mutate(Arm = dplyr::if_else(Family == "transformer", res_det$Incumbent, Arm))
 
-arms_voting <- intersect(seats_$Arm, unique(res_det$Spine$Arm))
+arms_all_ <- intersect(seats_$Arm, unique(res_det$Spine$Arm))
+
+# The sets are built here, before anything is reported, so the headline below can describe the set a
+# caller actually receives. Estimating on every seat and reporting that as the flag would describe a
+# vote nobody gets: the default excludes the generative arm, and with two arms a majority is
+# structurally impossible, so the tier vocabulary itself differs between the two.
+sets_voting <- list(
+  core = intersect(seats_$Arm[seats_$Family != "generative"], unique(res_det$Spine$Arm)),
+  full = arms_all_
+)
+sets_voting <- sets_voting[purrr::map_int(sets_voting, length) > 0L]
+
+if (!.lP$Param$DefaultVoteSet %in% names(sets_voting)) {
+  cli::cli_abort(c(
+    "The default voting set {.val {.lP$Param$DefaultVoteSet}} has no arms on this task.",
+    "i" = "Available: {names(sets_voting)}"
+  ))
+}
+arms_voting <- sets_voting[[.lP$Param$DefaultVoteSet]]
 
 # Coverage and accuracy come from the spine, not from the inventory, and only Family comes from the
 # seat table. The two sources both carry those columns and a plain join would suffix them into
@@ -579,14 +609,15 @@ arms_voting <- intersect(seats_$Arm, unique(res_det$Spine$Arm))
 # coincide for a categorical task and part company for a binary one, where the spine has already
 # silenced the keyword arm's negative class.
 seats_ |>
-  dplyr::filter(Arm %in% arms_voting) |>
-  dplyr::select(Family, Arm) |>
+  dplyr::filter(Arm %in% arms_all_) |>
+  dplyr::mutate(InDefault = dplyr::if_else(Arm %in% arms_voting, "<-", "")) |>
+  dplyr::select(Family, InDefault, Arm) |>
   dplyr::left_join(
     res_det$Roles |> dplyr::select(Arm, Role, Derived, Coverage, Accuracy),
     by = dplyr::join_by(Arm)
   ) |>
   dplyr::mutate(Coverage = tbl_pct(Coverage), Accuracy = tbl_pct(Accuracy)) |>
-  tbl_say(.title = "Arms permitted to vote on the confidence flag")
+  tbl_say(.title = "Arms permitted to vote, and which the default set uses")
 ```
 
 Derived arms are excluded by construction, since `ArmsCV` holds only arms read from run folders and
@@ -608,10 +639,16 @@ agree_det <- orch_agreement(
 )
 
 orch_report_agreement(
-  .tab  = agree_det,   # tier reliabilities
+  .tab  = agree_det,   # tier reliabilities for the DEFAULT set
   .arms = arms_voting  # named in the heading, since a tier means nothing without them
 )
 ```
+
+These are the reliabilities of the set a caller receives unless they ask otherwise, currently
+`core`. The alternatives are estimated and compared further down; a headline computed over every
+available seat would describe a vote nobody gets by default, and the difference is not a matter of
+degree -- with two arms a majority is arithmetically impossible, so the tier vocabulary changes as
+well as the numbers.
 
 The unanimous tier's error rate is the number that bounds what this flag can claim. Independent
 methods converging on the *same wrong answer* is the failure a concurrence flag is structurally
@@ -655,12 +692,6 @@ sets are estimated now and the manifest records which one a caller gets unless t
 
 ```{r}
 #| label: agreement-sets
-sets_voting <- list(
-  core = intersect(seats_$Arm[seats_$Family != "generative"], unique(res_det$Spine$Arm)),
-  full = arms_voting
-)
-sets_voting <- sets_voting[purrr::map_int(sets_voting, length) > 0L]
-
 agree_sets <- orch_agreement_sets(
   .spine    = res_det$Spine,  # every arm's prediction, per document
   .tab_pred = res_det$Nested, # the labels actually shipped
@@ -754,14 +785,27 @@ policies_hold <- orch_policy_grid(
   .families   = .lP$Param$Families                             # unchanged
 )
 
-dplyr::bind_rows(
-  orch_score_policies(.spine = spine_hold, .policies = res_det$Policies) |>
-    orch_pick_policy(.tolerance = .lP$Param$Tolerance) |>
-    dplyr::mutate(Arms = "Mined arms only", .before = 1),
-  orch_score_policies(.spine = spine_hold, .policies = policies_hold) |>
-    orch_pick_policy(.tolerance = .lP$Param$Tolerance) |>
-    dplyr::mutate(Arms = "Mined plus curated", .before = 1)
-) |>
+# Both arm sets scored in one dispatch. Two sequential passes over the full grid was the slowest
+# chunk in this document and, unlike the main search, the only one that did not use the workers
+# already running. What each pass computes is unchanged: this is the same two scorings, dispatched
+# rather than queued, so the robustness check remains an independent one rather than a cheaper
+# rearrangement of the headline.
+mirai::mirai_map(
+  .x = list(
+    list(Arms = "Mined arms only",    Policies = res_det$Policies),
+    list(Arms = "Mined plus curated", Policies = policies_hold)
+  ),
+  .f = function(.spec, .spine, .tolerance) {
+    orch_score_policies(.spine = .spine, .policies = .spec$Policies) |>
+      orch_pick_policy(.tolerance = .tolerance) |>
+      dplyr::mutate(Arms = .spec$Arms, .before = 1)
+  },
+  # Globals travel through .args, the way the nested search sends them. A worker sees nothing of this
+  # document's environment, so anything referenced inside .f and not passed here is missing there and
+  # missing only there -- which surfaces as an error several levels down from the line that caused it.
+  .args = list(.spine = spine_hold, .tolerance = .lP$Param$Tolerance)
+)[] |>
+  purrr::list_rbind() |>
   dplyr::mutate(Accuracy = tbl_pct(Accuracy), MacroF1 = sprintf("%.3f", MacroF1)) |>
   dplyr::select(Arms, Label, Accuracy, MacroF1, nRouted) |>
   tbl_say(.title = "Holdout fold: does hand curation change the best cascade?")
@@ -923,7 +967,8 @@ tab_artifacts <- purrr::map(
       .res          = .r,        # one task's arms and its deployed incumbent
       .dir_bert     = .dir_bert, # 03B's output root
       .dir_kw       = .dir_kw,   # 03C's output root
-      .kw_catalogue = kw_cat     # what 03C published and marked
+      .kw_catalogue = kw_cat,    # what 03C published and marked
+      .dir_llm      = .dir_llm   # 03D's output root; no rows for a task it has not run
     )
   }
 ) |>
@@ -938,12 +983,32 @@ no predictions for a terminal it had been told to use.
 
 ```{r}
 #| label: deploy-save-manifest
+# A set can only be pinned if every arm in it is pinned. The keyword seat is a mining run: it has
+# out-of-fold predictions on all five folds, and no single deployable lexicon -- five fold lists and
+# no all-data run -- so it can be scored and cannot be applied. Until the keyword stage publishes a
+# run for the table it ships, no set containing that seat is executable, and the sets are filtered
+# rather than the guard relaxed.
+#
+# The measurement above is unaffected and stays in the document. What changes is only what the
+# manifest promises: a flag estimated on arms a caller cannot run is a number with nothing behind it.
+pinned_arms <- tab_artifacts$Arm[tab_artifacts$LabelCol == res_det$LabelCol]
+sets_pinned <- sets_voting[purrr::map_lgl(sets_voting, \(.a) all(.a %in% pinned_arms))]
+
+tibble::tibble(
+  SetName = names(sets_voting),
+  Arms    = purrr::map_int(sets_voting, length),
+  Pinned  = names(sets_voting) %in% names(sets_pinned),
+  Missing = purrr::map_chr(sets_voting, \(.a) paste(setdiff(.a, pinned_arms), collapse = ", "))
+) |>
+  dplyr::mutate(Pinned = dplyr::if_else(Pinned, "yes", "NO")) |>
+  tbl_say(.title = "Voting sets: measured here, pinned in the manifest")
+
 orch_save_manifest(
   .results      = list(res_det, res_broad, res_amend), # every task's policy and validated score
   .artifacts    = tab_artifacts,                       # arm to artifact, verified on disk
   .agreement    = agree_sets,                          # reliability under every voting set
-  .sets         = sets_voting,                         # the sets themselves
-  .default_set  = .lP$Param$DefaultVoteSet,            # what a caller gets unless they ask
+  .sets         = sets_pinned,                         # only sets whose every arm is deployable
+  .default_set  = .lP$Param$DefaultVoteSet,            # checked against the sets actually pinned
   .default_kinds = .lP$Param$DefaultKinds,             # kinds enabled without being asked for
   .dir          = .lP$Output$Deploy,                   # the directory 03F reads
   .tab_prep     = tab_prep                             # provenance: sample size and fold count

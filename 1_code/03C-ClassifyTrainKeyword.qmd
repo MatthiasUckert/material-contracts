@@ -896,6 +896,18 @@ purrr::walk(pubs, function(.p) {
 })
 ```
 
+```{r}
+#| label: deploy-save-catalogue
+# Written after the tables, not before them, because it names them: a catalogue that reached disk
+# ahead of a failed write would describe artifacts nobody can open. The deployment stage reads this
+# file rather than rebuilding the choice, which is what keeps the row marked here and the table
+# applied there from disagreeing.
+arrow::write_parquet(
+  x    = catalogue,                                                 # one row per task and window
+  sink = fs::path(.lP$Output$Table, "catalogue.parquet")            # beside the tables it describes
+)
+```
+
 
 # Overview
 

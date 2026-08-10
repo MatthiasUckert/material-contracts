@@ -106,11 +106,15 @@ Every chunk in this document executes and no result is read from cache. This is 
 idempotent: `bert_sweep()` inspects the run directory, trains only configurations whose metrics are absent, and skips the
 rest. The first execution trains the full grid; subsequent executions complete in seconds and reproduce identical output.
 
-There is one deliberate exception. `RunRemaining` in the configuration below gates the two steps that spend GPU time, so
-the document can be rendered while the sweep is still in progress. That convenience is also the failure mode the
-no-caching rule exists to prevent -- a partially estimated grid still yields a leaderboard, a marginal-effect table and a
-crowned configuration, all of which look entirely normal. The Sweep coverage section immediately after training therefore
-reports what the results rest on, and both gated steps announce the skip rather than passing over it quietly.
+There is one deliberate exception. `RunSweep` and `RunDeploy` in the configuration below gate the two steps that spend GPU
+time, so the document can be rendered while the sweep is still in progress. They are separate flags because they answer
+different questions: whether to keep estimating the design, and whether to fit the configurations the evidence so far has
+crowned. Holding the first while setting the second deploys provisionally -- useful for exercising the stages downstream,
+and stated as such wherever it has consequences. That convenience is also the failure mode the no-caching rule exists to
+prevent: a partially estimated grid still yields a leaderboard, a marginal-effect table and a crowned configuration, all
+of which look entirely normal. The Sweep coverage section immediately after training reports what the results rest on,
+both gated steps announce the skip rather than passing over it quietly, and the deployment section reports which crowned
+configurations actually have a model behind them.
 
 Two further consequences follow, and both are deliberate. Deleting the run directory forces a complete retrain. Changing
 the labelled sample without deleting it produces stale results silently, because run identity is derived from
@@ -144,12 +148,21 @@ argument can be followed linearly and the evidence inspected as a whole.
     Script = here::here("contracts-engine", "classify_train.py")       # training entry point
   ),
   Param = list(
-    # The two GPU-spending steps in this document -- the sweep and the final fits -- are gated on
-    # this one flag. TRUE is the only setting under which the document's own claims about its design
-    # are true. FALSE renders against whatever runs already exist, which is useful while the sweep is
-    # still running or while the document itself is being edited, and is reported as a failure state
-    # everywhere it has consequences.
-    RunRemaining = TRUE
+    # The two GPU-spending steps are gated separately, because holding one is not a reason to hold
+    # the other. TRUE on both is the only setting under which this document's claims about its own
+    # design are true; anything else renders against whatever runs already exist and is reported as
+    # a failure state everywhere it has consequences.
+    RunSweep  = TRUE, # FALSE reports the training plan and trains nothing
+    # FALSE leaves the crowned configurations unfitted, so the orchestration stage has no artifact
+    # to pin. TRUE with RunSweep FALSE fits the crowns of a partial grid: a deployable pipeline built
+    # on a design that is not yet estimated, which is worth having while the stages downstream are
+    # still being built and is worth nothing as a result.
+    RunDeploy = TRUE,
+    # Destructive, and on the page for that reason. TRUE deletes any model under the deployment
+    # directory that is no longer crowned, because the directory is read by glob and a superseded
+    # model is a second artifact at a context length that already has one. FALSE keeps them and the
+    # duplicate variants travel into the manifest.
+    PruneFinal = TRUE
   )
 )
 ```
@@ -203,7 +216,7 @@ already settled. Every remaining combination is estimated.
 ```{r}
 #| label: build-grid
 grid_all <- grid_full |>
-  dplyr::filter(epochs != 10, lr != 1e-5, max_len == 256)
+  dplyr::filter(epochs != 10, lr != 1e-5)
 
 nrow(grid_all)
 ```
@@ -250,7 +263,7 @@ bert_sweep(
   .batch_size    = 32L,                       # held fixed across the study; not a swept axis
   .seed          = 42L,                       # initialisation and shuffling seed
   .overwrite     = FALSE,                     # FALSE skips configurations already present on disk
-  .run_remaining = .lP$Param$RunRemaining,    # FALSE reports the plan and trains nothing
+  .run_remaining = .lP$Param$RunSweep,        # FALSE reports the plan and trains nothing
   .verbose       = FALSE                      # stream per-epoch training loss to the console
 )
 ```
@@ -585,7 +598,7 @@ and length the configuration is still the one cross-validation selected under th
 
 ```{r}
 #| label: deploy-final-models
-bert_fit_final_all(
+tab_deployed <- bert_fit_final_all(
   .path_data     = .lP$Input$Prepared,                            # prepared sample
   .tab_overall   = tab_overall,                                   # bound per-fold metrics
   .model_dir     = .lP$Output$ModelFinal,                         # destination for the models
@@ -593,8 +606,75 @@ bert_fit_final_all(
   .max_lens      = c(256L, 512L),                                 # context lengths to deploy at
   .batch_size    = 32L,                                           # as used throughout
   .overwrite     = FALSE,                                         # FALSE skips existing models
-  .run_remaining = .lP$Param$RunRemaining,                        # FALSE reports the plan and fits nothing
+  .run_remaining = .lP$Param$RunDeploy,                           # FALSE reports the plan and fits nothing
   .verbose       = TRUE                                           # stream per-epoch training loss
+)
+```
+
+```{r}
+#| label: deploy-record-crown
+# The configuration this stage crowned per task, written where the orchestration stage can read it.
+# That stage used to rank the terminals again on a different criterion, which produced a third answer
+# to a question already settled here -- and a manifest naming a model that was never fitted. One
+# stage decides which configuration ships, and it is this one.
+#
+# The configuration NAME is the key, not an arm name. Arms are named by the orchestration stage,
+# which reconciles four engines under one convention; producing a second name here would be a second
+# convention, and the two would drift.
+#
+# ONE ROW PER TASK. Both context lengths are deployed and both are shipped as variants, but the
+# crowned row is a single configuration: the consumer takes it as a scalar and falls back to its own
+# ranking, with a warning rather than an error, if handed two.
+if (is.null(tab_deployed)) {
+  cli::cli_abort(c(
+    "No configuration can be crowned: the sweep produced no runs at any requested length.",
+    "i" = "Every claim this document makes about deployment is unsupported in that state."
+  ))
+}
+
+# The tiebreak is explicit rather than inherited from row order. MacroF1 is rounded to three
+# decimals, so two lengths CAN tie on the recorded value while differing underneath, and the row
+# order that would otherwise decide it is an accident of how the plan was built. Preferring the
+# shorter context on a tie is this document's own finding: equal measured accuracy, half the
+# inference cost.
+crown_ <- tab_deployed |>
+  dplyr::arrange(dplyr::desc(MacroF1), MaxLen) |>
+  dplyr::slice_head(n = 1L, by = LabelCol) |>
+  bert_report_crown(.model_dir = .lP$Output$ModelFinal)             # marks which crowns are fitted
+
+arrow::write_parquet(
+  x    = crown_,                                                    # one row per task
+  sink = fs::path(.lP$Output$ModelFinal, "deployed.parquet")        # beside the models it names
+)
+```
+
+`Fitted` is the column to read. A crown is chosen from the sweep metrics and exists whether or not
+anything was fitted, so a `NO` means the configuration the evidence selected has no model behind it
+-- either because the crown moved since the last deployment, or because `RunDeploy` was off. The
+record still ships, because it names what should run; the orchestration stage discovers models on
+disk and refuses to pin an arm whose artifact is absent, so an unfitted crown fails there with a
+sentence rather than being deployed by accident.
+
+## Superseded models
+
+The deployment directory is read by glob, so a model stays a candidate variant for as long as it sits
+there. As the sweep completes a crown can move, and the configuration it moved away from is then a
+second model at the same context length -- indistinguishable from the current one to anything asking
+for that length, since variants are labelled by the length rather than by the configuration behind
+them. Superseded models are therefore deleted rather than renamed, which is this document's one
+departure from the repository's rule for retired outputs: a checkpoint is several hundred megabytes
+and refitting reproduces it exactly from metrics that are still on disk, so keeping it stores a copy
+of something already derivable at the cost of the largest files in the project.
+
+Pruning waits until a task has every one of its crowns fitted. Applied to a partial deployment it
+would delete the models a task has and leave it with none.
+
+```{r}
+#| label: deploy-prune-superseded
+bert_prune_final(
+  .tab_crown = tab_deployed,             # every task and length, NOT the one-row-per-task record
+  .model_dir = .lP$Output$ModelFinal,    # the directory read by glob downstream
+  .prune     = .lP$Param$PruneFinal      # FALSE reports what would be removed and removes nothing
 )
 ```
 

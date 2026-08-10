@@ -426,6 +426,179 @@ bert_sweep <- function(.path_data, .grid,
 
 # Deploy: crowned config + final all-data fit --------------------------------------------------------------------------
 
+#' Remove deployable models that are no longer crowned
+#'
+#' The deployment directory is discovered by glob, so every model ever fitted stays a candidate
+#' variant for as long as it sits there. A configuration crowned under an earlier sweep and since
+#' beaten is not a variant anybody would choose: it is a SECOND model at the same context length, and
+#' the manifest labels variants by that length, so the two become indistinguishable to a caller
+#' asking for one of them. Nothing errors; a stage downstream simply cannot tell which was meant.
+#'
+#' DELETED rather than moved aside, which is a deliberate exception to this repository's rule for
+#' superseded outputs and applies to these artifacts alone. A transformer checkpoint is several
+#' hundred megabytes and is reproduced exactly by refitting the configuration the sweep metrics still
+#' record, so retaining it keeps a copy of something already derivable at the cost of the largest
+#' files in the project. A keyword table, by contrast, is kilobytes and is kept.
+#'
+#' A task is pruned only once every configuration it crowned is fitted. Pruning against an incomplete
+#' deployment would delete the models a task actually has and leave it with none.
+#'
+#' @param .tab_crown Per task and length crown table from bert_fit_final_all(), carrying LabelCol and
+#'   ConfigName. NOT the one-row-per-task deployment record: pruning against that would treat the
+#'   second context length as superseded and delete it.
+#' @param .model_dir Directory the deployable models are written under.
+#' @param .prune Logical. FALSE reports what would be removed and removes nothing.
+#' @return Invisibly a tibble of every directory considered: LabelCol, ConfigName, Path, Keep, Ready,
+#'   Removed.
+bert_prune_final <- function(.tab_crown, .model_dir, .prune = TRUE) {
+  if (FALSE) {
+    .tab_crown <- tab_deployed
+    .model_dir <- .lP$Output$ModelFinal
+    .prune     <- TRUE
+  }
+  if (!fs::dir_exists(.model_dir)) {
+    cli::cli_alert_info("No deployment directory at {.path {(.model_dir)}}; nothing to prune.")
+    return(invisible(NULL))
+  }
+  # Not recursive, so every path considered is a direct child of the deployment directory and the
+  # glob is the only thing selecting it. A destructive step should not be able to reach further than
+  # the one directory it was pointed at.
+  dirs_ <- fs::dir_ls(.model_dir, type = "directory", glob = "*__FINAL")
+  if (length(dirs_) == 0L) {
+    cli::cli_alert_info("No models under {.path {(.model_dir)}}; nothing to prune.")
+    return(invisible(NULL))
+  }
+
+  found_ <- tibble::tibble(
+    Path       = as.character(dirs_),
+    ConfigName = sub("__FINAL$", "", fs::path_file(dirs_))
+  ) |>
+    dplyr::mutate(LabelCol = sub("__.*$", "", .data$ConfigName))
+
+  ready_ <- .tab_crown |>
+    dplyr::mutate(
+      Fitted = unname(fs::dir_exists(
+        fs::path(.model_dir, paste0(.data$ConfigName, "__FINAL"), "model")
+      ))
+    ) |>
+    dplyr::summarise(Ready = all(.data$Fitted), .by = LabelCol)
+
+  # A directory whose task is absent from the crown table is left alone rather than removed: this
+  # call was told about some tasks and knows nothing about the others.
+  out_ <- found_ |>
+    dplyr::mutate(Keep = .data$ConfigName %in% .tab_crown$ConfigName) |>
+    dplyr::left_join(ready_, by = dplyr::join_by(LabelCol)) |>
+    dplyr::mutate(
+      Ready   = dplyr::coalesce(.data$Ready, FALSE),
+      Removed = !.data$Keep & .data$Ready & .prune
+    )
+
+  if (any(out_$Removed)) purrr::walk(out_$Path[out_$Removed], \(.p) fs::dir_delete(.p))
+
+  cli::cli_h2("Deployment directory")
+  out_ |>
+    dplyr::transmute(
+      Task   = .data$LabelCol,
+      Config = clf_config_label(.config_name = .data$ConfigName),
+      Status = dplyr::case_when(
+        .data$Keep    ~ "crowned",
+        .data$Removed ~ "removed",
+        !.data$Ready  ~ "kept: task not fully deployed",
+        TRUE          ~ "kept: pruning off"
+      )
+    ) |>
+    dplyr::arrange(.data$Task, .data$Status) |>
+    tbl_say()
+
+  n_rm_ <- sum(out_$Removed)
+  cli::cli_text("")
+  if (!.prune) {
+    cli::cli_alert_warning(
+      "Pruning is off. Superseded models remain and are catalogued as additional variants at a \\
+       context length that already has one."
+    )
+  } else if (n_rm_ == 0L) {
+    cli::cli_alert_success("Nothing superseded: this directory holds the crowned models and no others.")
+  } else {
+    cli::cli_alert_info(
+      "Removed {n_rm_} superseded model{?s}. Each is reproduced by re-running deployment if its \\
+       configuration is crowned again, so nothing here is lost that the sweep cannot rebuild."
+    )
+  }
+  cli::cli_alert_info(
+    "A row reading {.val kept: task not fully deployed} means that task has a crown with no model \\
+     on disk, so nothing was removed for it. Fit it rather than reading the catalogue around it."
+  )
+  invisible(out_)
+}
+
+#' Whether each crowned configuration has a fitted model on disk
+#'
+#' The crown is read off the sweep metrics, so it exists whether or not anything was fitted. A record
+#' of it can therefore name a configuration that has no artifact behind it, and the next stage to
+#' notice is the one assembling the deployment manifest -- which refuses to pin a model it cannot
+#' find, correctly, but three documents away from the flag that caused it. Checking here puts the
+#' finding beside the decision.
+#'
+#' @param .tab Crown table from bert_fit_final_all(), carrying ConfigName.
+#' @param .model_dir Directory the deployable models are written under.
+#' @return .tab with the model path checked and a logical Fitted column.
+bert_crown_status <- function(.tab, .model_dir) {
+  if (FALSE) {
+    .tab       <- tab_deployed
+    .model_dir <- .lP$Output$ModelFinal
+  }
+  .tab |>
+    dplyr::mutate(
+      Model  = as.character(fs::path(.model_dir, paste0(.data$ConfigName, "__FINAL"), "model")),
+      Fitted = unname(fs::dir_exists(.data$Model))
+    )
+}
+
+#' Report the crowned configurations and whether each is deployable
+#'
+#' Fitted is the column to read. A crown without a model is not an error in this document -- the
+#' configuration is still the one the evidence selected -- but it is a deployment that cannot happen,
+#' and it is silent everywhere else until the manifest is assembled.
+#'
+#' @param .tab Crown table from bert_fit_final_all().
+#' @param .model_dir Directory the deployable models are written under.
+#' @return Invisibly .tab with the Fitted column added.
+bert_report_crown <- function(.tab, .model_dir) {
+  if (FALSE) {
+    .tab       <- tab_deployed
+    .model_dir <- .lP$Output$ModelFinal
+  }
+  out_ <- bert_crown_status(.tab = .tab, .model_dir = .model_dir)
+
+  cli::cli_h2("Crowned, one per task")
+  out_ |>
+    dplyr::transmute(
+      Task    = .data$LabelCol,
+      MaxLen  = .data$MaxLen,
+      Config  = .data$Config,
+      MacroF1 = sprintf("%.3f", .data$MacroF1),
+      Fitted  = dplyr::if_else(.data$Fitted, "yes", "NO")
+    ) |>
+    tbl_say()
+
+  n_miss_ <- sum(!out_$Fitted)
+  cli::cli_text("")
+  if (n_miss_ == 0L) {
+    cli::cli_alert_success("Every crowned configuration has a model on disk and can be deployed.")
+  } else {
+    cli::cli_alert_danger(
+      "Crowned configurations with no fitted model: {n_miss_}. The orchestration stage refuses to \\
+       pin an arm whose artifact is absent, so no manifest can be written until these are fitted."
+    )
+    cli::cli_alert_info(
+      "A NO here means the crown moved after the last deployment, or that deployment was gated off. \\
+       Either way the fix is to fit them; nothing about the crowning itself is wrong."
+    )
+  }
+  invisible(out_)
+}
+
 #' Read the crowned (top macro-F1) configuration's hyperparameters
 #'
 #' Picks the leaderboard's top config for one task and returns its hyperparameters
@@ -1125,6 +1298,29 @@ bert_report_coverage <- function(.grid,
       .by = label_col
     )
 
+  # WHERE A COMPLETE SUB-DESIGN SURVIVES. Adding an axis to the plan absorbs whatever was already
+  # crossed into a larger design that is not, and the whole-task answer then reports nothing as
+  # readable when a great deal is: holding the incomplete axis at a finished level leaves the other
+  # axes fully crossed, so their marginal effects are readable within it. Only the marginal effect of
+  # the axis being held is not.
+  #
+  # Computed for every axis rather than for the one that happens to be incomplete today, because
+  # which axis that is changes with the plan and a rule naming a column would need editing each time.
+  sub_ <- purrr::map(axes_, \(.a) {
+    cfg_ |>
+      dplyr::filter(.data$State == "Complete") |>
+      dplyr::group_by(.data$label_col, Level = as.character(.data[[.a]])) |>
+      dplyr::group_modify(\(.d, .k) {
+        rest_ <- setdiff(axes_, .a)
+        lv_   <- purrr::map_int(rest_, \(.b) dplyr::n_distinct(.d[[.b]]))
+        tibble::tibble(Configs = nrow(.d), Crossed = nrow(.d) == prod(lv_))
+      }) |>
+      dplyr::ungroup() |>
+      dplyr::mutate(Axis = .a)
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::filter(.data$Crossed, .data$Configs > 1L)
+
   out_ <- cfg_ |>
     dplyr::summarise(
       Planned    = dplyr::n(),
@@ -1166,6 +1362,20 @@ bert_report_coverage <- function(.grid,
          {?that task/those tasks}: an axis level estimated against only some settings of the others \\
          reflects where it sits, not what it does."
       )
+      # What IS readable, so an incomplete plan does not read as an empty one.
+      keep_ <- sub_ |> dplyr::filter(.data$label_col %in% uncrossed_)
+      if (nrow(keep_) > 0L) {
+        cli::cli_text("")
+        keep_ |>
+          dplyr::select(label_col, Axis, Level, Configs) |>
+          dplyr::arrange(.data$label_col, .data$Axis, .data$Level) |>
+          tbl_say(.title = "Complete sub-designs: hold this level and the rest is crossed")
+        cli::cli_text("")
+        cli::cli_alert_info(
+          "Within any row above, the marginal effects of the OTHER axes are readable. The marginal \\
+           effect of the held axis is not, which is the comparison the outstanding runs would supply."
+        )
+      }
     }
     lost_any_ <- out_ |> dplyr::filter(.data$Lost != "")
     if (nrow(lost_any_) > 0L) {
@@ -1455,7 +1665,9 @@ bert_report_perclass_all <- function(.tab_overall, .runs_roots,
 #'   from an incomplete sweep is a model whose configuration was crowned by a design that was never
 #'   estimated, which is worse than no model, so the skip is reported as a failure state.
 #' @param .verbose Logical. Stream per-epoch training loss to the console.
-#' @return Invisibly a tibble of the configurations fitted: Task, MaxLen, Config, MacroF1.
+#' @return Invisibly one row per task and length: LabelCol, MaxLen, ConfigName, Config, MacroF1.
+#'   Returned on every path where a plan exists, including the one that fits nothing, because the
+#'   table records which configuration is crowned rather than what this call did.
 bert_fit_final_all <- function(.path_data, .tab_overall, .model_dir,
                                .label_cols = c("ClassDetailed", "ClassBroad", "AmendType"),
                                .max_lens   = c(256L, 512L),
@@ -1499,39 +1711,64 @@ bert_fit_final_all <- function(.path_data, .tab_overall, .model_dir,
      x {dplyr::n_distinct(plan_$MaxLen)} context length{?s}"
   )
 
+  # Crowning is a property of the sweep metrics, not of the fitting: the leaderboard gives the same
+  # answer whether or not a model is written afterwards. Resolving it BEFORE the gate below is what
+  # lets this function return its table on every path where a plan exists, so a render that
+  # deliberately fits nothing still reports which configuration ships. The alternative -- deriving
+  # the record from the fitting loop -- turns a supported way of rendering this document into an
+  # error in whatever reads the result.
+  cfgs_ <- purrr::pmap(dplyr::select(plan_, Task, MaxLen), \(Task, MaxLen) {
+    bert_crowned_config(.tab_overall = .tab_overall, .label_col = Task, .max_len = MaxLen)
+  })
+
+  # ConfigName travels beside the display label. The label is for reading; the name is the key a
+  # downstream stage joins on, and a stage that has only the label has to parse it back -- which is
+  # how a deployment ends up pointing at a configuration nobody fitted. MaxLen is read back off the
+  # crowned run rather than off the plan, so the row describes the configuration rather than the
+  # request that produced it.
+  out_ <- purrr::map(cfgs_, \(.cfg) {
+    board_ <- .tab_overall |>
+      dplyr::filter(.data$LabelCol == .cfg$label_col) |>
+      clf_leaderboard() |>
+      dplyr::filter(.data$ConfigName == .cfg$config_name)
+
+    tibble::tibble(
+      LabelCol   = .cfg$label_col,
+      MaxLen     = .cfg$max_len,
+      ConfigName = .cfg$config_name,
+      Config     = clf_config_label(.config_name = .cfg$config_name),
+      MacroF1    = round(board_$F1macro_mean[[1]], 3)
+    )
+  }) |>
+    purrr::list_rbind()
+
   if (!.run_remaining) {
     cli::cli_alert_danger("DEPLOYMENT SKIPPED: {.arg .run_remaining} is FALSE. No model was fitted.")
     tbl_say(.tab = dplyr::select(plan_, Task, MaxLen, Runs), .title = "Would have been fitted")
-    return(invisible(NULL))
+    cli::cli_alert_info(
+      "The crowned configurations are still returned. Nothing downstream is misled by that: the \\
+       orchestration stage discovers models on disk and refuses a manifest whose crowned arm has no \\
+       artifact, so an unfitted crown fails there with a sentence rather than here with a silence."
+    )
+    return(invisible(out_))
   }
 
-  out_ <- purrr::pmap(dplyr::select(plan_, Task, MaxLen), \(Task, MaxLen) {
-    cfg_ <- bert_crowned_config(.tab_overall = .tab_overall, .label_col = Task, .max_len = MaxLen)
-    board_ <- .tab_overall |>
-      dplyr::filter(.data$LabelCol == Task) |>
-      clf_leaderboard() |>
-      dplyr::filter(.data$ConfigName == cfg_$config_name)
-
+  purrr::walk(cfgs_, \(.cfg) {
     bert_fit_final(
       .path_data  = .path_data,
-      .config     = cfg_,
+      .config     = .cfg,
       .model_dir  = .model_dir,
       .batch_size = .batch_size,
       .overwrite  = .overwrite,
       .verbose    = .verbose
     )
-
-    tibble::tibble(
-      Task    = Task,
-      MaxLen  = MaxLen,
-      Config  = clf_config_label(.config_name = cfg_$config_name),
-      MacroF1 = round(board_$F1macro_mean[[1]], 3)
-    )
-  }) |>
-    purrr::list_rbind()
+  })
 
   cli::cli_text("")
-  tbl_say(.tab = out_, .title = "Deployed models")
+  tbl_say(
+    .tab   = dplyr::select(out_, Task = LabelCol, MaxLen, Config, MacroF1),
+    .title = "Deployed models"
+  )
   cli::cli_text("")
   cli::cli_alert_info(
     "MacroF1 is the cross-validated score of that configuration, so the accuracy cost of the shorter \\
