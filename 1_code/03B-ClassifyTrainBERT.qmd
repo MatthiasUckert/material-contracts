@@ -152,7 +152,7 @@ argument can be followed linearly and the evidence inspected as a whole.
     # the other. TRUE on both is the only setting under which this document's claims about its own
     # design are true; anything else renders against whatever runs already exist and is reported as
     # a failure state everywhere it has consequences.
-    RunSweep  = TRUE, # FALSE reports the training plan and trains nothing
+    RunSweep  = FALSE, # FALSE reports the training plan and trains nothing
     # FALSE leaves the crowned configurations unfitted, so the orchestration stage has no artifact
     # to pin. TRUE with RunSweep FALSE fits the crowns of a partial grid: a deployable pipeline built
     # on a design that is not yet estimated, which is worth having while the stages downstream are

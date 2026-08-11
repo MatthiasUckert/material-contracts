@@ -300,23 +300,46 @@ plot_scale_colour_grad <- function(...) {
 }
 
 #' Percent axis with no wasted expansion
+#'
+#' Breaks are ggplot2's default unless .breaks is given; see plot_scale_y_pct() for when to give it.
+#'
 #' @param .accuracy Numeric. Rounding for the tick labels.
 #' @param .expand Numeric length-two. Multiplicative expansion, lower then upper.
+#' @param .breaks Break function or vector. Defaults to ggplot2's own choice.
 #' @return A ggplot2 scale.
-plot_scale_x_pct <- function(.accuracy = 1, .expand = c(0, 0.02)) {
+plot_scale_x_pct <- function(.accuracy = 1, .expand = c(0, 0.02), .breaks = ggplot2::waiver()) {
   ggplot2::scale_x_continuous(
     labels = scales::label_percent(accuracy = .accuracy),
+    breaks = .breaks,
     expand = ggplot2::expansion(mult = .expand)
   )
 }
 
 #' Percent axis with no wasted expansion
+#'
+#' .breaks defaults to ggplot2's own choice, which is scales::breaks_extended() -- an algorithm
+#' optimising a trade-off between simplicity and coverage that on a percentage axis will return
+#' sequences like 2, 5, 8, 10. No reader would choose that, and it looks unconsidered beside every
+#' other axis in the document. Pass scales::breaks_pretty(), which is restricted to multiples of
+#' one, two and five, wherever the default comes out badly.
+#'
+#' IT IS NOT THE DEFAULT, and the reason is a rule rather than a preference: every figure in the 03
+#' family already renders through this function, so changing what it returns would silently move
+#' tick marks across documents that are finished. Changes to this file are additive, with defaults
+#' that preserve existing behaviour, until a deliberate pass re-renders everything together.
+#'
+#' There is an inconsistency worth knowing about when that pass happens: plot_bar_ranked() already
+#' uses pretty breaks on its fixed-limit branch and this function's default on the other, so one
+#' figure type can render its axis two ways depending on whether limits were supplied.
+#'
 #' @param .accuracy Numeric. Rounding for the tick labels.
 #' @param .expand Numeric length-two. Multiplicative expansion, lower then upper.
+#' @param .breaks Break function or vector. Defaults to ggplot2's own choice.
 #' @return A ggplot2 scale.
-plot_scale_y_pct <- function(.accuracy = 1, .expand = c(0, 0.02)) {
+plot_scale_y_pct <- function(.accuracy = 1, .expand = c(0, 0.02), .breaks = ggplot2::waiver()) {
   ggplot2::scale_y_continuous(
     labels = scales::label_percent(accuracy = .accuracy),
+    breaks = .breaks,
     expand = ggplot2::expansion(mult = .expand)
   )
 }
@@ -683,10 +706,25 @@ plot_bar_ranked <- function(.tab, .cat, .val, .key = NULL, .short = FALSE, .labe
 #' @param .label_min Numeric or NULL. Suppress the printed value on cells below this. A sparse matrix
 #'   is mostly zeros, and printing every one of them buries the handful of cells that carry the
 #'   result under a field of noughts. The cell is still drawn and still shaded; only its label goes.
+#' @param .cell_label Character or NULL. Print this column's values in the cells while shading by
+#'   .fill. Separating the two is what makes a matrix readable when its columns are on wildly
+#'   different scales: shading a raw count that runs 3 to 500 puts every column but the largest at
+#'   the white end of the ramp, so the figure shows one column and hides the rest. Shade a
+#'   within-column share and print the count, and every column becomes legible without the numbers
+#'   changing. NULL prints .fill, which is the ordinary case.
+#' @param .drop Which axes discard levels nothing lands on. "none", the default, keeps every
+#'   registered level -- correct for a confusion matrix, where a category the classifier never
+#'   predicts must still hold its column, because its absence is the result. Name an axis where a
+#'   missing level is structural rather than informative: an engine that cannot emit a label has not
+#'   disagreed about it, and drawing it as an empty row invites exactly that misreading. It is
+#'   per-axis rather than a single flag because the two axes usually differ -- the same figure can
+#'   want its entity labels dropped and its contract types kept. Under a facet, dropping happens per
+#'   panel only where the facet is declared with free scales.
 #' @return A ggplot.
 plot_heatmap <- function(.tab, .x, .y, .fill, .key_x = NULL, .key_y = NULL, .short = FALSE,
                          .label = TRUE, .pct = FALSE, .accuracy = 0.01, .angle = 40,
-                         .extra = NULL, .limits = NULL, .label_min = NULL) {
+                         .extra = NULL, .limits = NULL, .label_min = NULL,
+                         .cell_label = NULL, .drop = c("none", "x", "y", "both")) {
   if (FALSE) {
     .tab      <- tibble::tibble(Pred = c("A", "B"), True = c("A", "A"), Share = c(0.9, 0.1))
     .x        <- "Pred"
@@ -702,10 +740,20 @@ plot_heatmap <- function(.tab, .x, .y, .fill, .key_x = NULL, .key_y = NULL, .sho
     .extra     <- NULL
     .limits    <- NULL
     .label_min <- NULL
+    .cell_label <- NULL
+    .drop      <- "none"
   }
+  .drop    <- match.arg(.drop)
+  drop_x_  <- .drop %in% c("x", "both")
+  drop_y_  <- .drop %in% c("y", "both")
   dat_ <- .tab |>
     dplyr::mutate(
       PlotFill = as.numeric(.data[[.fill]]),
+      PlotText = if (is.null(.cell_label)) {
+        as.numeric(.data[[.fill]])
+      } else {
+        as.numeric(.data[[.cell_label]])
+      },
       PlotX    = if (is.null(.key_x)) factor(as.character(.data[[.x]])) else {
         plot_factor(.data[[.x]], .key = .key_x, .short = .short, .extra = .extra)
       },
@@ -734,22 +782,37 @@ plot_heatmap <- function(.tab, .x, .y, .fill, .key_x = NULL, .key_y = NULL, .sho
   if (.label) {
     lab_ <- dat_
     if (!is.null(.label_min)) lab_ <- dplyr::filter(lab_, .data$PlotFill >= .label_min)
+    # The printed value formats on its own scale. Where .cell_label is a count and .fill a share,
+    # one formatter cannot serve both, and the percentage formatter would render a count of 262 as
+    # 26,200%.
+    fmt_lab_ <- if (is.null(.cell_label)) fmt_ else scales::label_number(accuracy = .accuracy)
     p_ <- p_ + ggplot2::geom_text(
       data    = lab_,
-      mapping = ggplot2::aes(label = fmt_(.data$PlotFill), colour = .data$PlotFill > mid_),
+      mapping = ggplot2::aes(label = fmt_lab_(.data$PlotText), colour = .data$PlotFill > mid_),
       size    = (.plot_base - 3) / ggplot2::.pt, family = .plot_font, show.legend = FALSE
     ) +
       ggplot2::scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "black"), guide = "none")
   }
 
   p_ +
-    plot_scale_fill_grad(labels = fmt_, name = NULL, limits = .limits) +
-    # drop = FALSE keeps every registered level on the axis even when nothing lands on it. A category
+    plot_scale_fill_grad(
+      labels = fmt_,
+      name   = NULL,
+      limits = .limits,
+      # With .cell_label the ramp carries a different quantity from the printed numbers, so a legend
+      # would invite reading the cells against the wrong scale.
+      guide  = if (is.null(.cell_label)) "colourbar" else "none"
+    ) +
+    # The default keeps every registered level on the axis even when nothing lands on it. A category
     # a classifier never predicts would otherwise lose its column, and the matrix would quietly stop
     # being square -- hiding the very fact that the category is never chosen. Where an axis is not
     # keyed, its factor carries only observed levels, so this changes nothing.
-    ggplot2::scale_x_discrete(drop = FALSE) +
-    ggplot2::scale_y_discrete(limits = rev, drop = FALSE) +
+    #
+    # Naming an axis in .drop inverts that for that axis, and does so PER PANEL when the facet uses
+    # free scales -- which is the only mechanism that works: dropping levels from the data instead
+    # would remove a level from every panel as soon as one panel used it.
+    ggplot2::scale_x_discrete(drop = drop_x_) +
+    ggplot2::scale_y_discrete(limits = rev, drop = drop_y_) +
     ggplot2::labs(x = NULL, y = NULL) +
     plot_theme(.grid = "none", .legend = "right") +
     ggplot2::theme(

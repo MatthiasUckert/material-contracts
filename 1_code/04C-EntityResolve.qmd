@@ -10,16 +10,16 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| purl: false
 knitr::opts_knit$set(root.dir = here::here())
 
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml, and overriding it per document is how two documents came to render at more
+# than twice the width of the rest.
 knitr::opts_chunk$set(
-  root.dir  = here::here(),
-  message   = TRUE,       # mandatory: cli writes through the message stream under knitr, so
-                          # message = FALSE would discard this document's entire output
-  warning   = FALSE,
-  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
-  fig.width = 7.5,        # fixed for every figure; only height varies, and only with row count
-  fig.align = "center",
-  dpi       = 200,
-  out.width = "100%"
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
 )
 
 options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
@@ -41,16 +41,21 @@ source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 source("1_code/_Commons/_NER.R", encoding = "UTF-8")
 
-# 03A owns the console formatter. 04B owns the anchor logic, the session helper and the date
-# cleaner; sourcing it rather than copying is what keeps the anchor this document validates against
-# identical to the one 04B measured with.
-source(
-  file     = init_create_script_fun(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare"),
-  encoding = "UTF-8"
-)
-source(
-  file     = init_create_script_fun(.dir_here = here::here(), .name_script = "04B-EntityMeasure"),
-  encoding = "UTF-8"
+# The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING: 03A
+# aliases the table helpers at SOURCE time, so sourcing it first throws part-way through the file.
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 03A owns the console formatter and the contract-type vocabulary; 04A the entity vocabularies and
+# the store; 04B the anchor logic, the session helper and the date cleaner. Sourcing rather than
+# copying is what keeps the anchor this document validates against identical to the one 04B
+# measured with.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "04A-EntityExtract", "04B-EntityMeasure"),
+  .f = function(.s) {
+    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+           encoding = "UTF-8")
+  }
 )
 
 cat("Main Directory: ")
@@ -77,7 +82,7 @@ This document does. It applies the settled policy to the candidate store, assign
 surviving span, and collapses those into one row per contract carrying the parties, the contract
 dates, the party locations, and what can honestly be said about value.
 
-## It resolves what 04E will produce, not what 04A extracted
+## It resolves what 04D will produce, not what 04A extracted
 
 The store holds eight engines over full text. The corpus pass will run **one engine per label over a
 capped window**. Resolving the union here would validate a pipeline nobody deploys, so the candidate
@@ -164,7 +169,7 @@ tab_policy <- ent_read_policy(.path = .lP$Input$Policy)
 tab_keys   <- ent_anchor_keys(.path_anchors = .lP$Input$Anchors)
 tab_rules  <- arrow::read_parquet(.lP$Input$Kept)
 
-clf_say_table(
+tbl_say(
   .tab = tab_policy |>
     dplyr::select(Label, Combo, CapChars, TailChars) |>
     dplyr::mutate(dplyr::across(c(CapChars, TailChars), as.integer)),
@@ -172,9 +177,16 @@ clf_say_table(
 )
 ```
 
-A tail of zero is the ordinary prefix case. Geography is the label that needs a non-zero one: a
-governing-law clause sits in the final fifth of a contract and no prefix reaches it, which the
-character-window grid in 04B showed costs twenty-six points of document-level recall.
+Every label reads full text, so the window part of this filter is a no-op and the deployed set is the
+candidate store restricted to the engines the policy names. That is deliberate rather than
+incidental: every candidate carries its offsets, so a window is a filter applied here at resolution
+rather than a decision taken at extraction, and imposing one later costs a `WHERE` clause where
+recovering one costs a corpus pass. 04B measures what a cap would have kept and what it would have
+cost; nothing in this document takes one.
+
+A label may carry more than one engine. 04B unions the cheap rule arms in regardless of the ranking,
+so dates run LexNLP and `dateregex` together and the spans both propose collapse to one. Adding an
+engine widens the deployed set and cannot narrow it; the count below is the union.
 
 ```{r}
 #| label: build-deployed
@@ -201,20 +213,72 @@ term in the contract that defines it, and part of a name in *Blue Ridge Real Est
 ent_defined_terms(.con = con, .path_text = .lP$Input$Text)
 ```
 
+Where several cues fire on one span with different roles, one has to win, and the rule that decides
+it was wrong in a way that emptied the term variable.
+
+04B judges a cue in a **direction**. A `signing` cue is validated by lift *above* the base rate,
+because the anchor is the contract's own date and a signing cue should concentrate on it. An
+`expiry` cue is validated by lift *below* it, because an expiry date falls after the filing, so a
+correct expiry cue must avoid the anchor. The two groups therefore carry high and low lift by
+construction. Ranking on raw lift descending means an expiry cue can never win a contested span: it
+wins only spans no signing cue reaches. That is why the role landed on 22 documents of 4,398 while
+the same cues fire in their thousands.
+
+**Proximity replaces it.** The nearest matching cue wins. This needs no scale on which a
+high-direction lift and a low-direction lift are comparable -- and none honestly exists, since the
+two measure different things -- and it answers the question actually being asked, which is not which
+cue is best but which cue is *about* this span. Ties in distance break on the narrower declared
+window, which is the reading session's own statement of how specific a cue is.
+
+The change was made in the expectation that it would rescue the expiry role, and **it does not**.
+The table below is what settles that, and it is reported rather than quietly dropped because a
+prediction that failed is evidence about the thing predicted. Expiry moves from 34 documents to 37.
+Whatever is emptying the term variable, it is not this.
+
+What the change does earn is elsewhere, and it matters more for the paper than the expiry question
+does. `statutory` dates rise sharply: these are references to an Act of 1933 or an Internal Revenue
+Code section, and they are exactly what inflates the published term measure to a maximum in the
+thousands of years. Under lift they were being captured by broad signing cues declared at two
+hundred characters; under proximity they go to `act of` and `code of`, declared at twelve and
+fifteen, which are the cues genuinely adjacent to them. `other` collapses in the same movement, as
+`base rent` at a 240-character window stops winning spans it was never about.
+
+```{r}
+#| label: compare-tiebreak
+tab_tiebreak <- ent_compare_tiebreak(
+  .con       = con,
+  .path_text = .lP$Input$Text,
+  .rules     = tab_rules,       # the rules 04B measured, with their lifts and declared windows
+  .ctx_max   = .lP$Params$CtxMax,
+  # The chosen rule is applied LAST, so the roles table is left under it and nothing below depends
+  # on a restore executing.
+  .tiebreaks = c("lift", "window", "proximity")
+)
+
+tab_tiebreak |>
+  tidyr::pivot_wider(
+    names_from = Tiebreak, values_from = c(NSpans, NDocs), values_fill = 0L
+  ) |>
+  tbl_say(.title = "What the tie-break changes, role by role")
+```
+
+A methodological change of this kind is measured rather than asserted, and the measurement here
+refutes the reason the change was proposed while supporting the change itself. Read the rows in this
+order: `DATE expiry`, which barely moves and sends the term question to the coverage grid below;
+`DATE statutory` and `DATE other`, which move in opposite directions by hundreds of documents and
+are the reassignment that justifies proximity; and `MONEY per_unit`, which rises by half again,
+because its cues are right-sided and tight and were losing to broader neighbours.
+
 ```{r}
 #| label: assign-roles
 n_roles <- ent_assign_roles(
   .con       = con,
   .path_text = .lP$Input$Text,
-  .rules     = tab_rules,          # the rules 04B measured, with their lifts
-  .ctx_max   = .lP$Params$CtxMax
+  .rules     = tab_rules,       # the rules 04B measured
+  .ctx_max   = .lP$Params$CtxMax,
+  .tiebreak  = "proximity"      # nearest cue wins; ties break on the narrower declared window
 )
 ```
-
-Where several cues fire on one span with different roles, the highest measured lift wins. That is
-the only non-arbitrary tie-break available and it uses the measurement rather than an ordering
-someone chose: it prefers the rule the anchor showed to be most concentrated on the thing it claims
-to mark.
 
 A span no cue reaches keeps a null role and is carried rather than discarded. For organisations that
 matters, because position in the preamble is itself evidence and the party resolver uses it.
@@ -260,28 +324,110 @@ one -- the trade is coverage for a measure that means what it says.
 
 ## Does the window preserve an expiry date?
 
-The character grid in 04B chooses a window on how often it recovers the **anchor**, and the date
-anchor is the contract's own date, which sits in the preamble. Nothing there measures whether an
-expiry date survives the same window. A head-only cap returned one for 22 documents of 4,398 while
-the same cues fire in their thousands over full text, so the window was chosen on one quantity and
-applied to another.
+The extraction now reads full text, so the grid below no longer chooses anything. It remains, and it
+remains the most useful table in this document, because it decomposes where the term variable is
+actually lost -- and that decomposition was invisible while a cap was in force.
+
+The history is worth keeping in view. The character grid in 04B ranks windows on how often they
+recover the **anchor**, and the date anchor is the contract's own date, which sits in the preamble.
+Nothing there measures whether an expiry date survives the same window. A cap was set on the first
+quantity and applied to the second, and the check that appeared to vindicate it could not have done
+so.
+
+The earlier version of this check could not settle it, and produced a flat line that looked like a
+result. It read the `roles` table, which descends from the already windowed candidate set, so its
+5,000 and 10,000 head rows queried a table holding nothing past 3,000 characters and could not
+differ from the 3,000 row whatever the truth was. And it filtered on the assigned role, which the
+lift tie-break was stripping -- so widening the window admitted spans whose role the same mechanism
+then removed. It measured the window *through* the defect it was being used to rule out.
+
+Both faults are fixed by going back to the source. Candidates come from the unfiltered store, so a
+wide head has something to find, and a span counts when any expiry cue reaches it rather than when
+the tie-break awarded it the role. The result is a **ceiling**: what a window could deliver, not
+what the deployed pipeline will. That is the right quantity for choosing a cap, because a cap that
+cannot clear the ceiling is disqualified whatever the resolver does afterwards.
 
 ```{r}
 #| label: measure-expiry-coverage
-ent_role_coverage(
-  .con   = con,
-  .label = "DATE",
-  .roles = "expiry",       # the role the anchor cannot speak to and the window was chosen without
-  .head  = c(3000L, 5000L, 10000L),
-  .tail  = c(0L, 2000L, 5000L, 10000L)
-) |>
-  dplyr::mutate(PctDocs = clf_pct(.data$PctDocs)) |>
-  clf_say_table(.title = "Documents with an expiry date inside the window")
+purrr::map(list(NULL, tab_policy), function(.p) {
+  ent_role_coverage(
+    .con       = con,
+    .path_text = .lP$Input$Text,   # the context the cues are matched in
+    .rules     = tab_rules,        # cues are applied here, not read off the role assignment
+    .label     = "DATE",
+    .roles     = "expiry",         # the role the anchor cannot speak to
+    .head      = c(3000L, 5000L, 10000L, 20000L, 100000000L),  # the last is the full document
+    .tail      = c(0L, 2000L, 5000L, 10000L),
+    .ctx_max   = .lP$Params$CtxMax,
+    .policy    = .p                # NULL pools every engine; the policy restricts to the one that runs
+  )
+}) |>
+  purrr::list_rbind() |>
+  dplyr::select(Engines, Head, Tail, NDocs, PctDocs) |>
+  tidyr::pivot_wider(
+    names_from = Engines, values_from = c(NDocs, PctDocs), values_fill = 0L
+  ) |>
+  dplyr::mutate(dplyr::across(dplyr::starts_with("PctDocs"), \(.x) tbl_pct(.x))) |>
+  tbl_say(.title = "Documents with an expiry cue reaching a date, inside the window")
 ```
 
-Read the tail column against the head column. If a tail of five thousand characters recovers more
-than trebling the head does, the term clause sits at the end of a contract and no prefix will reach
-it however generous.
+**Two columns, because there are two ceilings and they answer different questions.** Pooling every
+engine in the store gives the true upper bound on what is recoverable at all. Restricting to the
+engine the policy actually runs gives the number comparable to what the resolver produced. Reading
+one against the other mixes a window effect with an engine effect, which is what the first version
+of this table did.
+
+Three readings, in order.
+
+**The full-document row is the ceiling, and it is low.** Even reading every character of every
+contract, an expiry cue reaches a date in well under half the sample. So this is a cue problem
+before it is a window problem: the seven expiry cues are not enough vocabulary for the ways a
+contract states its term, and no window can fix that. Whatever the window decision, the term
+variable will not cover most of the corpus until the cue list grows.
+
+**A cap would nonetheless cost a great deal here.** Compare the 3,000-plus-5,000 row -- the window
+that was in force -- against the full-document row. The gap is roughly a factor of three, so the cap
+was discarding most of what the expiry cues could reach, on a variable that had not yet been built
+and against evidence that did not yet exist. That is the concrete case for extracting over full text
+and filtering afterwards.
+
+**The tie-break gap is the smallest of the three.** This table counts a document when *any* expiry
+cue reaches a date, while the role assignment is winner takes all, so a span on which the expiry cue
+loses counts here and not there. Set the deployed-engine figure at the current window against the
+resolved contract ends in the Resolution table above: the difference is real but modest, and it is
+the last term rather than the first.
+
+**The engine is the largest gap by an order of magnitude**, and it was not on the list of suspects.
+Compare the two columns at any row. The engine deployed for dates recovers a small fraction of what
+the store as a whole contains, and the reason is structural rather than accidental: 04B ranks
+engines on recall against the EDGAR anchor, and for dates that anchor is the contract's own date,
+which sits in the preamble. An engine that is excellent at the preamble formula and blind to term
+clauses scores at the top of that table and delivers almost nothing here.
+
+That is the same criticism this document already makes of the window -- chosen on a start date and
+applied to an end date -- and it turns out to hold for the engine too. The table below asks which
+engines the expiry cues can actually reach, so the choice can be revisited against the quantity it
+is meant to serve.
+
+```{r}
+#| label: measure-expiry-by-engine
+ent_role_by_engine(
+  .con       = con,
+  .path_text = .lP$Input$Text,
+  .rules     = tab_rules,
+  .label     = "DATE",
+  .roles     = "expiry",
+  .ctx_max   = .lP$Params$CtxMax
+) |>
+  dplyr::mutate(PctDocs = tbl_pct(.data$PctDocs)) |>
+  tbl_say(.title = "Which engine's dates an expiry cue can reach, over full text")
+```
+
+Read this beside `SpansPerAnchor` from 04B rather than on its own. Reaching more dates is recall,
+and the precision of those reaches is unmeasured here as it is everywhere in this family: an engine
+proposing five times the spans may reach five times the expiry dates and be no better for it. What
+the table settles is whether the current engine is leaving a large recoverable set on the table, not
+which engine should replace it.
 
 # Places
 
@@ -325,8 +471,8 @@ tab_vars |>
     .by = Class
   ) |>
   dplyr::arrange(dplyr::desc(.data$NDocs)) |>
-  dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) clf_pct(.x))) |>
-  clf_say_table(.title = "Resolution by contract type")
+  dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x))) |>
+  tbl_say(.title = "Resolution by contract type")
 ```
 
 Coverage is not uniform and should not be reported as though it were. A variable present in a third
@@ -342,9 +488,9 @@ DBI::dbGetQuery(con, paste0(
 )) |>
   dplyr::mutate(
     dplyr::across(c(Spans, NoRole), as.integer),
-    PctNoRole = clf_pct(.data$NoRole / .data$Spans)
+    PctNoRole = tbl_pct(.data$NoRole / .data$Spans)
   ) |>
-  clf_say_table(.title = "Spans no cue reached")
+  tbl_say(.title = "Spans no cue reached")
 ```
 
 A high share here is not a failure of the rules so much as a statement about how much of the
@@ -372,7 +518,7 @@ tibble::tibble(
     MB     = round(as.numeric(fs::file_size(.data$Path)) / 1024^2, 1),
     Path   = fs::path_file(.data$Path)
   ) |>
-  clf_say_table(.title = "Written by 04C")
+  tbl_say(.title = "Written by 04C")
 ```
 
 # Overview
@@ -381,17 +527,14 @@ tibble::tibble(
 
 ```{r}
 #| label: fig-duration
-#| fig-height: 3.4
-#| fig-cap: "Contract term under the published definition and under role classification."
-tab_vars |>
-  dplyr::select(DocID, DurationPaper, DurationNew) |>
-  tidyr::pivot_longer(-DocID, names_to = "Measure", values_to = "Years") |>
-  dplyr::filter(!is.na(.data$Years), .data$Years > -1, .data$Years < 60) |>
-  ggplot2::ggplot(ggplot2::aes(x = Years)) +
-  ggplot2::geom_histogram(bins = 60) +
-  ggplot2::facet_wrap(~Measure, nrow = 1, scales = "free_y") +
-  ggplot2::labs(x = "Contract term (years)", y = "Documents") +
-  ggplot2::theme_bw(base_size = 9)
+#| fig-height: !expr plot_height(2)
+#| fig-cap: "Contract term under the published definition and under role classification. The axis is
+#|   truncated at sixty years; the untruncated moments are in the table above."
+ent_plot_duration(
+  .tab       = tab_vars,
+  .max_years = 60,     # the published measure runs to thousands; see the caption
+  .bins      = 60L
+)
 ```
 
 The published panel is the one to read for its right tail; the axis is truncated at sixty years and
@@ -401,20 +544,18 @@ the values beyond it are the reason the standard deviation is what a referee fou
 
 ```{r}
 #| label: fig-place-roles
-#| fig-height: 4.6
-#| fig-cap: "Share of place occurrences carrying each role, by contract type."
-tab_vars |>
-  dplyr::select(Class, NPartyAddress, NIncorporation, NGoverningLaw, NPerformance,
-                NIncidental, NUnassigned) |>
-  tidyr::pivot_longer(-Class, names_to = "Role", values_to = "N") |>
-  dplyr::summarise(N = sum(.data$N, na.rm = TRUE), .by = c(Class, Role)) |>
-  dplyr::mutate(Share = .data$N / sum(.data$N), .by = Class) |>
-  ggplot2::ggplot(ggplot2::aes(x = Share, y = Class, fill = Role)) +
-  ggplot2::geom_col() +
-  ggplot2::scale_x_continuous(labels = scales::percent) +
-  ggplot2::labs(x = "Share of place occurrences", y = NULL) +
-  ggplot2::theme_bw(base_size = 9)
+#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")))
+#| fig-cap: "Share of place occurrences carrying each role, by contract type. Occurrences rather
+#|   than documents: one place name serves several roles inside one contract."
+ent_plot_place_roles(
+  .tab       = tab_vars,
+  .key_class = "ClassDetailed"   # the vocabulary 03A registered, so rows match the 03 family
+)
 ```
+
+Read the unassigned share first. It is the largest segment in every contract type, and it is the
+honest bound on this variable: a place occurrence no cue reached is carried rather than guessed at,
+so the roles below it describe a minority of the geography the extraction found.
 
 ## Everything again
 
@@ -425,7 +566,7 @@ ent_report_all_resolve(.n_deployed = n_deployed, .n_roles = n_roles, .tab = tab_
 
 # Next
 
-**04E** applies the same policy to the corpus. It needs nothing this document has not written: the
+**04D** applies the same policy to the corpus. It needs nothing this document has not written: the
 engine and window come from `extraction_policy.parquet`, the rules from `rules_kept.parquet`, and
 the resolution logic is the functions above run over a larger store.
 

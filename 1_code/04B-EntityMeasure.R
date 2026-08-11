@@ -1,4 +1,4 @@
-# 04B-EntityMeasure: score engines and rules against facts EDGAR already recorded ----
+# 04B-EntityMeasure: score engines and rules against facts EDGAR already recorded --------------------------------------
 #
 # WHAT THIS FILE DOES, IN ONE PARAGRAPH
 # 04A extracted candidates and described them; nothing was measured, because entity labels do not
@@ -13,20 +13,28 @@
 # match it is unlabelled, not wrong: most organisations in a contract are counterparties, agents and
 # third parties that EDGAR never recorded. So a rule's measured precision is the share of the spans
 # it keeps that are the KNOWN entity, which is a lower bound on precision and a proxy that behaves
-# well for ranking. Recall against the anchor is the honest number and needs no hedging: if an
-# engine never proposes the filer's own name, it did not find it.
+# well for ranking and badly as a level. Recall against the anchor is the honest number and needs no
+# hedging: if an engine never proposes the filer's own name, it did not find it.
 #
 # ROLES THAT THE ANCHOR CANNOT SPEAK TO
-# The filer is a party, so a cue for the `agent` or `regulator` role cannot be scored against it and
-# would look worthless if it were. Only the roles in .ALIGNED are scored on precision; the rest are
-# reported on coverage alone and marked as unmeasured. A `stop` rule is different and is scored
-# universally: it claims a span is never the entity, so any stop that kills an anchor is wrong by
-# its own definition, whatever role it carries.
+# The filer is a party, so a cue for the `agent` or `regulator` role cannot be confirmed against it
+# and would look worthless if it were scored as though it could. Only the roles in .ALIGNED are
+# judged, and they are judged in a DIRECTION: for a high-direction role the pass condition is lift
+# above the base rate, and for a low-direction role it is lift near zero, which is falsification
+# rather than confirmation. The rest are reported on coverage alone and marked unmeasured. A `stop`
+# rule is different and is scored universally: it claims a span is never the entity, so any stop
+# that kills an anchor is refuted by its own definition, whatever role it carries.
 #
 # WHICH FOLD, AND WHY IT DIFFERS BY SECTION
 # The reading session read folds 1-4, so rules are scored on fold 5 alone. Engine recall involves no
 # rules and cannot be contaminated, so it uses all 4,398 documents and is the more precise for it.
 # The two are reported separately and never averaged.
+#
+# WHAT LEAVES THIS FILE
+# Four artifacts. anchor_hits is the per-span verdict, read by every section here and by 04D.
+# rule_scores is the full record. rules_kept is the survivors, read by 04C and 04D. And
+# extraction_policy is the decision: one engine per label, a window, and a Basis saying what kind
+# of evidence stands behind each row. 04C and 04D read a decision rather than re-deriving one.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
@@ -45,7 +53,18 @@ if (FALSE) {
 }
 
 
-# 1. Anchors --------------------------------------------------------------
+# 0. Vocabulary ------------------------------------------------------------------------------------------------------
+# 04A registers Label and Combo when its library is sourced, and this document sources it. Nothing
+# is re-registered here: two registrations of one key would let the two documents order the same
+# axis differently, which is the failure a shared registry exists to prevent.
+#
+# Roles are NOT registered. They are a per-label vocabulary -- ORG has five, MONEY has seven, and
+# they do not overlap -- so a single flat key would order them arbitrarily and a per-label key would
+# be five registrations serving one figure. Where a role appears on an axis it carries its own
+# observed order.
+
+
+# 1. Anchors ---------------------------------------------------------------------------------------------------------
 # One known-true entity per document per label, derived from EDGAR rather than from the contract.
 
 #' Reduce a company name to a matchable key
@@ -338,7 +357,9 @@ ent_write_anchor_hits <- function(.con, .path_out, .window_days = 730L,
   cli::cli_alert_info("Flagging anchors ...")
   DBI::dbExecute(.con, paste0(
     "CREATE OR REPLACE TABLE anchor_hits AS ",
-    "SELECT sp.DocID, sp.Label, sp.Start, sp.Stop, sp.Span, sp.SpanNorm, ",
+    # SpanDate travels with the table. It is what lets the date window be varied in a query rather
+    # than by rebuilding anchor_hits, and it saves every consumer re-running the parse.
+    "SELECT sp.DocID, sp.Label, sp.Start, sp.Stop, sp.Span, sp.SpanNorm, sp.SpanDate, ",
     "  CASE sp.Label ",
     "    WHEN 'ORG'  THEN COALESCE(k.AnchorKey IS NOT NULL ",
     "                    AND (contains(sp.SpanNorm, k.AnchorKey) ",
@@ -376,8 +397,33 @@ ent_write_anchor_hits <- function(.con, .path_out, .window_days = 730L,
 #'
 #' @param .con Session with anchor_hits built.
 #' @return Tibble: Label, DocsWithAnchor, DocsMatched, PctMatched, Spans, AnchorSpans, BaseRate.
-ent_anchor_coverage <- function(.con) {
-  if (FALSE) .con <- con
+ent_anchor_coverage <- function(.con, .window_days = NULL) {
+  if (FALSE) {
+    .con         <- con
+    .window_days <- NULL
+  }
+
+  # The date test is re-evaluated here rather than read off anchor_hits when .window_days is given.
+  # The sensitivity analysis previously rebuilt the shared anchor_hits table once per window and
+  # relied on a later chunk to put it back, which makes every section after that point depend on a
+  # restore executing: reorder the document, or fail in between, and the rest of it silently reports
+  # against a window nobody chose. Recomputing one column in a query touches nothing.
+  isanchor_ <- if (is.null(.window_days)) {
+    "ah.IsAnchor"
+  } else {
+    paste0(
+      "CASE WHEN ah.Label <> 'DATE' THEN ah.IsAnchor ELSE COALESCE( ",
+      "  ah.SpanDate IS NOT NULL AND k.DateFiled IS NOT NULL ",
+      "  AND CAST(ah.SpanDate AS DATE) <= CAST(k.DateFiled AS DATE) ",
+      "  AND CAST(ah.SpanDate AS DATE) >= CAST(k.DateFiled AS DATE) - ",
+      as.integer(.window_days), ", FALSE) END"
+    )
+  }
+  from_ <- if (is.null(.window_days)) {
+    "anchor_hits ah"
+  } else {
+    "anchor_hits ah JOIN keys k USING (DocID)"
+  }
 
   DBI::dbGetQuery(.con, paste0(
     "WITH avail AS ( ",
@@ -386,9 +432,10 @@ ent_anchor_coverage <- function(.con) {
     "  UNION ALL SELECT 'DATE', COUNT(*) FROM keys WHERE DateFiled IS NOT NULL ",
     "  UNION ALL SELECT 'MONEY', 0), ",
     "agg AS ( ",
-    "  SELECT Label, COUNT(*) AS Spans, SUM(CASE WHEN IsAnchor THEN 1 ELSE 0 END) AS AnchorSpans, ",
-    "         COUNT(DISTINCT CASE WHEN IsAnchor THEN DocID END) AS DocsMatched ",
-    "  FROM anchor_hits GROUP BY Label) ",
+    "  SELECT ah.Label, COUNT(*) AS Spans, ",
+    "         SUM(CASE WHEN ", isanchor_, " THEN 1 ELSE 0 END) AS AnchorSpans, ",
+    "         COUNT(DISTINCT CASE WHEN ", isanchor_, " THEN ah.DocID END) AS DocsMatched ",
+    "  FROM ", from_, " GROUP BY ah.Label) ",
     "SELECT agg.Label, avail.N AS DocsWithAnchor, agg.DocsMatched, ",
     "       agg.Spans, agg.AnchorSpans, ",
     "       CAST(agg.DocsMatched AS DOUBLE) / NULLIF(avail.N, 0) AS PctMatched, ",
@@ -400,7 +447,7 @@ ent_anchor_coverage <- function(.con) {
 }
 
 
-# 2. Engine recall floors -------------------------------------------------
+# 2. Engine recall floors --------------------------------------------------------------------------------------------
 # The result that costs nothing and settles the engine question.
 
 #' Per-engine recall against the known entity, plus the cost of finding it
@@ -449,7 +496,32 @@ ent_engine_recall <- function(.con) {
 }
 
 
-# 3. Rule scoring ---------------------------------------------------------
+#' Read the extraction policy this family settled on
+#'
+#' Lives here rather than with its readers because 04B WRITES the artifact, and the design rule is
+#' that shared tooling sits in the earliest script that needs it. It was in 04C, which meant 04D
+#' had to source the whole resolution library to read one parquet -- and once 04D stopped resolving
+#' anything, it stopped sourcing 04C and the function became unreachable.
+#'
+#' A label may carry more than one row: the cheap rule arms are unioned into the policy regardless
+#' of the ranking, so dates run two engines. Consumers deploy every row for a label and deduplicate
+#' on the span.
+#'
+#' @param .path Policy parquet written by this document.
+#' @return Tibble: Label, Combo, CapChars, TailChars, and the recall each choice implies.
+ent_read_policy <- function(.path) {
+  if (FALSE) .path <- .lP$Input$Policy
+
+  pol_ <- arrow::read_parquet(.path)
+  need_ <- c("Label", "Combo", "CapChars")
+  miss_ <- setdiff(need_, names(pol_))
+  if (length(miss_) > 0L) cli::cli_abort("Policy is missing: {miss_}")
+  if (!"TailChars" %in% names(pol_)) pol_$TailChars <- 0L
+  pol_
+}
+
+
+# 3. Rule scoring ----------------------------------------------------------------------------------------------------
 
 #' Score every proposed rule against the anchor, on the held-out fold
 #'
@@ -630,23 +702,34 @@ ent_rule_verdict <- function(.tab, .aligned, .min_fire = 30L,
 }
 
 
-# 4. Window geometry ------------------------------------------------------
+# 4. Window geometry: proportional -----------------------------------------------------------------------------------
 
-#' What a head window, and a head-plus-tail window, would keep
+#' Does a window belong on a relative or an absolute axis?
 #'
-#' The reading session reported that confirmed entities cluster at both ends of a contract while the
-#' bulk of candidates do not. If that holds, a prefix window is the wrong SHAPE rather than merely
-#' the wrong size, and the whole of the governing-law and signature material sits outside it.
+#' The sibling of ent_window_chars(), and the two answer different questions. This one measures a
+#' window given as a FRACTION of each document; that one measures a window given in characters. The
+#' comparison between them is the question a cap cannot answer about itself: the median contract
+#' here runs 25,578 characters and the longest runs 10.4 million, so a 3,300-character cap is
+#' thirteen percent of the median and three hundredths of a percent of the longest. If the anchor
+#' sits at roughly a fixed FRACTION of the document whatever its length, a fixed character cap is
+#' badly calibrated for long documents and a proportional one would beat it. Only a fractional grid
+#' can show that, which is why this exists alongside the other.
 #'
-#' Both quantities are needed to judge a window and neither alone means anything: the share of
-#' ANCHORS kept is the recall it buys, the share of ALL SPANS kept is the cost it fails to avoid.
-#' A window that keeps 80% of anchors and 20% of spans is a good trade; one that keeps 80% of both
-#' has done nothing.
+#' THE DENOMINATOR IS DOCUMENTS, NOT MENTIONS, and the two are not interchangeable. A contract that
+#' names the filer forty times -- twenty in the preamble and twenty at the signature block -- is
+#' recovered by a head-only window: a party has to be found ONCE. Counting mentions, adding a tail
+#' records twenty further recovered spans and the tail looks valuable; counting documents it
+#' records nothing, correctly, because that document was already recovered. The mention denominator
+#' therefore flatters tails systematically, and the tail is exactly what is under dispute.
+#'
+#' It previously used mentions, in the same document whose prose argued against them.
 #'
 #' @param .con Session with anchor_hits built.
 #' @param .path_text Canonical text parquet, supplying document lengths.
-#' @param .head,.tail Numeric vectors of fractions to evaluate.
-#' @return Tibble: Label, Head, Tail, AnchorKept, SpansKept, Ratio.
+#' @param .head Numeric. Fractions of the document read from the front.
+#' @param .tail Numeric. Fractions read from the back; 0 is the plain prefix window.
+#' @return Tibble: Label, Head, Tail, DocRecall, SpansKept, Ratio. DocRecall is the share of
+#'   documents holding an anchor that keep at least one anchor mention inside the window.
 ent_window_grid <- function(.con, .path_text, .head = c(0.02, 0.05, 0.10, 0.20),
                             .tail = c(0, 0.05, 0.10, 0.20)) {
   if (FALSE) {
@@ -661,26 +744,33 @@ ent_window_grid <- function(.con, .path_text, .head = c(0.02, 0.05, 0.10, 0.20),
 
   DBI::dbExecute(.con, paste0(
     "CREATE OR REPLACE TABLE pos AS ",
-    "SELECT ah.Label, ah.IsAnchor, ",
+    "SELECT ah.DocID, ah.Label, ah.IsAnchor, ",
     "       ((ah.Start + ah.Stop) / 2.0) / length(t.TextRaw) AS Rel ",
     "FROM anchor_hits ah JOIN read_parquet('", as.character(fs::path_abs(.path_text)),
     "') t USING (DocID) WHERE length(t.TextRaw) > 0"
   ))
 
   DBI::dbGetQuery(.con, paste0(
-    "SELECT p.Label, g.Head, g.Tail, ",
-    "  SUM(CASE WHEN p.IsAnchor AND (p.Rel <= g.Head OR p.Rel >= 1 - g.Tail) THEN 1 ELSE 0 END) ",
-    "    / NULLIF(SUM(CASE WHEN p.IsAnchor THEN 1 ELSE 0 END), 0) AS AnchorKept, ",
+    "WITH base AS (SELECT Label, COUNT(DISTINCT DocID) AS NAnchorDocs FROM pos ",
+    "              WHERE IsAnchor GROUP BY Label) ",
+    "SELECT p.Label, g.Head, g.Tail, any_value(b.NAnchorDocs) AS NAnchorDocs, ",
+    "  COUNT(DISTINCT CASE WHEN p.IsAnchor AND (p.Rel <= g.Head OR p.Rel >= 1 - g.Tail) ",
+    "        THEN p.DocID END) ",
+    "    / CAST(any_value(b.NAnchorDocs) AS DOUBLE) AS DocRecall, ",
     "  SUM(CASE WHEN (p.Rel <= g.Head OR p.Rel >= 1 - g.Tail) THEN 1 ELSE 0 END) ",
     "    / CAST(COUNT(*) AS DOUBLE) AS SpansKept ",
-    "FROM pos p CROSS JOIN grid g GROUP BY p.Label, g.Head, g.Tail ORDER BY p.Label, g.Head, g.Tail"
+    "FROM pos p CROSS JOIN grid g JOIN base b ON p.Label = b.Label ",
+    "GROUP BY p.Label, g.Head, g.Tail ORDER BY p.Label, g.Head, g.Tail"
   )) |>
     tibble::as_tibble() |>
-    dplyr::mutate(Ratio = .data$AnchorKept / dplyr::na_if(.data$SpansKept, 0))
+    dplyr::mutate(
+      NAnchorDocs = as.integer(.data$NAnchorDocs),
+      Ratio       = .data$DocRecall / dplyr::na_if(.data$SpansKept, 0)
+    )
 }
 
 
-# 5. Section probe --------------------------------------------------------
+# 5. Section probe ---------------------------------------------------------------------------------------------------
 
 #' Locate known headings by searching for them, not by parsing lines
 #'
@@ -725,7 +815,7 @@ ent_probe_sections <- function(.path_text, .headings) {
 }
 
 
-# 7. Window geometry in characters, and the policy that follows ------------
+# 6. Window geometry: characters, and the policy that follows --------------------------------------------------------
 # The fractional grid answers a question nobody can act on: --max-chars takes a character count,
 # and a character cap is not a fixed fraction of anything -- 3,300 characters is thirteen percent
 # of the median contract and three hundredths of a percent of the longest.
@@ -740,7 +830,7 @@ ent_probe_sections <- function(.path_text, .headings) {
 #' only 12% of candidates.
 #'
 #' Three columns, because a cap is three trade-offs at once. DocRecall is what the cap buys.
-#' SpansKept is what 04D then has to resolve. CharsKept is what 04E has to read, and it is the only
+#' SpansKept is what 04D then has to resolve. CharsKept is what 04D has to read, and it is the only
 #' one that maps to wall-clock time.
 #'
 #' Restricted to the deployed engine where .policy is given. Pooling every engine overstates what
@@ -834,14 +924,20 @@ ent_window_chars <- function(.con, .path_text,
 #' @param .recall_tol Recall points below the best an engine may sit and still be considered.
 #' @param .cost_tol Relative cost gap treated as a tie.
 #' @return Tibble: Label, Combo, Basis, Recall, SpansPerAnchor, NConsidered, Rule.
-ent_choose_engines <- function(.tab, .defaults = character(0),
+ent_choose_engines <- function(.tab, .defaults = character(0), .proxy = character(0),
+                               .always = tibble::tibble(Label = character(0), Combo = character(0)),
                                .recall_tol = 0.10, .cost_tol = 0.15) {
   if (FALSE) {
     .tab         <- tab_eng
     .defaults    <- .DEFAULT_ENGINE
+    .proxy       <- .PROXY_BASIS
+    .always      <- .ALWAYS
     .recall_tol  <- 0.10
     .cost_tol    <- 0.15
   }
+  # A named vector indexed by a label that is absent returns NA, which is what the coalesce below
+  # relies on. An empty character vector indexes to NA the same way, so the default is safe.
+  .proxy <- .proxy[unique(.tab$Label)] |> purrr::set_names(unique(.tab$Label))
 
   measured_ <- .tab |>
     dplyr::filter(!is.na(.data$Recall), .data$SpansPerAnchor > 0) |>
@@ -860,26 +956,91 @@ ent_choose_engines <- function(.tab, .defaults = character(0),
                     "cheapest to within ", round(100 * .cost_tol), "%")
     )
 
+  # THREE KINDS OF EVIDENCE, NOT TWO. The original artifact carried Basis with values "measured" and
+  # "declared", which put two quite different situations under one word. A label with no anchor
+  # cannot be ranked on recall -- but money is not therefore unevidenced. The redaction-reach
+  # measurement asks whether an engine can propose a span at a site where a figure was WITHHELD,
+  # which is a capability rather than a tuned score, and it is the case that matters most because a
+  # figure is withheld precisely when it is commercially material. That is a measurement, on a
+  # proxy, and the artifact should say so rather than filing it beside a bare assertion.
+  #
+  # 04C and 04D read Basis to know how much weight a row carries. Collapsing the three would let a
+  # proxy-measured choice and an unevidenced default look identical downstream.
   need_ <- setdiff(unique(.tab$Label), measured_$Label)
   declared_ <- tibble::tibble(
     Label          = need_,
     Combo          = unname(.defaults[need_]),
-    Basis          = "declared",
+    Basis          = unname(dplyr::coalesce(.proxy[need_], "declared")),
     Recall         = NA_real_,
     SpansPerAnchor = NA_real_,
     NConsidered    = NA_integer_,
-    Rule           = "no anchor; engine asserted, not measured"
+    Rule           = dplyr::if_else(
+      !is.na(.proxy[need_]),
+      "no anchor; engine chosen on a measured proxy, not on recall",
+      "no anchor and no proxy; engine asserted, not measured"
+    )
   )
   gap_ <- declared_$Label[is.na(declared_$Combo)]
   if (length(gap_) > 0L) {
     cli::cli_abort("No default engine declared for {gap_}; 04C would drop the label silently.")
   }
 
-  dplyr::bind_rows(measured_, declared_) |> dplyr::arrange(.data$Label)
+  # THE CHEAP RULE ARMS RUN WHATEVER THE RANKING SAYS, and that is a policy rather than an oversight.
+  # The selection above trades recall against cost, which is the right trade for an engine costing
+  # hours per corpus pass. It is the wrong trade for one costing minutes: dateregex projects to
+  # three tenths of a corpus hour, so excluding it saves nothing measurable and forgoes whatever it
+  # finds that the winner does not.
+  #
+  # It forgoes a great deal. Dates are the case that showed it -- the ranking picked LexNLP over
+  # dateregex by 3.4 anchor-recall points, and dateregex reaches an expiry cue in 415 documents
+  # against LexNLP's 113. The anchor is the contract's own date, which sits in the preamble, so the
+  # criterion that made the choice could not see the difference.
+  #
+  # These are UNIONS, not replacements. 04C deploys candidates from every engine the policy names
+  # for a label and deduplicates on the span, so an engine added here widens the candidate set and
+  # cannot narrow it. What it costs is spans to resolve, and for a rule arm at comparable volume to
+  # the winner that cost is small and measured in the artifact.
+  #
+  # A row already chosen on merit is not duplicated: geography, money and redaction each have their
+  # rule arm as the ranked winner already.
+  always_ <- .always |>
+    dplyr::filter(.data$Label %in% unique(.tab$Label)) |>
+    dplyr::anti_join(
+      dplyr::bind_rows(measured_, declared_) |> dplyr::select(Label, Combo),
+      by = dplyr::join_by(Label, Combo)
+    ) |>
+    dplyr::left_join(
+      dplyr::select(.tab, Label, Combo, Recall, SpansPerAnchor),
+      by = dplyr::join_by(Label, Combo)
+    ) |>
+    dplyr::mutate(
+      Basis       = "always: cheap rule arm",
+      NConsidered = NA_integer_,
+      Rule        = "included regardless of rank; a rule arm costs minutes, not hours"
+    )
+
+  gap_always_ <- .always |>
+    dplyr::filter(.data$Label %in% unique(.tab$Label)) |>
+    dplyr::anti_join(dplyr::distinct(.tab, Label, Combo), by = dplyr::join_by(Label, Combo))
+  if (nrow(gap_always_) > 0L) {
+    cli::cli_abort(c(
+      "{.arg .always} names {nrow(gap_always_)} combination{?s} absent from the store.",
+      "i" = "{paste(gap_always_$Label, gap_always_$Combo, sep = '/')}",
+      "x" = "04C would join its candidate set against an engine that never ran."
+    ))
+  }
+
+  dplyr::bind_rows(measured_, declared_, always_) |>
+    dplyr::arrange(.data$Label, .data$Basis)
 }
 
 
-# 8. The one MONEY check that external data supports ----------------------
+# 7. Money: the three checks external data supports ------------------------------------------------------------------
+# Money has no anchor, so none of the machinery above reaches it. What follows is the whole of the
+# external evidence there is: whether a phrase cue co-occurs with a redaction marker, what the
+# surviving punctuation around a marker implies about what was removed, and whether an engine can
+# propose a span at a withheld site at all. The third is what puts a Basis of "measured: proxy"
+# rather than "declared" on the money row of the policy.
 
 #' Do the redaction cues fire where bracketed redaction markers sit?
 #'
@@ -939,7 +1100,7 @@ ent_redaction_check <- function(.con, .rules) {
 }
 
 
-# 8b. What the redaction markers conceal --------------------------------
+# 7b. What the redaction markers conceal -----------------------------------------------------------------------------
 # The redaction unit asks what was removed, and nothing external records that either. But the
 # characters immediately around a marker often survive the removal and identify it: a currency
 # symbol left standing before the gap, a percent sign after it, a unit noun following. That is
@@ -970,12 +1131,22 @@ ent_sql_currency <- function() {
 ent_read_rules <- function(.paths) {
   if (FALSE) .paths <- .lP$Input$Rules
 
-  have_ <- .paths[fs::file_exists(.paths)]
-  if (length(have_) == 0L) cli::cli_abort("No rule files found at {.path {(.paths)}}")
+  # A NAMED SESSION THAT IS NOT ON DISK IS A BROKEN CONFIGURATION, NOT A DEGRADED RUN, and this
+  # aborts rather than warning because the warning was missed twice. The bundle folder is renamed
+  # when a session is superseded, so the path in the configuration goes stale on exactly the
+  # occasions when a second session has just produced new rules. Each time, the document rendered,
+  # scored half the rule set, and reported a rule count that looked plausible on its own. One
+  # warning line in a render that emits several hundred is not a control.
   miss_ <- names(.paths)[!fs::file_exists(.paths)]
   if (length(miss_) > 0L) {
-    cli::cli_alert_warning("{length(miss_)} rule file{?s} missing: {miss_}")
+    cli::cli_abort(c(
+      "Rule file{?s} missing for session{?s} {miss_}.",
+      "i" = "Looked in: {.path {(.paths[miss_])}}",
+      "x" = "Scoring the sessions that ARE present would silently halve the rule set.",
+      "i" = "Fix the folder name in the configuration, or remove the session from it deliberately."
+    ))
   }
+  have_ <- .paths
 
   purrr::imap(have_, \(.p, .nm) dplyr::mutate(arrow::read_parquet(.p), Source = .nm)) |>
     purrr::list_rbind() |>
@@ -1051,7 +1222,7 @@ ent_redaction_shape <- function(.con, .rules, .shape_map) {
 }
 
 
-# 8c. Can an engine find a withheld amount at all? ------------------------
+# 7c. Can an engine find a withheld amount at all? -------------------------------------------------------------------
 # Money is the one label with no anchor, so the engine behind it went into the policy as a declared
 # default. Cross-engine agreement narrows the question -- the regex arm and the transformer overlap
 # at Jaccard 0.77, the highest of any cross-family pair in the store -- but agreement on what both
@@ -1151,7 +1322,7 @@ ent_redaction_reach <- function(.con, .near = 3L) {
 }
 
 
-# 9. Report ---------------------------------------------------------------
+# 8. Report ----------------------------------------------------------------------------------------------------------
 
 #' Anchor availability and how often any engine found it
 #' @param .tab Tibble from ent_anchor_coverage().
@@ -1160,9 +1331,9 @@ ent_report_anchors <- function(.tab) {
   if (FALSE) .tab <- tab_cov
 
   cli::cli_h2("Anchor availability and yield")
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
-      dplyr::mutate(PctMatched = clf_pct(.data$PctMatched), BaseRate = clf_pct(.data$BaseRate, 2L))
+      dplyr::mutate(PctMatched = tbl_pct(.data$PctMatched), BaseRate = tbl_pct(.data$BaseRate, 2L))
   )
   cli::cli_alert_info(
     "PctMatched is the share of documents where SOME engine proposed the known entity, so it caps \\
@@ -1179,11 +1350,11 @@ ent_report_engines <- function(.tab) {
   if (FALSE) .tab <- tab_eng
 
   cli::cli_h2("Engine recall on the known entity, all documents")
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
       dplyr::filter(!.data$Label %in% c("MONEY", "REDACT")) |>
       dplyr::mutate(
-        Recall         = clf_pct(.data$Recall),
+        Recall         = tbl_pct(.data$Recall),
         SpansPerAnchor = round(.data$SpansPerAnchor, 1)
       ) |>
       dplyr::select(Label, Combo, DocsWithAnchor, DocsFound, Recall, Spans, SpansPerAnchor) |>
@@ -1211,20 +1382,20 @@ ent_report_rules <- function(.tab, .n = 10L) {
   }
 
   cli::cli_h2("Rule verdicts")
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
       dplyr::count(.data$Label, .data$Kind, .data$Verdict, name = "N") |>
       tidyr::pivot_wider(names_from = Verdict, values_from = N, values_fill = 0L)
   )
 
   cli::cli_h2("Strongest cues among the roles the anchor confirms")
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
       dplyr::filter(.data$Kind == "cue", .data$NFire > 0L,
                     !is.na(.data$Direction), .data$Direction == "high") |>
       dplyr::slice_max(.data$Lift, n = .n, by = Label, with_ties = FALSE) |>
       dplyr::mutate(
-        Precision = clf_pct(.data$Precision), Recall = clf_pct(.data$Recall),
+        Precision = tbl_pct(.data$Precision), Recall = tbl_pct(.data$Recall),
         Lift = round(.data$Lift, 2)
       ) |>
       dplyr::select(Label, Role, Pattern, Side, Window, NFire, Precision, Recall, Lift) |>
@@ -1236,10 +1407,10 @@ ent_report_rules <- function(.tab, .n = 10L) {
                   .data$NFire >= 30L)
   if (nrow(low_) > 0L) {
     cli::cli_h2("Roles the anchor judges by absence")
-    clf_say_table(
+    tbl_say(
       .tab = low_ |>
         dplyr::slice_min(.data$Lift, n = .n, by = Label, with_ties = FALSE) |>
-        dplyr::mutate(Precision = clf_pct(.data$Precision), Lift = round(.data$Lift, 2)) |>
+        dplyr::mutate(Precision = tbl_pct(.data$Precision), Lift = round(.data$Lift, 2)) |>
         dplyr::select(Label, Role, Pattern, Side, NFire, Precision, Lift, Verdict) |>
         dplyr::arrange(.data$Label, .data$Lift)
     )
@@ -1253,7 +1424,7 @@ ent_report_rules <- function(.tab, .n = 10L) {
   bad_ <- .tab |> dplyr::filter(stringr::str_detect(.data$Verdict, "^REFUTED"))
   if (nrow(bad_) > 0L) {
     cli::cli_h2("Stops the anchor refutes")
-    clf_say_table(.tab = bad_ |> dplyr::select(Label, Role, Pattern, NFire, NAnchorFire))
+    tbl_say(.tab = bad_ |> dplyr::select(Label, Role, Pattern, NFire, NAnchorFire))
     cli::cli_alert_danger(
       "A stop claims its span is never the entity. These killed known entities, so they are wrong \\
        by their own definition and must not reach 04D."
@@ -1263,9 +1434,9 @@ ent_report_rules <- function(.tab, .n = 10L) {
   moved_ <- .tab |> dplyr::filter(!is.na(.data$SuggestedRole))
   if (nrow(moved_) > 0L) {
     cli::cli_h2("Cues whose role the anchor disputes")
-    clf_say_table(
+    tbl_say(
       .tab = moved_ |>
-        dplyr::mutate(Precision = clf_pct(.data$Precision), Lift = round(.data$Lift, 2)) |>
+        dplyr::mutate(Precision = tbl_pct(.data$Precision), Lift = round(.data$Lift, 2)) |>
         dplyr::select(Label, Role, SuggestedRole, Pattern, NFire, Precision, Lift) |>
         dplyr::arrange(dplyr::desc(.data$Lift))
     )
@@ -1284,20 +1455,22 @@ ent_report_rules <- function(.tab, .n = 10L) {
 ent_report_window <- function(.tab) {
   if (FALSE) .tab <- tab_window
 
-  cli::cli_h2("Head and head-plus-tail windows")
-  clf_say_table(
+  cli::cli_h2("Proportional windows: what a fraction of each document keeps")
+  tbl_say(
     .tab = .tab |>
       dplyr::filter(.data$Label != "MONEY") |>
       dplyr::mutate(
-        Head = clf_pct(.data$Head, 0L), Tail = clf_pct(.data$Tail, 0L),
-        AnchorKept = clf_pct(.data$AnchorKept), SpansKept = clf_pct(.data$SpansKept),
+        Head = tbl_pct(.data$Head, 0L), Tail = tbl_pct(.data$Tail, 0L),
+        DocRecall = tbl_pct(.data$DocRecall), SpansKept = tbl_pct(.data$SpansKept),
         Ratio = round(.data$Ratio, 2)
-      )
+      ) |>
+      dplyr::select(Label, Head, Tail, NAnchorDocs, DocRecall, SpansKept, Ratio)
   )
   cli::cli_alert_info(
-    "Ratio above 1 means the window is enriched for the known entity relative to the candidate \\
-     pool. Compare a head-only row against the same head with a tail added: if the tail buys more \\
-     anchors than spans, a prefix window is the wrong shape and not merely the wrong size."
+    "Read this against the character table, not on its own. Both report DOCUMENT recall, so the \\
+     two are directly comparable: where a fraction reaches a given recall for a smaller share of \\
+     the candidate pool than any character cap does, the cap is on the wrong axis and length is \\
+     doing the work."
   )
   invisible(.tab)
 }
@@ -1309,9 +1482,9 @@ ent_report_sections <- function(.tab) {
   if (FALSE) .tab <- tab_sections
 
   cli::cli_h2("Heading probe")
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
-      dplyr::mutate(dplyr::across(c(PctDocs, MedianPos, P25Pos, P75Pos), \(.x) clf_pct(.x)))
+      dplyr::mutate(dplyr::across(c(PctDocs, MedianPos, P25Pos, P75Pos), \(.x) tbl_pct(.x)))
   )
   cli::cli_alert_info(
     "A heading is usable when it appears in most documents AND sits in a narrow band. Frequent but \\
@@ -1328,16 +1501,16 @@ ent_report_window_chars <- function(.tab) {
   if (FALSE) .tab <- tab_wchar
 
   cli::cli_h2("Character caps: document-level recall against cost")
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
       dplyr::filter(.data$Label != "MONEY") |>
-      dplyr::mutate(dplyr::across(c(DocRecall, SpansKept, CharsKept), \(.x) clf_pct(.x)))
+      dplyr::mutate(dplyr::across(c(DocRecall, SpansKept, CharsKept), \(.x) tbl_pct(.x)))
   )
   cli::cli_alert_info(
     "DocRecall is what the cap buys: the share of documents in which at least one mention of the \\
      known entity survives. A party has to be found once, not every time it is named, so this is \\
      the number a cap should be chosen on. SpansKept is what 04D must resolve; CharsKept is what \\
-     04E must read."
+     04D must read."
   )
   invisible(.tab)
 }
@@ -1349,17 +1522,27 @@ ent_report_policy <- function(.tab) {
   if (FALSE) .tab <- tab_policy
 
   cli::cli_h2("Engine policy")
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
       dplyr::mutate(
-        Recall         = clf_pct(.data$Recall),
+        Recall         = tbl_pct(.data$Recall),
         SpansPerAnchor = round(.data$SpansPerAnchor, 1)
       )
   )
   cli::cli_alert_info(
-    "MONEY is absent because it has no anchor and therefore no recall to rank on. Its engine is a \\
-     stated default, not a measured choice."
+    "Read the Basis column before the numbers. A measured row was ranked on recall against the \\
+     anchor; a proxy row was chosen on evidence of a different kind, named in Rule; a declared row \\
+     rests on nothing but the assertion; an always row is a cheap rule arm carried regardless of \\
+     rank. Recall is blank where there is no anchor to compute it against, which is not the same \\
+     as a recall of zero."
   )
+  n_lab_ <- dplyr::n_distinct(.tab$Label)
+  if (nrow(.tab) > n_lab_) {
+    cli::cli_alert_info(
+      "A label with more than one row runs both engines and takes the UNION of their spans, \\
+       deduplicated. Adding an engine cannot narrow the candidate set; it costs spans to resolve."
+    )
+  }
   invisible(.tab)
 }
 
@@ -1374,10 +1557,10 @@ ent_report_redaction <- function(.tab) {
     cli::cli_alert_warning("No redaction cues in the rule set.")
     return(invisible(.tab))
   }
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
       dplyr::mutate(
-        dplyr::across(c(BaseRate, Precision), \(.x) clf_pct(.x)),
+        dplyr::across(c(BaseRate, Precision), \(.x) tbl_pct(.x)),
         Lift = round(.data$Lift, 2)
       )
   )
@@ -1401,11 +1584,11 @@ ent_report_redaction_shape <- function(.tab) {
     cli::cli_alert_warning("No redaction cues carry a role the shape test can speak to.")
     return(invisible(.tab))
   }
-  clf_say_table(
+  tbl_say(
     .tab = .tab |>
       dplyr::filter(.data$NFire > 0L) |>
       dplyr::mutate(
-        dplyr::across(c(BaseRate, Precision), \(.x) clf_pct(.x)),
+        dplyr::across(c(BaseRate, Precision), \(.x) tbl_pct(.x)),
         Lift = round(.data$Lift, 2)
       ) |>
       dplyr::select(Role, Shape, Pattern, Side, NFire, BaseRate, Precision, Lift)
@@ -1427,8 +1610,8 @@ ent_report_redaction_reach <- function(.tab) {
   if (FALSE) .tab <- tab_reach
 
   cli::cli_h2("Money engines at redaction sites")
-  clf_say_table(
-    .tab = .tab |> dplyr::mutate(PctCovered = clf_pct(.data$PctCovered))
+  tbl_say(
+    .tab = .tab |> dplyr::mutate(PctCovered = tbl_pct(.data$PctCovered))
   )
   cli::cli_alert_info(
     "A redaction marker is where an amount used to be, so this asks whether an engine can find one \\
@@ -1477,4 +1660,171 @@ ent_report_all <- function(.tab_cov, .tab_eng, .tab_rules, .tab_window, .tab_sec
   ent_report_sections(.tab = .tab_sections)
   ent_report_policy(.tab = .tab_policy)
   invisible(NULL)
+}
+
+
+# 9. Figures ---------------------------------------------------------------------------------------------------------
+# Three shapes, all through the shared design layer. They were inline ggplot in the runbook, on
+# theme_bw() and at heights off the ladder, which is why they are here now: a figure a reader will
+# see in the paper should not be defined in the document that happens to display it.
+
+#' Recall against adjudication cost, per engine
+#'
+#' The figure the engine policy is read off. Up and to the left is better: the same recall for fewer
+#' spans returned. An engine sitting far to the right at the same height as one on the left is
+#' paying an order of magnitude in adjudication cost for nothing, and that is the whole argument for
+#' preferring a narrow engine over a broad one.
+#'
+#' The horizontal axis is logarithmic because the engines span two orders of magnitude in spans per
+#' anchor. On a linear axis every rule extractor collapses onto the origin and the figure shows only
+#' that the transformer is expensive, which was never in doubt.
+#'
+#' MONEY is excluded rather than drawn empty: it has no anchor, so it has no recall, and a panel of
+#' points at an undefined height would invite reading an absence as a zero.
+#'
+#' @param .tab Tibble from ent_engine_recall().
+#' @return A ggplot.
+ent_plot_engine_recall <- function(.tab) {
+  if (FALSE) .tab <- tab_eng
+
+  .tab |>
+    dplyr::filter(.data$Label != "MONEY", !is.na(.data$Recall), .data$SpansPerAnchor > 0) |>
+    dplyr::mutate(
+      PlotLabel = plot_factor(.data$Label, .key = "Label"),
+      PlotCombo = plot_factor(.data$Combo, .key = "Combo", .short = TRUE)
+    ) |>
+    ggplot2::ggplot(ggplot2::aes(
+      x = .data$SpansPerAnchor, y = .data$Recall, colour = .data$PlotCombo
+    )) +
+    ggplot2::geom_point(size = 2) +
+    ggplot2::facet_wrap(~PlotLabel, nrow = 1) +
+    ggplot2::scale_x_log10() +
+    # A LOWER EXPANSION IS REQUIRED HERE, and its absence is not cosmetic: plot_scale_y_pct()
+    # defaults to none, which is right for a bar chart whose bars start at zero and wrong for a
+    # scatter, where the lowest point then sits exactly on the axis line and renders half cut off.
+    # The worst engine in a panel is precisely the point a reader is looking for.
+    plot_scale_y_pct(
+      .accuracy = 1,
+      .expand   = c(0.05, 0.05),
+      .breaks   = scales::breaks_pretty(n = 4)
+    ) +
+    plot_scale_colour_key(.key = "Combo", .short = TRUE) +
+    ggplot2::expand_limits(x = 1) +
+    ggplot2::labs(
+      x = "Spans returned per anchor recovered (log)",
+      y = "Recall on the known entity",
+      colour = NULL
+    ) +
+    plot_theme(.grid = "both", .legend = "bottom")
+}
+
+#' What each window shape keeps, against what it costs
+#'
+#' The diagonal is the null: a window keeping documents and candidates in equal proportion has
+#' selected nothing. Distance above it is the enrichment, and a tail line sitting above the
+#' tail-of-zero line is the reading session's claim -- that confirmed entities cluster at both ends
+#' while the bulk of candidates do not -- confirmed.
+#'
+#' Both axes are document-level, so this figure and the character table report the same quantity
+#' against a relative and an absolute axis. That comparison is the point: if a fraction reaches a
+#' given recall for a smaller share of the candidate pool than any character cap does, the cap is on
+#' the wrong axis and document length is doing the work.
+#'
+#' @param .tab Tibble from ent_window_grid().
+#' @return A ggplot.
+ent_plot_window <- function(.tab) {
+  if (FALSE) .tab <- tab_window
+
+  dat_ <- .tab |>
+    dplyr::filter(.data$Label != "MONEY") |>
+    dplyr::mutate(
+      PlotLabel = plot_factor(.data$Label, .key = "Label"),
+      # ORDERED BY THE NUMBER, NOT BY THE STRING. factor() on a formatted percentage sorts
+      # lexically, which puts the legend in the order 0%, 10%, 20%, 5% -- wrong, and wrong in a way
+      # that looks like a rendering quirk rather than a bug. The levels come from the sorted numeric
+      # values and the labels are formatted afterwards.
+      TailPct = factor(
+        scales::label_percent(accuracy = 1)(.data$Tail),
+        levels = scales::label_percent(accuracy = 1)(sort(unique(.data$Tail)))
+      )
+    )
+
+  dat_ |>
+    ggplot2::ggplot(ggplot2::aes(
+      x = .data$SpansKept, y = .data$DocRecall,
+      colour = .data$TailPct, group = .data$TailPct
+    )) +
+    ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "#B4B4B4") +
+    ggplot2::geom_line(linewidth = 0.5) +
+    ggplot2::geom_point(size = 1.6) +
+    ggplot2::facet_wrap(~PlotLabel, nrow = 1) +
+    # BOTH AXES RUN THE FULL UNIT INTERVAL, because the diagonal is the whole argument of the figure
+    # and it only means anything when the two axes share a range starting at zero. Auto-scaled, the
+    # vertical ran from 31% and the horizontal from 2%, so the null line appeared in one corner and
+    # the prose asking a reader to judge distance above it was asking for something not on the page.
+    # The clusters lose some spread; the reference they are being read against gains its meaning.
+    plot_scale_x_pct(
+      .accuracy = 1,
+      .expand   = c(0.02, 0.02),
+      .breaks   = scales::breaks_pretty(n = 4)
+    ) +
+    plot_scale_y_pct(
+      .accuracy = 1,
+      .expand   = c(0.02, 0.02),
+      .breaks   = scales::breaks_pretty(n = 4)
+    ) +
+    ggplot2::coord_cartesian(xlim = c(0, 1), ylim = c(0, 1)) +
+    plot_scale_colour_cat() +
+    ggplot2::labs(
+      x = "Share of all candidates kept", y = "Share of documents recovered",
+      colour = "Tail"
+    ) +
+    plot_theme(.grid = "both", .legend = "bottom")
+}
+
+#' Rule lift against how often the rule fires
+#'
+#' The useful region is upper right: a rule that concentrates the known entity AND fires often
+#' enough to matter. High lift on a handful of candidates is a curiosity; lift near one at any
+#' volume is the base rate wearing a phrase.
+#'
+#' READ THE TWO DIRECTIONS SEPARATELY, which is why they are coloured rather than pooled. For a
+#' high-direction role the pass condition is lift above the reference line; for a low-direction role
+#' it is lift below it, because the claim being tested is that the cue AVOIDS the anchor. Points
+#' from the two groups are not comparable on the vertical axis and a single cloud would imply they
+#' were.
+#'
+#' Both axes are logarithmic. Firing counts run from tens to hundreds of thousands, and lift is a
+#' ratio whose interesting range is symmetric about one on a log scale and badly skewed on a linear
+#' one.
+#'
+#' @param .tab Tibble from ent_rule_verdict().
+#' @return A ggplot.
+ent_plot_rule_lift <- function(.tab) {
+  if (FALSE) .tab <- tab_rules_scored
+
+  .tab |>
+    dplyr::filter(
+      .data$Kind == "cue", .data$Measurable, .data$NFire > 0L,
+      !is.na(.data$Lift), .data$Lift > 0, !is.na(.data$Direction)
+    ) |>
+    dplyr::mutate(
+      PlotLabel = plot_factor(.data$Label, .key = "Label"),
+      Pass      = dplyr::if_else(
+        .data$Direction == "high", "expected above 1", "expected below 1"
+      )
+    ) |>
+    ggplot2::ggplot(ggplot2::aes(x = .data$NFire, y = .data$Lift, colour = .data$Pass)) +
+    ggplot2::geom_hline(yintercept = 1, linetype = 2, colour = "#B4B4B4") +
+    ggplot2::geom_point(size = 1.6, alpha = 0.8) +
+    ggplot2::facet_wrap(~PlotLabel, nrow = 1) +
+    ggplot2::scale_x_log10(expand = ggplot2::expansion(mult = c(0.05, 0.05))) +
+    ggplot2::scale_y_log10(expand = ggplot2::expansion(mult = c(0.05, 0.05))) +
+    plot_scale_colour_cat() +
+    ggplot2::labs(
+      x = "Candidates the rule fires on (log)",
+      y = "Lift over base rate (log)",
+      colour = NULL
+    ) +
+    plot_theme(.grid = "both", .legend = "bottom")
 }

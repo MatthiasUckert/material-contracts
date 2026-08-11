@@ -10,16 +10,16 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| purl: false
 knitr::opts_knit$set(root.dir = here::here())
 
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml, and overriding it per document is how two documents came to render at more
+# than twice the width of the rest.
 knitr::opts_chunk$set(
   root.dir = here::here(),
-  message = TRUE, # mandatory: cli writes through the message stream under knitr, so
-  # message = FALSE would discard this document's entire output
-  warning = FALSE,
-  comment = "", # drops the "##" prefix, so console blocks copy verbatim
-  fig.width = 7.5, # fixed for every figure; only height varies, and only with row count
-  fig.align = "center",
-  dpi = 200,
-  out.width = "100%"
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
 )
 
 options(cli.num_colors = 1, cli.width = 120) # plain ASCII; ANSI codes paste as garbage
@@ -41,10 +41,23 @@ source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 source("1_code/_Commons/_NER.R", encoding = "UTF-8")
 
-# 03A owns the fixed-width console formatter every document in the monorepo reports through.
-source(
-  file     = init_create_script_fun(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare"),
-  encoding = "UTF-8"
+# The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING: 03A
+# registers its category vocabulary and aliases the table helpers at SOURCE time, not inside a
+# function, so sourcing it first throws part-way through the file and every function defined below
+# the failure silently never exists.
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 03A owns the console formatter and the contract-type vocabulary; 04A owns the sample, the store
+# and the entity vocabularies (Label, Combo) that every figure here orders its axes by. Sourcing
+# both rather than re-registering is what keeps an entity figure in this document and one in 04A
+# from ordering the same axis two ways.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
+  .f = function(.s) {
+    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+           encoding = "UTF-8")
+  }
 )
 
 cat("Main Directory: ")
@@ -125,12 +138,18 @@ The reading session read folds 1 to 4, so its rules are scored on fold 5 alone. 
 involves no rules and cannot have been taught, so it uses all 4,398 documents and is the more precise
 for it. The two are reported separately and never averaged.
 
-## Money is absent from most of this document
+## Money is absent from most of this document, but not from all of it
 
 EDGAR records no contract value. There is no anchor, so nothing in the engine table, the rule table
 or the window grid can be computed for it, and it is omitted rather than filled with zeros that would
-read as failure. The 64 money cues are carried through unscored, and the honest position is that they
-need either the redaction cross-check or hand labels.
+read as failure. Most of the 64 money cues are carried through unscored.
+
+One channel remains, and it carries the engine decision. A redacted amount leaves a bracketed marker
+where the figure used to be, so whether an engine proposes a span *there* is a capability that can
+be tested without any label at all -- and it is the case that matters most, because a figure is
+withheld precisely when it is commercially material. The policy records the money engine with a
+`Basis` of `measured: proxy`, distinguishing it in the artifact from a recall ranking on one side
+and a bare assertion on the other.
 
 # Configuration
 
@@ -166,7 +185,7 @@ need either the redaction cross-check or hand labels.
     Hits   = utils_file_path(.dir_main, "anchor_hits.parquet"), # per-span anchor labels
     Scores = utils_file_path(.dir_main, "rule_scores.parquet"), # every rule, measured
     Kept   = utils_file_path(.dir_main, "rules_kept.parquet"), # the survivors, for 04D
-    Policy = utils_file_path(.dir_main, "extraction_policy.parquet") # engine and cap, for 04E
+    Policy = utils_file_path(.dir_main, "extraction_policy.parquet") # engine and cap, for 04C/04D
   ),
   Params = list(
     FoldHoldout    = 5L, # the fold the reading session never saw
@@ -176,7 +195,12 @@ need either the redaction cross-check or hand labels.
     MinLift        = 1.2, # kept rules must beat the base rate by at least this factor
     RecallTol      = 0.10, # recall points an engine may trail the best and still be considered
     CostTol        = 0.15, # relative cost gap treated as a tie between engines
-    HeadChars      = c(1500L, 3000L, 5000L, 10000L, 20000L),
+    # The last entry is the full-document idiom, and it is in the grid rather than beside it for two
+    # reasons. It is the DEPLOYED configuration, so the policy artifact joins to it for the recall
+    # each label achieves -- without it every recall column in the artifact is NA. And it is the
+    # reference every capped row is read against: a cap is only interpretable as a fraction of what
+    # reading everything delivers.
+    HeadChars      = c(1500L, 3000L, 5000L, 10000L, 20000L, 100000000L),
     TailChars      = c(0L, 2000L, 5000L),
     CapChars       = 3000L # retained for reference; the artifact takes its window from .WINDOW
   )
@@ -254,20 +278,74 @@ need either the redaction cross-check or hand labels.
 # Engines for the labels the anchor cannot rank. Money has no external record of a contract's value
 # and redaction has no ground truth at all, so neither can be chosen on recall -- but both must be
 # NAMED, or 04C joins its candidate set against a policy with a hole in it and drops the label
-# without saying so. LexNLP fires on money in under a fifth of documents, which leaves the
-# transformer; redaction has one extractor.
-.DEFAULT_ENGINE <- c(MONEY = "spacy:en_core_web_trf", REDACT = "paper:redaction-v1")
+# without saying so.
+#
+# Money is the regex arm, and that is a measured choice on a proxy rather than a default. The
+# section below asks which engine can propose a span at a site where the amount was WITHHELD, which
+# is the case that matters most because a figure is redacted precisely when it is commercially
+# material. The regex arm has a pattern written for the shape a removal leaves behind; a transformer
+# has nothing to tag, because the number it would recognise is the thing that was taken out. Running
+# a transformer over 1.1 million documents for a label it cannot reach at the sites that matter is
+# the expensive way to be wrong.
+#
+# Redaction has one extractor, so its row is a default in the strict sense and says so.
+.DEFAULT_ENGINE <- c(MONEY = "paper:moneyregex-v4", REDACT = "paper:redaction-v1")
 
-# The window each label is read under. ORG and GPE are set from the character grid below. DATE is
-# NOT, and the reason matters: the date anchor is the contract's own date, which sits in the
-# preamble, so the grid measures how well a window finds a START and is silent about an END. A term
-# clause sits thousands of characters later, and a head-only window returned an expiry date for 22
-# of 4,398 documents. The tail here is a declared correction to a measurement that could not see
-# the quantity it was being used to choose.
+# What kind of evidence stands behind a Basis of neither "measured" nor "declared". A label named
+# here had no anchor to rank on but was not chosen arbitrarily either, and 04C and 04D read the
+# column to know how much weight the row carries.
+.PROXY_BASIS <- c(MONEY = "measured: proxy")
+
+# Engines carried whatever the ranking says, because they are too cheap for the ranking's trade to
+# apply to them. ent_choose_engines() trades recall against cost, which is right for an engine
+# costing hours per corpus pass and wrong for one costing minutes: dateregex projects to three
+# tenths of a corpus hour, so excluding it saves nothing measurable.
+#
+# It forgoes a great deal. The ranking preferred LexNLP to dateregex by 3.4 anchor-recall points,
+# and 04C finds dateregex reaching an expiry cue in 415 documents against LexNLP's 113 -- because
+# the anchor is the contract's own date, which sits in the preamble, so the criterion that made the
+# choice was blind to the difference.
+#
+# THIS IS A UNION AND NOT A REPLACEMENT. 04C deploys every engine the policy names for a label and
+# deduplicates on the span, so a row here widens the candidate set and cannot narrow it. What it
+# costs is spans to resolve, and the artifact records that.
+#
+# Only dates gain anything: geography, money and redaction each have their rule arm as the ranked
+# winner already, and organisations have no rule arm to add. The table is written out in full
+# regardless, so the policy is visible rather than inferred from where the ranking happened to land.
+.ALWAYS <- tibble::tribble(
+  ~Label,  ~Combo,
+  "DATE",  "paper:dateregex-v1",
+  "GPE",   "paper:gazetteer-v1",
+  "MONEY", "paper:moneyregex-v4",
+  "REDACT", "paper:redaction-v1"
+)
+
+# THE EXTRACTION READS THE WHOLE DOCUMENT. Every label carries the full-text idiom below, and the
+# reason is not that a window was found unnecessary -- the tables in this document measure exactly
+# what a window would keep and what it would cost. It is that a window does not have to be decided
+# at extraction time at all.
+#
+# Every candidate carries its offsets. So a window is a FILTER APPLIED AT RESOLUTION, not a decision
+# taken at extraction: extract once over full text and any cap can be imposed, revised or withdrawn
+# afterwards by a WHERE clause, on evidence that does not exist yet. Extract under a cap and the
+# evidence outside it is gone irreversibly, and recovering it means re-running the corpus.
+#
+# That asymmetry is the whole argument. A cap saves compute once; it costs the ability to answer
+# every later question about what sits outside it. The expiry work in 04C is the case in point --
+# the window chosen for dates was set on the contract's own date, which sits in the preamble, and
+# then applied to an end date that does not, and no amount of care in this document would have
+# caught that before the variable was built.
+#
+# The window measurements below are therefore RETAINED AND REFRAMED. They no longer choose a cap.
+# They report what a cap would have cost, which is the answer to the obvious referee question --
+# why not truncate, given the corpus size -- and they remain the evidence for reimposing a cap
+# later if the corpus pass proves unaffordable. The policy artifact still carries the columns, so
+# nothing downstream changes shape; the numbers in them are now the full-text idiom.
 .WINDOW <- tibble::tribble(
   ~Label, ~CapChars, ~TailChars, ~WindowBasis,
-  "ORG", 3000L, 0L, "measured: 91.7% document recall, 4.8% of characters",
-  "DATE", 3000L, 5000L, "declared: the anchor is a start date and cannot see expiry",
+  "ORG", 100000000L, 0L, "full text: a window is a resolution-time filter, not an extraction choice",
+  "DATE", 100000000L, 0L, "full text: same, and the expiry evidence in 04C requires it",
   "GPE", 100000000L, 0L, "full text: extraction is cheap and the window is not measurable",
   "MONEY", 100000000L, 0L, "full text: same",
   "REDACT", 100000000L, 0L, "full text: a cap drops 86% of markers"
@@ -277,7 +355,12 @@ fs::file_exists(c(.lP$Input$Text, .lP$Input$Anchors, .lP$Input$Store, .lP$Input$
 ```
 
 Failing here rather than three chunks later is deliberate. The rules path in particular points
-outside the repository, into the folder the reading session wrote to.
+outside the repository, into the folder the reading session wrote to, and that folder gets renamed
+whenever a session is superseded -- so the configured path goes stale on exactly the occasions when
+a new session has just produced rules worth scoring. `ent_read_rules()` now aborts on a named
+session that is not on disk rather than warning: it warned twice, the warning was missed twice, and
+each time the document rendered against half the rule set and reported a count that looked
+plausible on its own.
 
 # Anchors
 
@@ -343,7 +426,7 @@ hundreds of times over.
 #| label: score-rules
 tab_rules <- ent_read_rules(.paths = .lP$Input$Rules)
 
-clf_say_table(
+tbl_say(
   .tab = tab_rules |> dplyr::count(.data$Source, .data$Label, name = "N") |>
     tidyr::pivot_wider(names_from = Label, values_from = N, values_fill = 0L),
   .title = "Rules by session"
@@ -456,9 +539,22 @@ than only a nuisance, and this is the evidence that would establish it.
 The reading session reported, from three units independently, that confirmed entities cluster at both
 ends of a contract while the bulk of candidates do not. 04A concluded the opposite for organisations
 -- that they are spread flat -- but 04A measured every organisation span, and if the session is right
-then the flatness is the noise and the parties are not flat at all.
+then the flatness is the noise and the parties are not flat at all. 04A's positional figure supports
+the session on exactly this point: LexNLP's organisations are bimodal at the two ends of the
+document while all four spaCy models are flat throughout, which is what a party extractor and a
+defined-term collector respectively look like.
 
-That distinction decides the shape of the corpus pass, so it is measured rather than adopted.
+That distinction no longer decides the shape of the corpus pass -- the extraction reads full text,
+for the reason set out in the configuration -- but it decides how much a cap WOULD cost, which is
+the question a reader will ask given a corpus of 1.1 million documents. It is measured rather than
+adopted either way.
+
+The grid below puts the window on a RELATIVE axis, as a fraction of each document. Its sibling in
+the next section puts it on an absolute one, in characters. Both report the share of **documents**
+recovered, so the two are directly comparable, and the comparison answers a question neither can
+answer alone: whether a fixed character cap is the right kind of policy at all. The median contract
+here runs 25,578 characters and the longest runs 10.4 million, so 3,300 characters is thirteen
+percent of the median and three hundredths of a percent of the longest.
 
 ```{r}
 #| label: measure-window
@@ -487,9 +583,12 @@ The grid above is in fractions, and `--max-chars` takes a character count. A cha
 fixed fraction of anything: 3,300 characters is thirteen percent of the median contract here and
 three hundredths of a percent of the longest.
 
-It also uses the wrong denominator. It reports the share of anchor **mentions** a window retains, and
-a party has to be found **once**, not every time it is named. The share of **documents** in which at
-least one mention survives is the quantity a cap should be chosen on, and the two differ sharply.
+Both tables report the same denominator, and it is worth saying why it is documents rather than
+mentions. A contract naming the filer forty times -- twenty in the preamble, twenty at the signature
+block -- is recovered by a head-only window, because a party has to be found **once**. Counting
+mentions, adding a tail records twenty further recovered spans and the tail looks valuable; counting
+documents it records nothing, correctly. The mention denominator flatters tails systematically, and
+a tail is precisely what is under dispute for dates.
 
 ```{r}
 #| label: measure-window-chars
@@ -505,8 +604,19 @@ ent_report_window_chars(.tab = tab_wchar)
 ```
 
 Three columns because a cap is three trade-offs at once. `DocRecall` is what it buys, `SpansKept` is
-what 04D must then resolve, and `CharsKept` is what 04E must read -- the only one of the three that
+what 04C must then resolve, and `CharsKept` is what 04D must read -- the only one of the three that
 maps to wall-clock time.
+
+No row of the artifact this feeds is provisional any longer, because no row is a cap. Every label
+extracts over full text, and these numbers say what each label would have given up under one. Read
+`CharsKept` as the saving forgone and `DocRecall` as the recall bought by forgoing it.
+
+The DATE row is the reason the question was reopened. Its tail was originally a declared correction
+for an expiry-coverage problem, justified by a diagnostic that could not have established it: the
+check read a roles table built from the already windowed candidate set, so its wider head rows
+queried a table holding nothing past the cap. Corrected in 04C, it showed the deployed window
+discarding roughly two thirds of what the expiry cues could reach. A cap that cheap to get wrong,
+on a variable nobody had yet built, is a cap not worth taking at extraction time.
 
 The table above pools every engine, so a document counts as recovered when ANY of eight found the
 anchor inside the window. One of them will run, and what that one achieves is measured below --
@@ -523,11 +633,23 @@ tolerance is not decoration: on dates two engines sit at 2.7 and 2.8 spans per a
 inside measurement error, and without it the rule would trade three points of recall for a rounding
 difference.
 
+Then add the cheap rule arms regardless of where that landed, and take the **union**. The ranking
+trades recall against cost, which is the right trade for an engine costing hours per corpus pass and
+the wrong one for an engine costing minutes. Dates are the case that showed it: the ranking preferred
+LexNLP to `dateregex` by 3.4 anchor-recall points, and 04C finds `dateregex` reaching an expiry cue
+in 415 documents where LexNLP reaches 113. The anchor is the contract's own date, sitting in the
+preamble, so the criterion that made the choice could not see the quantity the term variable needs.
+
+A label with two rows below runs both engines and 04C deduplicates on the span. Adding an engine
+therefore cannot narrow the candidate set; it widens it, and what it costs is spans to resolve.
+
 ```{r}
 #| label: choose-engines
 tab_policy <- ent_choose_engines(
   .tab        = tab_eng,
-  .defaults   = .DEFAULT_ENGINE, # labels the anchor cannot rank still need an engine
+  .defaults   = .DEFAULT_ENGINE,  # labels the anchor cannot rank still need an engine
+  .proxy      = .PROXY_BASIS,     # and some of them were chosen on evidence of another kind
+  .always     = .ALWAYS,          # the rule arms run regardless; a union, not a replacement
   .recall_tol = .lP$Params$RecallTol,
   .cost_tol   = .lP$Params$CostTol
 ) |>
@@ -554,8 +676,11 @@ tab_wdeploy <- ent_window_chars(
 ent_report_window_chars(.tab = tab_wdeploy)
 ```
 
-Money is absent from the policy table above and should be. With no anchor there is no recall to rank on, so its
-engine is a stated default rather than a measured choice, and 04E should carry it as such.
+Money is absent from the recall ranking above and should be: with no anchor there is no recall to
+rank on. It is not thereby unevidenced. The redaction sections below ask whether an engine can
+propose a span at a site where the amount was withheld, and the policy records the answer as a
+`Basis` of `measured: proxy` -- a measurement of a different kind, distinguished in the artifact
+from both a recall ranking and a bare assertion, so that 04C and 04D can tell the three apart.
 
 # Sections
 
@@ -607,7 +732,7 @@ tibble::tibble(
     0L # excluded by construction in ent_write_anchor_hits(); reported so the claim is visible
   )
 ) |>
-  clf_say_table(.title = "Anchor construction")
+  tbl_say(.title = "Anchor construction")
 ```
 
 The last row is zero by construction rather than by observation: the SQL requires a parsed date at or
@@ -618,8 +743,8 @@ able to see that the constraint exists rather than infer it.
 #| label: validate-basereate
 tab_scores |>
   dplyr::distinct(Label, NCand, NAnchor, BaseRate) |>
-  dplyr::mutate(BaseRate = clf_pct(.data$BaseRate, .digits = 2L)) |>
-  clf_say_table(.title = "Held-out fold: what a rule must beat")
+  dplyr::mutate(BaseRate = tbl_pct(.data$BaseRate, .digits = 2L)) |>
+  tbl_say(.title = "Held-out fold: what a rule must beat")
 ```
 
 A base rate of a fraction of a percent means the anchor is a needle, and a rule reaching a precision
@@ -636,7 +761,7 @@ tab_rules_scored |>
     names_from = Measurable, values_from = N, values_fill = 0L,
     names_prefix = "Measurable_"
   ) |>
-  clf_say_table(.title = "Rules the anchor can and cannot judge")
+  tbl_say(.title = "Rules the anchor can and cannot judge")
 ```
 
 The unmeasured rules are not failures and must not be dropped on this document's evidence. They
@@ -646,37 +771,28 @@ address roles EDGAR never recorded -- agents, guarantors, regulators, governing 
 ```{r}
 #| label: inspect-anchor-sensitivity
 purrr::map(c(365L, 730L, 1095L), function(.w) {
-  ent_write_anchor_hits(
-    .con = con, .path_out = NULL, .window_days = .w,
-    .formats = .DATE_FORMATS
-  ) # session only
-  ent_anchor_coverage(.con = con) |>
+  ent_anchor_coverage(
+    .con         = con,
+    .window_days = .w    # re-evaluates the date test in the query; anchor_hits is not touched
+  ) |>
     dplyr::filter(.data$Label == "DATE") |>
     dplyr::transmute(WindowDays = .w, DocsMatched, PctMatched, BaseRate)
 }) |>
   purrr::list_rbind() |>
-  dplyr::mutate(PctMatched = clf_pct(.data$PctMatched), BaseRate = clf_pct(.data$BaseRate, 2L)) |>
-  clf_say_table(.title = "Date anchor: sensitivity to the window")
+  dplyr::mutate(PctMatched = tbl_pct(.data$PctMatched), BaseRate = tbl_pct(.data$BaseRate, 2L)) |>
+  tbl_say(.title = "Date anchor: sensitivity to the window")
 ```
 
 The date anchor is the one with a free parameter, and the paper's own delay analysis says contracts
 are filed some time after they are signed. If the matched share moves sharply between one and three
-years, the window is doing the work rather than the data, and the date results below should be read
+years, the window is doing the work rather than the data, and the date results above should be read
 as conditional on it.
 
-```{r}
-#| label: restore-anchor-hits
-ent_write_anchor_hits(
-  .con         = con,
-  .path_out    = NULL, # the file on disk was never touched by the loop
-  .window_days = .lP$Params$DateWindowDays,
-  .formats     = .DATE_FORMATS
-)
-```
-
-The sensitivity loop rebuilt the in-session anchor table three times, so it is restored to the
-configured window before the sections below read it. The artifact on disk was written once, in
-`# Anchors`, and no variant of it ever reached the filesystem.
+The variants are computed in the query rather than by rebuilding the anchor table. The earlier
+version rebuilt `anchor_hits` once per window and relied on a later chunk to restore it, which makes
+every section after this point depend on that restore executing: reorder the document, or fail in
+between, and the rest of it reports against a window nobody chose, with no error and nothing visibly
+different. Recomputing one column in a `SELECT` removes the dependency rather than managing it.
 
 # Deployment
 
@@ -699,9 +815,10 @@ tab_kept <- tab_rules_scored |>
 
 arrow::write_parquet(tab_kept, .lP$Output$Kept)
 
-# The policy artifact 04E consumes: one engine per label, the cap, and the document-level recall
-# each choice implies at that cap. Written as a table rather than described in prose so that 04E
-# reads a decision instead of re-deriving one.
+# The policy artifact 04C and 04D consume: one engine per label, the window, the document-level
+# recall each choice implies at that window, and the Basis saying what kind of evidence stands
+# behind the row. Written as a table rather than described in prose so that both read a decision
+# instead of re-deriving one, and so that a provisional row is visibly provisional.
 tab_policy_out <- tab_policy |>
   dplyr::left_join(
     tab_wdeploy |>
@@ -712,23 +829,56 @@ tab_policy_out <- tab_policy |>
     by = dplyr::join_by(Label, CapChars == Head, TailChars == Tail)
   )
 
+# A LEFT JOIN THAT MATCHES NOTHING IS SILENT, and this one did: the declared window was absent from
+# the character grid, so the artifact shipped with an empty recall column, which reads downstream as
+# "not measured" rather than as "the grid was never asked about this window". 04D printed a policy
+# table of NA and nothing failed.
+#
+# TWO WAYS TO GET AN EMPTY CELL, AND ONLY ONE IS A FAULT. A label with no anchor has no recall to
+# compute -- ent_window_chars() drops it entirely, because the denominator is documents holding a
+# known entity and money and redaction have none. That NA is correct and the Basis column already
+# explains it. The fault is a label that DOES appear in the grid but not at the window declared for
+# it, which means the grid was asked about the wrong windows. Checking without that distinction
+# aborts on the labels working exactly as designed, and tells the reader to add a grid value that
+# would change nothing.
+lab_measurable_ <- unique(tab_wchar$Label)
+lab_noanchor_   <- setdiff(tab_policy_out$Label, lab_measurable_)
+
+miss_ <- tab_policy_out |>
+  dplyr::filter(.data$Label %in% lab_measurable_, is.na(.data$DocRecallAtCap)) |>
+  dplyr::mutate(Want = paste0(.data$CapChars, "+", .data$TailChars))
+if (nrow(miss_) > 0L) {
+  cli::cli_abort(c(
+    "The character grid does not contain the declared window for {miss_$Label}.",
+    "i" = "Wanted head+tail: {miss_$Want}",
+    "x" = "The policy artifact would carry an empty recall column and nothing would report it.",
+    "i" = "Add the value to {.arg HeadChars} or {.arg TailChars} in the configuration."
+  ))
+}
+if (length(lab_noanchor_) > 0L) {
+  cli::cli_alert_info(
+    "Recall is blank for {lab_noanchor_} because {?it has/they have} no anchor to compute it \\
+     against. That is not a missing measurement; see the Basis column."
+  )
+}
+
 arrow::write_parquet(tab_policy_out, .lP$Output$Policy)
-clf_say_table(
+tbl_say(
   .tab = tab_policy_out |>
     dplyr::mutate(dplyr::across(
       c(Recall, DocRecallAtCap, SpansKeptAtCap, CharsKeptAtCap),
-      \(.x) clf_pct(.x)
+      \(.x) tbl_pct(.x)
     )) |>
     dplyr::select(
       Label, Combo, Basis, CapChars, TailChars, Recall, DocRecallAtCap,
       SpansKeptAtCap, CharsKeptAtCap
     ),
-  .title = "Extraction policy for 04E"
+  .title = "Extraction policy for 04C and 04D"
 )
 
 tab_kept |>
   dplyr::count(.data$Label, .data$Kind, name = "N") |>
-  clf_say_table(.title = "Rules carried into 04D")
+  tbl_say(.title = "Rules carried into 04D")
 ```
 
 Unmeasured rules that fire often enough are carried through rather than discarded. Dropping them
@@ -748,7 +898,7 @@ tibble::tibble(
     MB     = round(as.numeric(fs::file_size(.data$Path)) / 1024^2, 1),
     Path   = fs::path_file(.data$Path)
   ) |>
-  clf_say_table(.title = "Written by 04B")
+  tbl_say(.title = "Written by 04B")
 ```
 
 # Overview
@@ -757,19 +907,9 @@ tibble::tibble(
 
 ```{r}
 #| label: fig-engine-recall
-#| fig-height: 3.6
+#| fig-height: !expr ent_facet_height(4L)
 #| fig-cap: "Recall on the known entity against spans returned per anchor recovered, by engine."
-tab_eng |>
-  dplyr::filter(.data$Label != "MONEY", !is.na(.data$Recall), .data$SpansPerAnchor > 0) |>
-  ggplot2::ggplot(ggplot2::aes(x = SpansPerAnchor, y = Recall, label = Combo)) +
-  ggplot2::geom_point(size = 2) +
-  ggplot2::geom_text(size = 2.4, hjust = -0.1, check_overlap = TRUE) +
-  ggplot2::scale_x_log10() +
-  ggplot2::scale_y_continuous(labels = scales::percent) +
-  ggplot2::facet_wrap(~Label, nrow = 1) +
-  ggplot2::expand_limits(x = 1) +
-  ggplot2::labs(x = "Spans returned per anchor recovered (log)", y = "Recall on the known entity") +
-  ggplot2::theme_bw(base_size = 9)
+ent_plot_engine_recall(.tab = tab_eng)
 ```
 
 Up and to the left is better: the same recall for fewer spans. An engine sitting far right at the
@@ -779,52 +919,37 @@ same height as one on the left is paying an order of magnitude in adjudication c
 
 ```{r}
 #| label: fig-window
-#| fig-height: 4.0
-#| fig-cap: "Share of known entities kept against share of all candidates kept, by window shape."
-tab_window |>
-  dplyr::filter(.data$Label != "MONEY") |>
-  ggplot2::ggplot(ggplot2::aes(
-    x = SpansKept, y = AnchorKept,
-    colour = factor(Tail), group = factor(Tail)
-  )) +
-  ggplot2::geom_abline(slope = 1, intercept = 0, linetype = 2, colour = "grey60") +
-  ggplot2::geom_line() +
-  ggplot2::geom_point(size = 1.6) +
-  ggplot2::scale_x_continuous(labels = scales::percent) +
-  ggplot2::scale_y_continuous(labels = scales::percent) +
-  ggplot2::facet_wrap(~Label, nrow = 1) +
-  ggplot2::labs(
-    x = "Share of all candidates kept", y = "Share of known entities kept",
-    colour = "Tail"
-  ) +
-  ggplot2::theme_bw(base_size = 9)
+#| fig-height: !expr ent_facet_height(4L)
+#| fig-cap: "Share of documents recovered against share of all candidates kept, by window shape."
+ent_plot_window(.tab = tab_window)
 ```
 
-The diagonal is the null: a window that keeps entities and candidates in equal proportion has
-selected nothing. Distance above it is the enrichment, and a tail line sitting above the
-tail-of-zero line is the reading session's claim confirmed.
+The diagonal is the null: a window that recovers documents and keeps candidates in equal proportion
+has selected nothing. Distance above it is the enrichment, and a tail line sitting above the
+tail-of-zero line is the reading session's claim confirmed. Both axes run the full range from zero,
+which is what makes the reference line readable across the panel rather than only in one corner.
+
+Read this figure against the character table rather than on its own. Both report document recall, so
+a fraction reaching a given recall for a smaller share of the candidate pool than any character cap
+manages would mean the cap is on the wrong axis and document length is doing the work.
 
 ## Rule lift by label
 
 ```{r}
 #| label: fig-rule-lift
-#| fig-height: 3.6
-#| fig-cap: "Lift over the base rate against how often a rule fires, measurable cues only."
-tab_rules_scored |>
-  dplyr::filter(.data$Kind == "cue", .data$Measurable, .data$NFire > 0L, !is.na(.data$Lift)) |>
-  ggplot2::ggplot(ggplot2::aes(x = NFire, y = Lift)) +
-  ggplot2::geom_hline(yintercept = 1, linetype = 2, colour = "grey60") +
-  ggplot2::geom_point(size = 1.6, alpha = 0.7) +
-  ggplot2::scale_x_log10() +
-  ggplot2::scale_y_log10() +
-  ggplot2::facet_wrap(~Label, nrow = 1) +
-  ggplot2::labs(x = "Candidates the rule fires on (log)", y = "Lift over base rate (log)") +
-  ggplot2::theme_bw(base_size = 9)
+#| fig-height: !expr ent_facet_height(4L)
+#| fig-cap: "Lift over the base rate against how often a rule fires, measurable cues only. The two
+#|   colours are the two directions and must be read separately: a high-direction cue passes above
+#|   the line, a low-direction cue passes below it."
+ent_plot_rule_lift(.tab = tab_rules_scored)
 ```
 
-The useful region is upper right: a rule that concentrates the known entity *and* fires often enough
-to matter. High lift on a handful of candidates is a curiosity; lift near one at any volume is the
-base rate wearing a phrase.
+The useful region depends on the direction, which is why the two are coloured rather than pooled. A
+high-direction cue passes by sitting above the reference line and firing often enough to matter;
+high lift on a handful of candidates is a curiosity, and lift near one at any volume is the base
+rate wearing a phrase. A low-direction cue passes by sitting *below* it, because the claim being
+tested is that the cue avoids the anchor. The two groups are not comparable on the vertical axis and
+a single cloud would imply they were.
 
 ## The whole measurement in one block
 

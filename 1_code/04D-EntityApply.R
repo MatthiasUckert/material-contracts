@@ -1,4 +1,4 @@
-# 04D-EntityApply: apply the settled entity policy to the corpus ----
+# 04D-EntityApply: extract every engine over the whole corpus into one store ------------------------------------------
 #
 # WHAT THIS FILE DOES, IN ONE PARAGRAPH
 # Every decision has been made. 04A extracted, 04B measured which engine to keep and which window to
@@ -43,9 +43,10 @@ if (FALSE) {
 `%||%` <- function(.x, .y) if (is.null(.x)) .y else .x
 
 
-# 1. The corpus index -----------------------------------------------------
-# The labelled sample fits in memory and the corpus does not. What is held throughout is one row per
-# document with its path and the EDGAR facts; text is read one chunk at a time and discarded.
+# 1. The corpus index ------------------------------------------------------------------------------------------------
+# Where the documents are and what EDGAR knows about them. Walked once and cached: listing
+# 1.46 million files is not something to repeat on every render.
+
 
 #' One row per corpus document, with its path and the facts the release is checked against
 #'
@@ -109,27 +110,62 @@ ent_corpus_index <- function(.dir_corpus, .path_meta, .path_landing = NULL, .pat
     }
   }
 
+  # THE CORPUS SIZE TRAVELS WITH THE INDEX, and it has to, because the moment a limit is applied the
+  # index stops knowing how big the corpus is and nrow() silently becomes the rehearsal size. The
+  # throughput projection is computed from that number, so a rehearsal projected onto itself and
+  # reported the corpus pass as taking a tenth of an hour when the true figure was eighty.
+  #
+  # A rehearsal is the ONLY time the projection is wanted, which is exactly when nrow() is wrong.
+  n_corpus_ <- nrow(idx_)
+
+  # Total size on disk, taken BEFORE the limit for the same reason as the count: it is the corpus
+  # fingerprint, and a rehearsal that fingerprinted its own ten thousand documents would abort the
+  # release run with "the tree has changed" when nothing had. One stat call per file, once per
+  # render, which is seconds against a pass measured in days.
+  bytes_corpus_ <- sum(as.numeric(fs::file_size(idx_$Path)), na.rm = TRUE)
+
   if (!is.null(.limit) && .limit < nrow(idx_)) {
     idx_ <- withr::with_seed(.seed, dplyr::slice_sample(idx_, n = .limit))
     cli::cli_alert_warning(
-      "Limited to {nrow(idx_)} document{?s}, drawn at random across the whole tree. Output from a \\
-       limited run is written to a separate directory so it cannot be mistaken for a corpus pass."
+      "Limited to {nrow(idx_)} document{?s}, drawn at random across the whole tree. This writes to \\
+       the SAME store as a full run and its work counts towards it: the ledger records each \\
+       document against each engine, so setting Limit to NULL continues rather than restarting."
     )
   }
+  attr(idx_, "NCorpus")     <- as.integer(n_corpus_)
+  attr(idx_, "BytesCorpus") <- bytes_corpus_
   idx_
 }
 
-#' Where a run writes, kept apart when it is a rehearsal
-#' @param .dir Release directory.
-#' @param .limit The Limit parameter; NULL means a corpus pass.
-#' @return A path.
-ent_output_dir <- function(.dir, .limit = NULL) {
+
+#' How many documents the corpus holds, whatever the index was limited to
+#'
+#' The accessor exists so that a call site cannot reach for nrow() by mistake. Under a rehearsal
+#' nrow() is the rehearsal size, and every quantity scaled by it -- the throughput projection above
+#' all -- comes out wrong by whatever factor the limit imposed, silently and in the reassuring
+#' direction.
+#'
+#' @param .index Tibble from ent_corpus_index().
+#' @param .what Which quantity: the document count or the total size on disk.
+#' @return Numeric. The corpus figure, before any limit.
+ent_corpus_n <- function(.index, .what = c("docs", "bytes")) {
   if (FALSE) {
-    .dir   <- .lP$Output$Vars
-    .limit <- 2000L
+    .index <- tab_index
+    .what  <- "docs"
   }
-  if (is.null(.limit)) .dir else paste0(.dir, "_preview")
+  .what <- match.arg(.what)
+  key_  <- if (.what == "docs") "NCorpus" else "BytesCorpus"
+
+  n_ <- attr(.index, key_)
+  if (is.null(n_)) {
+    cli::cli_abort(c(
+      "Index carries no corpus {(.what)} figure.",
+      "i" = "It must come from ent_corpus_index(), which records both before limiting."
+    ))
+  }
+  n_
 }
+
 
 #' Read the text for one chunk; it enters memory here and leaves when the chunk is written
 #' @param .chunk Rows of the index.
@@ -146,269 +182,311 @@ ent_read_chunk <- function(.chunk) {
 }
 
 
-# 2. Extraction over two slices -------------------------------------------
+# 2. The plan --------------------------------------------------------------------------------------------------------
+# Which engines run and which labels each is asked for, checked against the dispatch before
+# any work starts.
 
-#' The distinct extractor runs a policy implies
+#' Which engine runs, and for which labels
 #'
-#' Several labels can share an engine under different windows -- LexNLP serves organisations with no
-#' tail and dates with one -- so running once per label would extract the same head twice. Grouping
-#' by engine and slice runs each combination once and keeps only the labels that asked for it.
+#' Replaces the head-and-tail slice plan the previous version built. Every label reads full text, so
+#' there is nothing to slice: what the policy still determines is which engines run and which labels
+#' each is asked for. Several labels can share an engine -- LexNLP serves organisations and dates --
+#' so grouping by engine runs each once rather than once per label.
 #'
 #' @param .policy Tibble from ent_read_policy().
-#' @return Tibble: Combo, Slice, Chars, Labels (a list column).
-ent_slice_plan <- function(.policy) {
+#' @return Tibble: Combo and Labels, a list column.
+ent_engine_plan <- function(.policy) {
   if (FALSE) .policy <- tab_policy
 
-  head_ <- .policy |>
-    dplyr::transmute(Combo, Slice = "head", Chars = as.integer(.data$CapChars), Label)
-  tail_ <- .policy |>
-    dplyr::filter(.data$TailChars > 0L) |>
-    dplyr::transmute(Combo, Slice = "tail", Chars = as.integer(.data$TailChars), Label)
+  cap_ <- unique(.policy$CapChars)
+  tail_ <- unique(.policy$TailChars)
+  if (!all(tail_ == 0L)) {
+    cli::cli_abort(c(
+      "The policy declares a tail for {.policy$Label[.policy$TailChars > 0L]}.",
+      "i" = "This document extracts full text only; a tail needs the slice design in _BackUp.",
+      "x" = "Ignoring it would extract a prefix and report success."
+    ))
+  }
 
-  dplyr::bind_rows(head_, tail_) |>
-    dplyr::summarise(Labels = list(sort(unique(.data$Label))), .by = c(Combo, Slice, Chars)) |>
-    dplyr::arrange(.data$Combo, .data$Slice)
+  .policy |>
+    dplyr::summarise(Labels = list(sort(unique(.data$Label))), .by = Combo) |>
+    dplyr::arrange(.data$Combo)
 }
 
-#' Write the slim text parquet one extractor run reads
-#'
-#' The tail slice records the offset it starts at. Every span the extractor returns for it indexes
-#' the slice, and adding the shift back is what keeps a corpus offset meaning the same thing as a
-#' sample offset. A document shorter than the budget is its own slice and the shift is zero.
-#'
-#' @param .docs Chunk with DocID and Text.
-#' @param .slice "head" or "tail".
-#' @param .chars Character budget.
-#' @param .path Destination parquet.
-#' @return Tibble: DocID, OffsetShift.
-ent_write_slice <- function(.docs, .slice, .chars, .path) {
-  if (FALSE) {
-    .docs  <- docs_
-    .slice <- "tail"
-    .chars <- 5000L
-    .path  <- fs::file_temp(ext = "parquet")
-  }
 
-  len_ <- stringi::stri_length(.docs$Text)
-  if (identical(.slice, "head")) {
-    txt_   <- stringi::stri_sub(.docs$Text, 1L, pmin(len_, .chars))
-    shift_ <- rep(0L, nrow(.docs))
-  } else {
-    shift_ <- pmax(0L, len_ - .chars)
-    txt_   <- stringi::stri_sub(.docs$Text, shift_ + 1L, len_)
-  }
-  fs::dir_create(fs::path_dir(.path))
-  arrow::write_parquet(tibble::tibble(DocID = .docs$DocID, TextRaw = txt_), .path)
-  tibble::tibble(DocID = .docs$DocID, OffsetShift = as.integer(shift_))
+#' The labels argument ner_run() expects, keyed by combination
+#'
+#' ner_run() takes labels either as a vector applying to everything or as a list keyed on the
+#' combination token. The second is what a mixed engine set needs: asking the gazetteer for DATE
+#' would return nothing and asking LexNLP for GPE would return the geoentity pass this project
+#' excludes by policy.
+#'
+#' @param .plan Tibble from ent_engine_plan().
+#' @return Named list of character vectors.
+ent_plan_labels <- function(.plan) {
+  if (FALSE) .plan <- tab_plan
+  purrr::set_names(.plan$Labels, .plan$Combo)
 }
 
-#' Dispatch one combo to its extractor
 #'
-#' The same wrappers 04A ran, so the corpus is extracted by the code the measurement was made on.
-#' A combo with no branch aborts rather than returning nothing, because an engine silently absent
-#' from a corpus pass is a column of missing variables nobody can explain afterwards.
+#' ner_run() dispatches on the combination token through a chain of branches, so one it does not
+#' cover surfaces as an abort from inside the extraction loop -- after the index is built and the
+#' first chunks have run. On a corpus pass that is hours in. Naming the supported set once, here,
+#' lets the plan be checked before any work starts.
 #'
-#' @param .combo Engine token, as in the policy.
-#' @param .input,.output Parquet paths.
-#' @param .labels Labels to request.
-#' @param .max_chars Truncation, or NULL; the slice is already cut, so this is normally NULL.
-#' @param .n_process,.batch_size,.timeout Per-combo throughput knobs.
-#' @param .device spaCy device string.
-#' @param .quiet Passed through.
-#' @return Invisibly .output.
-ent_run_engine <- function(.combo, .input, .output, .labels, .max_chars = NULL,
-                           .n_process = 16L, .batch_size = 64L, .timeout = 0L,
-                           .device = "auto", .quiet = TRUE) {
-  if (FALSE) {
-    .combo  <- "lexnlp"
-    .input  <- fs::file_temp(ext = "parquet")
-    .output <- fs::file_temp(ext = "parquet")
-    .labels <- c("ORG", "DATE")
-  }
-
-  parts_ <- strsplit(.combo, ":", fixed = TRUE)[[1]]
-  engine_ <- parts_[1]
-  model_  <- if (length(parts_) > 1L) paste(parts_[-1], collapse = ":") else engine_
-
-  if (engine_ == "spacy") {
-    ner_spacy(.inputs = .input, .output = .output, .labels = .labels, .max_chars = .max_chars,
-              .model = model_, .device = if (grepl("trf", model_, fixed = TRUE)) .device else "cpu",
-              .batch_size = .batch_size, .n_process = if (grepl("trf", model_, fixed = TRUE)) 1L
-              else .n_process, .timeout = .timeout, .quiet = .quiet)
-  } else if (engine_ == "lexnlp") {
-    ner_lexnlp(.inputs = .input, .output = .output, .labels = .labels, .max_chars = .max_chars,
-               .chunk_size = .batch_size, .n_process = .n_process, .timeout = .timeout,
-               .quiet = .quiet)
-  } else if (engine_ == "paper" && model_ == "dateregex-v1") {
-    ner_dateregex(.inputs = .input, .output = .output, .labels = .labels,
-                  .max_chars = .max_chars, .quiet = .quiet)
-  } else if (engine_ == "paper" && model_ == "gazetteer-v1") {
-    ner_gazetteer(.inputs = .input, .output = .output, .labels = .labels, .max_chars = .max_chars,
-                  .n_process = .n_process, .chunk_size = .batch_size, .timeout = .timeout,
-                  .quiet = .quiet)
-  } else if (engine_ == "paper" && model_ == "redaction-v1") {
-    ner_redaction(.inputs = .input, .output = .output, .labels = .labels, .max_chars = .max_chars,
-                  .n_process = .n_process, .chunk_size = .batch_size, .timeout = .timeout,
-                  .quiet = .quiet)
-  } else {
-    cli::cli_abort("No extractor for combo {.val {(.combo)}}.")
-  }
-  invisible(.output)
+#' @return Character vector of supported engine and model-stem tokens.
+ent_engine_supported <- function() {
+  c("spacy", "lexnlp", "paper:dateregex", "paper:gazetteer", "paper:redaction", "paper:moneyregex")
 }
 
-#' Extract one chunk under the whole policy and return candidates on full-document offsets
+
+#' Fail before the pass rather than during it
 #'
-#' @param .docs Chunk with DocID and Text.
-#' @param .plan Tibble from ent_slice_plan().
-#' @param .dir_work Scratch directory for the slices and the extractor output.
-#' @param .knobs Named list of per-combo throughput settings.
-#' @param .device spaCy device string.
-#' @return Tibble: DocID, Label, Start, Stop, Span, LabelRaw, Engine, Model.
-ent_extract_chunk <- function(.docs, .plan, .dir_work, .knobs = list(), .device = "auto") {
+#' Checks every combination in the plan against the dispatch. This exists because the check it
+#' performs was missing: money moved from the transformer to the regex arm in 04B, the policy and
+#' the throughput knobs were updated, and the extractor dispatch was not -- so the plan named an
+#' engine nothing could run and a rehearsal aborted three combinations into the first chunk.
+#'
+#' Also warns on a combination with no throughput knobs. That is not fatal -- the defaults apply --
+#' but on this engine set the defaults are wrong often enough to be worth seeing: the transformer
+#' cannot share a device, LexNLP stalls without a timeout.
+#'
+#' @param .plan Tibble from ent_engine_plan().
+#' @param .knobs Named list of per-combination throughput settings.
+#' @return Invisibly the plan, unchanged.
+ent_check_plan <- function(.plan, .knobs = list()) {
   if (FALSE) {
-    .docs     <- docs_
-    .plan     <- tab_plan
-    .dir_work <- fs::path(.dir_main, "Work")
+    .plan  <- tab_plan
+    .knobs <- .KNOBS
+  }
+
+  stem_ <- function(.x) {
+    eng_ <- sub(":.*$", "", .x)
+    mod_ <- sub("-v[0-9]+$", "", sub("^[^:]*:", "", .x))
+    dplyr::if_else(grepl(":", .x, fixed = TRUE), paste0(eng_, ":", mod_), eng_)
+  }
+
+  bad_ <- setdiff(stem_(unique(.plan$Combo)), ent_engine_supported())
+  if (length(bad_) > 0L) {
+    cli::cli_abort(c(
+      "The policy names {length(bad_)} engine{?s} this document cannot run: {bad_}.",
+      "i" = "Dispatch covers: {ent_engine_supported()}.",
+      "x" = "Left to the extraction loop this would abort part-way through a corpus pass."
+    ))
+  }
+
+  noknob_ <- setdiff(unique(.plan$Combo), names(.knobs))
+  if (length(noknob_) > 0L) {
+    cli::cli_alert_warning(
+      "No throughput settings for {noknob_}; the defaults apply, which are rarely right."
+    )
+  }
+  cli::cli_alert_success("Plan checked: {dplyr::n_distinct(.plan$Combo)} engine{?s} dispatchable.")
+  invisible(.plan)
+}
+
+
+# 3. The store fingerprint -------------------------------------------------------------------------------------------
+# The one guard that cannot be recovered after the fact. See ent_corpus_manifest().
+
+
+#' What the corpus store was built against
+#'
+#' THE OFFSET CONTRACT, AND IT IS DIFFERENT FROM 04A'S. The sample freezes one canonical text to
+#' disk and every offset indexes that file. A corpus of 1.46 million documents cannot be frozen that
+#' way -- the text alone runs to tens of gigabytes -- so the contract here is the reading function
+#' instead: every offset indexes clf_read_text(Path), which is deterministic and is the same
+#' function 04A derived its canonical text with.
+#'
+#' That holds only while the parsed tree holds. Regenerate the corpus and every offset in the store
+#' silently indexes a different string: is.na() catches nothing, spans rehydrate as plausible
+#' nonsense, and no number changes visibly. This fingerprint is what makes that loud.
+#'
+#' Size on disk rather than character count, because counting characters means reading 1.46 million
+#' files and the fingerprint would then cost more than the thing it guards. A regenerated tree
+#' changes its byte total; a tree that has not been touched does not.
+#'
+#' @param .index Tibble from ent_corpus_index(), unlimited.
+#' @param .run Character. Combination tokens this store is built with.
+#' @param .labels Named list from ent_plan_labels().
+#' @return One-row tibble: NDocs, TotalBytes, Run, Labels, CreatedAt.
+ent_corpus_manifest <- function(.index, .run, .labels) {
+  if (FALSE) {
+    .index  <- tab_index
+    .run    <- tab_plan$Combo
+    .labels <- lst_labels
+  }
+
+  # BOTH FIGURES DESCRIBE THE CORPUS, NOT THE INDEX IN HAND. Under a rehearsal the index holds the
+  # rehearsal, so computing either from it would write a fingerprint of ten thousand documents and
+  # then abort the release run against it -- reporting a regenerated tree when nothing had changed,
+  # which is the one message here a reader would act on immediately and wrongly.
+  tibble::tibble(
+    NDocs      = ent_corpus_n(.index, .what = "docs"),
+    TotalBytes = ent_corpus_n(.index, .what = "bytes"),
+    Run        = paste(sort(.run), collapse = " | "),
+    Labels     = paste(sort(unique(unlist(.labels))), collapse = ","),
+    CreatedAt  = Sys.time()
+  )
+}
+
+
+#' Compare the corpus fingerprint against the one the store was built under
+#'
+#' Same shape as 04A's manifest check and for the same reason: the DuckDB ledger records that a
+#' document was processed by an engine and nothing else. It cannot tell that the document's text has
+#' changed underneath it, so a rebuilt corpus produces a store that reports itself complete and
+#' holds offsets into a string that no longer exists.
+#'
+#' A fingerprint mismatch is fatal here rather than advisory. On the sample a stale store wastes a
+#' render; on the corpus it produces a released dataset whose spans point at the wrong characters.
+#'
+#' The engine inventory is not a fingerprint and is reported rather than enforced: adding an engine
+#' is the ordinary incremental case, and the ledger handles it correctly.
+#'
+#' @param .path_manifest Where the manifest is written.
+#' @param .manifest One-row tibble from ent_corpus_manifest().
+#' @return Invisibly, a tibble of the comparison.
+ent_corpus_manifest_sync <- function(.path_manifest, .manifest) {
+  if (FALSE) {
+    .path_manifest <- .lP$Store$Manifest
+    .manifest      <- ent_corpus_manifest(tab_index, tab_plan$Combo, lst_labels)
+  }
+
+  show_ <- function(.x) {
+    if (is.numeric(.x)) format(.x, scientific = FALSE, trim = TRUE) else as.character(.x)
+  }
+  keys_ <- c("NDocs", "TotalBytes", "Labels", "Run")
+  kind_ <- c("fingerprint", "fingerprint", "fingerprint", "inventory")
+  cur_  <- purrr::map_chr(keys_, \(.k) show_(.manifest[[.k]]))
+
+  if (!fs::file_exists(.path_manifest)) {
+    fs::dir_create(fs::path_dir(.path_manifest))
+    arrow::write_parquet(.manifest, .path_manifest)
+    out_ <- tibble::tibble(Field = keys_, Kind = kind_, Stored = "(new)", Current = cur_,
+                           Match = TRUE, Note = "store created")
+    tbl_say(.tab = out_, .title = "Corpus fingerprint")
+    return(invisible(out_))
+  }
+
+  old_ <- arrow::read_parquet(.path_manifest)
+  out_ <- tibble::tibble(
+    Field  = keys_,
+    Kind   = kind_,
+    Stored = purrr::map_chr(keys_, \(.k) show_(old_[[.k]])),
+    Current = cur_
+  ) |>
+    dplyr::mutate(Same = .data$Stored == .data$Current)
+
+  split_ <- function(.x) if (is.na(.x)) character(0) else trimws(strsplit(.x, "|", fixed = TRUE)[[1]])
+  was_   <- split_(out_$Stored[out_$Field == "Run"])
+  now_   <- split_(out_$Current[out_$Field == "Run"])
+
+  out_ <- out_ |>
+    dplyr::mutate(
+      Match = dplyr::if_else(.data$Kind == "inventory", TRUE, .data$Same),
+      Note  = dplyr::case_when(
+        .data$Kind == "inventory" & identical(was_, now_) ~ "unchanged",
+        .data$Kind == "inventory" ~ paste0(length(now_), " asked for, ", length(was_), " stored"),
+        .data$Same ~ "",
+        TRUE ~ "TREE HAS CHANGED -- every offset in the store is suspect"
+      ),
+      Stored  = dplyr::if_else(.data$Kind == "inventory", paste0(length(was_), " combos"), .data$Stored),
+      Current = dplyr::if_else(.data$Kind == "inventory", paste0(length(now_), " combos"), .data$Current)
+    ) |>
+    dplyr::select(Field, Kind, Stored, Current, Match, Note)
+
+  tbl_say(.tab = out_, .title = "Corpus fingerprint")
+
+  bad_ <- out_ |> dplyr::filter(.data$Kind == "fingerprint", !.data$Match)
+  if (nrow(bad_) > 0L) {
+    cli::cli_abort(c(
+      "The corpus does not match what this store was built against: {bad_$Field}.",
+      "x" = "Offsets in the store index text that has since been regenerated.",
+      "i" = "Move the store aside and rebuild, or restore the tree it was built from."
+    ))
+  }
+  if (!identical(was_, now_)) arrow::write_parquet(.manifest, .path_manifest)
+  invisible(out_)
+}
+
+
+# 4. Extraction ------------------------------------------------------------------------------------------------------
+
+#' Extract one chunk of the corpus into the shared store
+#'
+#' The chunk exists to bound memory, not to bound work: the text of five hundred documents is held
+#' in R for as long as the extractors need it and then dropped. Resumption is NOT by chunk. It is
+#' the store's own ledger, which records each document against each engine, so an interrupted run
+#' resumes at the document it stopped on rather than at the start of its chunk, and a re-run of a
+#' finished chunk costs one query.
+#'
+#' ner_run() does the extraction, and using it rather than a corpus-specific implementation is the
+#' point: it is the function that built the sample store in 04A, so the two stores are populated by
+#' one piece of code and differ only in what was pointed at them.
+#'
+#' @param .chunk Rows of the corpus index.
+#' @param .db_path The corpus candidate store.
+#' @param .run Character. Combination tokens to run.
+#' @param .labels Named list from ent_plan_labels().
+#' @param .dir_work Scratch directory; the chunk's text parquet is written and deleted here.
+#' @param .knobs Named list of per-combination throughput settings.
+#' @param .device Passed to the spaCy extractor.
+#' @return Invisibly, a one-row tibble: documents read and seconds taken.
+ent_extract_corpus_chunk <- function(.chunk, .db_path, .run, .labels, .dir_work,
+                                     .knobs = list(), .device = "auto") {
+  if (FALSE) {
+    .chunk    <- dplyr::slice_head(tab_index, n = 50L)
+    .db_path  <- .lP$Store$NerDB
+    .run      <- tab_plan$Combo
+    .labels   <- lst_labels
+    .dir_work <- .lP$Work$Dir
     .knobs    <- .KNOBS
     .device   <- "auto"
   }
 
+  t0_    <- Sys.time()
+  docs_  <- ent_read_chunk(.chunk = .chunk)
+  if (nrow(docs_) == 0L) {
+    return(invisible(tibble::tibble(nDocs = 0L, Seconds = 0)))
+  }
+
   fs::dir_create(.dir_work)
-  out_ <- purrr::pmap(.plan, function(Combo, Slice, Chars, Labels) {
-    tag_  <- paste0(gsub("[^A-Za-z0-9]", "-", Combo), "_", Slice)
-    in_   <- fs::path(.dir_work, paste0("in_", tag_, ".parquet"))
-    outp_ <- fs::path(.dir_work, paste0("out_", tag_, ".parquet"))
-    if (fs::file_exists(outp_)) fs::file_delete(outp_)
+  path_ <- fs::file_temp(pattern = "corpus_", tmp_dir = .dir_work, ext = "parquet")
+  arrow::write_parquet(tibble::tibble(DocID = docs_$DocID, TextRaw = docs_$Text), path_)
+  on.exit(if (fs::file_exists(path_)) fs::file_delete(path_), add = TRUE)
 
-    shift_ <- ent_write_slice(.docs = .docs, .slice = Slice, .chars = Chars, .path = in_)
-    knob_  <- .knobs[[Combo]] %||% list()
-    ent_run_engine(
-      .combo      = Combo,
-      .input      = in_,
-      .output     = outp_,
-      .labels     = Labels,
-      .max_chars  = NULL,                       # the slice is already cut
-      .n_process  = knob_$n_process  %||% 16L,
-      .batch_size = knob_$batch_size %||% 64L,
-      .timeout    = knob_$timeout    %||% 0L,
-      .device     = .device,
-      .quiet      = TRUE
-    )
-    cand_ <- arrow::read_parquet(outp_) |>
-      dplyr::filter(!is.na(.data$Start), .data$Label %in% Labels) |>
-      dplyr::left_join(shift_, by = dplyr::join_by(DocID)) |>
-      dplyr::mutate(
-        Start = as.integer(.data$Start) + .data$OffsetShift,
-        Stop  = as.integer(.data$Stop)  + .data$OffsetShift
-      ) |>
-      dplyr::select(-OffsetShift)
-    fs::file_delete(c(in_, outp_)[fs::file_exists(c(in_, outp_))])
-    cand_
-  }) |>
-    purrr::list_rbind()
-
-  # A short document is its whole head slice and its whole tail slice, so the same span arrives
-  # twice. Deduplicating on the span itself is exact; deduplicating on the document is not.
-  dplyr::distinct(out_, DocID, Label, Start, Stop, Span, .keep_all = TRUE)
-}
-
-
-# 3. Resolution over a chunk ----------------------------------------------
-
-#' A DuckDB session holding one chunk's candidates in the shape the resolvers expect
-#'
-#' 04C reads a table called deployed and a table called lens, and gets them by filtering a persistent
-#' store through the policy. Here the extraction was already run under the policy, so the candidates
-#' ARE the deployed set. Building the same two tables means every resolver below is the code 04C was
-#' validated with rather than a corpus variant of it.
-#'
-#' @param .cands Tibble from ent_extract_chunk().
-#' @param .docs Chunk with DocID and Text.
-#' @param .path_text Where the chunk's text is written for the resolvers to slice context from.
-#' @return A live DBI connection; the caller disconnects.
-ent_chunk_session <- function(.cands, .docs, .path_text) {
-  if (FALSE) {
-    .cands     <- cand_
-    .docs      <- docs_
-    .path_text <- fs::file_temp(ext = "parquet")
+  knob_ <- function(.k) {
+    v_ <- purrr::map(.knobs, .k) |> purrr::compact()
+    if (length(v_) == 0L) NULL else v_
   }
 
-  arrow::write_parquet(tibble::tibble(DocID = .docs$DocID, TextRaw = .docs$Text), .path_text)
-  con_ <- DBI::dbConnect(duckdb::duckdb())
-  ent_put_table(.con = con_, .name = "deployed", .tab = dplyr::select(
-    .cands, DocID, Label, Start, Stop, Span, LabelRaw
-  ))
-  DBI::dbExecute(con_, paste0(
-    "CREATE OR REPLACE TABLE lens AS SELECT DocID, length(TextRaw) AS DocLen ",
-    "FROM read_parquet('", as.character(fs::path_abs(.path_text)), "') WHERE length(TextRaw) > 0"
-  ))
-  con_
-}
-
-#' Resolve one chunk into variable rows, using 04C's resolvers unchanged
-#'
-#' @param .con Session from ent_chunk_session().
-#' @param .path_text The chunk's text parquet.
-#' @param .rules Tibble of rules kept by 04B.
-#' @param .keys Per-document anchor keys for this chunk.
-#' @param .formats strptime formats.
-#' @param .ctx_max Context width.
-#' @param .head_pos Position under which an uncued organisation still reads as a party.
-#' @return Tibble: one row per document.
-ent_resolve_chunk <- function(.con, .path_text, .rules, .keys, .formats,
-                              .ctx_max = 400L, .head_pos = 0.10) {
-  if (FALSE) {
-    .con       <- con_
-    .path_text <- path_text_
-    .rules     <- tab_rules
-    .keys      <- keys_
-    .formats   <- .DATE_FORMATS
-  }
-
-  ent_defined_terms(.con = .con, .path_text = .path_text)
-  ent_assign_roles(.con = .con, .path_text = .path_text, .rules = .rules, .ctx_max = .ctx_max)
-
-  ent_assemble(
-    .keys     = .keys,
-    .parties  = ent_resolve_parties(.con = .con, .head_pos = .head_pos),
-    .dates    = ent_resolve_dates(.con = .con, .formats = .formats),
-    .places   = ent_resolve_places(.con = .con),
-    .value    = ent_resolve_value(.con = .con),
-    # The published measure needs every date in the document, and at corpus scale "every date in the
-    # document" is every date the deployed engines returned -- there is no unfiltered store to fall
-    # back on. The column therefore describes the deployed window, and 04C's sample figure is the
-    # one that reproduces the published definition on full text.
-    .pubdates = ent_published_dates_chunk(.con = .con, .formats = .formats)
+  ner_run(
+    .inputs        = path_,
+    .db_path       = .db_path,
+    .run           = .run,
+    .labels        = .labels,
+    .max_chars     = NULL,        # full text; the window is a resolution-time filter in 04E
+    .retry_timeout = FALSE,
+    .id_col        = "DocID",
+    .text_col      = "TextRaw",
+    .docs_per_run  = NULL,        # the chunk IS the slice; ner_run must not re-chunk it
+    .device        = .device,
+    .n_process     = knob_("n_process")  %||% 16L,
+    .batch_size    = knob_("batch_size") %||% 64L,
+    .timeout       = knob_("timeout")    %||% 0L,
+    .keep_staging  = FALSE,
+    .quiet         = TRUE
   )
-}
 
-#' Maximum date per document, from this chunk's candidates
-#' @param .con Session with roles built.
-#' @param .formats strptime formats.
-#' @return Tibble: DocID, MaxDateAny, NDatesFull.
-ent_published_dates_chunk <- function(.con, .formats) {
-  if (FALSE) {
-    .con     <- con_
-    .formats <- .DATE_FORMATS
-  }
-
-  fmt_ <- paste0("['", paste(.formats, collapse = "','"), "']")
-  DBI::dbGetQuery(.con, paste0(
-    "WITH d AS (SELECT DISTINCT DocID, Span FROM deployed WHERE Label = 'DATE'), ",
-    "p AS (SELECT DocID, CAST(try_strptime(", ent_sql_dateclean("Span"), ", ", fmt_,
-    ") AS DATE) AS D FROM d) ",
-    "SELECT DocID, max(D) AS MaxDateAny, COUNT(D) AS NDatesFull FROM p ",
-    "WHERE D IS NOT NULL GROUP BY DocID"
-  )) |>
-    tibble::as_tibble() |>
-    dplyr::mutate(NDatesFull = as.integer(.data$NDatesFull))
+  invisible(tibble::tibble(
+    nDocs   = nrow(docs_),
+    Seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+  ))
 }
 
 
-# 4. Bookkeeping ----------------------------------------------------------
-# The two timing helpers follow 03F-ClassifyApply.R, which solved the same problem for the
-# classifier: a corpus pass is measured in hours, so the rate has to be measured on this machine
-# rather than assumed, and a resumed run must keep the timings it already paid for.
+# 5. Bookkeeping and report ------------------------------------------------------------------------------------------
 
 #' Record what one chunk cost, beside the output rather than inside it
 #' @param .dir Output directory.
@@ -438,14 +516,16 @@ ent_write_timing <- function(.dir, .chunk, .n_docs, .seconds, .n_cands) {
   invisible(path_)
 }
 
+
 #' Measured throughput, and what a full pass would cost at that rate
 #' @param .dir Output directory.
 #' @param .n_corpus Documents a full pass would cover.
 #' @return Invisibly the timing tibble.
-ent_report_throughput <- function(.dir, .n_corpus) {
+ent_report_throughput <- function(.dir, .n_corpus, .n_cands = NULL) {
   if (FALSE) {
-    .dir      <- .dir_out
-    .n_corpus <- nrow(tab_index)
+    .dir      <- .dir_store
+    .n_corpus <- ent_corpus_n(tab_index)
+    .n_cands  <- sum(.ov$ledger$Candidates)
   }
   dir_ <- fs::path(.dir, "_timing")
   if (!fs::dir_exists(dir_)) {
@@ -459,64 +539,38 @@ ent_report_throughput <- function(.dir, .n_corpus) {
 
   rate_ <- sum(tab_$nDocs) / sum(tab_$Seconds)
   cli::cli_h2("Measured throughput")
-  clf_say_table(
+  tbl_say(
     .tab = tibble::tibble(
       Chunks      = nrow(tab_),
       Documents   = sum(tab_$nDocs),
-      Candidates  = sum(tab_$nCands),
       Minutes     = round(sum(tab_$Seconds) / 60, 1),
       DocsPerSec  = round(rate_, 1),
-      CandsPerDoc = round(sum(tab_$nCands) / sum(tab_$nDocs), 1),
-      FullPassHrs = round(.n_corpus / rate_ / 3600, 1)
+      CorpusDocs  = as.integer(.n_corpus),
+      FullPassHrs = round(.n_corpus / rate_ / 3600, 1),
+      FullPassDay = round(.n_corpus / rate_ / 3600 / 24, 1),
+      # Candidate figures come from the STORE and only when it has been read. The timing log cannot
+      # supply them: a chunk the ledger had already seen does no work, so its candidate count is
+      # zero and the per-document rate would fall by however much of the run was resumed.
+      Candidates  = if (is.null(.n_cands)) NULL else as.integer(.n_cands),
+      CandsPerDoc = if (is.null(.n_cands)) NULL else round(.n_cands / sum(tab_$nDocs), 1),
+      CorpusMCand = if (is.null(.n_cands)) NULL else {
+        round(.n_cands / sum(tab_$nDocs) * .n_corpus / 1e6, 1)
+      }
     )
   )
   cli::cli_alert_info(
-    "Extraction and resolution are timed together, because that is what a pass costs. \\
-     CandsPerDoc times the corpus is what 04E's consumer has to store."
+    "Extraction only; resolution is 04E and costs a fraction of this. CorpusDocs is the tree \\
+     before any limit, so the projection means the same thing whether this run was a rehearsal or \\
+     the release."
   )
+  if (sum(tab_$nDocs) < .n_corpus) {
+    cli::cli_alert_warning(
+      "Projected from {sum(tab_$nDocs)} of {(.n_corpus)} documents. The draw is random across the \\
+       whole tree, so it is unbiased on document COUNT -- but cost follows length, and 04A found \\
+       the corpus tail longer than the labelled sample's. Read this as a floor."
+    )
+  }
   invisible(tab_)
 }
 
 
-# 5. Report ---------------------------------------------------------------
-
-#' What the pass produced and how far it agrees with the EDGAR facts
-#' @param .tab Assembled variable rows.
-#' @return Invisibly .tab.
-ent_report_apply <- function(.tab) {
-  if (FALSE) .tab <- tab_vars
-
-  cli::cli_h2("Released variables")
-  clf_say_table(
-    .tab = tibble::tibble(
-      Item = c("Documents", "With >=2 parties", "With a contract start", "With a contract end",
-               "With an amount", "With a redaction marker", "With a party address"),
-      N = c(nrow(.tab),
-            sum(.tab$NParties >= 2L, na.rm = TRUE),
-            sum(!is.na(.tab$ContractStart)),
-            sum(!is.na(.tab$ContractEnd)),
-            sum(!is.na(.tab$MaxAmount)),
-            sum(dplyr::coalesce(.tab$NRedact, 0L) > 0L),
-            sum(dplyr::coalesce(.tab$NPartyAddress, 0L) > 0L))
-    ) |>
-      dplyr::mutate(Share = clf_pct(.data$N / nrow(.tab)))
-  )
-
-  cli::cli_h2("Consistency flags carried by the release")
-  clf_say_table(
-    .tab = tibble::tibble(
-      Check = c("Party set contains the filer", "Contract start at or before the filing date"),
-      N     = c(sum(.tab$HasFilerParty, na.rm = TRUE),
-                sum(.tab$ContractStart <= .tab$DateFiled, na.rm = TRUE)),
-      Of    = c(sum(!is.na(.tab$HasFilerParty)),
-                sum(!is.na(.tab$ContractStart) & !is.na(.tab$DateFiled)))
-    ) |>
-      dplyr::mutate(Share = clf_pct(.data$N / .data$Of))
-  )
-  cli::cli_alert_info(
-    "These are computed for every released row, not on a sample: the filer's name and its filing \\
-     date are EDGAR facts available corpus-wide, so a user can condition on them without re-running \\
-     anything."
-  )
-  invisible(.tab)
-}

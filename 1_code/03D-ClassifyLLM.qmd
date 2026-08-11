@@ -132,7 +132,8 @@ having, since writing that documentation is the main human cost of adopting this
     Llm  = utils_file_path(.dir_main, "runs")   # written here, in the shared schema
   ),
   Output = list(
-    Cache = utils_file_path(.dir_main, "cache") # one file per answered document
+    Cache = utils_file_path(.dir_main, "cache"),            # one file per answered document
+    Rates = utils_file_path(.dir_main, "rates.parquet")     # fitted generation rates, keyed on shape
   ),
   Engine = list(
     Host    = "http://localhost:11434", # local Ollama
@@ -400,9 +401,19 @@ llm_report_cost(
   .num_ctx       = NULL,                # derived per shape, as the sweep derives it
   .ctx_min       = .lP$Engine$CtxMin,   # floor
   .ctx_max       = .lP$Engine$CtxMax,   # ceiling
-  .timeout       = .lP$Engine$Timeout   # per-request ceiling
+  .timeout       = .lP$Engine$Timeout,  # per-request ceiling
+  .rate_store    = .lP$Output$Rates,    # fitted rates persist; only new shapes are timed
+  .refit         = FALSE                # TRUE after a hardware or server change
 )
 ```
+
+A rate is a property of this machine, this model and this prompt shape, and none of those differs
+between two renders of the same document -- so the fitted rates are kept and only a shape the store
+has never seen is timed. The store is keyed on the shape and the derived window rather than on a
+chunk name, which is the same discipline the answer cache follows and for the same reason: a
+name-keyed store hands back the previous configuration's number without erroring. `FittedOn` travels
+with each rate and is printed, so a number measured on different hardware is visible rather than
+merely old.
 
 Read the per-task rows rather than the total. The sweep skips any configuration whose runs are
 already on disk and caches every individual answer besides, so a task that has already run costs
@@ -417,7 +428,7 @@ always-executing document affordable here, and it is the same bargain 03B and 03
 
 ```{r}
 #| label: sweep-blind
-llm_sweep(
+swept_blind <- llm_sweep(
   .grid          = grid_blind,             # configurations to run
   .tab_prep      = tab_prep,               # prepared sample
   .definitions   = tab_definitions,        # codebook text, or NULL
@@ -485,7 +496,7 @@ category name.
 
 ```{r}
 #| label: sweep-crossfold
-llm_sweep(
+swept_cross <- llm_sweep(
   .grid          = grid_cross,             # configurations to run
   .tab_prep      = tab_prep,               # prepared sample
   .definitions   = tab_definitions,        # codebook text, or NULL
@@ -522,10 +533,15 @@ tab_overall <- clf_load_overall(.runs_roots = c(.lP$Runs$Bert, .dir_runs))
 
 ```{r}
 #| label: results-leaderboard
-llm_report_leaderboard(
-  .tab_overall = tab_overall,     # bound per-fold metrics
-  .label_col   = "ClassDetailed", # task
-  .n           = 20L              # rows to display
+purrr::walk(
+  .x = .lP$Param$Tasks,
+  .f = function(.t) {
+    llm_report_leaderboard(
+      .tab_overall = tab_overall,     # bound per-fold metrics
+      .label_col   = .t,              # task
+      .n           = 20L              # rows to display
+    )
+  }
 )
 ```
 
@@ -535,16 +551,17 @@ accuracy column would rank the two by how often each was allowed to stay silent.
 
 ```{r}
 #| label: results-effects
-purrr::walk(
-  .x = c("Model", "Guidance", "AllowAbstain", "Think"),
-  .f = function(.a) {
+tidyr::expand_grid(
+  Task = .lP$Param$Tasks,                           # every taxonomy
+  Axis = c("Model", "Guidance", "AllowAbstain", "Think")   # axes that could have been swept
+) |>
+  purrr::pwalk(function(Task, Axis) {
     llm_report_effect(
-      .tab_overall = tab_overall,     # bound per-fold metrics
-      .axis        = .a,              # axis to marginalise over
-      .label_col   = "ClassDetailed"  # task
+      .tab_overall = tab_overall,  # bound per-fold metrics
+      .axis        = Axis,         # axis to marginalise over
+      .label_col   = Task          # task
     )
-  }
-)
+  })
 ```
 
 An axis taking one level in every tier is skipped rather than printed, so this block stays silent
@@ -563,37 +580,60 @@ folds its documents happened to reach.
 
 ```{r}
 #| label: results-head-to-head
-llm_report_head_to_head(
-  .tab_overall = tab_overall,      # every method, identical folds, identical scoring
-  .label_col   = "ClassDetailed",  # task
-  .tier        = c("blind", "crossfold") # the tiers scored on the whole sample
+purrr::walk(
+  .x = .lP$Param$Tasks,
+  .f = function(.t) {
+    llm_report_head_to_head(
+      .tab_overall = tab_overall,             # every method, identical folds, identical scoring
+      .label_col   = .t,                      # task
+      .tier        = c("blind", "crossfold")  # the tiers scored on the whole sample
+    )
+  }
 )
 ```
 
 ```{r}
-#| label: results-perclass
+#| label: results-leading-config
 # A full-coverage tier, not simply the highest scorer. A tuned configuration is scored on the single
 # fold its prompt never read, so choosing on score alone would silently switch this table -- and the
 # disagreement table below it -- onto a fifth of the sample, where the counts look like a full pass
 # and are not. Blind and crossfold both cover every fold and are both usable by the orchestrator.
-cfg_llm_blind <- tab_overall |>
-  dplyr::filter(LabelCol == "ClassDetailed", grepl("^llm-", Model),
-                Tier %in% c("blind", "crossfold")) |>
-  dplyr::summarise(MacroF1 = mean(F1_macro), nFolds = dplyr::n_distinct(TestFold), .by = ConfigName) |>
-  dplyr::slice_max(MacroF1, n = 1L, with_ties = FALSE)
+#
+# Resolved per task and kept in a named list. The leading configuration is a property of a task, and
+# a single object named for the detailed taxonomy would have to be rebuilt silently to describe any
+# other -- which is how a table comes to be captioned for one task and computed from another.
+pred_llm_task <- purrr::map(.lP$Param$Tasks, function(.t) {
+  cfg_ <- tab_overall |>
+    dplyr::filter(LabelCol == .t, grepl("^llm-", Model), Tier %in% c("blind", "crossfold")) |>
+    dplyr::summarise(MacroF1 = mean(F1_macro), nFolds = dplyr::n_distinct(TestFold),
+                     .by = ConfigName) |>
+    dplyr::slice_max(MacroF1, n = 1L, with_ties = FALSE)
 
-cli::cli_alert_info(
-  "Describing {cfg_llm_blind$ConfigName} over {cfg_llm_blind$nFolds} folds."
-)
+  cli::cli_alert_info("{(.t)}: describing {cfg_$ConfigName} over {cfg_$nFolds} folds.")
 
-pred_llm <- clf_pool_predictions(
-  .runs_roots  = .dir_runs,                  # LLM runs for this render
-  .config_name = cfg_llm_blind$ConfigName    # blind tier, all folds
-)
+  clf_pool_predictions(
+    .runs_roots  = .dir_runs,        # LLM runs for this render
+    .config_name = cfg_$ConfigName   # full-coverage tier, all folds
+  )
+}) |>
+  purrr::set_names(.lP$Param$Tasks)
 
-clf_report_perclass(
-  .tab_pred = pred_llm,                                  # blind arm, pooled across every fold
-  .title    = "Leading full-coverage LLM configuration -- per category" # heading
+# The detailed taxonomy is the one the label-provenance check and the summary block describe, both of
+# which are arguments about that taxonomy rather than about the arm. Bound here so those chunks read
+# a name that says which task they mean.
+pred_llm <- pred_llm_task[["ClassDetailed"]]
+```
+
+```{r}
+#| label: results-perclass
+purrr::walk(
+  .x = .lP$Param$Tasks,
+  .f = function(.t) {
+    clf_report_perclass(
+      .tab_pred = pred_llm_task[[.t]],                                    # pooled across every fold
+      .title    = paste0("Leading full-coverage LLM configuration: ", .t) # heading
+    )
+  }
 )
 ```
 
@@ -606,15 +646,28 @@ would make this arm worth routing to regardless of its aggregate score.
 
 ```{r}
 #| label: results-disagreement
-pred_det <- bert_best_predictions(
-  .tab_overall = clf_load_overall(.runs_roots = .lP$Runs$Bert), # transformer metrics only
-  .runs_roots  = .lP$Runs$Bert,                                 # run folders to pool from
-  .label_col   = "ClassDetailed"                                # task
-)
+tab_bert <- clf_load_overall(.runs_roots = .lP$Runs$Bert)   # transformer metrics only, read once
 
-llm_report_disagreement(
-  .pred_llm  = pred_llm, # leading LLM configuration
-  .pred_bert = pred_det  # crowned transformer configuration
+pred_bert_task <- purrr::map(.lP$Param$Tasks, function(.t) {
+  bert_best_predictions(
+    .tab_overall = tab_bert,        # transformer metrics
+    .runs_roots  = .lP$Runs$Bert,   # run folders to pool from
+    .label_col   = .t               # task
+  )
+}) |>
+  purrr::set_names(.lP$Param$Tasks)
+
+pred_det <- pred_bert_task[["ClassDetailed"]]  # named for the chunks that mean this taxonomy
+
+purrr::walk(
+  .x = .lP$Param$Tasks,
+  .f = function(.t) {
+    cli::cli_h3(.t)
+    llm_report_disagreement(
+      .pred_llm  = pred_llm_task[[.t]],   # leading LLM configuration for this task
+      .pred_bert = pred_bert_task[[.t]]   # crowned transformer configuration for this task
+    )
+  }
 )
 ```
 
@@ -639,7 +692,7 @@ any task whatever it scores.
 
 ```{r}
 #| label: robustness-sweep-tuned
-llm_sweep(
+swept_tuned <- llm_sweep(
   .grid          = grid_tuned,             # configurations to run
   .tab_prep      = tab_prep,               # prepared sample
   .definitions   = tab_definitions,        # codebook text, or NULL
@@ -715,13 +768,22 @@ places is how the two would come to disagree.
 
 ```{r}
 #| label: deploy-inventory
-fs::dir_ls(.dir_runs, type = "directory") |>
-  fs::path_file() |>
-  tibble::tibble(Run = _) |>
-  dplyr::mutate(ConfigName = sub("_F\\d+$", "", Run)) |>
-  dplyr::count(ConfigName, name = "Folds") |>
-  tbl_say(.title = "Runs written, available to the orchestrator")
+llm_report_inventory(
+  .swept     = dplyr::bind_rows(swept_blind, swept_cross, swept_tuned), # every cell touched here
+  .runs_root = .dir_runs                                                # what the orchestrator reads
+)
 ```
+
+A run folder outlives the naming scheme that produced it. Adding a term to a configuration name --
+the context window, say -- leaves every existing folder perfectly readable under a name the current
+scheme would never write, and nothing errors. The orchestrator then reads one prompt under two
+names, ranks it as two arms carrying identical scores, and either double-counts its folds or drops
+one of them arbitrarily.
+
+So this reconciles rather than lists. Both sweeps report the configuration name of every cell they
+touched, written or skipped, which makes the set of current names exact and needs no rule about
+which scheme is in force. Superseded runs are named and left alone: deleting is cheap to say and
+expensive to be wrong about, and these cost nights of inference to produce.
 
 # Overview
 
@@ -736,6 +798,27 @@ llm_report_all(
   .label_col   = "ClassDetailed"  # task
 )
 ```
+
+```{r}
+#| label: fig-llm-gradient
+#| fig-height: !expr plot_height(3L)
+#| fig-cap: "Macro-F1 against worked examples per category, one panel per taxonomy, full-coverage
+#|   tiers only. Zero examples is the blind prompt. Ribbons are one standard error across folds. The
+#|   vertical scale is free by panel: a binary decision starts near a coin flip and a twelve-way one
+#|   near a twentieth, so a shared axis would put the eye on the intercepts, which are not comparable
+#|   across taxonomies, rather than on the slopes, which are."
+llm_plot_gradient(
+  .tab_overall = tab_overall,      # bound per-fold metrics
+  .tasks       = .lP$Param$Tasks   # panels, in reading order
+)
+```
+
+The slope is the result, not the level. Each taxonomy is a different problem and their intercepts say
+only how many categories there are; that showing the model a handful of examples from folds it is not
+scored on moves every one of them, in the same direction and with the same flattening, is a statement
+about prompting rather than about any one label set. It is also the claim a reader is most likely to
+doubt from a single taxonomy, where a fine-grained scheme resisting a one-sentence instruction is the
+obvious competing explanation.
 
 ```{r}
 #| label: fig-llm-leaderboard
@@ -804,10 +887,16 @@ transformer weak is the only place a cascade can gain anything.
 
 The orchestrator inventories these runs alongside the transformer's and the keyword table's and
 decides whether routing to this arm beats the transformer alone. Nothing about that decision is taken
-here; this document supplies an arm and a set of numbers describing it.
+here; this document supplies arms and a set of numbers describing them.
 
-Two extensions cost only compute. Running the same grid with `.label_cols` set to `ClassBroad` or
-`AmendType` produces the equivalent arm for the other tasks -- amendment is the more interesting of
-the two, since a model reading for *reference to a prior agreement* is doing exactly what 03B argued
-keyword matching could not. And adding a model tag to `.lP$Param$Models` extends the size axis
-without any other change, since every answer already caches on the tag.
+It now supplies one per taxonomy, which changes what the orchestrator can do rather than only how
+much of it. A confidence flag computed from the arms that committed needs a generative opinion on the
+task it is flagging, so a single-task arm confined the flag to a single task and left its manifest
+block with no task dimension at all. Three arms remove that constraint; taking it up is 03E's work.
+
+One extension still costs only compute. Adding a tag to `.lP$Param$Models` extends the size axis with
+no other change, since every answer caches on the tag and nothing already paid for is repaid. The
+blind tier is where that is cheapest -- it shows no worked examples, so it carries the shortest prompt
+of any tier -- and it is where the question a larger model raises actually lives: whether the distance
+between this arm and the transformer is a fact about language models or a fact about an eight-billion
+parameter one.

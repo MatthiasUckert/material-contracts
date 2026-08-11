@@ -1,5 +1,5 @@
 ---
-title: "Entity Extraction at Scale -- Applying the Deployed Policy (04D)"
+title: "Entity Extraction at Scale -- Every Engine Over the Whole Corpus (04D)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -10,15 +10,15 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| purl: false
 knitr::opts_knit$set(root.dir = here::here())
 
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
 knitr::opts_chunk$set(
-  root.dir  = here::here(),
-  message   = TRUE,       # mandatory: cli writes through the message stream under knitr
-  warning   = FALSE,
-  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
-  fig.width = 7.5,
-  fig.align = "center",
-  dpi       = 200,
-  out.width = "100%"
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
 )
 
 options(cli.num_colors = 1, cli.width = 120)
@@ -40,11 +40,16 @@ source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 source("1_code/_Commons/_NER.R", encoding = "UTF-8")
 
-# 03A supplies the console formatter and the text reader; 04B the anchor logic, the session helpers
-# and the date cleaner; 04C the resolvers. Nothing here re-implements any of them: the corpus is
-# resolved by the code the sample was validated with, pointed at documents that carry no labels.
+# The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING: 03A
+# aliases the table helpers at SOURCE time, so sourcing it first throws part-way through the file.
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 03A supplies the console formatter and the text reader; 04A the entity vocabularies and the store
+# overview; 04B the policy reader. The corpus is extracted by the code the sample was extracted
+# with, pointed at documents that carry no labels.
 purrr::walk(
-  .x = c("03A-ClassifyPrepare", "04B-EntityMeasure", "04C-EntityResolve"),
+  .x = c("03A-ClassifyPrepare", "04A-EntityExtract", "04B-EntityMeasure"),
   .f = function(.s) {
     source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
            encoding = "UTF-8")
@@ -67,48 +72,49 @@ source(file = .path_fun, encoding = "UTF-8")
 
 # Purpose
 
-Every decision has been made. 04A extracted eight engines over full text and described what came
-back. 04B measured which engine to keep per label, which character budget to read it under, and
-which of two reading sessions' rules survive contact with the EDGAR anchors. 04C turned spans into
-the four published variables and checked them against facts EDGAR recorded.
+04A ran every available extractor over the 4,398 hand-classified contracts and described what came
+back. 04B measured which engines to keep. This document runs the survivors over the whole
+Exhibit-10 corpus -- around 1.46 million documents, none of them labelled -- and writes every
+candidate span into one DuckDB store.
 
-This stage does none of that again. It reads `extraction_policy.parquet` and `rules_kept.parquet`
-and applies them to a corpus that carries no labels.
+**That store is the deliverable, and nothing here resolves anything.** No roles are assigned, no
+variables are built, no window is applied. Those are 04E.
 
-That separation is the point. An apply stage free to choose its own engine or its own window is one
-whose output depends on which version of it last ran, and a released dataset cannot be defended on
-those terms. The engine per label, the budget from each end and the rules all arrive as artifacts.
-What is left here is bookkeeping: index the tree, slice the text, run the extractors, resolve, write.
+## Why extraction and resolution are separate documents
 
-## The window is two slices, not one truncation
+They were one document, and separating them is the whole point of building a store.
 
-`--max-chars` truncates a prefix, and 04B found that geography needs the end of a contract as much
-as the beginning: a governing-law clause sits in the final fifth, and a head-only window costs
-twenty-six points of document-level recall on places.
+Extraction is expensive, deterministic and settled: the engine set was decided in 04B on measured
+recall, and running it costs days. Resolution is cheap, contested and still being designed -- the
+role rules came from reading sessions rather than measurement, the tie-break between competing cues
+was rewritten once already, and the window that was in force turned out to have been chosen on a
+quantity it could not see.
 
-So a label carrying a tail budget is extracted **twice**, from a head slice and a tail slice, and the
-tail's offsets are shifted back onto the full document before anything reads them. Splicing the two
-into one string would have been less code and would have made every offset index a text that exists
-nowhere. A document shorter than both budgets is its own slice twice over, so the union is
-deduplicated on the span rather than on the document.
+Fused, every change to a rule meant re-extracting 1.46 million documents. Split, a rule change is a
+re-read of a store that already exists. The expensive half is done once and the contested half can
+be argued about for as long as it needs.
 
-## The anchors travel with the release
+## The offset contract, and how it differs from 04A's
 
-The filer's name and its filing date are EDGAR facts, available for every contract in the corpus and
-not only for the labelled sample. The consistency checks 04C ran as diagnostics therefore run here
-too, and **every released row carries** whether the filer appeared among its resolved parties and
-whether its contract date precedes its filing.
+04A freezes one canonical text to disk and every offset in the project indexes that file. A corpus
+this size cannot be frozen that way: the text alone runs to tens of gigabytes, and storing a second
+copy of the corpus to guarantee a property is a poor trade.
 
-A user can condition on those without re-running anything, which is a materially different offer
-from a single headline number.
+So the contract here is the reading **function** rather than a file. Every offset indexes
+`clf_read_text(Path)`, which is deterministic and is the same function 04A derived its canonical
+text with. The two stores are therefore in the same coordinate system by construction.
 
-## What this document cannot carry over from 04C
+That holds only while the parsed tree holds. Regenerate the corpus and every offset in the store
+silently indexes a different string: `is.na()` catches nothing, spans rehydrate as plausible
+nonsense, and no number changes visibly. The fingerprint below is what makes that failure loud, and
+it is fatal rather than advisory -- on the sample a stale store wastes a render, here it produces a
+released dataset whose spans point at the wrong characters.
 
-One column changes meaning at scale and should not be read across. The published term measure is
-the latest date *anywhere in the document* minus the filing date, and at corpus scale there is no
-unfiltered store to take it from -- only what the deployed engines returned inside the window. The
-column is still written, because it is what a corpus-scale reproduction of the published definition
-can see, but the figure that reproduces that definition on full text is 04C's, on the sample.
+## Resumption is the ledger, not the output
+
+The store records each document against each engine. An interrupted run therefore resumes at the
+document it stopped on rather than at the start of a chunk, and re-running a finished pass costs one
+query per engine. Chunks bound memory; they do not bound work.
 
 # Configuration
 
@@ -121,7 +127,6 @@ can see, but the figure that reproduces that definition on full text is 04C's, o
     # fs::path, not utils_file_path: the project helper creates what it names, and a corpus tree
     # conjured into existence would report itself present while holding nothing.
     Policy      = fs::path(.dir_measure, "extraction_policy.parquet"), # written by 04B
-    Kept        = fs::path(.dir_measure, "rules_kept.parquet"),        # written by 04B
     DirCorpus   = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/Exhibit10/",
     MetaData    = "../pMatDisc/2_output/01-GetEDGAR/Output/FullMetaData.parquet",
     LandingPage = "../pMatDisc/2_output/01-GetEDGAR/Output/LandingPage.parquet"
@@ -129,334 +134,219 @@ can see, but the figure that reproduces that definition on full text is 04C's, o
   Cache = list(
     CorpusFiles = utils_file_path(.dir_main, "Cache", "CorpusFiles.parquet") # DocID to Path index
   ),
-  Output = list(
-    Vars = utils_file_path(.dir_main, "variables")  # the released variables
+  Store = list(
+    # THE DELIVERABLE. One file, same schema as 04A's sample store, written by the same code.
+    NerDB    = utils_file_path(.dir_main, "Store", "CorpusCandidates.duckdb"),
+    Manifest = utils_file_path(.dir_main, "Store", "manifest.parquet")
   ),
   Work = list(
-    Dir = utils_file_path(.dir_main, "Work")        # slices and extractor output, deleted per chunk
+    Dir = utils_file_path(.dir_main, "Work")   # per-chunk text parquet, deleted as it is consumed
   ),
   Param = list(
-    ChunkSize  = 500L,   # documents per output file; a corpus pass should not be one write
-    CtxMax     = 400L,   # context width the rules are matched in, as 04B scored them
-    HeadPos    = 0.10,   # an uncued organisation this far in still reads as a party
+    ChunkSize  = 2000L,  # documents held in memory at once; not a unit of resumption
     IndexRerun = FALSE,  # TRUE re-walks the tree; FALSE reuses the cached index
-    Device     = "auto", # CNN models to CPU, transformer to Metal
+    Device     = "auto",
     # The switch that decides whether this document is a rehearsal or the release. An integer draws
-    # that many documents at random from the whole tree and writes them to a separate directory;
-    # NULL processes the corpus. Set an integer, read the throughput, then set NULL.
-    Limit      = 2000L
+    # that many documents at random from the whole tree and writes them to a separate store; NULL
+    # processes the corpus. Set an integer, read the throughput, then set NULL.
+    Limit      = 10000L
   )
 )
 
-# Per-combo throughput settings, as in 04A. The transformer occupies one device and cannot be shared
-# across processes; LexNLP runs in a container and its date grammar stalls on a few long documents.
+# Per-combination throughput settings, and only the engines the policy names. LexNLP is the one to
+# watch: it runs in a container, its date grammar stalls pathologically on a small number of long
+# documents, and it now reads full text. The timeout is what keeps a stall from becoming a hang.
 .KNOBS <- list(
-  "lexnlp"                = list(n_process = 24L, batch_size =  8L, timeout = 60L),
-  "spacy:en_core_web_trf" = list(n_process =  1L, batch_size = 128L, timeout = 600L),
-  "paper:gazetteer-v1"    = list(n_process = 16L, batch_size =  8L, timeout = 120L),
-  "paper:redaction-v1"    = list(n_process = 16L, batch_size = 64L, timeout =  0L),
-  "paper:dateregex-v1"    = list(n_process =  1L, batch_size = NULL, timeout = 0L)
+  "lexnlp"              = list(n_process = 24L, batch_size =  8L, timeout = 60L),
+  "paper:gazetteer-v1"  = list(n_process = 16L, batch_size =  8L, timeout = 120L),
+  "paper:redaction-v1"  = list(n_process = 16L, batch_size = 64L, timeout =  0L),
+  "paper:moneyregex-v4" = list(n_process = 16L, batch_size = 64L, timeout =  0L),
+  "paper:dateregex-v1"  = list(n_process =  1L, batch_size = NULL, timeout = 0L)
 )
 
-# The same formats 04B parsed with and 04C resolved with. Three copies of one list is two too many;
-# they are written out rather than sourced so that a change in one is visibly a change in all.
-.DATE_FORMATS <- c(
-  "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
-  "%d %B, %Y", "%d %B %Y", "%d %b, %Y", "%d %b %Y",
-  "%m/%d/%Y",  "%d/%m/%Y", "%Y-%m-%d",  "%m-%d-%Y", "%Y/%m/%d", "%d-%b-%Y", "%m.%d.%Y"
-)
-
-fs::file_exists(c(.lP$Input$Policy, .lP$Input$Kept))
+fs::file_exists(.lP$Input$Policy)
 ```
 
-Nothing here is cached except the file index. The expensive work is the extractor passes, and those
-are checkpointed by writing resolved chunks as they complete -- a resumable design rather than a
-cache: an interrupted run restarts at the first chunk with no output file.
-
-# The policy
+# The plan
 
 ```{r}
 #| label: load-policy
 tab_policy <- ent_read_policy(.path = .lP$Input$Policy)
-tab_rules  <- arrow::read_parquet(.lP$Input$Kept)
-tab_plan   <- ent_slice_plan(.policy = tab_policy)
+tab_plan   <- ent_engine_plan(.policy = tab_policy)
+lst_labels <- ent_plan_labels(.plan = tab_plan)
 
-clf_say_table(
-  .tab = tab_policy |>
-    dplyr::select(Label, Combo, Basis, CapChars, TailChars, DocRecallAtCap) |>
-    dplyr::mutate(
-      dplyr::across(c(CapChars, TailChars), as.integer),
-      DocRecallAtCap = clf_pct(.data$DocRecallAtCap)
-    ),
-  .title = "Policy this pass applies"
-)
-```
+# Checked before any work starts rather than discovered inside the extraction loop. The dispatch is
+# a chain of branches, so an engine it does not cover would abort after the index is built and the
+# first chunks have run -- hours into a corpus pass.
+ent_check_plan(.plan = tab_plan, .knobs = .KNOBS)
 
-Read that table before anything else. Every line is a decision made once and validated, and a run
-applying the wrong configuration should be visible in the first screen of output rather than in the
-released variables. `Basis` distinguishes an engine chosen on measured recall from one asserted
-because no anchor could rank it -- money and redaction are the second kind.
-
-```{r}
-#| label: show-plan
-clf_say_table(
+tbl_say(
   .tab = tab_plan |>
     dplyr::mutate(Labels = purrr::map_chr(.data$Labels, \(.x) paste(.x, collapse = ", "))),
   .title = "Extractor runs per chunk"
 )
 ```
 
-Several labels share an engine under different windows, so running once per label would extract the
-same head twice. Grouping by engine and slice runs each combination once and keeps only the labels
-that asked for it.
+A label appearing under two engines is not a mistake. 04B unions the cheap rule arms into the policy
+regardless of the ranking, so dates are extracted by LexNLP and by the ported date patterns, and the
+spans both propose are deduplicated when 04E reads them.
+
+# The corpus
 
 ```{r}
 #| label: build-index
 tab_index <- ent_corpus_index(
   .dir_corpus   = .lP$Input$DirCorpus,     # the parsed-contract tree, Exhibit 10 only
-  .path_meta    = .lP$Input$MetaData,      # filer name and filing date
-  .path_landing = .lP$Input$LandingPage,   # registered addresses
+  .path_meta    = .lP$Input$MetaData,      # filer name and filing date, carried for 04E
+  .path_landing = .lP$Input$LandingPage,   # registered addresses, likewise
   .path_cache   = .lP$Cache$CorpusFiles,   # walking a million files is cached, not repeated
   .rerun        = .lP$Param$IndexRerun,
   .limit        = .lP$Param$Limit,         # NULL processes the corpus; an integer rehearses
   .seed         = 42L
 )
 
-.dir_out <- ent_output_dir(.dir = .lP$Output$Vars, .limit = .lP$Param$Limit)
-
-tab_index |>
-  dplyr::summarise(
-    Documents   = dplyr::n(),
-    WithCompany = sum(!is.na(.data$CompanyName)),
-    WithFiled   = sum(!is.na(.data$DateFiled))
-  ) |>
-  clf_say_table(.title = paste0("Corpus to process -> ", fs::path_rel(.dir_out, here::here())))
+# The timing log sits beside the store, and a limited run writes to the same place as a full one.
+.dir_store <- fs::path_dir(.lP$Store$NerDB)
 ```
 
-The corpus is an index here, not a table. The labelled sample fits in memory and the corpus does
-not: over a million contracts of full text is hundreds of gigabytes, so what is held throughout is
-one row per document with its path and the EDGAR facts. Text is read one chunk at a time and
-discarded. Any code that treats corpus text as a column runs out of memory somewhere past the first
-hundred thousand documents.
+**A limited run is the first part of the release, not a throwaway.** Earlier versions of this
+document wrote a rehearsal to a separate directory so it could not be mistaken for a corpus pass.
+That was right when the output was a set of resolved variables, where a partial file read as a
+complete one. It is wrong for a store: the ledger records each document against each engine, so a
+rehearsal's ten thousand documents are simply ten thousand documents that no longer need doing.
+Setting `Limit` to `NULL` afterwards continues from there rather than starting again.
 
-# A rehearsal on one chunk
+The fingerprint is taken against the **corpus**, not against whatever the limit left in hand. A
+rehearsal that fingerprinted its own draw would abort the release run reporting a regenerated tree
+when nothing had changed -- the one message here that a reader would act on immediately, and
+wrongly.
 
-Before a corpus pass, one chunk end to end. It exercises every extractor, both slices, the offset
-shift and the whole resolver chain, and it costs a minute -- which is the right price for
-discovering that a model directory moved or that the policy names an engine with no branch.
+# The store fingerprint
 
 ```{r}
-#| label: rehearse-chunk
-docs_head <- ent_read_chunk(.chunk = dplyr::slice_head(tab_index, n = 50L))
-
-cand_head <- ent_extract_chunk(
-  .docs     = docs_head,
-  .plan     = tab_plan,             # one run per engine per slice
-  .dir_work = .lP$Work$Dir,         # slices and raw output, deleted as they are consumed
-  .knobs    = .KNOBS,
-  .device   = .lP$Param$Device
+#| label: check-manifest
+ent_corpus_manifest_sync(
+  .path_manifest = .lP$Store$Manifest,
+  .manifest      = ent_corpus_manifest(
+    .index  = tab_index,        # documents and their size on disk
+    .run    = tab_plan$Combo,   # which engines
+    .labels = lst_labels        # and which labels each was asked for
+  )
 )
-
-cand_head |>
-  dplyr::count(.data$Label, .data$Engine, .data$Model, name = "N") |>
-  clf_say_table(.title = "Candidates from one rehearsal chunk")
 ```
 
-```{r}
-#| label: rehearse-resolve
-path_text_ <- fs::path(.lP$Work$Dir, "rehearse_text.parquet")
-con_head <- ent_chunk_session(.cands = cand_head, .docs = docs_head, .path_text = path_text_)
+A **fingerprint** row that fails means the parsed tree has changed since this store was built --
+document count or total bytes on disk, both measured over the whole corpus whatever `Limit` says. Every
+offset it holds indexes text that no longer exists, and nothing downstream can detect that. Move the
+store aside and rebuild.
 
-vars_head <- ent_resolve_chunk(
-  .con       = con_head,
-  .path_text = path_text_,
-  .rules     = tab_rules,
-  .keys      = dplyr::transmute(
-    docs_head, DocID, Fold = NA_integer_, Class = NA_character_,
-    DateFiled  = suppressWarnings(anytime::anydate(as.character(.data$DateFiled))),
-    AnchorKey  = ent_norm_company(.data$CompanyName),
-    AnchorText = NA_character_
-  ),
-  .formats   = .DATE_FORMATS,
-  .ctx_max   = .lP$Param$CtxMax,
-  .head_pos  = .lP$Param$HeadPos
-)
+The **inventory** row is not a fingerprint. Which engines have been asked for says nothing about
+what is already stored, and adding one is the ordinary incremental case the ledger handles: the new
+engine reports its documents missing and the rest report none.
 
-DBI::dbDisconnect(con_head, shutdown = TRUE)
-
-vars_head |>
-  dplyr::select(DocID, NParties, ContractStart, ContractEnd, MaxAmount, NRedact, HasFilerParty) |>
-  head(10) |>
-  clf_say_table(.title = "First ten resolved documents")
-```
-
-An empty `ContractEnd` column is the expected result rather than a disappointment: 04C found an
-expiry date for well under one percent of the labelled sample, and a rehearsal of fifty documents
-will usually find none. What the rehearsal is checking is that every extractor ran, that the tail
-slice's offsets landed on the full document, and that the resolvers produced columns rather than
-errors.
-
-# The corpus pass
-
-Chunked, and each chunk written as it completes. A corpus pass is measured in hours, so a failure at
-document nine hundred thousand should cost one chunk rather than the run, and a restart should
-resume rather than begin again.
+# Extraction
 
 ```{r}
-#| label: apply-corpus
-fs::dir_create(.dir_out)
+#| label: extract-corpus
+fs::dir_create(fs::path_dir(.lP$Store$NerDB))
 
 chunks_ <- split(tab_index, ceiling(seq_len(nrow(tab_index)) / .lP$Param$ChunkSize))
 cli::cli_alert_info("{length(chunks_)} chunk{?s} of up to {(.lP$Param$ChunkSize)} documents.")
 
-purrr::iwalk(chunks_, function(.chunk, .i) {
-  path_ <- fs::path(.dir_out, sprintf("vars_%04d.parquet", as.integer(.i)))
-  if (fs::file_exists(path_)) {
-    cli::cli_alert_info("Chunk {(.i)}: already written, skipping.")
-    return(invisible(NULL))
-  }
-
-  t0_ <- Sys.time()
-  docs_ <- ent_read_chunk(.chunk = .chunk)
-  if (nrow(docs_) == 0L) {
-    cli::cli_alert_warning("Chunk {(.i)}: no readable documents; nothing written.")
-    return(invisible(NULL))
-  }
-
-  cand_ <- ent_extract_chunk(
-    .docs = docs_, .plan = tab_plan, .dir_work = .lP$Work$Dir,
-    .knobs = .KNOBS, .device = .lP$Param$Device
+tab_timing <- purrr::imap(chunks_, function(.chunk, .i) {
+  out_ <- ent_extract_corpus_chunk(
+    .chunk    = .chunk,
+    .db_path  = .lP$Store$NerDB,   # one store for the whole corpus
+    .run      = tab_plan$Combo,
+    .labels   = lst_labels,
+    .dir_work = .lP$Work$Dir,      # the chunk's text parquet, written and deleted
+    .knobs    = .KNOBS,
+    .device   = .lP$Param$Device
   )
-  ptxt_ <- fs::path(.lP$Work$Dir, sprintf("text_%04d.parquet", as.integer(.i)))
-  con_  <- ent_chunk_session(.cands = cand_, .docs = docs_, .path_text = ptxt_)
-
-  out_ <- ent_resolve_chunk(
-    .con       = con_,
-    .path_text = ptxt_,
-    .rules     = tab_rules,
-    .keys      = dplyr::transmute(
-      docs_, DocID, Fold = NA_integer_, Class = NA_character_,
-      DateFiled  = suppressWarnings(anytime::anydate(as.character(.data$DateFiled))),
-      AnchorKey  = ent_norm_company(.data$CompanyName),
-      AnchorText = NA_character_
-    ),
-    .formats   = .DATE_FORMATS,
-    .ctx_max   = .lP$Param$CtxMax,
-    .head_pos  = .lP$Param$HeadPos
-  )
-  DBI::dbDisconnect(con_, shutdown = TRUE)
-  fs::file_delete(ptxt_[fs::file_exists(ptxt_)])
-
-  arrow::write_parquet(out_, path_)
   ent_write_timing(
-    .dir     = .dir_out,
+    .dir     = .dir_store,
     .chunk   = .i,
-    .n_docs  = nrow(out_),
-    .seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs")),
-    .n_cands = nrow(cand_)
+    .n_docs  = out_$nDocs,
+    .seconds = out_$Seconds,
+    .n_cands = NA_integer_        # counted from the store below, not per chunk
   )
-  cli::cli_alert_success("Chunk {(.i)}: {nrow(out_)} document{?s} written.")
-})
+  cli::cli_alert_success("Chunk {(.i)}: {out_$nDocs} document{?s} in {round(out_$Seconds)}s.")
+  out_
+}) |>
+  purrr::list_rbind()
 ```
 
-```{r}
-#| label: apply-throughput
-ent_report_throughput(.dir = .dir_out, .n_corpus = nrow(tab_index))
-```
-
-Set `Limit` to `NULL` once that projection is acceptable. The rate is measured on this machine under
-this configuration, so it is the only figure worth planning a night around. `CandsPerDoc` times the
-corpus is what has to be stored if the spans are released alongside the variables.
+Nothing is deleted on a re-run and nothing is recomputed. A chunk whose documents the ledger already
+holds costs one query per engine and reports zero seconds of work.
 
 # Results
 
 ```{r}
-#| label: results-summary
-tab_vars <- fs::dir_ls(.dir_out, glob = "*.parquet") |>
-  purrr::map(arrow::read_parquet) |>
-  purrr::list_rbind()
+#| label: summarise-store
+.ov <- ent_overview(
+  .db_path  = .lP$Store$NerDB,
+  .inputs   = NULL,   # the corpus text is not held on disk; length and position need 04E
+  .id_col   = "DocID",
+  .text_col = "TextRaw",
+  .quiet    = FALSE
+)
 
-ent_report_apply(.tab = tab_vars)
+ent_report_store(.ov = .ov)
 ```
 
-# Validation
+`Docs` must be identical across engines. A shortfall is an unfinished run, not a quiet engine, and
+re-running this document resolves it.
+
+Position and length are absent, and deliberately: computing them needs the text, which this document
+reads a chunk at a time and does not keep. 04A reports both on the sample, where the canonical text
+is on disk, and the corpus is assumed to behave the same way only where it is said so explicitly.
+
+# Throughput
 
 ```{r}
-#| label: validate-release
-tab_vars |>
-  dplyr::summarise(
-    Documents      = dplyr::n(),
-    MedParties     = stats::median(.data$NParties, na.rm = TRUE),
-    PctFilerParty  = mean(.data$HasFilerParty, na.rm = TRUE),
-    PctStartBefore = mean(.data$ContractStart <= .data$DateFiled, na.rm = TRUE),
-    PctAnyPlace    = mean(dplyr::coalesce(.data$NPlaces, 0L) > 0L),
-    PctAnyAmount   = mean(!is.na(.data$MaxAmount))
-  ) |>
-  dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) clf_pct(.x))) |>
-  clf_say_table(.title = "The release against the EDGAR facts")
+#| label: report-throughput
+ent_report_throughput(
+  .dir      = .dir_store,
+  # NOT nrow(tab_index). Under a rehearsal the index holds the rehearsal, so nrow() would project
+  # the corpus pass onto the sample and report it as a fraction of an hour.
+  .n_corpus = ent_corpus_n(tab_index),
+  # From the store rather than the timing log: a resumed chunk does no work and would contribute a
+  # zero. CorpusMCand is the projected store in millions of candidate spans.
+  .n_cands  = sum(.ov$ledger$Candidates)
+)
 ```
 
-`PctFilerParty` is the number to compare against 04C. The sample put it at 64.8% under the same
-policy, so a corpus figure far from that means the corpus differs from the sample in some way the
-sample could not show -- and a figure close to it means the pipeline behaves as it was measured to.
+Read the projection as a floor. The draw is random across the whole tree, so it is unbiased on
+document count -- but cost follows length, and 04A found the corpus tail longer than the labelled
+sample's.
 
-```{r}
-#| label: validate-coverage
-tab_vars |>
-  dplyr::summarise(
-    dplyr::across(
-      c(NParties, NPlaces, NPartyAddress, NRedact, NAmounts),
-      \(.x) mean(dplyr::coalesce(.x, 0L) > 0L)
-    )
-  ) |>
-  tidyr::pivot_longer(dplyr::everything(), names_to = "Variable", values_to = "Coverage") |>
-  dplyr::mutate(Coverage = clf_pct(.data$Coverage)) |>
-  dplyr::arrange(dplyr::desc(.data$Variable)) |>
-  clf_say_table(.title = "Share of released documents carrying each variable")
-```
-
-Coverage is not uniform and must not be reported as though it were. A variable present in a third of
-documents and nine tenths of another type is two different variables, and which contract types can
-carry each one at all is the column that matters for the paper.
+`CorpusMCand` is what the finished store holds, in millions of candidate spans. Multiply the store
+size on disk by the same ratio for the disk figure; both scale linearly, because a candidate row is
+a fixed width and the store carries one per span whatever the document it came from.
 
 # Deployment
 
 ```{r}
 #| label: deploy-summary
 tibble::tibble(
-  Artifact = c("Released variables", "Timings"),
-  Path     = c(.dir_out, fs::path(.dir_out, "_timing"))
+  Artifact = c("Candidate store", "Store manifest"),
+  Path     = c(.lP$Store$NerDB, .lP$Store$Manifest)
 ) |>
   dplyr::mutate(
-    Files = purrr::map_int(.data$Path, \(.p) {
-      if (!fs::dir_exists(.p)) return(0L)
-      length(fs::dir_ls(.p, glob = "*.parquet"))
-    }),
-    MB   = purrr::map_dbl(.data$Path, \(.p) {
-      if (!fs::dir_exists(.p)) return(0)
-      round(sum(as.numeric(fs::file_size(fs::dir_ls(.p, glob = "*.parquet")))) / 1024^2, 1)
-    }),
-    Path = fs::path_rel(.data$Path, here::here())
+    Exists = fs::file_exists(.data$Path),
+    MB     = round(as.numeric(fs::file_size(.data$Path)) / 1024^2, 1),
+    Path   = fs::path_rel(.data$Path, here::here())
   ) |>
-  clf_say_table(.title = "Written by 04D")
+  tbl_say(.title = "Written by 04D")
 ```
 
 # Next
 
-The variables are written; what remains is the paper. Three things belong in it as limitations
-rather than being discovered by a reader.
+**04E** reads this store and turns spans into the variables the paper reports. It assigns a role to
+each span from the rules 04B kept, resolves the roles into parties, contract dates, party locations
+and value, and writes one row per contract.
 
-**Money is unvalidated.** EDGAR records no contract value, so the largest-amount heuristic is
-carried because it is the best available, not because it has been checked. Only the redaction role
-has external corroboration, and that speaks to six cues.
-
-**The contract term is thin.** 04C found an expiry date for well under one percent of the sample,
-and a window sensitivity check showed the cause is not the window. Until that is understood, the
-term variable covers a small and possibly unrepresentative subset, and the published measure it
-would replace remains the one with a standard deviation nobody can defend.
-
-**Nothing validates the variables themselves.** The anchors confirm that the filer appears among the
-resolved parties and that the contract date precedes its filing, which establishes that the
-extraction finds real things. It does not establish that the party count, the term or the value are
-right. That needs a document-level gold set of fifty to eighty contracts, and it is the one piece of
-this family that cannot be built from EDGAR facts or a reading session.
+Everything still open is open there rather than here. The window is a filter over the offsets in
+this store, so it can be imposed, revised or withdrawn without re-extracting anything. The role
+rules, the tie-break and the expiry cue set are all questions this document deliberately does not
+answer, and it costs nothing that they remain unanswered while the store is built.

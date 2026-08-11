@@ -1134,6 +1134,73 @@ llm_sweep <- function(.grid, ...) {
 
 # 7. Cost, before it is spent ------------------------------------------------------------------------------------------
 
+# The identity of a fitted rate. Everything here changes how long one answer takes: the prompt
+# through the categories, the guidance level, the worked examples and the document window; the
+# hardware path through the model tag and the context window, which sets the size of the attention
+# cache. Nothing else does -- which tier a configuration belongs to and how many documents it faces
+# change the bill, not the rate. Keyed on this rather than on a chunk name, for the same reason the
+# answer cache is: a name-keyed store serves the previous configuration's number without erroring.
+LLM_RATE_KEYS <- c("Task", "Model", "Guidance", "Shots", "NChars", "Abstain", "Think", "NumCtx")
+
+#' The shape of a rate table, with no rows in it
+#'
+#' Defined once because two callers need an empty one and neither may produce a table with no
+#' COLUMNS. An empty tibble is not the same object as a zero-row tibble of the right type: the first
+#' fails a join with a message about missing columns, and it appears only once the store exists and a
+#' render finds nothing left to measure -- which is to say, never on the render that writes the code
+#' and always on the one after.
+#'
+#' @return Zero-row tibble carrying the rate schema.
+llm_rates_empty <- function() {
+  tibble::tibble(
+    Task = character(), Model = character(), Guidance = character(), Shots = integer(),
+    NChars = integer(), Abstain = logical(), Think = logical(), NumCtx = integer(),
+    SecsPerDoc = numeric(), Answered = integer(), FittedOn = character(), FittedN = integer()
+  )
+}
+
+#' Read previously fitted generation rates
+#'
+#' Missing store, unreadable store and store from an older key set all return the same thing: no
+#' known rates. A projection that silently reused a rate fitted under a different key would be worse
+#' than one that re-times, and re-timing costs minutes rather than correctness.
+#'
+#' @param .path Parquet file, or NULL to keep nothing.
+#' @param .key_cols Columns identifying a rate.
+#' @return Tibble with the key columns plus SecsPerDoc, Answered, FittedOn, FittedN.
+llm_rates_read <- function(.path, .key_cols = LLM_RATE_KEYS) {
+  if (FALSE) {
+    .path     <- .lP$Output$Rates
+    .key_cols <- LLM_RATE_KEYS
+  }
+  if (is.null(.path) || !fs::file_exists(.path)) return(llm_rates_empty())
+
+  out_ <- tryCatch(arrow::read_parquet(.path), error = function(e) NULL)
+  if (is.null(out_) || !all(.key_cols %in% names(out_))) {
+    cli::cli_alert_warning(
+      "The rate store at {(.path)} does not carry the current key, so every shape is re-timed."
+    )
+    return(llm_rates_empty())
+  }
+  out_
+}
+
+#' Persist fitted generation rates
+#'
+#' @param .rates Tibble to store.
+#' @param .path Parquet file, or NULL to keep nothing.
+#' @return Invisibly .rates.
+llm_rates_write <- function(.rates, .path) {
+  if (FALSE) {
+    .rates <- rates_
+    .path  <- .lP$Output$Rates
+  }
+  if (is.null(.path)) return(invisible(.rates))
+  fs::dir_create(fs::path_dir(.path))
+  arrow::write_parquet(x = .rates, sink = .path)
+  invisible(.rates)
+}
+
 #' Time a handful of documents per prompt shape and project the sweep
 #'
 #' A local generation is seconds and the sample is thousands of documents, so a sweep is measured in
@@ -1153,10 +1220,17 @@ llm_sweep <- function(.grid, ...) {
 #'
 #' It times classification directly rather than a whole cell. A cell partitions its documents into
 #' run folders by fold, which a five-document probe cannot fill, and writing runs is not part of what
-#' is being measured anyway. The probe caches into a temporary directory, so a repeat projection
-#' measures the model again rather than reporting the speed of a cache hit -- at the price of costing
-#' `.n` generations per shape on every render, which is the standing tax for a number that stays
-#' true.
+#' is being measured anyway. The probe caches into a temporary directory rather than the sweep's, so
+#' a rate is always measured against the model rather than against a cache hit.
+#'
+#' FITTED RATES PERSIST, KEYED ON WHAT DETERMINES THEM. A rate is a property of a machine, a model
+#' and a prompt shape, none of which changes between two renders of the same document -- so re-timing
+#' every shape on every render buys an identical number for real minutes of inference. The store is
+#' keyed on the shape and the derived window, exactly as the answer cache is keyed on the prompt, so
+#' a changed configuration misses and is re-timed rather than being served the old configuration's
+#' number. `FittedOn` travels with each rate and is printed, because a rate is only as good as the
+#' machine it was measured on and a stale one should be visible rather than merely absent. Pass
+#' `.refit = TRUE` after a hardware or server change; pass `.rate_store = NULL` to keep nothing.
 #'
 #' @param .grid Output of llm_grid(), or several bound together.
 #' @param .tab_prep Prepared sample.
@@ -1171,11 +1245,15 @@ llm_sweep <- function(.grid, ...) {
 #' @param .host,.num_ctx,.timeout Transport settings. A NULL window is derived per shape exactly as
 #'   the sweep derives it, because the window sets the size of the attention cache and therefore the
 #'   speed of the thing being measured.
+#' @param .rate_store Parquet file holding fitted rates, or NULL to fit everything every time.
+#' @param .refit Logical. Re-time every shape and overwrite the store. For a new machine or a
+#'   changed server, where the stored numbers are wrong rather than merely old.
 #' @return Invisibly a tibble, one row per shape.
 llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, .n = 5L,
                             .limit = NULL, .seed = 42L, .host = "http://localhost:11434",
                             .num_ctx = NULL, .timeout = 600, .example_chars = 700L,
-                            .ctx_min = 8192L, .ctx_max = 32768L) {
+                            .ctx_min = 8192L, .ctx_max = 32768L,
+                            .rate_store = NULL, .refit = FALSE) {
   if (FALSE) {
     .grid          <- dplyr::bind_rows(grid_blind, grid_cross)
     .tab_prep      <- tab_prep
@@ -1190,6 +1268,8 @@ llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, 
     .example_chars <- 700L
     .ctx_min       <- .lP$Engine$CtxMin
     .ctx_max       <- .lP$Engine$CtxMax
+    .rate_store    <- .lP$Output$Rates
+    .refit         <- FALSE
   }
   # Tier decides how many documents a cell classifies, not how long each one takes, so it is counted
   # here and left out of the shape below. Two cells at one shot count and different tiers pay the
@@ -1211,12 +1291,12 @@ llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, 
   docs_ <- withr::with_seed(.seed, dplyr::slice_sample(.tab_prep, n = .n))
 
   cli::cli_h2("Cost projection")
-  cli::cli_alert_info(
-    "Timing {(.n)} documents on each of {nrow(shapes_)} prompt shapes: \\
-     {nrow(shapes_) * .n} generations before anything else starts."
-  )
 
-  out_ <- purrr::map(seq_len(nrow(shapes_)), function(.i) {
+  # EVERY SHAPE IS RESOLVED WITHOUT INFERENCE FIRST. Building the prompt and deriving the window are
+  # pure functions of the configuration and the sample, so they cost nothing and can be done for all
+  # shapes; only the RATE needs the model. Resolving first is what makes the store keyable, because
+  # the derived window is part of what determines the rate and is not knowable from the grid alone.
+  prompts_ <- purrr::map(seq_len(nrow(shapes_)), function(.i) {
     sh_     <- shapes_[.i, ]
     labels_ <- llm_labels(.tab_prep = .tab_prep, .label_col = sh_$LabelCol)
     block_  <- llm_render_labels(.labels = labels_, .definitions = .definitions,
@@ -1242,39 +1322,82 @@ llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, 
     # measures a smaller attention cache and reports a rate the sweep cannot reproduce.
     ctx_ <- .num_ctx %||% llm_ctx_for(.tokens = budget_$EstTokens, .min = .ctx_min, .max = .ctx_max)
 
+    list(
+      Shape = tibble::tibble(
+        Task      = sh_$LabelCol,
+        Model     = sh_$Model,
+        Guidance  = sh_$Guidance,
+        Shots     = sh_$Shots,
+        NChars    = sh_$NChars,
+        Abstain   = sh_$AllowAbstain,
+        Think     = sh_$Think,
+        NumCtx    = ctx_,
+        EstTokens = budget_$EstTokens,
+        Configs   = sh_$Configs,
+        Calls     = sh_$Docs
+      ),
+      Labels = labels_, Block = block_, Examples = ex_
+    )
+  })
+  shape_tab_ <- purrr::map(prompts_, "Shape") |> purrr::list_rbind()
+
+  known_ <- llm_rates_read(.path = .rate_store, .key_cols = LLM_RATE_KEYS)
+  need_  <- if (.refit) {
+    shape_tab_
+  } else {
+    shape_tab_ |> dplyr::anti_join(known_, by = LLM_RATE_KEYS)
+  }
+  cli::cli_alert_info(
+    "{nrow(shape_tab_)} prompt shape{?s}, {nrow(need_)} needing a rate: \\
+     {nrow(need_) * .n} generation{?s} before anything else starts."
+  )
+
+  fitted_ <- purrr::map(seq_len(nrow(need_)), function(.j) {
+    key_ <- need_[.j, ]
+    pr_  <- purrr::detect(prompts_, function(.p) {
+      identical(.p$Shape[LLM_RATE_KEYS], key_[LLM_RATE_KEYS])
+    })
     t0_    <- Sys.time()
     probe_ <- llm_classify(
       .tab           = docs_,
-      .label_col     = sh_$LabelCol,
-      .labels        = labels_,
-      .labels_block  = block_,
-      .task_line     = .task_lines[[sh_$LabelCol]],
-      .examples      = ex_,
-      .model         = sh_$Model,
-      .allow_abstain = sh_$AllowAbstain,
-      .n_chars       = sh_$NChars,
-      .cache_dir     = fs::path(tempdir(), paste0("llmcost-", as.integer(Sys.time()), "-", .i)),
-      .think         = sh_$Think,
-      .num_ctx       = ctx_,
+      .label_col     = key_$Task,
+      .labels        = pr_$Labels,
+      .labels_block  = pr_$Block,
+      .task_line     = .task_lines[[key_$Task]],
+      .examples      = pr_$Examples,
+      .model         = key_$Model,
+      .allow_abstain = key_$Abstain,
+      .n_chars       = key_$NChars,
+      .cache_dir     = fs::path(tempdir(), paste0("llmcost-", as.integer(Sys.time()), "-", .j)),
+      .think         = key_$Think,
+      .num_ctx       = key_$NumCtx,
       .host          = .host,
       .timeout       = .timeout
     )
-    rate_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs")) / .n
-
-    tibble::tibble(
-      Task       = sh_$LabelCol,
-      Model      = sh_$Model,
-      Shots      = sh_$Shots,
-      Configs    = sh_$Configs,
-      EstTokens  = budget_$EstTokens,
-      NumCtx     = ctx_,
-      Calls      = sh_$Docs,
-      Answered   = sum(!is.na(probe_$Raw)),
-      SecsPerDoc = round(rate_, 2),
-      Hours      = round(sh_$Docs * rate_ / 3600, 1)
-    )
+    key_[LLM_RATE_KEYS] |>
+      dplyr::mutate(
+        SecsPerDoc = round(as.numeric(difftime(Sys.time(), t0_, units = "secs")) / .n, 2),
+        Answered   = sum(!is.na(probe_$Raw)),
+        FittedOn   = as.character(Sys.Date()),
+        FittedN    = as.integer(.n)
+      )
   }) |>
     purrr::list_rbind()
+
+  # Binding an empty list returns a tibble with no COLUMNS rather than no rows, so the joins below
+  # lose the key they join on. The schema is restored rather than inferred from the loop, because a
+  # loop that ran zero times has no schema to infer -- and this is the branch a second render takes
+  # every time, once the store holds every shape.
+  if (nrow(fitted_) == 0L) fitted_ <- llm_rates_empty()
+
+  rates_ <- dplyr::bind_rows(fitted_, dplyr::anti_join(known_, fitted_, by = LLM_RATE_KEYS))
+  llm_rates_write(.rates = rates_, .path = .rate_store)
+
+  out_ <- shape_tab_ |>
+    dplyr::inner_join(rates_, by = LLM_RATE_KEYS) |>
+    dplyr::mutate(Hours = round(.data$Calls * .data$SecsPerDoc / 3600, 1)) |>
+    dplyr::select(Task, Model, Shots, Configs, EstTokens, NumCtx, Calls, Answered, SecsPerDoc,
+                  FittedOn, Hours)
 
   out_ |>
     dplyr::arrange(.data$Task, .data$Shots) |>
@@ -1297,6 +1420,12 @@ llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, 
      disk costs nothing: the sweep skips a configuration whose runs exist, and every individual \\
      answer is cached besides. Read the per-task rows to price what is actually outstanding."
   )
+  if (nrow(fitted_) == 0L) {
+    cli::cli_alert_info(
+      "No shape was timed on this render; every rate came from the store. FittedOn says when each \\
+       was measured -- re-render with .refit = TRUE after a hardware or server change."
+    )
+  }
   cli::cli_alert_info(
     "These figures are serial. Set OLLAMA_NUM_PARALLEL above one to overlap requests; the model, \\
      not the client, is the bottleneck."
@@ -1306,6 +1435,75 @@ llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, 
 
 
 # 8. Reporting ---------------------------------------------------------------------------------------------------------
+
+#' Reconcile the runs on disk against the configurations this render produced
+#'
+#' The old inventory was a directory listing, which is a statement about the filesystem rather than
+#' about this document. A run folder outlives the naming scheme that produced it: add a term to
+#' `llm_config_name()` -- the context window, say -- and every existing folder keeps a name the
+#' current scheme would never write, while remaining perfectly readable. Nothing errors. The
+#' orchestrator then reads one prompt under two names, ranks it as two arms with identical scores,
+#' and either double-counts its folds or drops one of them arbitrarily.
+#'
+#' Reconciled rather than guessed. Both sweeps return the configuration name of every cell they
+#' touched, written or skipped, so the set of current names is known exactly and needs no rule about
+#' which naming scheme is in force. Anything on disk and outside that set is superseded; anything in
+#' the set and not on disk did not complete.
+#'
+#' A superseded run is REPORTED, NOT DELETED. Deleting is cheap to say and expensive to be wrong
+#' about, and these cost nights of inference to produce.
+#'
+#' @param .swept Bound return values of llm_sweep(), carrying ConfigName.
+#' @param .runs_root Runs directory for this render.
+#' @return Invisibly a tibble of the runs on disk, with Status.
+llm_report_inventory <- function(.swept, .runs_root) {
+  if (FALSE) {
+    .swept     <- dplyr::bind_rows(swept_blind, swept_cross, swept_tuned)
+    .runs_root <- .dir_runs
+  }
+  disk_ <- fs::dir_ls(.runs_root, type = "directory") |>
+    fs::path_file() |>
+    tibble::tibble(Run = _) |>
+    dplyr::mutate(ConfigName = sub("_F\\d+$", "", .data$Run)) |>
+    dplyr::count(ConfigName, name = "Folds")
+
+  current_ <- .swept |> dplyr::distinct(ConfigName) |> dplyr::pull(ConfigName)
+
+  out_ <- disk_ |>
+    dplyr::mutate(
+      Status = dplyr::if_else(.data$ConfigName %in% current_, "current", "SUPERSEDED")
+    ) |>
+    dplyr::arrange(.data$Status, .data$ConfigName)
+
+  missing_ <- setdiff(current_, disk_$ConfigName)
+
+  cli::cli_h2("Runs on disk against the configurations this render produced")
+  out_ |> tbl_say()
+  cli::cli_text("")
+
+  n_old_ <- sum(out_$Status == "SUPERSEDED")
+  if (n_old_ > 0L) {
+    cli::cli_alert_warning(
+      "{n_old_} configuration{?s} on disk {?was/were} not produced by any grid in this render. The \\
+       orchestrator reads this directory, so {?it/they} will enter its inventory as {?an arm/arms} \\
+       nothing here can account for -- and where the prompt is the same as a current one, as a \\
+       duplicate of it carrying identical scores under a second name."
+    )
+    cli::cli_alert_info(
+      "Left in place deliberately. Confirm against the current names above and remove the folders, \\
+       or keep them and expect the duplication downstream."
+    )
+  } else {
+    cli::cli_alert_success("Every run on disk was produced by a configuration in this render.")
+  }
+  if (length(missing_) > 0L) {
+    cli::cli_alert_danger(
+      "{length(missing_)} configuration{?s} {?was/were} swept but {?has/have} no runs on disk: \\
+       {missing_}"
+    )
+  }
+  invisible(out_)
+}
 
 #' Leaderboard across LLM configurations for one task
 #'
@@ -1692,6 +1890,68 @@ llm_n_configs <- function(.tab_overall, .label_col = "ClassDetailed", .n = 12L) 
 #' @param .tab_overall Bound per-fold metrics from clf_load_overall().
 #' @param .label_col Character. Task to plot.
 #' @return A ggplot.
+#' The prompting gradient, one panel per taxonomy
+#'
+#' The finding this stage carries is not a score, it is a SHAPE: showing the model worked examples
+#' drawn from folds it is not being scored on lifts it substantially, and each further example lifts
+#' it again with diminishing returns. Read on one taxonomy that shape is a fact about a taxonomy,
+#' and a reader is entitled to ask whether twelve fine-grained categories are simply hard to describe
+#' in a sentence. Read on three -- twelve categories, seven, and a binary -- it is a fact about
+#' prompting.
+#'
+#' Panels rather than colours because the tasks are not comparable in level: a binary decision starts
+#' near a coin flip and a twelve-way one near a twentieth, so plotting them on shared axes would put
+#' the eye on the intercepts, which mean nothing across taxonomies, instead of on the slopes, which
+#' are the whole point. The vertical scale is free for the same reason and is the one place in this
+#' document where it is.
+#'
+#' Full-coverage tiers only. A tuned configuration is scored on a single fold, so its point would sit
+#' on the same line as five-fold estimates while describing a fifth of the sample.
+#'
+#' @param .tab_overall Bound per-fold metrics.
+#' @param .tasks Tasks to panel, in the order they should read.
+#' @return A ggplot.
+llm_plot_gradient <- function(.tab_overall, .tasks = c("ClassDetailed", "ClassBroad", "AmendType")) {
+  if (FALSE) {
+    .tab_overall <- tab_overall
+    .tasks       <- c("ClassDetailed", "ClassBroad", "AmendType")
+  }
+  # Summarised before the plot so the axis breaks can be read off what is actually drawn. Taking them
+  # from the input instead would let a tier or a task this figure excludes put a tick on the axis.
+  dat_ <- .tab_overall |>
+    dplyr::filter(
+      .data$LabelCol %in% .tasks,
+      !.data$Smoke,
+      grepl("^llm-", .data$Model),
+      .data$Tier %in% c("blind", "crossfold")
+    ) |>
+    dplyr::summarise(
+      MacroF1 = mean(.data$F1_macro),
+      SE      = stats::sd(.data$F1_macro) / sqrt(dplyr::n()),
+      .by = c(LabelCol, Model, Shots)
+    ) |>
+    dplyr::mutate(
+      Model    = sub("^llm-", "", .data$Model),
+      LabelCol = factor(.data$LabelCol, levels = .tasks)
+    )
+
+  dat_ |>
+    ggplot2::ggplot(ggplot2::aes(x = .data$Shots, y = .data$MacroF1, colour = .data$Model)) +
+    ggplot2::geom_ribbon(
+      ggplot2::aes(ymin = .data$MacroF1 - .data$SE, ymax = .data$MacroF1 + .data$SE,
+                   fill = .data$Model),
+      alpha = 0.15, colour = NA
+    ) +
+    ggplot2::geom_line(linewidth = 0.6) +
+    ggplot2::geom_point(size = 2.2) +
+    ggplot2::facet_wrap(ggplot2::vars(LabelCol), scales = "free_y") +
+    plot_scale_colour_cat(name = "Model") +
+    plot_scale_fill_cat(name = "Model") +
+    ggplot2::scale_x_continuous(breaks = sort(unique(dat_$Shots))) +
+    ggplot2::labs(x = "Worked examples per category", y = "Macro-F1") +
+    plot_theme(.grid = "both", .legend = "bottom")
+}
+
 llm_plot_coverage <- function(.tab_overall, .label_col = "ClassDetailed") {
   if (FALSE) {
     .tab_overall <- tab_overall
