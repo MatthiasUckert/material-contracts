@@ -1134,94 +1134,172 @@ llm_sweep <- function(.grid, ...) {
 
 # 7. Cost, before it is spent ------------------------------------------------------------------------------------------
 
-#' Time one configuration on a handful of documents and project the sweep
+#' Time a handful of documents per prompt shape and project the sweep
 #'
 #' A local generation is seconds and the sample is thousands of documents, so a sweep is measured in
 #' nights. Read this before starting one: the projection is fitted on this machine and this model
 #' rather than on a nominal figure, and it is the difference between an overnight run and a week of
 #' them.
 #'
+#' ONE RATE PER PROMPT SHAPE, NOT ONE RATE FOR THE GRID. With the reasoning pass off the answer is a
+#' single enum token, so nearly the whole cost is prefill and prefill is the prompt. The prompt is
+#' the category list plus the worked examples, and the example block is categories times shots -- so
+#' a four-shot twelve-category prompt runs several times the length of a blind one, and a
+#' two-category task is a fraction of a twelve-category one at the same shot count. A single rate
+#' fitted on one blind cell and multiplied by every cell's documents understates the long shapes and
+#' overstates the short ones simultaneously, and the two errors do not cancel: per task they point in
+#' opposite directions. The grid is therefore grouped into the shapes that genuinely differ, each is
+#' timed, and each is projected against its own documents.
+#'
 #' It times classification directly rather than a whole cell. A cell partitions its documents into
 #' run folders by fold, which a five-document probe cannot fill, and writing runs is not part of what
-#' is being measured anyway. The probe also caches into a temporary directory, so a repeat projection
-#' measures the model again rather than reporting the speed of a cache hit.
+#' is being measured anyway. The probe caches into a temporary directory, so a repeat projection
+#' measures the model again rather than reporting the speed of a cache hit -- at the price of costing
+#' `.n` generations per shape on every render, which is the standing tax for a number that stays
+#' true.
 #'
-#' @param .grid Output of llm_grid(); the first row supplies the configuration to time.
+#' @param .grid Output of llm_grid(), or several bound together.
 #' @param .tab_prep Prepared sample.
 #' @param .task_lines Named character vector: task column to the sentence describing it.
 #' @param .definitions Optional definitions tibble.
-#' @param .n Documents to time.
+#' @param .n Documents to time PER SHAPE. Total probe cost is this times the number of shapes.
 #' @param .limit Cap the sweep is to be run under, or NULL. The projection is for what will actually
 #'   be run, so a capped sweep must be projected against the cap rather than against the corpus.
 #' @param .seed Fixed, so the probe draws the same documents each render.
-#' @param .host,.num_ctx,.timeout Transport settings.
-#' @return Invisibly a one-row projection tibble.
+#' @param .example_chars Characters shown per worked example, as in the sweep.
+#' @param .ctx_min,.ctx_max Floor and ceiling for the derived window.
+#' @param .host,.num_ctx,.timeout Transport settings. A NULL window is derived per shape exactly as
+#'   the sweep derives it, because the window sets the size of the attention cache and therefore the
+#'   speed of the thing being measured.
+#' @return Invisibly a tibble, one row per shape.
 llm_report_cost <- function(.grid, .tab_prep, .task_lines, .definitions = NULL, .n = 5L,
                             .limit = NULL, .seed = 42L, .host = "http://localhost:11434",
-                            .num_ctx = 8192L, .timeout = 600) {
+                            .num_ctx = NULL, .timeout = 600, .example_chars = 700L,
+                            .ctx_min = 8192L, .ctx_max = 32768L) {
   if (FALSE) {
-    .grid       <- grid_blind
-    .tab_prep   <- tab_prep
-    .task_lines <- .lP$TaskLines
-    .n          <- 5L
-    .limit      <- 100L
+    .grid          <- dplyr::bind_rows(grid_blind, grid_cross)
+    .tab_prep      <- tab_prep
+    .task_lines    <- .lP$TaskLines
+    .definitions   <- tab_definitions
+    .n             <- 5L
+    .limit         <- NULL
+    .seed          <- 42L
+    .host          <- .lP$Engine$Host
+    .num_ctx       <- NULL
+    .timeout       <- .lP$Engine$Timeout
+    .example_chars <- 700L
+    .ctx_min       <- .lP$Engine$CtxMin
+    .ctx_max       <- .lP$Engine$CtxMax
   }
-  cell_   <- .grid[1, ]
-  labels_ <- llm_labels(.tab_prep = .tab_prep, .label_col = cell_$LabelCol)
-  block_  <- llm_render_labels(.labels = labels_, .definitions = .definitions,
-                               .guidance = cell_$Guidance)
-
-  # Sampled rather than taken from the top: generation time scales with input length, and the first
-  # rows of the sample are not a random draw from the length distribution.
-  docs_ <- withr::with_seed(.seed, dplyr::slice_sample(.tab_prep, n = .n))
-
-  calls_ <- .grid |>
+  # Tier decides how many documents a cell classifies, not how long each one takes, so it is counted
+  # here and left out of the shape below. Two cells at one shot count and different tiers pay the
+  # same rate on different amounts of work.
+  cells_ <- .grid |>
     dplyr::mutate(
       Docs = dplyr::if_else(.data$Tier == "tuned", round(nrow(.tab_prep) / 5), nrow(.tab_prep)),
       Docs = if (is.null(.limit)) .data$Docs else pmin(.data$Docs, .limit)
-    ) |>
-    dplyr::pull(Docs) |>
-    sum()
+    )
+
+  shape_cols_ <- c("LabelCol", "Model", "Guidance", "Shots", "NChars", "AllowAbstain", "Think")
+  shapes_ <- cells_ |>
+    dplyr::summarise(
+      Configs = dplyr::n(),
+      Docs    = sum(.data$Docs),
+      .by     = dplyr::all_of(shape_cols_)
+    )
+
+  docs_ <- withr::with_seed(.seed, dplyr::slice_sample(.tab_prep, n = .n))
 
   cli::cli_h2("Cost projection")
   cli::cli_alert_info(
-    "Timing {(.n)} document{?s} on {cell_$Model} \\
-     ({if (isTRUE(cell_$Think)) 'reasoning on' else 'reasoning off'}) to fit a rate for this machine."
+    "Timing {(.n)} documents on each of {nrow(shapes_)} prompt shapes: \\
+     {nrow(shapes_) * .n} generations before anything else starts."
   )
 
-  t0_ <- Sys.time()
-  probe_ <- llm_classify(
-    .tab           = docs_,
-    .label_col     = cell_$LabelCol,
-    .labels        = labels_,
-    .labels_block  = block_,
-    .task_line     = .task_lines[[cell_$LabelCol]],
-    .examples      = NULL,
-    .model         = cell_$Model,
-    .allow_abstain = cell_$AllowAbstain,
-    .n_chars       = cell_$NChars,
-    .cache_dir     = fs::path(tempdir(), paste0("llmcost-", as.integer(Sys.time()))),
-    .think         = cell_$Think,
-    .num_ctx       = .num_ctx,
-    .host          = .host,
-    .timeout       = .timeout
-  )
-  rate_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs")) / .n
+  out_ <- purrr::map(seq_len(nrow(shapes_)), function(.i) {
+    sh_     <- shapes_[.i, ]
+    labels_ <- llm_labels(.tab_prep = .tab_prep, .label_col = sh_$LabelCol)
+    block_  <- llm_render_labels(.labels = labels_, .definitions = .definitions,
+                                 .guidance = sh_$Guidance)
+    ex_ <- if (sh_$Shots > 0L) {
+      llm_render_examples(
+        .tab = llm_examples(.tab_prep = .tab_prep, .label_col = sh_$LabelCol,
+                            .folds = sort(unique(.tab_prep$Fold))[-1], # one fold held out, as in the sweep
+                            .per_class = sh_$Shots, .seed = .seed),
+        .label_col = sh_$LabelCol, .n_chars = .example_chars
+      )
+    } else {
+      NULL
+    }
+    budget_ <- llm_prompt_budget(
+      .labels_block  = block_,
+      .task_line     = .task_lines[[sh_$LabelCol]],
+      .examples      = ex_,
+      .allow_abstain = sh_$AllowAbstain,
+      .n_chars       = sh_$NChars
+    )
+    # Derived as the sweep derives it. A probe run at a smaller window than the sweep will use
+    # measures a smaller attention cache and reports a rate the sweep cannot reproduce.
+    ctx_ <- .num_ctx %||% llm_ctx_for(.tokens = budget_$EstTokens, .min = .ctx_min, .max = .ctx_max)
 
-  out_ <- tibble::tibble(
-    Configs      = nrow(.grid),
-    Limit        = if (is.null(.limit)) NA_integer_ else as.integer(.limit),
-    Calls        = calls_,
-    Answered     = sum(!is.na(probe_$Raw)),
-    SecsPerDoc   = round(rate_, 2),
-    ProjectedHrs = round(calls_ * rate_ / 3600, 1)
-  )
-  tbl_say(.tab = out_)
+    t0_    <- Sys.time()
+    probe_ <- llm_classify(
+      .tab           = docs_,
+      .label_col     = sh_$LabelCol,
+      .labels        = labels_,
+      .labels_block  = block_,
+      .task_line     = .task_lines[[sh_$LabelCol]],
+      .examples      = ex_,
+      .model         = sh_$Model,
+      .allow_abstain = sh_$AllowAbstain,
+      .n_chars       = sh_$NChars,
+      .cache_dir     = fs::path(tempdir(), paste0("llmcost-", as.integer(Sys.time()), "-", .i)),
+      .think         = sh_$Think,
+      .num_ctx       = ctx_,
+      .host          = .host,
+      .timeout       = .timeout
+    )
+    rate_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs")) / .n
+
+    tibble::tibble(
+      Task       = sh_$LabelCol,
+      Model      = sh_$Model,
+      Shots      = sh_$Shots,
+      Configs    = sh_$Configs,
+      EstTokens  = budget_$EstTokens,
+      NumCtx     = ctx_,
+      Calls      = sh_$Docs,
+      Answered   = sum(!is.na(probe_$Raw)),
+      SecsPerDoc = round(rate_, 2),
+      Hours      = round(sh_$Docs * rate_ / 3600, 1)
+    )
+  }) |>
+    purrr::list_rbind()
+
+  out_ |>
+    dplyr::arrange(.data$Task, .data$Shots) |>
+    tbl_say(.title = "Per prompt shape")
   cli::cli_text("")
+
+  out_ |>
+    dplyr::summarise(
+      Configs = sum(.data$Configs),
+      Calls   = sum(.data$Calls),
+      Hours   = round(sum(.data$Hours), 1),
+      .by     = Task
+    ) |>
+    dplyr::arrange(dplyr::desc(.data$Hours)) |>
+    tbl_say(.title = "Per task")
+  cli::cli_text("")
+
   cli::cli_alert_info(
-    "Every answer is cached, so an interrupted sweep resumes and a re-render costs a directory \\
-     listing. Set OLLAMA_NUM_PARALLEL above one to overlap requests; the model, not the client, is \\
-     the bottleneck."
+    "{round(sum(out_$Hours), 1)} hours for everything above, of which any configuration already on \\
+     disk costs nothing: the sweep skips a configuration whose runs exist, and every individual \\
+     answer is cached besides. Read the per-task rows to price what is actually outstanding."
+  )
+  cli::cli_alert_info(
+    "These figures are serial. Set OLLAMA_NUM_PARALLEL above one to overlap requests; the model, \\
+     not the client, is the bottleneck."
   )
   invisible(out_)
 }

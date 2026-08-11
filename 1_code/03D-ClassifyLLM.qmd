@@ -141,6 +141,16 @@ having, since writing that documentation is the main human cost of adopting this
     Timeout = 600                       # a 32b model on a long excerpt can take minutes
   ),
   Param = list(
+    # All three taxonomies. The generative arm ran on the detailed one alone while its shape was
+    # unknown, which is why the confidence flag is estimated on one task and the manifest's
+    # confidence block has no task dimension. Cost is the reason it stayed there and cost is why it
+    # need not: the answer is one enum token, so the bill is prefill, and prefill is the category
+    # list plus categories-times-shots worked examples. Seven categories and two cost a fraction of
+    # twelve at the same settings, and the two together come to roughly what the detailed taxonomy
+    # cost on its own. Three independent estimates of the blind-to-crossfold gradient, across
+    # taxonomies of twelve, seven and two categories, is also a far stronger claim about prompting
+    # than one estimate on one taxonomy.
+    Tasks       = c("ClassDetailed", "ClassBroad", "AmendType"),
     Models      = "qwen3:8b",                 # add "qwen3:32b" once the smaller model's shape is known
     Guidance    = c("labels", "codebook"),    # what the model is told about the taxonomy
     NChars      = 6000L,                      # header window; roughly the transformer's reading span
@@ -297,10 +307,22 @@ nights rather than minutes. The projection below is fitted on this machine and t
 on a nominal figure, and it is the difference between an overnight run and a week of them. Read it
 before starting.
 
+It prices every grid this document runs, and it fits a separate rate for each distinct prompt. Both
+of those matter more than they sound. With the reasoning pass off the answer is a single token drawn
+from an enum, so nearly the whole cost is reading the prompt -- and the prompt is the category list
+plus categories-times-shots worked examples. A four-shot prompt over twelve categories is several
+times the length of a blind one, and a two-category task at the same shot count is a fraction of a
+twelve-category one. One rate taken from one blind cell and multiplied across the grid would
+understate the long shapes and overstate the short ones at the same time, which is not a rounding
+error but the difference between reading a night correctly and reading it as an afternoon.
+
 ```{r}
-#| label: grid-blind
+#| label: cost-build-grids
+# Every grid is built here, before the projection, because a projection that cannot see a grid
+# cannot price it -- and the two tiers it could not see are three quarters of the work. Each is
+# displayed in the section that argues for it.
 grid_blind <- llm_grid(
-  .label_cols    = "ClassDetailed",     # the headline task; the others follow once this settles
+  .label_cols    = .lP$Param$Tasks,     # every taxonomy, not only the headline one
   .models        = .lP$Param$Models,    # size as an axis
   .guidance      = .lP$Param$Guidance,  # what the model is told
   .shots         = 0L,                  # a blind prompt shows no labelled example
@@ -310,8 +332,37 @@ grid_blind <- llm_grid(
   .tier          = "blind"              # no examples at all; entitled to every fold
 )
 
+grid_cross <- llm_grid(
+  .label_cols    = .lP$Param$Tasks,     # every taxonomy
+  .models        = .lP$Param$Models,    # same models
+  .guidance      = .lP$Param$Guidance,  # same guidance as the blind tier
+  .shots         = .lP$Param$Shots,     # examples per category, drawn from the complement folds
+  .n_chars       = .lP$Param$NChars,    # same window
+  .allow_abstain = .lP$Param$Abstain,   # same refusal regime, so the tiers compare
+  .think         = .lP$Param$Think,     # same reasoning regime
+  .tier          = "crossfold"          # examples from the complement; entitled to every fold
+)
+
+# ClassDetailed alone, deliberately. This tier prices development-with-hindsight against the blind
+# arm on the one fold a tuned prompt never read. It is a statement about method rather than a
+# measurement of a taxonomy, and it cannot enter the router on any task, so running it three times
+# would buy a second and third illustration of the same point at the cost of real inference.
+grid_tuned <- llm_grid(
+  .label_cols    = "ClassDetailed",      # the worked example; see above
+  .models        = .lP$Param$Models,     # same models
+  .guidance      = .lP$Param$Guidance,   # whatever guidance the blind tier had available
+  .shots         = .lP$Param$Shots,      # worked examples, drawn from folds 1-4 only
+  .n_chars       = .lP$Param$NChars,     # same window
+  .allow_abstain = .lP$Param$Abstain,    # matched to the blind tier, or the tiers are not comparable
+  .think         = .lP$Param$Think,      # same regime as the blind tier, so the tiers compare
+  .tier          = "tuned"               # holdout fold only
+)
+```
+
+```{r}
+#| label: grid-blind
 grid_blind |>
-  dplyr::select(Model, Guidance, Window = NChars, Abstain = AllowAbstain, Think) |>
+  dplyr::select(Task = LabelCol, Model, Guidance, Window = NChars, Abstain = AllowAbstain, Think) |>
   tbl_say(.title = paste0("Blind grid: ", nrow(grid_blind), " configurations"))
 ```
 
@@ -330,19 +381,32 @@ llm_check_models(
 
 ```{r}
 #| label: cost-projection
+# Every grid this document runs, not the blind one alone. The blind tier is one configuration per
+# task out of the four that cover every fold, and it is the cheapest of them by a wide margin
+# because it shows no worked examples -- so projecting the night from it alone understates the night
+# by most of it. The grids are bound rather than projected separately because the shapes have to be
+# grouped across them: a crossfold cell and a tuned cell at the same shot count carry the same
+# prompt and differ only in how many documents they classify.
 llm_report_cost(
-  .grid        = grid_blind,          # what would be run
-  .tab_prep    = tab_prep,            # documents to sample from
-  .task_lines  = .lP$TaskLines,       # as in the real pass
-  .definitions = tab_definitions,     # as in the real pass
-  .n           = 5L,                  # documents used to fit the rate
-  .limit       = .lP$Param$Limit,     # project what will actually run, not the whole corpus
-  .seed        = 42L,                 # same documents on every render
-  .host        = .lP$Engine$Host,     # local Ollama
-  .num_ctx     = NULL,                # derived from the longest prompt, not fixed
-  .timeout     = .lP$Engine$Timeout   # per-request ceiling
+  .grid          = dplyr::bind_rows(grid_blind, grid_cross, grid_tuned),
+  .tab_prep      = tab_prep,            # documents to sample from
+  .task_lines    = .lP$TaskLines,       # as in the real pass
+  .definitions   = tab_definitions,     # as in the real pass
+  .n             = 5L,                  # documents per shape used to fit its rate
+  .limit         = .lP$Param$Limit,     # project what will actually run, not the whole corpus
+  .seed          = 42L,                 # same documents on every render
+  .example_chars = 700L,                # as in the sweep; examples dominate the long shapes
+  .host          = .lP$Engine$Host,     # local Ollama
+  .num_ctx       = NULL,                # derived per shape, as the sweep derives it
+  .ctx_min       = .lP$Engine$CtxMin,   # floor
+  .ctx_max       = .lP$Engine$CtxMax,   # ceiling
+  .timeout       = .lP$Engine$Timeout   # per-request ceiling
 )
 ```
+
+Read the per-task rows rather than the total. The sweep skips any configuration whose runs are
+already on disk and caches every individual answer besides, so a task that has already run costs
+nothing and its row prices work that will not happen. The total prices a tree with nothing in it.
 
 # The blind sweep
 
@@ -395,19 +459,9 @@ is the leak this tier exists to avoid.
 
 ```{r}
 #| label: grid-crossfold
-grid_cross <- llm_grid(
-  .label_cols    = "ClassDetailed",     # the headline task
-  .models        = .lP$Param$Models,    # same models
-  .guidance      = .lP$Param$Guidance,  # same guidance as the blind tier
-  .shots         = .lP$Param$Shots,     # examples per category, drawn from the complement folds
-  .n_chars       = .lP$Param$NChars,    # same window
-  .allow_abstain = .lP$Param$Abstain,   # same refusal regime, so the tiers compare
-  .think         = .lP$Param$Think,     # same reasoning regime
-  .tier          = "crossfold"          # examples from the complement; entitled to every fold
-)
-
 grid_cross |>
-  dplyr::select(Model, Guidance, Shots, Window = NChars, Abstain = AllowAbstain, Think) |>
+  dplyr::select(Task = LabelCol, Model, Guidance, Shots, Window = NChars, Abstain = AllowAbstain,
+                Think) |>
   tbl_say(.title = paste0("Cross-fold grid: ", nrow(grid_cross), " configurations"))
 ```
 
@@ -578,19 +632,13 @@ here: the cross-fold tier does the same job honestly on every fold, and supersed
 originally carrying. What remains is the comparison that needs a single held-out fold, and the gap
 between it and the blind arm is what development-with-hindsight is worth on this task.
 
-```{r}
-#| label: grid-tuned
-grid_tuned <- llm_grid(
-  .label_cols    = "ClassDetailed",      # same task
-  .models        = .lP$Param$Models,     # same models
-  .guidance      = .lP$Param$Guidance,   # whatever guidance the blind tier had available
-  .shots         = .lP$Param$Shots,      # worked examples, drawn from folds 1-4 only
-  .n_chars       = .lP$Param$NChars,     # same window
-  .allow_abstain = .lP$Param$Abstain,    # matched to the blind tier, or the tiers are not comparable
-  .think         = .lP$Param$Think,      # same regime as the blind tier, so the tiers compare
-  .tier          = "tuned"               # holdout fold only
-)
+The grid was built with the others so the cost projection could price it. It stays on the detailed
+taxonomy: this tier measures what development-with-hindsight is worth against the blind arm, which is
+a claim about method rather than about a taxonomy, and no tuned configuration can enter the router on
+any task whatever it scores.
 
+```{r}
+#| label: robustness-sweep-tuned
 llm_sweep(
   .grid          = grid_tuned,             # configurations to run
   .tab_prep      = tab_prep,               # prepared sample

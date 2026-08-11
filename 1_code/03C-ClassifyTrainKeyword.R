@@ -269,16 +269,27 @@ kw_mine_sweep <- function(.grid, .path_data, .mines_root, .python, .script,
 #' Reads manifests rather than parsing directory names, so a change to the naming scheme cannot
 #' silently mislabel a run.
 #'
+#' MINED CELLS BY DEFAULT. The manual mines written for the generated arm sit under the same root and
+#' carry the same axes -- task, source, window, n-gram order, stopword regime -- so any filter naming
+#' those axes and not the mode collects both. That costs nothing on a fresh tree, because the manual
+#' mines do not exist at the moment the index is built, and it silently changes the published tables
+#' on every render after the first, when they do. A bug that appears only on the second run is one
+#' that appears only in someone else's hands. The default is therefore the safe set, and a caller
+#' wanting the written-list mines has to name them.
+#'
 #' @param .mines_root Mines directory.
+#' @param .mode Mine mode to return: "mine", "manual", or NULL for both.
 #' @return Tibble, one row per mine, ordered by task then configuration.
-kw_mine_index <- function(.mines_root) {
-  if (FALSE) .mines_root <- .lP$Output$Mines
-
+kw_mine_index <- function(.mines_root, .mode = "mine") {
+  if (FALSE) {
+    .mines_root <- .lP$Output$Mines
+    .mode       <- "mine"
+  }
   paths_ <- fs::dir_ls(.mines_root, recurse = TRUE, glob = "*mine.json")
   paths_ <- paths_[!grepl("_smoke", paths_, fixed = TRUE)]
   if (length(paths_) == 0L) cli::cli_abort("No mine.json found under {(.mines_root)}")
 
-  purrr::map(paths_, function(.p) {
+  idx_ <- purrr::map(paths_, function(.p) {
     m_ <- jsonlite::read_json(.p, simplifyVector = TRUE)
     tibble::tibble(
       MineDir   = as.character(fs::path_dir(.p)),
@@ -289,6 +300,10 @@ kw_mine_index <- function(.mines_root) {
       NWords    = as.integer(m_$nwords),
       NgramMax  = as.integer(m_$ngram_range[[2]]),
       Stopwords = m_$stopwords %||% "none",
+      # Read rather than assumed. It is never swept, which is exactly why assuming it is dangerous:
+      # a value nobody varies is a value nobody notices changing, and the applier has to reproduce
+      # the tokenisation the mine was built under or the lexicon fires on different documents.
+      MinTokenLen = as.integer(m_$min_token_len %||% 3L),
       TermsFile = m_$terms_file %||% NA_character_,
       TermsHash = m_$terms_hash %||% NA_character_,
       Fold      = as.integer(m_$test_fold),
@@ -299,9 +314,15 @@ kw_mine_index <- function(.mines_root) {
       MineSec   = as.numeric(m_$duration_sec)
     )
   }) |>
-    purrr::list_rbind() |>
+    purrr::list_rbind()
+
+  # Explicit rather than a recycled condition inside filter(). This function is the one that got the
+  # mode wrong; it is not the place to be clever about how the correction is expressed.
+  if (!is.null(.mode)) idx_ <- idx_ |> dplyr::filter(.data$Mode %in% .mode)
+
+  idx_ |>
     dplyr::arrange(.data$LabelCol, .data$Source, .data$Stopwords, .data$NWords, .data$NgramMax,
-                   .data$Fold)
+                   .data$MinTokenLen, .data$Fold)
 }
 
 #' Load one mine's artifacts
@@ -511,28 +532,203 @@ kw_select_grid <- function(.min_precision = 0.95,
 
 
 # 3. Decision: turning a lexicon into labels ---------------------------------------------------------------------------
+# Two functions produce hits and one function consumes them. kw_hits_mine reads the incidence table
+# the miner already wrote, which is free and is what the sweeps use; kw_hits_engine computes incidence
+# for documents no mine has ever seen, which is what a corpus pass needs. They return the same four
+# columns, and kw_decide cannot tell which produced its input. That is the point: the rule that
+# decides a label is written once, so a table's measured precision and its applied precision are the
+# same quantity rather than two similar ones.
 
-#' Term hits on the held-out fold, independent of the threshold
+#' The decision rule a task's keyword arm runs under
+#'
+#' Amendment is structurally unlike the taxonomies. An original contract is defined by the ABSENCE of
+#' amendment language, so there is no argument-maximum across classes to take and nothing to abstain
+#' into: a document firing no term is evidence for Original, not evidence for nothing. The rule is
+#' therefore binary, and a multiclass rule applied to it would label most of the corpus as undecided
+#' and report a coverage figure that describes the rule rather than the contracts.
+#'
+#' Defined here because two stages need it. Measurement calls it directly; deployment reads it out of
+#' the published catalogue, which is written from it. Stated twice, the two would eventually disagree
+#' about what a no-hit document means, and the disagreement would surface as an applied accuracy that
+#' does not reproduce the published one -- with nothing anywhere reporting a fault.
+#'
+#' @param .label_col Character. Task.
+#' @return List with Mode and PositiveClass; PositiveClass is NA outside binary mode.
+kw_mode <- function(.label_col) {
+  if (FALSE) .label_col <- "AmendType"
+  if (identical(.label_col, "AmendType")) {
+    list(Mode = "binary", PositiveClass = "Amended")
+  } else {
+    list(Mode = "multiclass", PositiveClass = NA_character_)
+  }
+}
+
+#' Term hits on a mine's held-out fold, independent of the threshold
 #'
 #' Computed once per lexicon so that an entire threshold curve costs one join. A term can belong to
 #' more than one class lexicon, hence the many-to-many relationship.
 #'
+#' THE INDEX CONVERSION HAPPENS HERE AND NOWHERE ELSE. DocIdx is the mine's own row index, written
+#' zero-based by the miner and converted on load; DocID is the document's real identifier. They are
+#' not interchangeable and are never both in flight downstream, because a rename that collapsed one
+#' into the other would destroy exactly the mapping this join depends on while leaving code that
+#' still runs.
+#'
 #' @param .lexicon Output of kw_select.
 #' @param .mine Loaded mine carrying a held-out fold.
-#' @return Tibble with DocIdx, Class, Term, Power.
-kw_hits <- function(.lexicon, .mine) {
+#' @return Tibble with DocID, Class, Term, Power.
+kw_hits_mine <- function(.lexicon, .mine) {
   if (FALSE) {
     .mine    <- kw_load_mine(.mine_dir = idx_mine$MineDir[[1]])
     .lexicon <- kw_select(.mine = .mine)
   }
   if (is.null(.mine$IncTest)) cli::cli_abort("This mine holds nothing out; there is no fold to score")
 
-  .mine$IncTest |>
+  out_ <- .mine$IncTest |>
     dplyr::inner_join(
       .lexicon |> dplyr::select(Class, Term, Power),
       by           = dplyr::join_by(Term),
       relationship = "many-to-many"
+    ) |>
+    # Left rather than inner, so an index the document table does not hold is an abort rather than a
+    # silent shortfall. An inner join here would quietly drop those hits, and the only symptom would
+    # be a coverage figure slightly lower than it should be -- which is indistinguishable from a
+    # lexicon that simply fires less often.
+    dplyr::left_join(
+      .mine$DocsTest |> dplyr::select(DocIdx, DocID),
+      by = dplyr::join_by(DocIdx)
     )
+
+  n_lost_ <- sum(is.na(out_$DocID))
+  if (n_lost_ > 0L) {
+    cli::cli_abort(c(
+      "{n_lost_} hit{?s} name{?s/} a row index this mine's held-out document table does not hold.",
+      "i" = "The incidence table and the document table travelled separately, so the join is no \\
+             longer the mapping it appears to be."
+    ))
+  }
+  out_ |> dplyr::select(DocID, Class, Term, Power)
+}
+
+#' Term hits from the engine, for documents no mine has seen
+#'
+#' Shells out to keyword_apply.py, which matches under the analyzer the miner used. The tokenisation
+#' cannot be reproduced on this side: terms are n-grams formed AFTER stopword removal, so a term mined
+#' as "corporation borrower" came from "the corporation and the borrower" and cannot be found by
+#' looking for it literally. A hand-written substring search over raw text under-matches a published
+#' table badly and reports nothing while doing it, which is why matching lives in one place and that
+#' place is Python.
+#'
+#' What crosses the seam is (DocID, Term) and nothing else. The engine knows nothing of classes,
+#' thresholds or labels; those are the decision, and the decision is kw_decide. Returning finished
+#' predictions instead would put a second copy of the rule behind the seam and recreate the problem
+#' one layer up.
+#'
+#' @param .lexicon Published table or selected lexicon, carrying Class, Term and Power.
+#' @param .docs Documents to score, carrying .doc_col and the text column implied by .source.
+#' @param .source Field the table was mined against: text or docdesc.
+#' @param .n_words Truncation window in whitespace words; 0 reads the whole document.
+#' @param .stopwords Stopword regime the table was mined under.
+#' @param .min_token_len Shortest alphabetic token kept.
+#' @param .python,.script Interpreter and keyword_apply.py.
+#' @param .doc_col,.text_col,.desc_col Column names in .docs.
+#' @param .out_dir Scratch directory for the parquet seam.
+#' @return Tibble with DocID, Class, Term, Power.
+kw_hits_engine <- function(.lexicon, .docs, .source, .n_words, .stopwords, .min_token_len,
+                           .python, .script,
+                           .doc_col  = "DocID",
+                           .text_col = "Text",
+                           .desc_col = "DocDesc",
+                           .out_dir  = fs::path(tempdir(), "kw-apply")) {
+  if (FALSE) {
+    .lexicon       <- pubs[[1]]$Lexicon
+    .docs          <- dplyr::slice_head(tab_prepared, n = 100L)
+    .source        <- "text"
+    .n_words       <- 512L
+    .stopwords     <- "none"
+    .min_token_len <- 3L
+    .python        <- .lP$Engine$Python
+    .script        <- .lP$Engine$ScriptApply
+    .doc_col       <- "DocID"
+    .text_col      <- "Text"
+    .desc_col      <- "DocDesc"
+    .out_dir       <- fs::path(tempdir(), "kw-apply")
+  }
+  if (!fs::file_exists(.python)) {
+    cli::cli_abort(c(
+      "No Python interpreter at {(.python)}.",
+      "i" = "The mining sweep runs through {.path contracts-engine/.venv/bin/python}; the applier \\
+             must run through the same one, or it is a different tokenisation."
+    ))
+  }
+  if (!fs::file_exists(.script)) {
+    cli::cli_abort(c(
+      "No applier script at {(.script)}.",
+      "i" = "Expected {.path contracts-engine/keyword_apply.py}, the companion to keyword_train.py."
+    ))
+  }
+  text_col_ <- if (identical(.source, "docdesc")) .desc_col else .text_col
+  need_     <- c(.doc_col, text_col_)
+  miss_     <- setdiff(need_, names(.docs))
+  if (length(miss_) > 0L) cli::cli_abort("The documents carry no {miss_} column.")
+
+  fs::dir_create(.out_dir)
+  lex_in_  <- fs::path(.out_dir, "lexicon.parquet")
+  doc_in_  <- fs::path(.out_dir, "docs.parquet")
+  hits_out_ <- fs::path(.out_dir, "hits.parquet")
+
+  # Distinct terms, because the engine matches a vocabulary and a term belonging to two classes is one
+  # vocabulary entry. The class and its Power are joined back afterwards, which is also where the
+  # many-to-many relationship belongs.
+  .lexicon |>
+    dplyr::distinct(Term) |>
+    arrow::write_parquet(lex_in_)
+  .docs |>
+    dplyr::select(dplyr::all_of(c(.doc_col, text_col_))) |>
+    arrow::write_parquet(doc_in_)
+
+  args_ <- c(
+    .script,
+    "--lexicon",       as.character(lex_in_),
+    "--data",          as.character(doc_in_),
+    "--out",           as.character(hits_out_),
+    "--doc-col",       .doc_col,
+    "--text-col",      .text_col,
+    "--desc-col",      .desc_col,
+    "--source",        .source,
+    "--nwords",        as.character(as.integer(.n_words)),
+    "--stopwords",     .stopwords,
+    "--min-token-len", as.character(as.integer(.min_token_len))
+  )
+
+  # Captured rather than echoed. The child writes progress and warnings on both streams, and letting
+  # them through redraws over any progress bar this is called under; capturing also means the output
+  # is available to quote when the call fails, where otherwise it has already scrolled past.
+  out_lines_ <- suppressWarnings(
+    system2(.python, args = args_, stdout = TRUE, stderr = TRUE)
+  )
+  status_ <- attr(out_lines_, "status")
+  if (!is.null(status_) && !identical(as.integer(status_), 0L)) {
+    cli::cli_abort(c(
+      "The keyword applier failed (exit {status_}).",
+      "i" = "Last lines from the engine:",
+      utils::tail(out_lines_, 10L)
+    ))
+  }
+
+  hits_ <- arrow::read_parquet(hits_out_)
+  if (nrow(hits_) == 0L) {
+    return(tibble::tibble(DocID = character(), Class = character(), Term = character(),
+                          Power = numeric()))
+  }
+  hits_ |>
+    dplyr::transmute(DocID = as.character(.data$DocID), Term = as.character(.data$Term)) |>
+    dplyr::inner_join(
+      .lexicon |> dplyr::select(Class, Term, Power),
+      by           = dplyr::join_by(Term),
+      relationship = "many-to-many"
+    ) |>
+    dplyr::select(DocID, Class, Term, Power)
 }
 
 #' Assign labels from term hits at one threshold
@@ -547,83 +743,126 @@ kw_hits <- function(.lexicon, .mine) {
 #' argument-maximum rule does not apply. The positive class is predicted where any of its terms
 #' clears the threshold and the other label otherwise, with no abstention.
 #'
-#' @param .hits Output of kw_hits.
-#' @param .mine Loaded mine; its held-out documents supply the universe and the truth.
+#' THE DOCUMENT UNIVERSE IS SUPPLIED, NOT DISCOVERED. Measurement passes a fold's held-out rows and
+#' the classes the training folds carried; deployment passes a corpus chunk and the classes the
+#' manifest pins. Reading either off a mine would tie the rule to an object a corpus pass does not
+#' have, and the rule has to be the same one in both places or the published precision describes a
+#' system nobody runs.
+#'
+#' Truth is optional. A corpus document has no label, and NA is what unknown looks like; branching the
+#' output schema on whether labels exist would give the two stages different columns to reconcile.
+#'
+#' @param .hits Output of kw_hits_mine or kw_hits_engine.
+#' @param .docs Documents to decide over, carrying DocID and optionally Label.
+#' @param .classes Character vector of the classes in play.
 #' @param .tau Power threshold, acting as the evidence gate.
 #' @param .mode Decision rule to apply.
 #' @param .positive_class Class predicted on any hit, required in binary mode.
+#' @param .probs Logical. TRUE returns the per-class score table, which is one row per document per
+#'   class and therefore the expensive part of this function at corpus scale.
 #' @param .none Abstention sentinel.
-#' @return List with Pred (one row per document) and Prob (one row per document and class).
-kw_decide <- function(.hits, .mine,
+#' @return List with Pred (one row per document, carrying the runner-up) and Prob (one row per
+#'   document and class, empty when .probs is FALSE).
+kw_decide <- function(.hits, .docs, .classes,
                       .tau            = 0.70,
                       .mode           = c("multiclass", "binary"),
                       .positive_class = NULL,
+                      .probs          = TRUE,
                       .none           = KW_NONE) {
   if (FALSE) {
     .mine           <- kw_load_mine(.mine_dir = idx_mine$MineDir[[1]])
-    .hits           <- kw_hits(.lexicon = kw_select(.mine = .mine), .mine = .mine)
+    .hits           <- kw_hits_mine(.lexicon = kw_select(.mine = .mine), .mine = .mine)
+    .docs           <- .mine$DocsTest
+    .classes        <- sort(unique(.mine$DocsTrain$Label))
     .tau            <- 0.70
     .mode           <- "multiclass"
     .positive_class <- NULL
+    .probs          <- TRUE
     .none           <- KW_NONE
   }
-  .mode    <- match.arg(.mode)
-  docs_    <- .mine$DocsTest
-  classes_ <- sort(unique(.mine$DocsTrain$Label))
+  .mode <- match.arg(.mode)
+  docs_ <- .docs
+  if (!"Label" %in% names(docs_)) docs_$Label <- NA_character_
 
   best_ <- .hits |>
     dplyr::filter(.data$Power >= .tau) |>
-    dplyr::arrange(.data$DocIdx, .data$Class, dplyr::desc(.data$Power), .data$Term) |>
-    dplyr::distinct(DocIdx, Class, .keep_all = TRUE)
+    dplyr::arrange(.data$DocID, .data$Class, dplyr::desc(.data$Power), .data$Term) |>
+    dplyr::distinct(DocID, Class, .keep_all = TRUE)
 
-  prob_ <- tidyr::expand_grid(DocIdx = docs_$DocIdx, Class = classes_) |>
-    dplyr::left_join(best_ |> dplyr::select(DocIdx, Class, Power), by = dplyr::join_by(DocIdx, Class)) |>
-    dplyr::mutate(Prob = dplyr::coalesce(.data$Power, 0)) |>
-    dplyr::left_join(docs_ |> dplyr::select(DocIdx, DocID), by = dplyr::join_by(DocIdx)) |>
-    dplyr::select(DocID, Class, Prob)
+  prob_ <- if (.probs) {
+    tidyr::expand_grid(DocID = docs_$DocID, Class = .classes) |>
+      dplyr::left_join(best_ |> dplyr::select(DocID, Class, Power),
+                       by = dplyr::join_by(DocID, Class)) |>
+      dplyr::mutate(Prob = dplyr::coalesce(.data$Power, 0)) |>
+      dplyr::select(DocID, Class, Prob)
+  } else {
+    tibble::tibble(DocID = character(), Class = character(), Prob = numeric())
+  }
 
   if (.mode == "binary") {
-    if (is.null(.positive_class)) cli::cli_abort("Binary mode requires .positive_class")
-    other_ <- setdiff(classes_, .positive_class)
+    if (is.null(.positive_class) || is.na(.positive_class)) {
+      cli::cli_abort("Binary mode requires .positive_class")
+    }
+    other_ <- setdiff(.classes, .positive_class)
     if (length(other_) != 1L) cli::cli_abort("Binary mode expects exactly two classes")
 
     pred_ <- docs_ |>
       dplyr::left_join(
         best_ |> dplyr::filter(.data$Class == .positive_class) |>
-          dplyr::select(DocIdx, PosPower = Power, PosTerm = Term),
-        by = dplyr::join_by(DocIdx)
+          dplyr::select(DocID, PosPower = Power, PosTerm = Term),
+        by = dplyr::join_by(DocID)
       ) |>
       dplyr::mutate(
         PredLabel = dplyr::if_else(!is.na(.data$PosPower), .positive_class, other_),
         Score     = dplyr::coalesce(.data$PosPower, 0),
-        TopTerm   = .data$PosTerm
+        TopTerm   = .data$PosTerm,
+        # NO RUNNER-UP EXISTS HERE. The rule is not an argument-maximum across classes: the negative
+        # label is assigned by absence of evidence, so naming it as a second choice with a score would
+        # report a comparison that was never made. NA is what "this rule does not produce one" looks
+        # like, and it is distinguishable from a class that genuinely scored zero.
+        Pred2     = NA_character_,
+        Score2    = NA_real_
       ) |>
-      dplyr::select(DocID, TrueLabel = Label, PredLabel, Score, TopTerm)
+      dplyr::select(DocID, TrueLabel = Label, PredLabel, Score, TopTerm, Pred2, Score2)
 
     return(list(Pred = pred_, Prob = prob_))
   }
 
-  top_ <- best_ |>
+  # Ranked by CLASS, not by term. A document matching four terms of one category and one of another
+  # has two candidate classes, not five candidate terms, and the runner-up worth recording is the
+  # second class.
+  ranked_ <- best_ |>
+    dplyr::arrange(.data$DocID, dplyr::desc(.data$Power), .data$Class) |>
     dplyr::mutate(
       MaxPower = max(.data$Power),
       nTied    = sum(.data$Power == max(.data$Power)),
-      .by = DocIdx
+      Rank     = dplyr::row_number(),
+      .by = DocID
     ) |>
-    dplyr::arrange(.data$DocIdx, dplyr::desc(.data$Power), .data$Class) |>
-    dplyr::distinct(DocIdx, .keep_all = TRUE)
+    dplyr::filter(.data$Rank <= 2L)
 
   pred_ <- docs_ |>
     dplyr::left_join(
-      top_ |> dplyr::select(DocIdx, WinClass = Class, WinTerm = Term, MaxPower, nTied),
-      by = dplyr::join_by(DocIdx)
+      ranked_ |> dplyr::filter(.data$Rank == 1L) |>
+        dplyr::select(DocID, WinClass = Class, WinTerm = Term, MaxPower, nTied),
+      by = dplyr::join_by(DocID)
+    ) |>
+    dplyr::left_join(
+      ranked_ |> dplyr::filter(.data$Rank == 2L) |>
+        dplyr::select(DocID, NextClass = Class, NextPower = Power),
+      by = dplyr::join_by(DocID)
     ) |>
     dplyr::mutate(
       Committed = !is.na(.data$MaxPower) & .data$nTied == 1L,
       PredLabel = dplyr::if_else(.data$Committed, .data$WinClass, .none),
       Score     = dplyr::if_else(.data$Committed, .data$MaxPower, 0),
-      TopTerm   = dplyr::if_else(.data$Committed, .data$WinTerm, NA_character_)
+      TopTerm   = dplyr::if_else(.data$Committed, .data$WinTerm, NA_character_),
+      # Carried only where the document committed. An abstention has no first choice, so reporting a
+      # second one would invite a reader to break the tie the rule declined to break.
+      Pred2     = dplyr::if_else(.data$Committed, .data$NextClass, NA_character_),
+      Score2    = dplyr::if_else(.data$Committed, .data$NextPower, NA_real_)
     ) |>
-    dplyr::select(DocID, TrueLabel = Label, PredLabel, Score, TopTerm)
+    dplyr::select(DocID, TrueLabel = Label, PredLabel, Score, TopTerm, Pred2, Score2)
 
   list(Pred = pred_, Prob = prob_)
 }
@@ -636,16 +875,22 @@ kw_decide <- function(.hits, .mine,
 #' Encodes every axis that varied, so the shared leaderboard -- which keys on this string -- ranks
 #' keyword and transformer configurations side by side without knowing their axes differ.
 #'
+#' EVERY SELECTION AXIS APPEARS. An axis omitted from this name is an axis two configurations can
+#' differ on while sharing an identifier, and the run folder is named from it -- so the second write
+#' lands in the first one's directory and replaces results nobody asked to replace. The evidence
+#' floors were previously absent, which was harmless only while nothing varied them; the published
+#' tables vary them, because their floors are chosen per task rather than swept.
+#'
 #' @param .label_col,.source,.nwords,.ngram_max,.stopwords Mining axes.
-#' @param .min_precision,.min_reach,.max_terms Selection axes.
+#' @param .min_precision,.min_hits,.min_tot,.min_reach,.max_terms Selection axes.
 #' @param .tau Power threshold.
 #' @param .seed Stamped for parity.
 #' @param .terms_tag Optional short tag identifying a supplied term list. Mined runs pass NULL and
 #'   keep their existing names; only runs scored from a written list are distinguished by it.
 #' @return Character scalar.
 kw_config_name <- function(.label_col, .source, .nwords, .ngram_max, .stopwords,
-                           .min_precision, .min_reach, .max_terms, .tau, .seed = 42L,
-                           .terms_tag = NULL) {
+                           .min_precision, .min_hits, .min_tot, .min_reach, .max_terms, .tau,
+                           .seed = 42L, .terms_tag = NULL) {
   if (FALSE) {
     .label_col     <- "ClassDetailed"
     .source        <- "text"
@@ -653,6 +898,8 @@ kw_config_name <- function(.label_col, .source, .nwords, .ngram_max, .stopwords,
     .ngram_max     <- 3L
     .stopwords     <- "none"
     .min_precision <- 0.95
+    .min_hits      <- 5L
+    .min_tot       <- 5L
     .min_reach     <- 0.01
     .max_terms     <- 25L
     .tau           <- 0.70
@@ -665,6 +912,8 @@ kw_config_name <- function(.label_col, .source, .nwords, .ngram_max, .stopwords,
     .label_col, "__keyword-", .source, "__",
     "W", window_, "_N", .ngram_max, "_SW", sw_,
     "_P", sprintf("%02d", round(.min_precision * 100)),
+    "_H", as.integer(.min_hits),
+    "_C", as.integer(.min_tot),
     "_R", sprintf("%03d", round(.min_reach * 1000)),
     "_M", .max_terms,
     "_T", sprintf("%02d", round(.tau * 100)),
@@ -709,9 +958,13 @@ kw_evaluate <- function(.mine,
   man_ <- .mine$Manifest
   if (is.null(.mine$IncTest)) cli::cli_abort("An all-data mine holds nothing out and cannot be scored")
 
-  binary_ <- identical(man_$label_col, "AmendType")
-  pos_    <- if (binary_) "Amended" else NULL
-  t0_     <- Sys.time()
+  # The rule comes from kw_mode rather than from a test on the task name here, so measurement and
+  # deployment cannot end up running different rules on the same task.
+  mode_    <- kw_mode(.label_col = man_$label_col)
+  binary_  <- identical(mode_$Mode, "binary")
+  pos_     <- if (binary_) mode_$PositiveClass else NULL
+  classes_ <- sort(unique(.mine$DocsTrain$Label))
+  t0_      <- Sys.time()
 
   lex_ <- kw_select(
     .mine            = .mine,
@@ -727,21 +980,30 @@ kw_evaluate <- function(.mine,
   lex_tau_ <- lex_ |> dplyr::filter(.data$Power >= .tau)
 
   if (nrow(lex_tau_) == 0L) {
+    # The negative label is whichever class is not the positive one, read off the training folds. An
+    # empty lexicon under the binary rule predicts it everywhere, which is a real prediction and
+    # scores as one; under the multiclass rule the same table decides nothing and abstains.
+    none_ <- if (binary_) setdiff(classes_, pos_) else KW_NONE
     pred_ <- .mine$DocsTest |>
       dplyr::transmute(
         DocID, TrueLabel = Label,
-        PredLabel = if (binary_) "Original" else KW_NONE,
+        PredLabel = none_,
         Score     = 0,
-        TopTerm   = NA_character_
+        TopTerm   = NA_character_,
+        Pred2     = NA_character_,
+        Score2    = NA_real_
       )
     prob_ <- tibble::tibble(DocID = character(), Class = character(), Prob = numeric())
   } else {
     dec_  <- kw_decide(
-      .hits           = kw_hits(.lexicon = lex_, .mine = .mine),
-      .mine           = .mine,
+      .hits           = kw_hits_mine(.lexicon = lex_, .mine = .mine),
+      .docs           = .mine$DocsTest |> dplyr::select(DocID, Label),
+      .classes        = classes_,
       .tau            = .tau,
-      .mode           = if (binary_) "binary" else "multiclass",
-      .positive_class = pos_
+      .mode           = mode_$Mode,
+      .positive_class = pos_,
+      .probs          = TRUE,
+      .none           = KW_NONE
     )
     pred_ <- dec_$Pred
     prob_ <- dec_$Prob
@@ -754,6 +1016,8 @@ kw_evaluate <- function(.mine,
     .ngram_max     = man_$ngram_range[[2]],
     .stopwords     = man_$stopwords %||% "none",
     .min_precision = .min_precision,
+    .min_hits      = .min_hits,
+    .min_tot       = .min_tot,
     .min_reach     = .min_reach,
     .max_terms     = .max_terms,
     .tau           = .tau,
@@ -969,11 +1233,13 @@ kw_tau_curve <- function(.mine_dirs, .taus = seq(0.40, 0.96, by = 0.02), ...) {
   prepped_ <- purrr::map(.mine_dirs, function(.d) {
     mine_ <- kw_load_mine(.mine_dir = .d)
     lex_  <- kw_select(.mine = mine_, ...)
+    mode_ <- kw_mode(.label_col = mine_$Manifest$label_col)
     list(
-      Mine   = mine_,
-      Lex    = lex_,
-      Hits   = kw_hits(.lexicon = lex_, .mine = mine_),
-      Binary = identical(mine_$Manifest$label_col, "AmendType")
+      Lex     = lex_,
+      Hits    = kw_hits_mine(.lexicon = lex_, .mine = mine_),
+      Docs    = mine_$DocsTest |> dplyr::select(DocID, Label),
+      Classes = sort(unique(mine_$DocsTrain$Label)),
+      Mode    = mode_
     )
   })
 
@@ -981,10 +1247,16 @@ kw_tau_curve <- function(.mine_dirs, .taus = seq(0.40, 0.96, by = 0.02), ...) {
     pred_ <- purrr::map(prepped_, function(.p) {
       kw_decide(
         .hits           = .p$Hits,
-        .mine           = .p$Mine,
+        .docs           = .p$Docs,
+        .classes        = .p$Classes,
         .tau            = .t,
-        .mode           = if (.p$Binary) "binary" else "multiclass",
-        .positive_class = if (.p$Binary) "Amended" else NULL
+        .mode           = .p$Mode$Mode,
+        .positive_class = if (identical(.p$Mode$Mode, "binary")) .p$Mode$PositiveClass else NULL,
+        # The curve reads precision, coverage and breadth off the predictions. The per-class score
+        # table is one row per document per class per threshold and is never consulted here, so
+        # building it would multiply the cost of the sweep by the number of categories for nothing.
+        .probs          = FALSE,
+        .none           = KW_NONE
       )$Pred
     }) |>
       purrr::list_rbind()
@@ -1056,6 +1328,260 @@ kw_operating_point <- function(.curve, .target_precision = 0.95, .tolerance = 0.
   .curve |>
     dplyr::filter(!is.na(.data$SelPrecision), .data$Coverage > 0) |>
     dplyr::slice_max(.data$SelPrecision, n = 1L, with_ties = FALSE)
+}
+
+#' The mining cells behind one published table
+#'
+#' Resolves task and window to the fold mines that estimate the table and the all-data mine that
+#' produces it, holding the n-gram order, stopword regime and source at the values the mining sweep
+#' crowned.
+#'
+#' WRITTEN ONCE BECAUSE IT WAS WRITTEN TWICE. The publication step and the threshold probe both need
+#' this filter, and a filter stated in two places is two places that have to agree about which axes
+#' identify a cell. The axes not named here are the ones that matter: mode, because the manual mines
+#' of the generated arm share every axis that is named, and token length, because nothing varies it
+#' and so nobody watches it.
+#'
+#' @param .label_col,.n_words,.source Table to resolve.
+#' @param .idx_mine Mining index.
+#' @param .cfg_mine Crowned mining configuration per task and source.
+#' @return List: Cells, Dirs, DirAll, NgramMax, Stopwords, MinTokenLen.
+kw_publish_cells <- function(.label_col, .n_words, .idx_mine, .cfg_mine, .source = "text") {
+  if (FALSE) {
+    .label_col <- "ClassBroad"
+    .n_words   <- 512L
+    .idx_mine  <- idx_mine
+    .cfg_mine  <- cfg_mine
+    .source    <- "text"
+  }
+  cfg_ <- .cfg_mine |> dplyr::filter(.data$LabelCol == .label_col, .data$Source == .source)
+  if (nrow(cfg_) == 0L) {
+    cli::cli_abort("No crowned mining configuration for {(.label_col)} on {(.source)}.")
+  }
+
+  cells_ <- .idx_mine |>
+    dplyr::filter(
+      .data$LabelCol  == .label_col,
+      .data$Source    == .source,
+      .data$NWords    == .n_words,
+      .data$NgramMax  == cfg_$NgramMax[[1]],
+      .data$Stopwords == cfg_$Stopwords[[1]]
+    )
+  dirs_    <- cells_ |> dplyr::filter(.data$Fold > 0L) |> dplyr::pull(MineDir)
+  dir_all_ <- cells_ |> dplyr::filter(.data$Fold == 0L) |> dplyr::pull(MineDir)
+  if (length(dirs_) == 0L || length(dir_all_) == 0L) {
+    cli::cli_abort("No mines for {(.label_col)} at window {(.n_words)} on {(.source)}.")
+  }
+  if (length(dir_all_) > 1L) {
+    cli::cli_abort("{length(dir_all_)} all-data mines match {(.label_col)} at window {(.n_words)}.")
+  }
+
+  # ONE MINE PER FOLD, ASSERTED STRUCTURALLY. A fold appearing twice means the axes above do not
+  # identify a cell, whatever the reason -- and the consequences do not announce themselves: the
+  # threshold curve pools two populations, the fold-agreement filter counts one fold twice, and the
+  # published table changes without anything reporting that it did.
+  dup_ <- cells_ |>
+    dplyr::filter(.data$Fold > 0L) |>
+    dplyr::summarise(n = dplyr::n(), .by = Fold) |>
+    dplyr::filter(.data$n > 1L)
+  if (nrow(dup_) > 0L) {
+    cli::cli_abort(c(
+      "More than one mine matches {(.label_col)} at window {(.n_words)} for fold{?s} {dup_$Fold}.",
+      "i" = "Mines matching: {cells_$MineName[cells_$Fold %in% dup_$Fold]}"
+    ))
+  }
+
+  # The token length is not one of the axes this filter selects on, because it has never been varied.
+  # That is precisely why it is checked: an unvaried parameter is one nobody watches, and two mines
+  # differing only on it would be pooled here into a table whose terms were formed under two
+  # tokenisations while the catalogue pinned one of them.
+  tl_ <- unique(cells_$MinTokenLen)
+  if (length(tl_) != 1L) {
+    cli::cli_abort(c(
+      "The mines for {(.label_col)} at window {(.n_words)} disagree on the minimum token length: {tl_}.",
+      "i" = "Publishing across them would pin one tokenisation for terms formed under several."
+    ))
+  }
+
+  list(
+    Cells = cells_, Dirs = dirs_, DirAll = dir_all_,
+    NgramMax = cfg_$NgramMax[[1]], Stopwords = cfg_$Stopwords[[1]],
+    MinTokenLen = as.integer(tl_)
+  )
+}
+
+#' Does the threshold grid's lower edge decide the operating point
+#'
+#' A grid is a choice about where to look, and an optimum sitting on its edge was not found by the
+#' rule -- it was imposed by the edge. That is easy to miss where the rule's tiebreak reaches the
+#' threshold last: under the binary rule coverage is one by construction, so most categories and
+#' widest coverage are ties for every threshold and the lowest one always wins. The reported optimum
+#' is then the smallest number offered, and it would move if a smaller one were offered.
+#'
+#' Traces the curve below the published floor and selects twice from the one curve: once restricted to
+#' the thresholds actually published, once over the whole extension. Where the two agree the floor is
+#' documentation; where they differ it is a parameter, and one nobody set deliberately.
+#'
+#' This REPORTS rather than decides. Extending the grid would change a published artifact, which is
+#' not a change to make as a side effect of checking whether it should be made.
+#'
+#' @param .label_col,.n_words,.source Table to probe.
+#' @param .idx_mine,.cfg_mine Mining index and the crowned cell naming the held axes.
+#' @param .floors One-row tibble from kw_task_floors().
+#' @param .target_precision,.min_classes,.tolerance Acceptance rule, as published.
+#' @param .taus_published Thresholds the published table was chosen from.
+#' @param .taus_extended Thresholds to trace, which must contain .taus_published.
+#' @return Two-row tibble: Grid, Tau, Terms, Classes, Coverage, SelPrecision, F1_macro, plus Binds.
+kw_tau_floor_probe <- function(.label_col, .n_words, .idx_mine, .cfg_mine, .floors,
+                               .target_precision, .min_classes,
+                               .taus_published, .taus_extended,
+                               .tolerance = 0.01, .source = "text") {
+  if (FALSE) {
+    .label_col        <- "AmendType"
+    .n_words          <- 256L
+    .idx_mine         <- idx_mine
+    .cfg_mine         <- cfg_mine
+    .floors           <- floors_task[["AmendType"]]
+    .target_precision <- 0.85
+    .min_classes      <- 2L
+    .taus_published   <- seq(0.40, 0.96, by = 0.02)
+    .taus_extended    <- seq(0.10, 0.96, by = 0.02)
+    .tolerance        <- 0.01
+    .source           <- "text"
+  }
+  # THRESHOLDS ARE COMPARED ON A FIXED INTEGER SCALE, NOT AS DOUBLES. Two seq() calls reaching the
+  # same nominal threshold from different starting points disagree in the last place -- 11 of the 29
+  # published values here do -- so comparing by value either refuses a legal pair of grids or, far
+  # worse, quietly keeps two thirds of the rows and selects an operating point from a curve with holes
+  # in it. The scale is fixed rather than tolerance-based because the grid is decimal by construction.
+  key_      <- function(.x) as.integer(round(.x * 1e4))
+  pub_key_  <- key_(.taus_published)
+  ext_key_  <- key_(.taus_extended)
+  n_absent_ <- sum(!pub_key_ %in% ext_key_)
+  if (n_absent_ > 0L) {
+    cli::cli_abort(c(
+      "The extended grid must contain the published one, or the two rows are not comparable.",
+      "i" = "{n_absent_} of {length(pub_key_)} published thresholds are absent from the extension."
+    ))
+  }
+  cells_ <- kw_publish_cells(
+    .label_col = .label_col,
+    .n_words   = .n_words,
+    .idx_mine  = .idx_mine,
+    .cfg_mine  = .cfg_mine,
+    .source    = .source
+  )
+
+  curve_ <- kw_tau_curve(
+    .mine_dirs     = cells_$Dirs,
+    .taus          = .taus_extended,
+    .min_precision = .target_precision,
+    .min_hits      = .floors$MinHits,
+    .min_tot       = .floors$MinTot,
+    .min_reach     = .floors$MinReach,
+    .max_terms     = .floors$MaxTerms
+  )
+
+  pick_ <- function(.c) {
+    kw_operating_point(
+      .curve            = .c,
+      .target_precision = .target_precision,
+      .tolerance        = .tolerance,
+      .min_classes      = .min_classes
+    )
+  }
+  # Asserted rather than trusted. A restriction that silently loses rows produces a curve the rule can
+  # still select from, so the failure arrives as a plausible operating point rather than as an error.
+  curve_pub_ <- curve_ |> dplyr::filter(key_(.data$Tau) %in% pub_key_)
+  if (nrow(curve_pub_) != length(pub_key_)) {
+    cli::cli_abort(c(
+      "Restricting the traced curve to the published grid kept {nrow(curve_pub_)} of \\
+       {length(pub_key_)} thresholds.",
+      "i" = "The curve and the published grid disagree about which thresholds exist."
+    ))
+  }
+  op_pub_ <- pick_(curve_pub_)
+  op_ext_ <- pick_(curve_)
+
+  # A FLOOR BINDS WHEN IT CHANGES THE TABLE, NOT WHEN IT CHANGES THE NUMBER IN THE TAU COLUMN. The
+  # acceptance rule prefers the lowest acceptable threshold, so where a range of thresholds selects
+  # the same lexicon it reports the bottom of that range -- and moves to the new bottom the moment a
+  # lower one is offered, having changed nothing. That happens by construction here: the evidence and
+  # precision gates bound Power from below, since the weakest term that can pass MinHits of 5 at the
+  # promised precision still carries a Wilson bound near 0.5, so every threshold beneath that selects
+  # an identical lexicon. Reported as two facts because they are two: whether the reported threshold
+  # moved, and whether anything followed from it.
+  moves_ <- op_ext_$Tau < op_pub_$Tau
+  binds_ <- moves_ &&
+    !(identical(op_ext_$nTerms, op_pub_$nTerms) &&
+      identical(op_ext_$nClassesHit, op_pub_$nClassesHit) &&
+      isTRUE(all.equal(op_ext_$Coverage, op_pub_$Coverage)) &&
+      isTRUE(all.equal(op_ext_$SelPrecision, op_pub_$SelPrecision)))
+
+  dplyr::bind_rows(
+    op_pub_ |> dplyr::mutate(Grid = "published"),
+    op_ext_ |> dplyr::mutate(Grid = "extended")
+  ) |>
+    dplyr::transmute(
+      Task = .label_col, NWords = as.integer(.n_words), Grid,
+      Tau, Terms = .data$nTerms, Classes = .data$nClassesHit,
+      Coverage, SelPrecision, F1_macro,
+      Moves = moves_, Binds = binds_
+    )
+}
+
+#' Print the threshold-floor probe
+#'
+#' @param .tab Output of kw_tau_floor_probe(), bound across tasks.
+#' @return Invisibly .tab.
+kw_report_tau_floor <- function(.tab) {
+  if (FALSE) .tab <- tab_tau_floor
+  .tab |>
+    dplyr::mutate(
+      Window       = dplyr::if_else(.data$NWords == 0L, "full", as.character(.data$NWords)),
+      Coverage     = tbl_pct(.data$Coverage),
+      SelPrecision = tbl_pct(.data$SelPrecision)
+    ) |>
+    dplyr::select(Task, Window, Grid, Tau, Terms, Classes, Coverage, SelPrecision, F1_macro) |>
+    tbl_say(.title = "Operating point under the published grid and under a wider one")
+  cli::cli_text("")
+
+  ext_    <- .tab |> dplyr::filter(.data$Grid == "extended")
+  n_bind_ <- sum(ext_$Binds)
+  n_move_ <- sum(ext_$Moves)
+
+  if (n_bind_ > 0L) {
+    cli::cli_alert_warning(
+      "{n_bind_} of {nrow(ext_)} tables select a DIFFERENT table when the grid is widened, so the \\
+       published floor is deciding what ships. Read the extended row against the published one: more \\
+       terms at held precision means the floor is costing coverage, and more terms at lower precision \\
+       means it is protecting the promise and should be argued as a floor rather than left looking \\
+       like an optimum."
+    )
+    return(invisible(.tab))
+  }
+
+  if (n_move_ > 0L) {
+    cli::cli_alert_success(
+      "Widening the grid changes no published table. {n_move_} of {nrow(ext_)} report a lower \\
+       threshold and an otherwise identical row, which is the threshold being unidentified rather \\
+       than the floor binding: the evidence and precision gates already bound Power well above the \\
+       floor, so every threshold beneath that selects the same terms and the rule reports the lowest \\
+       of them."
+    )
+    cli::cli_alert_info(
+      "That is the reading of an operating point at 0.40 on a task where coverage is one by \\
+       construction. The threshold is not a corner solution; it is the bottom of a range over which \\
+       nothing varies, and quoting the realised precision rather than the threshold remains the \\
+       right way to describe the table."
+    )
+    return(invisible(.tab))
+  }
+
+  cli::cli_alert_success(
+    "No table reaches the lower edge of either grid, so the floor never entered the decision."
+  )
+  invisible(.tab)
 }
 
 
@@ -1218,9 +1744,8 @@ kw_terms_evaluate <- function(.path_data, .terms_file, .label_col, .source, .nwo
   # task, and the results would be silently averaged across them. The manifest records the list each
   # mine consumed, so the mine is identified by its input rather than by its shape.
   want_ <- as.character(fs::path_abs(.terms_file))
-  idx_  <- kw_mine_index(.mines_root = .mines_root) |>
+  idx_  <- kw_mine_index(.mines_root = .mines_root, .mode = "manual") |>
     dplyr::filter(
-      .data$Mode      == "manual",
       .data$LabelCol  == .label_col,
       .data$Source    == .source,
       .data$NWords    == .nwords,
@@ -1742,7 +2267,8 @@ kw_task_floors <- function(.perf_sel, .label_col, .tolerance = 0.01, .min_covera
 #' @param .tolerance Numeric. Precision band treated as indistinguishable.
 #' @param .min_folds Integer. Fold agreement required of a published term.
 #' @param .source Character. Text field the arm reads.
-#' @return List: LabelCol, NWords, Floors, Curve, Operating, Lexicon.
+#' @return List: LabelCol, NWords, Source, NgramMax, Stopwords, MinTokenLen, Mode, PositiveClass,
+#'   ConfigName, Dirs, DirAll, Promised, Floors, Curve, Operating, Lexicon.
 kw_publish_lexicon <- function(.label_col, .n_words, .idx_mine, .cfg_mine, .floors,
                                .target_precision, .min_classes,
                                .taus = seq(0.40, 0.96, by = 0.02), .tolerance = 0.01,
@@ -1760,27 +2286,16 @@ kw_publish_lexicon <- function(.label_col, .n_words, .idx_mine, .cfg_mine, .floo
     .min_folds        <- 3L
     .source           <- "text"
   }
-  cfg_ <- .cfg_mine |> dplyr::filter(.data$LabelCol == .label_col, .data$Source == .source)
-  if (nrow(cfg_) == 0L) {
-    cli::cli_abort("No crowned mining configuration for {(.label_col)} on {(.source)}.")
-  }
-
-  cells_ <- .idx_mine |>
-    dplyr::filter(
-      .data$LabelCol  == .label_col,
-      .data$Source    == .source,
-      .data$NWords    == .n_words,
-      .data$NgramMax  == cfg_$NgramMax[[1]],
-      .data$Stopwords == cfg_$Stopwords[[1]]
-    )
-  dirs_    <- cells_ |> dplyr::filter(.data$Fold > 0L) |> dplyr::pull(MineDir)
-  dir_all_ <- cells_ |> dplyr::filter(.data$Fold == 0L) |> dplyr::pull(MineDir)
-  if (length(dirs_) == 0L || length(dir_all_) == 0L) {
-    cli::cli_abort("No mines for {(.label_col)} at window {(.n_words)} on {(.source)}.")
-  }
+  cells_ <- kw_publish_cells(
+    .label_col = .label_col,
+    .n_words   = .n_words,
+    .idx_mine  = .idx_mine,
+    .cfg_mine  = .cfg_mine,
+    .source    = .source
+  )
 
   curve_ <- kw_tau_curve(
-    .mine_dirs     = dirs_,
+    .mine_dirs     = cells_$Dirs,
     .taus          = .taus,
     .min_precision = .target_precision,
     .min_hits      = .floors$MinHits,
@@ -1799,8 +2314,8 @@ kw_publish_lexicon <- function(.label_col, .n_words, .idx_mine, .cfg_mine, .floo
   # The all-data mine holds nothing out, which is what makes the fold-agreement filter legitimate
   # against it and illegitimate against any single fold mine.
   lex_ <- kw_lexicon_final(
-    .mine_dir_all    = dir_all_,
-    .mine_dirs_folds = dirs_,
+    .mine_dir_all    = cells_$DirAll,
+    .mine_dirs_folds = cells_$Dirs,
     .tau             = op_$Tau,
     .min_folds       = .min_folds,
     .min_precision   = .target_precision,
@@ -1810,12 +2325,204 @@ kw_publish_lexicon <- function(.label_col, .n_words, .idx_mine, .cfg_mine, .floo
     .max_terms       = .floors$MaxTerms
   )
 
+  mode_ <- kw_mode(.label_col = .label_col)
+
+  # THE CONFIGURATION NAME IS COMPUTED HERE, once, and everything else reads it. It is the join key
+  # between the artifact and the runs that estimate it, exactly as the transformer's is, so a second
+  # construction site would be a second answer to "which runs measured this table" -- and the two
+  # would diverge on the first axis anyone added.
+  cfg_name_ <- kw_config_name(
+    .label_col     = .label_col,
+    .source        = .source,
+    .nwords        = .n_words,
+    .ngram_max     = cells_$NgramMax,
+    .stopwords     = cells_$Stopwords,
+    .min_precision = .target_precision,
+    .min_hits      = .floors$MinHits,
+    .min_tot       = .floors$MinTot,
+    .min_reach     = .floors$MinReach,
+    .max_terms     = .floors$MaxTerms,
+    .tau           = op_$Tau,
+    .seed          = 42L,
+    .terms_tag     = NULL
+  )
+
   list(
     LabelCol = .label_col, NWords = as.integer(.n_words), Source = .source,
-    NgramMax = cfg_$NgramMax[[1]], Stopwords = cfg_$Stopwords[[1]],
+    NgramMax = cells_$NgramMax, Stopwords = cells_$Stopwords,
+    MinTokenLen = cells_$MinTokenLen,
+    Mode = mode_$Mode, PositiveClass = mode_$PositiveClass,
+    ConfigName = cfg_name_,
+    # Carried rather than recomputed downstream. Which cells belong to this published table is a
+    # filter over three crowned axes, and a caller rebuilding it would be a second place that has to
+    # agree about what the crowned axes were.
+    Dirs = cells_$Dirs, DirAll = cells_$DirAll,
     Promised = .target_precision, Floors = .floors,
     Curve = curve_, Operating = op_, Lexicon = lex_
   )
+}
+
+#' Out-of-fold runs for one published table
+#'
+#' WHAT THIS ESTIMATES, AND WHAT IT DELIBERATELY DOES NOT. The published table is mined on all the
+#' labelled data and then filtered on fold agreement, so scoring it against any fold's held-out
+#' documents would score it on documents it was built from. The number would be optimistic and would
+#' sit in the orchestration stage's leaderboard beside transformer arms whose fold scores are
+#' genuinely held out.
+#'
+#' So this estimates the PROCEDURE, the way the transformer arm does: mine at these axes, select at
+#' these floors, decide at this threshold, measured on documents the mine never read. The artifact is
+#' the all-data table, exactly as the transformer's artifact is an all-data refit whose weights are
+#' never scored out of fold either. The two are joined by configuration name, which is why that name
+#' is computed once upstream and asserted here rather than rebuilt.
+#'
+#' The estimate describes the procedure BEFORE the fold-agreement filter, which can only remove terms.
+#' That gap is stated where the filter is applied and is the price of a filter that would otherwise
+#' let a held-out fold influence its own selection.
+#'
+#' @param .pub One kw_publish_lexicon() result.
+#' @param .runs_root Runs directory, the same one the sweep writes to.
+#' @param .seed Integer. Stamped for parity with the other engines.
+#' @return Tibble of the per-fold metric rows, one per fold.
+kw_publish_runs <- function(.pub, .runs_root, .seed = 42L) {
+  if (FALSE) {
+    .pub       <- pubs[[1]]
+    .runs_root <- .lP$Output$Runs
+    .seed      <- 42L
+  }
+  out_ <- purrr::map(.pub$Dirs, function(.d) {
+    kw_evaluate(
+      .mine          = kw_load_mine(.mine_dir = .d),
+      .min_precision = .pub$Promised,
+      .min_hits      = .pub$Floors$MinHits,
+      .min_tot       = .pub$Floors$MinTot,
+      .min_reach     = .pub$Floors$MinReach,
+      .max_terms     = .pub$Floors$MaxTerms,
+      .tau           = .pub$Operating$Tau,
+      .runs_root     = .runs_root,
+      .seed          = .seed
+    )
+  }) |>
+    purrr::list_rbind()
+
+  # The assertion is the point of the function. Two independent constructions of one identifier is
+  # exactly the shape that lets a manifest pin an artifact nobody measured, and it fails silently:
+  # the runs land under one name, the catalogue advertises another, and the orchestration stage's
+  # join simply returns nothing rather than reporting a mismatch.
+  seen_ <- unique(out_$ConfigName)
+  if (length(seen_) != 1L || !identical(seen_, .pub$ConfigName)) {
+    cli::cli_abort(c(
+      "The runs written for {(.pub$LabelCol)} at window {(.pub$NWords)} do not carry the published \\
+       configuration name.",
+      "i" = "Published: {(.pub$ConfigName)}",
+      "i" = "Written: {seen_}"
+    ))
+  }
+  out_ |> dplyr::select(ConfigName, Run, TestFold, Coverage, SelPrecision, Accuracy, F1_macro,
+                        nTerms, nClassesHit)
+}
+
+#' Do the two hit producers agree
+#'
+#' The mine's incidence table and the engine implement one tokenisation in one place, but they reach
+#' it by different routes: the miner transformed the held-out fold against its full candidate
+#' vocabulary while mining, and the engine transforms the same documents against the lexicon alone.
+#' If those ever diverge, every published precision becomes a number about a system nobody runs, and
+#' the divergence is invisible -- the terms still fire, just on different documents.
+#'
+#' PREDICTION: the two sets of (DocID, Term) pairs are identical, so MineOnly and EngineOnly are both
+#' zero. A nonzero count on either side is a tokenisation disagreement, not a selection one: the
+#' lexicon is held fixed across both. MineOnly alone would mean the engine is under-matching, which is
+#' the failure that motivated the seam; EngineOnly alone would mean the mine's candidate filters
+#' removed a term the lexicon still names.
+#'
+#' @param .pub One kw_publish_lexicon() result.
+#' @param .mine_dir Directory of the fold mine to check against.
+#' @param .docs Prepared sample carrying DocID and the text columns.
+#' @param .python,.script Interpreter and keyword_apply.py.
+#' @return One-row tibble: Task, NWords, Fold, nTerms, nDocs, nMine, nEngine, MineOnly, EngineOnly,
+#'   Agree.
+kw_parity_check <- function(.pub, .mine_dir, .docs, .python, .script) {
+  if (FALSE) {
+    .pub      <- pubs[[1]]
+    .mine_dir <- pubs[[1]]$Dirs[[1]]
+    .docs     <- tab_prepared
+    .python   <- .lP$Engine$Python
+    .script   <- .lP$Engine$ScriptApply
+  }
+  mine_ <- kw_load_mine(.mine_dir = .mine_dir)
+  lex_  <- kw_select(
+    .mine          = mine_,
+    .min_precision = .pub$Promised,
+    .min_hits      = .pub$Floors$MinHits,
+    .min_tot       = .pub$Floors$MinTot,
+    .min_reach     = .pub$Floors$MinReach,
+    .max_terms     = .pub$Floors$MaxTerms
+  ) |>
+    dplyr::filter(.data$Power >= .pub$Operating$Tau)
+
+  # The fold's held-out documents, with their text, which the mine does not carry.
+  docs_ <- mine_$DocsTest |>
+    dplyr::select(DocID) |>
+    dplyr::inner_join(.docs, by = dplyr::join_by(DocID))
+
+  from_mine_ <- kw_hits_mine(.lexicon = lex_, .mine = mine_) |>
+    dplyr::distinct(DocID, Term)
+  from_eng_  <- kw_hits_engine(
+    .lexicon       = lex_,
+    .docs          = docs_,
+    .source        = .pub$Source,
+    .n_words       = .pub$NWords,
+    .stopwords     = .pub$Stopwords,
+    .min_token_len = .pub$MinTokenLen,
+    .python        = .python,
+    .script        = .script
+  ) |>
+    dplyr::distinct(DocID, Term)
+
+  tibble::tibble(
+    Task       = .pub$LabelCol,
+    NWords     = .pub$NWords,
+    Fold       = as.integer(mine_$Manifest$test_fold),
+    nTerms     = dplyr::n_distinct(lex_$Term),
+    nDocs      = nrow(docs_),
+    nMine      = nrow(from_mine_),
+    nEngine    = nrow(from_eng_),
+    MineOnly   = nrow(dplyr::anti_join(from_mine_, from_eng_, by = dplyr::join_by(DocID, Term))),
+    EngineOnly = nrow(dplyr::anti_join(from_eng_, from_mine_, by = dplyr::join_by(DocID, Term)))
+  ) |>
+    dplyr::mutate(Agree = .data$MineOnly == 0L & .data$EngineOnly == 0L)
+}
+
+#' Print the parity check
+#'
+#' @param .tab Output of kw_parity_check(), bound across published tables.
+#' @return Invisibly .tab.
+kw_report_parity <- function(.tab) {
+  if (FALSE) .tab <- tab_parity
+  cli::cli_h2("Mine and engine, matching the same lexicon")
+  .tab |>
+    dplyr::mutate(
+      Window = dplyr::if_else(.data$NWords == 0L, "full", as.character(.data$NWords)),
+      Agree  = dplyr::if_else(.data$Agree, "yes", "NO")
+    ) |>
+    dplyr::select(Task, Window, Fold, nTerms, nDocs, nMine, nEngine, MineOnly, EngineOnly, Agree) |>
+    tbl_say()
+  cli::cli_text("")
+  n_bad_ <- sum(!.tab$Agree)
+  if (n_bad_ == 0L) {
+    cli::cli_alert_success(
+      "Every published table matches identically whichever producer is asked, so the precision each \\
+       one reports is the precision it will realise when applied."
+    )
+  } else {
+    cli::cli_alert_danger(
+      "{n_bad_} table{?s} match{?es/} differently through the engine than through the mine. The \\
+       lexicon is held fixed across both, so this is a tokenisation disagreement and every published \\
+       precision below is measured under a rule deployment will not reproduce."
+    )
+  }
+  invisible(.tab)
 }
 
 #' Choose the window a task ships by default
@@ -1898,7 +2605,19 @@ kw_catalogue <- function(.pubs, .tolerance = 0.01) {
       Coverage   = .p$Operating$Coverage,
       Reached    = .p$Operating$nClassesHit,
       Terms      = nrow(.p$Lexicon),
-      Categories = dplyr::n_distinct(.p$Lexicon$Class)
+      Categories = dplyr::n_distinct(.p$Lexicon$Class),
+      # THE APPLIER CONFIGURATION. Not deployment knobs -- nobody applying a table chooses its
+      # stopword regime -- but pinned all the same, because they decide which n-grams can form and
+      # therefore which documents the table fires on. Pinned is not the same as offered. Without them
+      # a downstream stage has to guess, and a guess that happens to be wrong produces ordinary
+      # labels on the wrong documents and reports nothing.
+      ConfigName    = .p$ConfigName,
+      Source        = .p$Source,
+      Stopwords     = .p$Stopwords,
+      NgramMax      = as.integer(.p$NgramMax),
+      MinTokenLen   = as.integer(.p$MinTokenLen),
+      Mode          = .p$Mode,
+      PositiveClass = .p$PositiveClass
     )
   }) |>
     purrr::list_rbind() |>
@@ -1938,6 +2657,19 @@ kw_report_catalogue <- function(.tab) {
   cli::cli_alert_info(
     "Where Categories is below Reached, the fold-agreement filter removed the last surviving term \\
      for a category. Reached describes the procedure; Categories describes the file."
+  )
+
+  # Long identifiers destroy a console table, and these are constant within a task. Reported once
+  # underneath instead, which is also where a reader can see that they were pinned at all.
+  cli::cli_text("")
+  .tab |>
+    dplyr::distinct(Task, Source, Stopwords, NgramMax, MinTokenLen, Mode, PositiveClass) |>
+    tbl_say(.title = "Applier configuration, pinned per task")
+  cli::cli_text("")
+  cli::cli_alert_info(
+    "These are not knobs a caller chooses. They decide which n-grams can form and therefore which \\
+     documents a table fires on, so they travel with it: a table matched under a different \\
+     tokenisation from the one it was mined under produces ordinary labels on the wrong documents."
   )
   invisible(.tab)
 }

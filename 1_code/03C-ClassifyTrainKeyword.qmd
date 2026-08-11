@@ -112,6 +112,15 @@ Splitting them keeps the mining grid at a few hundred cells and leaves the selec
 interactive. It also makes the engine task-agnostic: the amendment decision rule is a decision, so it
 lives here.
 
+The same line divides matching from deciding, and it has to, because **a table's precision is a
+property of how its terms are matched**. Terms are n-grams formed after stopword removal, so a term
+mined as `corporation borrower` came from "the corporation and the borrower" and cannot be found by
+searching for it. Any second implementation of the match -- a substring search over raw text, however
+carefully written -- under-matches the table it is applied to, and reports a precision that describes a
+system nobody runs. So matching lives in Python and is called by every stage that needs it, including
+this one; the decision lives in R and is called by both. Which of the two produced a set of hits is
+invisible to the rule that turns them into labels.
+
 # Configuration
 
 ```{r}
@@ -124,6 +133,14 @@ lives here.
   "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractData",
   "KeyWordsClaude"
 )
+
+# ONE GENERATOR FOR BOTH THRESHOLD GRIDS. Written as two seq() calls they agree to the eye and not to
+# the bit: 11 of the 29 published thresholds would differ from their extended twins in the last place,
+# because the accumulated representation error depends on where the sequence started. The published
+# grid would then not be a subset of the probe grid in any sense a value comparison can see. Generated
+# once and sliced, it is one, and the robustness check below is provably probing the same thresholds
+# the tables were chosen from. The slice is taken on the same integer scale the comparison uses.
+.taus_probe <- seq(0.10, 0.96, by = 0.02)
 
 .lP <- list(
   Input = list(
@@ -140,7 +157,10 @@ lives here.
   ),
   Engine = list(
     Python = here::here("contracts-engine", ".venv", "bin", "python"),
-    Script = here::here("contracts-engine", "keyword_train.py")
+    Script = here::here("contracts-engine", "keyword_train.py"),
+    # The applier. One interpreter for both, because a table matched under a different tokenisation
+    # from the one it was mined under fires on different documents and says nothing about it.
+    ScriptApply = here::here("contracts-engine", "keyword_apply.py")
   ),
   Param = list(
     # The promise, and the breadth required of a table before a threshold is acceptable. Both are
@@ -154,6 +174,10 @@ lives here.
     Tolerance       = 0.01, # precision band treated as indistinguishable; roughly two SEs here
     MinFolds        = 3L, # fold agreement required of a published term
     HoldoutFold     = 5L, # the fold the generated arm never read
+    # The thresholds a published table is chosen from, and the same grid extended downward for the
+    # robustness check. The first is a slice of the second, not a second sequence that resembles it.
+    TausPublished   = .taus_probe[round(.taus_probe * 1e4) >= 4000L],
+    TausProbe       = .taus_probe,
     Seed            = 42L # fixed upstream in 03A and reused unchanged
   )
 )
@@ -430,6 +454,44 @@ sel_best |>
   dplyr::mutate(Coverage = tbl_pct(mCoverage), Precision = tbl_pct(mPrecision)) |>
   dplyr::select(MinReach, MaxTerms, Terms = mTerms, Classes = mClasses, Coverage, Precision) |>
   tbl_say(.title = "Selection floors carried forward")
+```
+
+The floors govern list length and marginal reach, and neither depends on how much text the miner
+read, so they are settled once per task and held while the window varies. Settling them here rather
+than at deployment keeps the selection decisions in the section that reports the evidence for them,
+and gives the robustness checks below the same numbers the published tables will use rather than a
+second copy computed from the same sweep.
+
+```{r}
+#| label: choose-task-floors
+floors_task <- purrr::map(
+  .x = c("ClassDetailed", "ClassBroad", "AmendType"),
+  .f = function(.task) {
+    kw_task_floors(
+      .perf_sel     = perf_sel,              # selection sweep, every task
+      .label_col    = .task,                 # task
+      .tolerance    = .lP$Param$Tolerance,   # differences too small to measure
+      .min_coverage = 0.25                   # below this, not publishable
+    )
+  }
+) |>
+  purrr::set_names(c("ClassDetailed", "ClassBroad", "AmendType"))
+```
+
+Which tables exist is settled here for the same reason. Every task is crossed with every window the
+mining sweep covered, because the window is this arm's cost knob and its coverage knob at once and
+which one to ship is a decision worth leaving open until someone has throughput figures. The crossing
+is named once and read twice: the robustness checks below probe exactly the cells Deployment
+publishes, which they could not be relied on to do if each built its own grid.
+
+```{r}
+#| label: choose-publish-plan
+# The full-document cell is recorded as zero words upstream and travels as zero here; only the file
+# name spells it out.
+plan_pub <- tidyr::expand_grid(
+  Task   = c("ClassDetailed", "ClassBroad", "AmendType"),
+  NWords = sort(unique(idx_mine$NWords))
+)
 ```
 
 # Results
@@ -779,6 +841,68 @@ that; it can only observe that the phrase is imprecise and discard it. A reader 
 convention and look instead for the structural markers of modification, which is what the session was
 asked to do.
 
+## Whether the threshold grid decides its own answer
+
+The operating point is chosen from a grid of thresholds, and a grid is a statement about where to
+look. An optimum on its lower edge was therefore not found by the acceptance rule; it was supplied by
+the edge. The binary task is where this is most likely to happen and least likely to be noticed:
+coverage is one for every threshold, because a document firing no term is still labelled, so the
+rule's first two criteria -- most categories, then widest coverage -- tie everywhere and the choice
+falls entirely to the last one, which prefers the lowest threshold on offer.
+
+The check traces every published cell below the floor and selects twice from one curve: once
+restricted to the thresholds the table was actually chosen from, once over the whole extension.
+Agreement means the floor is documentation. Disagreement means it is a parameter, and one set by the
+shape of a sequence rather than by an argument. Every cell rather than one per task, because which
+window ships is settled downstream of here and a check that covered only the crowned window would
+answer for a table that may not be the one published.
+
+Nothing published moves either way. Extending the grid would change an artifact, and that is not a
+change to make as a side effect of asking whether it should be made.
+
+```{r}
+#| label: robust-tau-floor
+tab_tau_floor <- purrr::pmap(plan_pub, function(Task, NWords) {
+  kw_tau_floor_probe(
+    .label_col        = Task,                                    # task to probe
+    .n_words          = NWords,                                  # every published window, not one
+    .idx_mine         = idx_mine,                                # every mining cell
+    .cfg_mine         = cfg_mine,                                # crowned cell names the held axes
+    .floors           = floors_task[[Task]],                     # this task's selection floors
+    .target_precision = .lP$Param$TargetPrecision[[Task]],       # this task's promise
+    .min_classes      = .lP$Param$MinClasses[[Task]],            # breadth it must reach
+    .taus_published   = .lP$Param$TausPublished,                 # the grid the tables were chosen from
+    .taus_extended    = .lP$Param$TausProbe,                     # the same grid, extended downward
+    .tolerance        = .lP$Param$Tolerance,                     # differences too small to measure
+    .source           = "text"                                   # the field the shipped arm reads
+  )
+}) |>
+  purrr::list_rbind()
+```
+
+```{r}
+#| label: robust-report-tau-floor
+kw_report_tau_floor(.tab = tab_tau_floor)
+```
+
+Two facts are reported because they are two. `Moves` is whether the threshold the rule names changed;
+`Binds` is whether anything followed from it. They come apart wherever a range of thresholds selects
+the same lexicon, which is the ordinary case here rather than an edge one: the evidence and precision
+gates bound Power from below, since the weakest term that can pass a floor of five hits at the
+promised precision still carries a Wilson bound near 0.5, so every threshold beneath that selects an
+identical table. The rule prefers the lowest acceptable threshold and therefore reports the bottom of
+that range, and moves to a new bottom as soon as one exists, having changed nothing.
+
+This is the reading of an operating point at the floor on a task where coverage is one by
+construction. It is not a corner solution and nothing is being left on the table; the threshold is
+simply not identified below the point where the gates already bind. It is also why the realised
+precision and not the threshold is the number to quote about a published table.
+
+Where a floor does bind, the row to read is the extended one against the published one. More terms at
+held precision means the floor is costing coverage and should move. More terms at lower precision
+means it is protecting the promise, and should be argued as a floor rather than left to look like an
+optimum.
+
 # Deployment
 
 The folds pay for the estimate; the all-data mine produces the artifact. A published term must also
@@ -802,32 +926,8 @@ mining sweep crowned. Those are not deployment knobs: nobody applying a publishe
 read the filer's title instead of the contract. They were settled on the evidence and stay settled.
 
 ```{r}
-#| label: deploy-task-floors
-# The floors govern list length and marginal reach, neither of which depends on how much text the
-# miner read. Settled once per task and held while the window varies.
-floors_task <- purrr::map(
-  .x = c("ClassDetailed", "ClassBroad", "AmendType"),
-  .f = function(.task) {
-    kw_task_floors(
-      .perf_sel     = perf_sel,              # selection sweep, every task
-      .label_col    = .task,                 # task
-      .tolerance    = .lP$Param$Tolerance,   # differences too small to measure
-      .min_coverage = 0.25                   # below this, not publishable
-    )
-  }
-) |>
-  purrr::set_names(c("ClassDetailed", "ClassBroad", "AmendType"))
-```
-
-```{r}
 #| label: deploy-publish-tables
-# Every task crossed with every window the mining sweep covered. The full-document cell is recorded
-# as zero words upstream and travels as zero here; only the file name spells it out.
-plan_pub <- tidyr::expand_grid(
-  Task   = c("ClassDetailed", "ClassBroad", "AmendType"),
-  NWords = sort(unique(idx_mine$NWords))
-)
-
+# The crossing was settled with the floors, in the section that reports the evidence for both.
 # Named for the pair they describe. The catalogue below is sorted for reading, so an index taken
 # from it and applied here would return a different task's table -- and silently, since a lexicon is
 # a lexicon whatever categories it holds.
@@ -840,7 +940,7 @@ pubs <- purrr::pmap(plan_pub, function(Task, NWords) {
     .floors           = floors_task[[Task]],                   # this task's selection floors
     .target_precision = .lP$Param$TargetPrecision[[Task]],     # this task's promise
     .min_classes      = .lP$Param$MinClasses[[Task]],          # breadth it must reach
-    .taus             = seq(0.40, 0.96, by = 0.02),            # thresholds to trace
+    .taus             = .lP$Param$TausPublished,               # thresholds to trace
     .tolerance        = .lP$Param$Tolerance,                   # differences too small to measure
     .min_folds        = .lP$Param$MinFolds,                    # fold agreement a term must show
     .source           = "text"                                 # the field the shipped arm reads
@@ -907,6 +1007,109 @@ arrow::write_parquet(
   sink = fs::path(.lP$Output$Table, "catalogue.parquet")            # beside the tables it describes
 )
 ```
+
+## The table as an arm
+
+A published table is an artifact, and until now that is all it was: a file with a precision printed on
+it, sitting outside the comparison every other arm takes part in. That is a gap rather than a
+modesty. The orchestration stage ranks arms on out-of-fold macro-F1 and votes among them, and an arm
+it cannot see cannot be ranked, cannot be voted on, and cannot be named in a manifest -- so a voting
+set naming this one describes something the manifest is unable to pin.
+
+Closing the gap needs runs, and the runs must estimate the right thing. Scoring the published file
+against a fold's held-out documents would score it on documents it was built from: the terms were
+selected on the all-data mine and their Power estimated there, and every fold's held-out documents
+contributed to both. The number would be optimistic, and it would then sit on a leaderboard beside
+transformer arms whose fold scores are genuinely held out.
+
+So what is estimated is the **procedure** -- mine at these axes, select at these floors, decide at this
+threshold -- measured on documents the mine never read, exactly as the transformer arm is. The artifact
+is the all-data table, exactly as the transformer's artifact is an all-data refit whose weights are
+never scored out of fold either. Artifact and estimate are joined by configuration name, computed once
+where the table is published and asserted where the runs are written.
+
+The estimate describes the procedure **before** the fold-agreement filter, which can only remove
+terms. That gap is the price of a filter that would otherwise let a held-out fold influence its own
+selection, and it is stated at the top of this section rather than hidden in a caption.
+
+```{r}
+#| label: deploy-check-parity
+# Run before the tables become arms, not in Validation, because it is a gate on what follows rather
+# than a check on what came before: a run written under a lexicon the applier matches differently is
+# worse than no run at all, since it is a plausible number for the wrong system.
+tab_parity <- purrr::map(pubs, function(.p) {
+  kw_parity_check(
+    .pub      = .p,                    # this task and window
+    .mine_dir = .p$Dirs[[1]],          # one fold is enough; the tokenisation is not fold-specific
+    .docs     = tab_prep,              # the text the mine does not carry
+    .python   = .lP$Engine$Python,     # the interpreter the miner ran under
+    .script   = .lP$Engine$ScriptApply # the applier
+  )
+}) |>
+  purrr::list_rbind()
+```
+
+```{r}
+#| label: deploy-report-parity
+kw_report_parity(.tab = tab_parity)
+```
+
+The two producers reach the same tokenisation by different routes. The miner transformed the held-out
+fold against its full candidate vocabulary while mining; the applier transforms the same documents
+against the published lexicon alone. The lexicon is held fixed across both, so a disagreement here is
+about matching and never about selection. Terms appearing only on the mine's side mean the applier
+under-matches, which is the failure this seam exists to remove; terms appearing only on the applier's
+side mean the mine's candidate filters dropped a term the published table still names.
+
+```{r}
+#| label: deploy-publish-runs
+runs_published <- purrr::map(pubs, function(.p) {
+  kw_publish_runs(
+    .pub       = .p,                  # this task and window
+    .runs_root = .lP$Output$Runs,     # the same root the sweep writes to
+    .seed      = .lP$Param$Seed       # stamped for parity with the other engines
+  )
+}) |>
+  purrr::list_rbind()
+```
+
+They are written to the same run directory as everything else in this document, not to a directory of
+their own. A separate root would let the published tables into the orchestration stage's inventory
+without passing the fold-coverage filter every other arm passes, and an arm exempt from a filter is
+exactly how a configuration estimated on some folds ends up ranked against configurations estimated on
+all of them.
+
+```{r}
+#| label: deploy-report-runs
+runs_published |>
+  dplyr::summarise(
+    Folds     = dplyr::n(),
+    Coverage  = mean(Coverage),
+    Precision = mean(SelPrecision),
+    MacroF1   = mean(F1_macro),
+    Terms     = round(mean(nTerms)),
+    Classes   = round(mean(nClassesHit)),
+    .by = ConfigName
+  ) |>
+  # Joined back for the labels. The configuration name is the key and is far too long to print, so
+  # the table is read by task and window and the name stays where the join needs it.
+  dplyr::inner_join(
+    catalogue |> dplyr::select(ConfigName, Task, NWords),
+    by = dplyr::join_by(ConfigName)
+  ) |>
+  dplyr::mutate(
+    Window    = dplyr::if_else(NWords == 0L, "full", as.character(NWords)),
+    Coverage  = tbl_pct(Coverage),
+    Precision = tbl_pct(Precision)
+  ) |>
+  dplyr::arrange(Task, dplyr::desc(MacroF1)) |>
+  dplyr::select(Task, Window, Folds, Terms, Classes, Coverage, Precision, MacroF1) |>
+  tbl_say(.title = "Out-of-fold estimates for the published configurations")
+```
+
+Every row must read five folds. A configuration short of that was estimated on a different quantity
+from its neighbours, and a mean over three folds and a mean over five are not comparable however close
+they look.
 
 
 # Overview
@@ -1007,6 +1210,17 @@ kw_plot_reach(
 
 # Next
 
-03D compares the keyword and transformer arms on the shared leaderboard, using the run folders written
-here. 03E applies the deployed transformer to the full corpus; the keyword table is an independent
-artifact that does not enter that path and ships alongside the archived dataset.
+03E ranks every arm on one leaderboard and searches for a routing policy among them. The published
+tables now enter it on the same terms as the transformer configurations: run folders under a
+configuration name, five folds each, joined to the artifact this document wrote. That is what lets a
+voting set name the keyword arm and the manifest pin what it named -- until now it could do the first
+and not the second, so no confidence flag could ship.
+
+03F applies the manifest to the corpus. It calls the same applier this document calls and the same
+decision this document decides with, through the parameters pinned in the catalogue, so the precision
+printed on a table is the precision it realises on 1.4 million documents rather than a number about a
+similar system.
+
+The tables also ship as artifacts in their own right, alongside the archived dataset, which is what
+they were built for and remains the reason the objective here is publishable precision rather than
+aggregate accuracy.
