@@ -198,11 +198,13 @@ ent_read_chunk <- function(.chunk) {
 ent_engine_plan <- function(.policy) {
   if (FALSE) .policy <- tab_policy
 
-  cap_ <- unique(.policy$CapChars)
   tail_ <- unique(.policy$TailChars)
   if (!all(tail_ == 0L)) {
+    # A local, because cli reads {.policy...} as a style and errors -- and this branch only fires
+    # when something has gone wrong, which is the worst place to hide a second fault.
+    lab_ <- .policy$Label[.policy$TailChars > 0L]
     cli::cli_abort(c(
-      "The policy declares a tail for {.policy$Label[.policy$TailChars > 0L]}.",
+      "The policy declares a tail for {lab_}.",
       "i" = "This document extracts full text only; a tail needs the slice design in _BackUp.",
       "x" = "Ignoring it would extract a prefix and report success."
     ))
@@ -289,6 +291,173 @@ ent_check_plan <- function(.plan, .knobs = list()) {
 # 3. The store fingerprint -------------------------------------------------------------------------------------------
 # The one guard that cannot be recovered after the fact. See ent_corpus_manifest().
 
+
+#' What the store already holds, before anything is run
+#'
+#' THE FIRST THING A READER OF A TWO-DAY PASS NEEDS, and its absence caused real confusion: a second
+#' render found every document already extracted, so the loop had nothing to do and printed nothing,
+#' which is indistinguishable from a loop that is broken. Silence is a bad way to say "finished".
+#'
+#' Reports per engine because the ledger is per engine, and a document counts as complete only when
+#' every declared engine has seen it -- adding an engine to the policy makes every document in the
+#' store incomplete again, correctly, and this is where that becomes visible rather than surprising.
+#'
+#' The remaining-time estimate uses the rate already measured in the timing log rather than a
+#' constant, so it sharpens as the pass proceeds and says so when there is nothing to go on yet.
+#'
+#' @param .db_path The corpus candidate store.
+#' @param .n_corpus Integer. Documents in the corpus, from ent_corpus_n().
+#' @param .run Character. Combination tokens the plan declares.
+#' @param .dir Directory holding the _timing log, or NULL to skip the estimate.
+#' @return Invisibly, a tibble of the per-engine figures.
+ent_store_status <- function(.db_path, .n_corpus, .run, .dir = NULL) {
+  if (FALSE) {
+    .db_path  <- .lP$Store$NerDB
+    .n_corpus <- ent_corpus_n(tab_index)
+    .run      <- tab_plan$Combo
+    .dir      <- .dir_store
+  }
+
+  cli::cli_h2("Store status before this run")
+
+  if (!fs::file_exists(.db_path)) {
+    cli::cli_alert_info("No store yet. All {(.n_corpus)} corpus document{?s} are to be extracted.")
+    return(invisible(tibble::tibble()))
+  }
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  combo_ <- "CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END"
+  per_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT ", combo_, " AS Combo, COUNT(DISTINCT DocID) AS DocsDone, ",
+    "  SUM(CASE WHEN Status = 'timeout' THEN 1 ELSE 0 END) AS Timeouts FROM runs GROUP BY 1"
+  )) |>
+    tibble::as_tibble()
+  cand_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT ", combo_, " AS Combo, COUNT(*) AS Candidates FROM candidates GROUP BY 1"
+  )) |>
+    tibble::as_tibble()
+
+  in_ <- paste0("('", paste(.run, collapse = "','"), "')")
+  done_all_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT COUNT(*) AS N FROM (SELECT DocID FROM runs WHERE ", combo_, " IN ", in_,
+    " GROUP BY DocID HAVING COUNT(DISTINCT ", combo_, ") >= ", length(.run), ")"
+  ))$N
+
+  out_ <- tibble::tibble(Combo = sort(unique(c(.run, per_$Combo)))) |>
+    dplyr::left_join(per_, by = "Combo") |>
+    dplyr::left_join(cand_, by = "Combo") |>
+    dplyr::mutate(
+      Declared   = .data$Combo %in% .run,
+      DocsDone   = dplyr::coalesce(as.integer(.data$DocsDone), 0L),
+      Timeouts   = dplyr::coalesce(as.integer(.data$Timeouts), 0L),
+      Candidates = dplyr::coalesce(as.integer(.data$Candidates), 0L),
+      PctCorpus  = .data$DocsDone / .n_corpus
+    ) |>
+    dplyr::select(Combo, Declared, DocsDone, PctCorpus, Timeouts, Candidates)
+
+  tbl_say(.tab = dplyr::mutate(out_, PctCorpus = tbl_pct(.data$PctCorpus, 2L)))
+
+  pending_ <- .n_corpus - done_all_
+  cli::cli_alert_info(
+    "{done_all_} of {(.n_corpus)} document{?s} complete on all {length(.run)} declared engine{?s}; \\
+     {pending_} pending."
+  )
+
+  # The estimate uses what has actually been measured here rather than a constant.
+  if (!is.null(.dir) && pending_ > 0L) {
+    logs_ <- fs::dir_ls(fs::path(.dir, "_timing"), glob = "*.parquet", fail = FALSE)
+    if (length(logs_) > 0L) {
+      tim_ <- purrr::map(logs_, arrow::read_parquet) |> purrr::list_rbind()
+      new_ <- if ("nNew" %in% names(tim_)) sum(tim_$nNew) else sum(tim_$nDocs)
+      if (new_ > 0L && sum(tim_$Seconds) > 0) {
+        rate_ <- new_ / sum(tim_$Seconds)
+        cli::cli_alert_info(
+          "At the {round(rate_, 1)} doc/s measured so far: {round(pending_ / rate_ / 3600, 1)}h \\
+           remaining, finishing about {format(Sys.time() + pending_ / rate_, '%a %d %b %H:%M')}."
+        )
+      }
+    } else {
+      cli::cli_alert_info("No timings yet; the first chunk will produce an estimate.")
+    }
+  }
+  if (any(!out_$Declared)) {
+    cli::cli_alert_warning(
+      "The store holds {out_$Combo[!out_$Declared]}, which this run does not declare. Those rows \\
+       are left alone; they neither count towards completeness nor get extended."
+    )
+  }
+  invisible(out_)
+}
+
+#' The documents that still need extracting
+#'
+#' ASKED ONCE, UP FRONT, RATHER THAN ONCE PER CHUNK. ner_run() already consults the ledger and skips
+#' what it has seen, so a resumed run was correct without this -- but it was correct expensively.
+#' Every chunk first read its documents' TEXT off disk and wrote a parquet, and only then discovered
+#' there was nothing to extract. On a corpus re-render that is 1.46 million file reads to establish
+#' that the work is already done.
+#'
+#' Asking here instead makes the remaining work the thing that gets chunked, which has three
+#' consequences beyond the saving. Progress is against a denominator that means something. The
+#' throughput rate stops being distorted by chunks that did nothing. And the document reports what
+#' is left before it starts, which is what a reader of a two-day run wants to know first.
+#'
+#' PENDING IS PER DOCUMENT, NOT PER COMBINATION, because the text is read once and handed to every
+#' engine. A document one engine has not seen must be read whatever the other four have done. The
+#' ledger row is what counts as seen, whatever its status: a timeout was tried, and ner_run() only
+#' revisits one when asked with .retry_timeout.
+#'
+#' @param .db_path The corpus candidate store. Absent means everything is pending.
+#' @param .index Tibble from ent_corpus_index().
+#' @param .run Character. Combination tokens the plan declares.
+#' @return .index filtered to pending documents, with its corpus attributes preserved.
+ent_pending <- function(.db_path, .index, .run) {
+  if (FALSE) {
+    .db_path <- .lP$Store$NerDB
+    .index   <- tab_index
+    .run     <- tab_plan$Combo
+  }
+
+  # ATTRIBUTES DO NOT SURVIVE A FILTER. NCorpus and BytesCorpus are carried on the index and dplyr
+  # drops them, so the fingerprint and the projection would both silently lose their denominator.
+  keep_ <- attributes(.index)[c("NCorpus", "BytesCorpus")]
+  restore_ <- function(.t) {
+    attr(.t, "NCorpus")     <- keep_$NCorpus
+    attr(.t, "BytesCorpus") <- keep_$BytesCorpus
+    .t
+  }
+
+  if (!fs::file_exists(.db_path)) {
+    cli::cli_alert_info("No store yet: all {nrow(.index)} document{?s} pending.")
+    return(restore_(.index))
+  }
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  in_ <- paste0("('", paste(.run, collapse = "','"), "')")
+  done_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT DocID FROM ( ",
+    "  SELECT DocID, COUNT(DISTINCT CASE WHEN Engine = Model THEN Engine ",
+    "         ELSE Engine || ':' || Model END) AS NCombos ",
+    "  FROM runs WHERE (CASE WHEN Engine = Model THEN Engine ",
+    "        ELSE Engine || ':' || Model END) IN ", in_, " GROUP BY DocID) ",
+    "WHERE NCombos >= ", length(.run)
+  ))$DocID
+
+  out_ <- dplyr::filter(.index, !.data$DocID %in% done_)
+  n_done_ <- nrow(.index) - nrow(out_)
+  if (n_done_ > 0L) {
+    cli::cli_alert_info(
+      "{n_done_} document{?s} already complete in the store; {nrow(out_)} pending."
+    )
+  } else {
+    cli::cli_alert_info("Nothing in the store yet for this set: {nrow(out_)} pending.")
+  }
+  restore_(out_)
+}
 
 #' What the corpus store was built against
 #'
@@ -413,6 +582,98 @@ ent_corpus_manifest_sync <- function(.path_manifest, .manifest) {
 
 # 4. Extraction ------------------------------------------------------------------------------------------------------
 
+#' A running account of a pass measured in days
+#'
+#' WRITTEN THREE WAYS, AND NOT THROUGH cli, WHICH IS THE POINT. cli emits a condition through
+#' message(), and anything that handles messages holds them: knitr buffers a chunk's messages until
+#' the chunk ends, so a loop running for two days shows nothing at all until it is over. That is the
+#' opposite of what a progress report is for, and it is why three earlier attempts at this -- a
+#' purrr bar, a cli bar, cli alert lines -- all produced silence.
+#'
+#' cat() to the console bypasses the condition system entirely and flush.console() forces it out
+#' immediately, which covers the interactive case. The LOG FILE covers everything else: it is a
+#' plain text file appended one line per chunk, so progress can be watched with `tail -f` from
+#' another terminal, read after RStudio has been closed, or checked on a machine that is running
+#' the pass headless. On a two-day run that is not a convenience, it is the only way to know the
+#' thing is alive without touching the session.
+#'
+#' sprintf rather than glue or cli interpolation: no dot-literal rules, no evaluation environment to
+#' get wrong, no dependency on a package's formatting decisions in the one function whose job is to
+#' still work when other things are not.
+#'
+#' @param .n_chunks Integer. Chunks in this pass.
+#' @param .n_docs Integer. Documents still to extract.
+#' @param .path_log Character or NULL. Plain text log appended one line per chunk.
+#' @return An environment to hand to ent_progress_step().
+ent_progress_new <- function(.n_chunks, .n_docs, .path_log = NULL) {
+  if (FALSE) {
+    .n_chunks <- length(chunks_)
+    .n_docs   <- nrow(tab_todo)
+    .path_log <- .lP$Store$Progress
+  }
+
+  e_ <- new.env(parent = emptyenv())
+  e_$NChunks <- as.integer(.n_chunks)
+  e_$NDocs   <- as.integer(.n_docs)
+  e_$Chunk   <- 0L
+  e_$Docs    <- 0L
+  e_$Seconds <- 0
+  e_$Log     <- .path_log
+
+  head_ <- sprintf(
+    "== %s | %d chunk(s), %d document(s) to extract ==",
+    format(Sys.time(), "%Y-%m-%d %H:%M:%S"), e_$NChunks, e_$NDocs
+  )
+  cat(head_, "\n", sep = "", file = stdout())
+  utils::flush.console()
+  if (!is.null(.path_log)) {
+    fs::dir_create(fs::path_dir(.path_log))
+    cat(head_, "\n", sep = "", file = .path_log, append = TRUE)
+    cat("Watch it with: tail -f ", as.character(.path_log), "\n", sep = "", file = stdout())
+    utils::flush.console()
+  }
+  e_
+}
+
+#' Report one chunk, and what it implies for the rest
+#'
+#' The rate is cumulative rather than per chunk, so a single slow chunk -- a run of long documents,
+#' a LexNLP stall -- moves the estimate rather than dominating it.
+#'
+#' @param .progress Environment from ent_progress_new().
+#' @param .n_new Documents this chunk actually extracted.
+#' @param .seconds Wall-clock seconds the chunk took.
+#' @return Invisibly, the environment.
+ent_progress_step <- function(.progress, .n_new, .seconds) {
+  if (FALSE) {
+    .progress <- prog_
+    .n_new    <- 2000L
+    .seconds  <- 264
+  }
+
+  .progress$Chunk   <- .progress$Chunk + 1L
+  .progress$Docs    <- .progress$Docs + as.integer(.n_new)
+  .progress$Seconds <- .progress$Seconds + as.numeric(.seconds)
+
+  rate_  <- .progress$Docs / max(.progress$Seconds, 1e-9)
+  left_  <- max(.progress$NDocs - .progress$Docs, 0L)
+  eta_h_ <- if (rate_ > 0) left_ / rate_ / 3600 else NA_real_
+  eta_at_ <- if (is.finite(eta_h_)) format(Sys.time() + left_ / rate_, "%a %d %b %H:%M") else "?"
+
+  line_ <- sprintf(
+    "[%s] chunk %d/%d | %s doc in %ds | %.1f doc/s | %s left | %.1fh | ETA %s",
+    format(Sys.time(), "%H:%M:%S"),
+    .progress$Chunk, .progress$NChunks,
+    format(as.integer(.n_new), big.mark = ","), round(as.numeric(.seconds)),
+    rate_, format(left_, big.mark = ","), eta_h_, eta_at_
+  )
+
+  cat(line_, "\n", sep = "", file = stdout())
+  utils::flush.console()
+  if (!is.null(.progress$Log)) cat(line_, "\n", sep = "", file = .progress$Log, append = TRUE)
+  invisible(.progress)
+}
+
 #' Extract one chunk of the corpus into the shared store
 #'
 #' The chunk exists to bound memory, not to bound work: the text of five hundred documents is held
@@ -461,7 +722,7 @@ ent_extract_corpus_chunk <- function(.chunk, .db_path, .run, .labels, .dir_work,
     if (length(v_) == 0L) NULL else v_
   }
 
-  ner_run(
+  run_ <- ner_run(
     .inputs        = path_,
     .db_path       = .db_path,
     .run           = .run,
@@ -476,11 +737,30 @@ ent_extract_corpus_chunk <- function(.chunk, .db_path, .run, .labels, .dir_work,
     .batch_size    = knob_("batch_size") %||% 64L,
     .timeout       = knob_("timeout")    %||% 0L,
     .keep_staging  = FALSE,
+    # THE EXTRACTORS' OWN BARS ARE OFF, and this is what makes the loop's bar readable. Each Python
+    # extractor writes a tqdm bar to stderr; five engines per chunk over hundreds of chunks is five
+    # bars per chunk, all writing carriage returns to the same line cli is drawing the pass on. The
+    # inner bars report one extractor on 2,000 documents, which is the wrong unit anyway -- what a
+    # reader of a two-day run needs is how far through the corpus it is.
+    .no_progress   = TRUE,
     .quiet         = TRUE
   )
 
+  # DOCUMENTS IN THE CHUNK AND DOCUMENTS ACTUALLY EXTRACTED ARE DIFFERENT NUMBERS, and conflating
+  # them corrupts the projection in the flattering direction. A chunk the ledger already covers
+  # returns in seconds while still reporting its full document count, so a rate taken as
+  # nDocs / Seconds over a partly resumed run overstates throughput by whatever share was resumed --
+  # a rehearsal continued from an earlier one reported nine documents a second where the true figure
+  # was seven and a half, and forty-three hours where it was fifty-four.
+  #
+  # nNew is the largest number of documents any single engine had to process. Not the sum, because
+  # five engines over the same document is one document's worth of reading; not the minimum, because
+  # an engine that had already finished says nothing about the four that had not.
+  n_new_ <- if (is.null(run_) || nrow(run_) == 0L) 0L else max(as.integer(run_$Docs), 0L)
+
   invisible(tibble::tibble(
     nDocs   = nrow(docs_),
+    nNew    = n_new_,
     Seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs"))
   ))
 }
@@ -495,21 +775,21 @@ ent_extract_corpus_chunk <- function(.chunk, .db_path, .run, .labels, .dir_work,
 #' @param .seconds Wall time.
 #' @param .n_cands Candidates extracted.
 #' @return Invisibly the path written.
-ent_write_timing <- function(.dir, .chunk, .n_docs, .seconds, .n_cands) {
+ent_write_timing <- function(.dir, .chunk, .n_docs, .n_new, .seconds) {
   if (FALSE) {
-    .dir     <- .dir_out
+    .dir     <- .dir_store
     .chunk   <- 1L
-    .n_docs  <- 500L
-    .seconds <- 120
-    .n_cands <- 40000L
+    .n_docs  <- 2000L
+    .n_new   <- 2000L
+    .seconds <- 233
   }
   dir_ <- fs::path(.dir, "_timing")
   fs::dir_create(dir_)
   path_ <- fs::path(dir_, sprintf("timing_%04d.parquet", as.integer(.chunk)))
   arrow::write_parquet(
     tibble::tibble(
-      Chunk = as.integer(.chunk), nDocs = as.integer(.n_docs),
-      nCands = as.integer(.n_cands), Seconds = as.numeric(.seconds), WrittenAt = Sys.time()
+      Chunk = as.integer(.chunk), nDocs = as.integer(.n_docs), nNew = as.integer(.n_new),
+      Seconds = as.numeric(.seconds), WrittenAt = Sys.time()
     ),
     path_
   )
@@ -537,12 +817,22 @@ ent_report_throughput <- function(.dir, .n_corpus, .n_cands = NULL) {
     purrr::list_rbind()
   if (nrow(tab_) == 0L) return(invisible(NULL))
 
-  rate_ <- sum(tab_$nDocs) / sum(tab_$Seconds)
+  # Per document of NEW work. See ent_extract_corpus_chunk(): a resumed chunk returns its full
+  # document count in a handful of seconds, so nDocs here would flatter the projection by whatever
+  # share of the run was already in the ledger.
+  n_new_  <- if ("nNew" %in% names(tab_)) sum(tab_$nNew) else sum(tab_$nDocs)
+  n_seen_ <- sum(tab_$nDocs)
+  if (n_new_ == 0L) {
+    cli::cli_alert_info("Every chunk was already in the ledger; nothing to time.")
+    return(invisible(tab_))
+  }
+  rate_ <- n_new_ / sum(tab_$Seconds)
   cli::cli_h2("Measured throughput")
   tbl_say(
     .tab = tibble::tibble(
       Chunks      = nrow(tab_),
-      Documents   = sum(tab_$nDocs),
+      Documents   = n_seen_,
+      Extracted   = n_new_,
       Minutes     = round(sum(tab_$Seconds) / 60, 1),
       DocsPerSec  = round(rate_, 1),
       CorpusDocs  = as.integer(.n_corpus),
@@ -552,9 +842,9 @@ ent_report_throughput <- function(.dir, .n_corpus, .n_cands = NULL) {
       # supply them: a chunk the ledger had already seen does no work, so its candidate count is
       # zero and the per-document rate would fall by however much of the run was resumed.
       Candidates  = if (is.null(.n_cands)) NULL else as.integer(.n_cands),
-      CandsPerDoc = if (is.null(.n_cands)) NULL else round(.n_cands / sum(tab_$nDocs), 1),
+      CandsPerDoc = if (is.null(.n_cands)) NULL else round(.n_cands / n_seen_, 1),
       CorpusMCand = if (is.null(.n_cands)) NULL else {
-        round(.n_cands / sum(tab_$nDocs) * .n_corpus / 1e6, 1)
+        round(.n_cands / n_seen_ * .n_corpus / 1e6, 1)
       }
     )
   )
@@ -563,9 +853,15 @@ ent_report_throughput <- function(.dir, .n_corpus, .n_cands = NULL) {
      before any limit, so the projection means the same thing whether this run was a rehearsal or \\
      the release."
   )
-  if (sum(tab_$nDocs) < .n_corpus) {
+  if (n_new_ < n_seen_) {
+    cli::cli_alert_info(
+      "{n_seen_ - n_new_} document{?s} in these chunks were already in the ledger. The rate is per \\
+       document EXTRACTED, so the projection is unaffected by how much was resumed."
+    )
+  }
+  if (n_seen_ < .n_corpus) {
     cli::cli_alert_warning(
-      "Projected from {sum(tab_$nDocs)} of {(.n_corpus)} documents. The draw is random across the \\
+      "Projected from {n_new_} newly extracted of {(.n_corpus)} documents. The draw is random across the \\
        whole tree, so it is unbiased on document COUNT -- but cost follows length, and 04A found \\
        the corpus tail longer than the labelled sample's. Read this as a floor."
     )

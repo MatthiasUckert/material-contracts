@@ -716,6 +716,11 @@ ner_moneyregex <- function(
 #' @param .timeout Integer or named list. Stall guard, optionally per combination.
 #' @param .work_dir Character. Where staging parquet is written.
 #' @param .keep_staging Logical. TRUE leaves staging files in place after ingest.
+#' @param .no_progress Logical. Pass --no-progress to every extractor, suppressing the tqdm bar it
+#'   writes to stderr. Leave FALSE where this is the only thing running and the per-engine bar is
+#'   the progress display; set TRUE where a CALLER owns the display. The two cannot share a terminal
+#'   line: tqdm and cli both write carriage returns, and a corpus loop that shows its own bar over
+#'   chunks gets it overwritten by one bar per extractor per chunk.
 #' @param .overwrite Logical. Passed to the extractors.
 #' @param .quiet Logical. Suppress per-combination messages.
 #' @return Invisibly, a tibble of what each combination processed.
@@ -734,6 +739,7 @@ ner_run <- function(
     .batch_size = 64L, # spaCy batch / LexNLP+gazetteer chunksize -- scalar or named
     .timeout = list(spacy = 600L, lexnlp = 60L, "paper:gazetteer-v1" = 120L), # stall guard secs, 0=off
     .keep_staging = FALSE,
+    .no_progress = FALSE, # suppress the EXTRACTORS' own bars; see the note in the roxygen
     .quiet = FALSE
 ) {
   if (FALSE) {
@@ -751,6 +757,7 @@ ner_run <- function(
     .batch_size <- 64L
     .timeout <- list(spacy = 600L, lexnlp = 60L, "paper:gazetteer-v1" = 120L)
     .keep_staging <- FALSE
+    .no_progress <- FALSE
     .quiet <- FALSE
   }
 
@@ -848,7 +855,7 @@ ner_run <- function(
       }
 
       if (!fs::file_exists(stage_)) {
-        con_tmp_ <- DBI::dbConnect(duckdb::duckdb())
+        con_tmp_ <- ner_db_connect()
         duckdb::duckdb_register(con_tmp_, "ner_slice_docs", data.frame(DocID = ids_))
         files_sql_ <- paste0("'", files_, "'", collapse = ", ")
         DBI::dbExecute(con_tmp_, paste0(
@@ -870,41 +877,41 @@ ner_run <- function(
           .id_col = .id_col, .text_col = .text_col,
           .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
           .model = combos_$ModelArg[i_], .device = device_,
-          .batch_size = batch_, .n_process = n_process_, .quiet = .quiet
+          .batch_size = batch_, .n_process = n_process_, .no_progress = .no_progress, .quiet = .quiet
         )
       } else if (engine_ == "lexnlp") {
         ner_lexnlp(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,
           .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .chunk_size = batch_, .n_process = n_process_, .quiet = .quiet
+          .chunk_size = batch_, .n_process = n_process_, .no_progress = .no_progress, .quiet = .quiet
         )
       } else if (engine_ == "paper" && model_ == "dateregex-v1") {
         ner_dateregex(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars, .quiet = .quiet
+          .labels = labels_, .max_chars = .max_chars, .no_progress = .no_progress, .quiet = .quiet
         )
       } else if (engine_ == "paper" && model_ == "moneyregex-v4") {
         ner_moneyregex(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,
           .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .n_process = n_process_, .chunk_size = batch_, .quiet = .quiet
+          .n_process = n_process_, .chunk_size = batch_, .no_progress = .no_progress, .quiet = .quiet
         )
       } else if (engine_ == "paper" && model_ == "redaction-v1") {
         ner_redaction(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,
           .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .n_process = n_process_, .chunk_size = batch_, .quiet = .quiet
+          .n_process = n_process_, .chunk_size = batch_, .no_progress = .no_progress, .quiet = .quiet
         )
       } else if (engine_ == "paper" && model_ == "gazetteer-v1") {
         ner_gazetteer(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,
           .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .n_process = n_process_, .chunk_size = batch_, .quiet = .quiet
+          .n_process = n_process_, .chunk_size = batch_, .no_progress = .no_progress, .quiet = .quiet
         )
       } else {
         cli::cli_abort("No dispatch for {.val {key_em_}}.")
@@ -975,6 +982,43 @@ ner_arg <- function(.x, .engine, .model, .default = NULL) {
 # document was seen by a combination and with what outcome. The ledger is what makes extraction
 # resumable, and its blindness to labels and truncation is why 04A carries a manifest beside it.
 
+#' Open a DuckDB connection with its own progress bar turned off
+#'
+#' EVERY CONNECTION IN THIS PROJECT GOES THROUGH HERE, and the reason is a display collision rather
+#' than anything about the data. DuckDB prints a progress bar for long-running queries by writing
+#' carriage returns to the terminal. So does cli, which is what the corpus pass in 04D uses to show
+#' how far through it is. Two writers on one line produce a smear that reports neither, and on a
+#' pass measured in days the progress display is not a nicety -- it is the only evidence the run is
+#' alive.
+#'
+#' DuckDB's own bar is the one to drop: it reports a single query, cli reports the pass. The setting
+#' is applied per connection rather than globally because there is no global to set from R, and it
+#' is wrapped in a tolerant call because the two setting names have moved between DuckDB versions
+#' and a connection that works is worth more than a bar that is definitely off.
+#'
+#' @param .db_path Path to the database file, or NULL for an in-memory connection.
+#' @param .read_only Logical. Open read-only. DuckDB is single-writer, so anything that only reads
+#'   should say so and leave the writer free.
+#' @return A live DBI connection. The caller disconnects with dbDisconnect(con, shutdown = TRUE).
+ner_db_connect <- function(.db_path = NULL, .read_only = FALSE) {
+  if (FALSE) {
+    .db_path   <- .lP$Store$NerDB
+    .read_only <- TRUE
+  }
+
+  # The two raw dbConnect() calls in this project, and they belong here: everything else routes
+  # through this function so the settings below cannot be forgotten at a call site.
+  con_ <- if (is.null(.db_path)) {
+    DBI::dbConnect(duckdb::duckdb())
+  } else {
+    DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = .read_only)
+  }
+  for (stmt_ in c("SET enable_progress_bar = false", "SET enable_progress_bar_print = false")) {
+    try(DBI::dbExecute(con_, stmt_), silent = TRUE)
+  }
+  con_
+}
+
 #' Open the candidate store, creating its schema if absent
 #'
 #' Safe to call repeatedly: the DDL is idempotent, so a caller never has to know whether the store
@@ -993,7 +1037,7 @@ ner_db_init <- function(.db_path, .quiet = FALSE) {
 
   exists_ <- fs::file_exists(.db_path)
   fs::dir_create(fs::path_dir(.db_path))
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path))
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = FALSE)
 
   # candidates = real hits only -- the harmonised Python schema (Engine + Model
   # are parquet columns). Null-span sentinels AND timeout markers are dropped
@@ -1286,7 +1330,7 @@ ner_bench <- function(.inputs, .grid, .id_col = "DocID", .text_col = "TextRaw") 
 
   # docs in scope, once (for docs/s)
   files_ <- ner_input_files(.inputs)
-  con_tmp_ <- DBI::dbConnect(duckdb::duckdb())
+  con_tmp_ <- ner_db_connect()
   files_sql_ <- paste0("'", files_, "'", collapse = ", ")
   n_docs_ <- DBI::dbGetQuery(con_tmp_, paste0(
     "SELECT COUNT(DISTINCT \"", .id_col, "\") AS n FROM read_parquet([", files_sql_, "])"

@@ -283,7 +283,7 @@ ent_session <- function(.db_path, .keys) {
     .db_path <- .lP$Input$Store
     .keys    <- tab_keys
   }
-  con_ <- DBI::dbConnect(duckdb::duckdb())
+  con_ <- ner_db_connect()
   DBI::dbExecute(con_, paste0("ATTACH '", as.character(fs::path_abs(.db_path)),
                               "' AS s (READ_ONLY)"))
   ent_put_table(.con = con_, .name = "keys", .tab = dplyr::mutate(
@@ -793,7 +793,7 @@ ent_probe_sections <- function(.path_text, .headings) {
     .path_text <- .lP$Input$Text
     .headings  <- .HEADINGS
   }
-  con_ <- DBI::dbConnect(duckdb::duckdb())
+  con_ <- ner_db_connect()
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
   ent_put_table(.con = con_, .name = "probe", .tab = data.frame(Heading = .headings))
 

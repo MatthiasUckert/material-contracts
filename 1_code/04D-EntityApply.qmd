@@ -137,7 +137,12 @@ query per engine. Chunks bound memory; they do not bound work.
   Store = list(
     # THE DELIVERABLE. One file, same schema as 04A's sample store, written by the same code.
     NerDB    = utils_file_path(.dir_main, "Store", "CorpusCandidates.duckdb"),
-    Manifest = utils_file_path(.dir_main, "Store", "manifest.parquet")
+    Manifest = utils_file_path(.dir_main, "Store", "manifest.parquet"),
+    # Plain text, one line per chunk, appended. This is what makes a two-day pass watchable: tail
+    # it from another terminal, read it after RStudio has been closed, check it on a machine running
+    # the pass headless. Console output is buffered by knitr and gone when the session ends; a file
+    # is neither.
+    Progress = utils_file_path(.dir_main, "Store", "progress.log")
   ),
   Work = list(
     Dir = utils_file_path(.dir_main, "Work")   # per-chunk text parquet, deleted as it is consumed
@@ -149,7 +154,7 @@ query per engine. Chunks bound memory; they do not bound work.
     # The switch that decides whether this document is a rehearsal or the release. An integer draws
     # that many documents at random from the whole tree and writes them to a separate store; NULL
     # processes the corpus. Set an integer, read the throughput, then set NULL.
-    Limit      = 10000L
+    Limit      = NULL
   )
 )
 
@@ -246,12 +251,56 @@ engine reports its documents missing and the rest report none.
 
 # Extraction
 
+The store is asked what it already holds before any text is read, and says so. `ner_run()` would skip completed
+documents anyway, but only after each chunk had read its documents off disk and written them out --
+on a corpus re-render, 1.46 million file reads to establish that the work was already done.
+
+Asking here instead makes the remaining work the thing that gets chunked, so the progress bar counts
+against a denominator that means something and the throughput rate is not diluted by chunks that
+did nothing.
+
 ```{r}
-#| label: extract-corpus
+#| label: store-status
 fs::dir_create(fs::path_dir(.lP$Store$NerDB))
 
-chunks_ <- split(tab_index, ceiling(seq_len(nrow(tab_index)) / .lP$Param$ChunkSize))
-cli::cli_alert_info("{length(chunks_)} chunk{?s} of up to {(.lP$Param$ChunkSize)} documents.")
+ent_store_status(
+  .db_path  = .lP$Store$NerDB,
+  .n_corpus = ent_corpus_n(tab_index),   # the whole tree, whatever Limit says
+  .run      = tab_plan$Combo,
+  .dir      = .dir_store                 # supplies the rate already measured
+)
+
+tab_todo <- ent_pending(
+  .db_path = .lP$Store$NerDB,   # absent means everything is pending
+  .index   = tab_index,
+  .run     = tab_plan$Combo     # a document is done only when every declared engine has seen it
+)
+```
+
+A document counts as complete only when **every** declared engine has seen it, which is why adding
+an engine to the policy makes every document in the store incomplete again. That is correct rather
+than surprising, and this is where it becomes visible.
+
+```{r}
+#| label: extract-corpus
+chunks_ <- if (nrow(tab_todo) == 0L) {
+  list()
+} else {
+  split(tab_todo, ceiling(seq_len(nrow(tab_todo)) / .lP$Param$ChunkSize))
+}
+
+if (length(chunks_) == 0L) {
+  cli::cli_alert_success(
+    "Nothing to extract: every document in scope is already in the store. Raise Limit or set it \\
+     to NULL to take in more of the corpus."
+  )
+}
+
+prog_ <- ent_progress_new(
+  .n_chunks = length(chunks_),
+  .n_docs   = nrow(tab_todo),
+  .path_log = .lP$Store$Progress   # tail -f this to watch a long pass from anywhere
+)
 
 tab_timing <- purrr::imap(chunks_, function(.chunk, .i) {
   out_ <- ent_extract_corpus_chunk(
@@ -266,18 +315,35 @@ tab_timing <- purrr::imap(chunks_, function(.chunk, .i) {
   ent_write_timing(
     .dir     = .dir_store,
     .chunk   = .i,
-    .n_docs  = out_$nDocs,
-    .seconds = out_$Seconds,
-    .n_cands = NA_integer_        # counted from the store below, not per chunk
+    .n_docs  = out_$nDocs,     # documents in the chunk
+    .n_new   = out_$nNew,      # of which this many actually had to be extracted
+    .seconds = out_$Seconds
   )
-  cli::cli_alert_success("Chunk {(.i)}: {out_$nDocs} document{?s} in {round(out_$Seconds)}s.")
+  ent_progress_step(.progress = prog_, .n_new = out_$nNew, .seconds = out_$Seconds)
   out_
 }) |>
   purrr::list_rbind()
 ```
 
-Nothing is deleted on a re-run and nothing is recomputed. A chunk whose documents the ledger already
-holds costs one query per engine and reports zero seconds of work.
+One line per chunk, written with `cat()` and flushed immediately, and appended to a plain text log.
+Not through `cli`, and that matters: `cli` emits a condition through `message()`, and anything that
+handles messages holds them -- knitr buffers a chunk's messages until the chunk ends, so a loop
+running for two days shows nothing at all until it is over. Three earlier attempts here, a purrr
+bar and a `cli` bar and `cli` alert lines, all produced silence for that reason.
+
+The log file is the part that actually solves it. Console output is buffered under a render and gone
+when the session ends; a file is neither, so `tail -f` on it works from another terminal, after
+RStudio has been closed, or on a machine running the pass headless.
+
+The rate is cumulative, so one slow chunk moves the estimate rather than dominating it, and the line
+carries the number a bar's only real advantage was: when this finishes.
+
+**A run with nothing pending prints nothing from this loop, and that is why the status table above
+exists.** A silent loop and a broken loop look identical, so the state is reported before the work
+rather than inferred from its absence.
+
+Nothing is deleted on a re-run and nothing is recomputed. A second render finds every document
+already in the ledger, extracts nothing, and says so.
 
 # Results
 
@@ -320,6 +386,11 @@ Read the projection as a floor. The draw is random across the whole tree, so it 
 document count -- but cost follows length, and 04A found the corpus tail longer than the labelled
 sample's.
 
+The rate is per document **extracted**, not per document seen. That distinction is what stops a
+resumed run from flattering itself: a chunk the ledger already covered returns its full document
+count in seconds, and a rate taken over documents seen would improve every time the pass was
+restarted, silently and in the direction that makes it look affordable.
+
 `CorpusMCand` is what the finished store holds, in millions of candidate spans. Multiply the store
 size on disk by the same ratio for the disk figure; both scale linearly, because a candidate row is
 a fixed width and the store carries one per span whatever the document it came from.
@@ -329,8 +400,8 @@ a fixed width and the store carries one per span whatever the document it came f
 ```{r}
 #| label: deploy-summary
 tibble::tibble(
-  Artifact = c("Candidate store", "Store manifest"),
-  Path     = c(.lP$Store$NerDB, .lP$Store$Manifest)
+  Artifact = c("Candidate store", "Store manifest", "Progress log"),
+  Path     = c(.lP$Store$NerDB, .lP$Store$Manifest, .lP$Store$Progress)
 ) |>
   dplyr::mutate(
     Exists = fs::file_exists(.data$Path),

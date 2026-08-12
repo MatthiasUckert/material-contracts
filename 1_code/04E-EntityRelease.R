@@ -62,7 +62,7 @@ ent_chunk_session <- function(.cands, .docs, .path_text) {
   }
 
   arrow::write_parquet(tibble::tibble(DocID = .docs$DocID, TextRaw = .docs$Text), .path_text)
-  con_ <- DBI::dbConnect(duckdb::duckdb())
+  con_ <- ner_db_connect()
   ent_put_table(.con = con_, .name = "deployed", .tab = dplyr::select(
     .cands, DocID, Label, Start, Stop, Span, LabelRaw
   ))

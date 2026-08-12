@@ -332,7 +332,7 @@ ent_manifest <- function(.path_text, .run, .labels, .max_chars) {
     .max_chars <- NULL
   }
 
-  con_ <- DBI::dbConnect(duckdb::duckdb())
+  con_ <- ner_db_connect()
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
   fp_ <- DBI::dbGetQuery(con_, paste0(
     "SELECT COUNT(*) AS NDocs, SUM(length(TextRaw)) AS TextChars ",
@@ -412,7 +412,7 @@ ent_superseded <- function(.db_path, .run) {
                           Declared = logical(0), Verdict = character(0)))
   }
 
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
   have_ <- DBI::dbGetQuery(con_, paste0(
     "SELECT DISTINCT CASE WHEN Engine = Model THEN Engine ",
@@ -604,7 +604,7 @@ ent_check_offsets <- function(.db_path, .path_text, .n = 2000L) {
 
   if (!fs::file_exists(.db_path)) cli::cli_abort("No NER store at {.path {(.db_path)}}.")
 
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
   DBI::dbGetQuery(con_, paste0(
@@ -721,7 +721,7 @@ ent_yield_by_class <- function(.db_path, .path_text, .path_class,
   }
 
   ref_ <- ner_parse_combo(.ref_combo)
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
   tab_ <- DBI::dbGetQuery(con_, paste0(
@@ -773,7 +773,7 @@ ent_length_outliers <- function(.db_path, .path_text, .path_class, .n = 10L) {
     .n          <- 10L
   }
 
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
   DBI::dbGetQuery(con_, paste0(
@@ -828,7 +828,7 @@ ent_head_cap <- function(.path_text, .n_words = 512L, .round_to = 100L) {
     .round_to  <- 100L
   }
 
-  con_ <- DBI::dbConnect(duckdb::duckdb())
+  con_ <- ner_db_connect()
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
   q_ <- DBI::dbGetQuery(con_, paste0(
@@ -1033,7 +1033,7 @@ ent_head_coverage <- function(.db_path, .cap) {
     .cap     <- tab_cap$Cap
   }
 
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
   DBI::dbGetQuery(con_, paste0(
@@ -1071,7 +1071,7 @@ ent_head_vs_full <- function(.db_head, .db_full, .cap) {
     .cap     <- tab_cap$Cap
   }
 
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_head), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_head, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
   DBI::dbExecute(con_, paste0(
     "ATTACH '", as.character(fs::path_abs(.db_full)), "' AS full_store (READ_ONLY)"
@@ -1480,7 +1480,7 @@ ent_overview <- function(.db_path,
 
   if (!fs::file_exists(.db_path)) cli::cli_abort("No NER store at {.path {(.db_path)}}.")
 
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
   add_combo_ <- function(.df) {
@@ -1623,7 +1623,7 @@ ent_alignment <- function(.db_path, .quiet = FALSE) {
   }
   if (!fs::file_exists(.db_path)) cli::cli_abort("No NER store at {.path {(.db_path)}}.")
 
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
   if (DBI::dbGetQuery(con_, "SELECT COUNT(*) AS n FROM candidates")$n == 0L) {
@@ -1791,7 +1791,7 @@ ent_profile_by_class <- function(.db_path,
 
   if (!fs::file_exists(.db_path)) cli::cli_abort("No NER store at {.path {(.db_path)}}.")
 
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = TRUE)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
   add_combo_ <- function(.df) {
