@@ -66,7 +66,7 @@ ner_spacy <- function(
     .output,
     .id_col = "DocID",
     .text_col = "TextRaw",
-    .labels = c("ORG", "GPE", "DATE", "MONEY"), # NULL -> omit --label -> keep all
+    .labels = c("ORG", "PERSON", "GPE", "DATE", "MONEY"), # NULL -> omit --label -> keep all
     .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
     .timeout = 600L, # per-window stall guard in seconds (0 = off)
     .model = "en_core_web_sm",
@@ -83,7 +83,7 @@ ner_spacy <- function(
     .output <- file.path(.lP$Cache$NerTest, "test_spacy_sm.parquet")
     .id_col <- "DocID"
     .text_col <- "TextRaw"
-    .labels <- c("ORG", "GPE", "DATE", "MONEY")
+    .labels <- c("ORG", "PERSON", "GPE", "DATE", "MONEY")
     .max_chars <- NULL
     .timeout <- 600L
     .model <- "en_core_web_sm"
@@ -676,6 +676,50 @@ ner_moneyregex <- function(
   return(invisible(.output))
 }
 
+#' The labels a combination is asked for
+#'
+#' THE POLICY LIVES HERE AND NOWHERE ELSE, because two readers need it and they must not drift.
+#' ner_run() uses it to build the --label argument; 04A's manifest uses it to fingerprint the store.
+#' While the policy was a local inside ner_run(), the manifest could only record that a policy
+#' existed -- it wrote the literal string "per-combo policy" -- so editing the policy left the
+#' fingerprint unchanged and the store reported itself complete under a label set it had never been
+#' built with. PERSON was absent from every spaCy extraction for a full pass that way, with nothing
+#' in any document able to show it.
+#'
+#' The grid this describes is deliberately ragged. spaCy is the only multi-label statistical engine
+#' and the only source of PERSON; LexNLP excludes persons and places by policy; the four ported
+#' paper extractors are single-label specialists. An engine's absent labels are a property of the
+#' engine rather than a failure of the run.
+#'
+#' Keyed by "engine" and by "engine:model", with engine:model winning, because the paper's models
+#' differ from one another.
+#'
+#' @param .engine Character. Engine token.
+#' @param .model Character. Model tag.
+#' @param .labels Character, named list or NULL. An explicit override, exactly as ner_run() takes
+#'   it; NULL applies the policy.
+#' @return Character vector of unified labels.
+ner_label_policy <- function(.engine, .model, .labels = NULL) {
+  if (FALSE) {
+    .engine <- "spacy"
+    .model  <- "en_core_web_lg"
+    .labels <- NULL
+  }
+
+  policy_ <- list(
+    "spacy"               = c("ORG", "PERSON", "GPE", "DATE", "MONEY"),
+    "lexnlp"              = c("ORG", "DATE", "MONEY"),
+    "paper:dateregex-v1"  = "DATE",
+    "paper:gazetteer-v1"  = "GPE",
+    "paper:redaction-v1"  = "REDACT",
+    "paper:moneyregex-v4" = "MONEY"
+  )
+
+  key_em_  <- paste0(.engine, ":", .model)
+  default_ <- if (!is.null(policy_[[key_em_]])) policy_[[key_em_]] else policy_[[.engine]]
+  ner_arg(.labels, .engine, .model, .default = default_)
+}
+
 #' Run a set of engine and model combinations into the candidate store
 #'
 #' The orchestrator every extraction goes through, so that one ledger governs what has been done and
@@ -691,8 +735,9 @@ ner_moneyregex <- function(
 #'
 #' THE LEDGER IS BLIND TO THREE THINGS: which labels were requested, whether the text was truncated
 #' first, and how the model was labelled. A store built under one truncation and re-run under
-#' another therefore does nothing at all and reports success. Keep .labels and .max_chars fixed for
-#' the life of a store, and record them in a manifest so a later mismatch is visible.
+#' another therefore does nothing at all and reports success. 04A closes the label half of this by
+#' fingerprinting ner_label_policy() in its manifest and clearing the engines whose set has moved;
+#' .max_chars still has to be held fixed for the life of a store by hand.
 #'
 #' Stall protection differs by engine because the failure modes differ. A spaCy window stall drops
 #' to sequential processing and skips the offender; a LexNLP extractor or gazetteer document over
@@ -761,17 +806,6 @@ ner_run <- function(
     .quiet <- FALSE
   }
 
-  # Per-combo label policy -- fallback when .labels doesn't name a combo. Keyed
-  # by "engine" and/or "engine:model"; engine:model wins (paper's two models
-  # differ: dateregex -> DATE, gazetteer -> GPE).
-  labels_policy_ <- list(
-    "spacy"              = c("ORG", "GPE", "DATE", "MONEY"),
-    "lexnlp"             = c("ORG", "DATE", "MONEY"),
-    "paper:dateregex-v1" = "DATE",
-    "paper:gazetteer-v1" = "GPE",
-    "paper:redaction-v1" = "REDACT",
-    "paper:moneyregex-v4" = "MONEY"
-  )
 
   # Parse .run tokens ("engine" or "engine:model") into the combo grid. Model =
   # the tag stamped into the parquet; ModelArg = what the wrapper receives. Bare
@@ -838,12 +872,7 @@ ner_run <- function(
     cands_ <- 0L
 
     # Resolve this combo's knobs once (broadcast scalar/vector or engine[:model])
-    default_labels_ <- if (!is.null(labels_policy_[[key_em_]])) {
-      labels_policy_[[key_em_]]
-    } else {
-      labels_policy_[[engine_]]
-    }
-    labels_ <- ner_arg(.labels, engine_, model_, .default = default_labels_)
+    labels_ <- ner_label_policy(.engine = engine_, .model = model_, .labels = .labels)
     n_process_ <- ner_arg(.n_process, engine_, model_, .default = 16L)
     batch_ <- ner_arg(.batch_size, engine_, model_, .default = 64L)
     timeout_ <- ner_arg(.timeout, engine_, model_, .default = 0L)

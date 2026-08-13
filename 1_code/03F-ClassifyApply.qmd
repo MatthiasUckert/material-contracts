@@ -1,5 +1,5 @@
 ---
-title: "Contract Classification -- Applying the Deployed Classifier (03F)"
+title: "Contract Classification -- Labelling the Corpus (03F)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -7,21 +7,20 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ```{r}
 #| label: setup
 #| include: false
-#| purl: false
 knitr::opts_knit$set(root.dir = here::here())
 
 knitr::opts_chunk$set(
-  root.dir  = here::here(),
-  message   = TRUE,       # mandatory: cli writes through the message stream under knitr
-  warning   = FALSE,
-  comment   = "",         # drops the "##" prefix, so console blocks copy verbatim
-  fig.width = 7.5,
-  fig.align = "center",
-  dpi       = 200,
-  out.width = "100%"
+  root.dir = here::here(),
+  message  = TRUE,       # mandatory: cli writes through the message stream under knitr
+  warning  = FALSE,
+  comment  = ""
 )
 
 options(cli.num_colors = 1, cli.width = 120)
+
+# Tables render either as styled html or as fixed-width console blocks. The console path is what a
+# table is for while a long run is being watched; the rendered path is what a reader meets.
+options(mc.table_mode = "console")
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -29,28 +28,21 @@ options(cli.num_colors = 1, cli.width = 120)
   rstudioapi::getActiveDocumentContext()[["path"]]
 }
 .name_script <- fs::path_ext_remove(basename(.name_script))
-
-library <- function(...) suppressPackageStartupMessages(base::library(...))
 ```
 
 ```{r}
-#| label: load-libraries
+#| label: setup-sources
 #| echo: false
 source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
-
-# The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING: the
-# sample script registers its category vocabulary and aliases the table helpers at SOURCE time, not
-# inside a function, so sourcing it first throws part-way through the file and every function defined
-# below the failure silently never exists. A file's top-level statements are part of its interface.
 source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
 source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
 
-# 03A supplies the scoring and formatting layer, 03B the transformer inference call, 03D the
-# generative arm's prompt machinery. Nothing here re-implements any of them: the deployed classifier
-# is the same code the folds were run through, pointed at documents that carry no labels.
+# 03A supplies the text reader and the category vocabulary, 03B the deployed models, 03C the lexicon
+# and -- crucially -- the decision rule that turns term hits into a class. Nothing here reimplements
+# any of them: the classifier applied to the corpus is the code the folds were run through.
 purrr::walk(
-  .x = c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03D-ClassifyLLM"),
+  .x = c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword"),
   .f = function(.s) {
     source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
            encoding = "UTF-8")
@@ -58,612 +50,505 @@ purrr::walk(
 )
 
 cat("Main Directory: ")
-(.dir_main <- init_create_script_dir(
-  .dir_here    = here::here(), # project root
-  .name_script = .name_script  # this document's name
-))
+(.dir_main <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script))
 
 cat("Function File: ")
-(.path_fun <- init_create_script_fun(
-  .dir_here    = here::here(), # project root
-  .name_script = .name_script  # resolves to 1_code/03F-ClassifyApply.R
-))
+(.path_fun <- init_create_script_fun(.dir_here = here::here(), .name_script = .name_script))
 source(file = .path_fun, encoding = "UTF-8")
 ```
 
 # Purpose
 
-Every decision has been made. 03B chose a transformer and refit it on all labelled documents, 03C
-published a keyword table, 03D added a generative arm, and 03E decided how to combine them and how
-much to trust each result. This stage does none of that again. It reads what 03E wrote and applies
-it to the corpus.
+Every decision has been made. 03B fitted a transformer per task and per context length and crowned
+one of each. 03C published a keyword table per task and marked one. 03E measured what combining them
+would buy and reported the answer. This document makes none of those decisions again: it reads what
+those stages deployed and runs it over roughly 1.1 million Exhibit-10 contracts.
 
-That separation is the point. An apply stage free to make its own decisions is an apply stage whose
-output depends on which version of it last ran, and a released dataset cannot be defended on those
-terms. So `mc_classify()` reads every default from the manifest and has almost none of its own, and
-an argument passed explicitly is recorded as a **departure** in the result rather than quietly
-honoured -- a caller can run a different checkpoint, they simply cannot do so invisibly.
+Two engines, in their own sections. The transformer supplies the label. The keyword table supplies an
+independent second opinion on every document it has a term for -- worth nothing as a label, as 03E
+established, and worth something as a signal that a reader can recompute on any filing.
 
-## What comes back
+## The store is the design
 
-One row per document per task: the label, which arm decided it, that arm's confidence, what every arm
-said independently, the agreement tier, and the reliability estimated for that tier under the voting
-set that was actually used. A user of the released dataset can condition on trust without re-running
-anything, which is a materially different offer from a single headline accuracy.
+A pass over a million documents does not complete in one sitting, and it must not begin again from
+zero when it fails at ninety per cent. Everything lands in one DuckDB, and three questions can be put
+to it at any moment:
 
-## Why the generative arm is off by default
+**What is done** -- rows under the current run key. **What is missing** -- the corpus minus what is
+done minus what failed, returned as identifiers rather than a count, so the claim is checkable.
+**What has changed** -- whether the configuration about to run differs from the one that wrote the
+rows already there.
 
-It is the most independent vote available and the only arm that saw none of the labelled sample, so
-it is the one that most improves the flag. It is also hours of inference across a corpus of this
-size rather than minutes. It is therefore pinned in the manifest and disabled: asking for it is one
-argument, and a run that does not ask gets the two-family flag together with reliability numbers
-estimated on the vote it actually ran.
+The third is the one that is easy to leave out and the one that quietly corrupts a released dataset.
+A table holding two context lengths under one name looks exactly like a table holding one.
 
-That last clause is the part that would be easy to get wrong. A two-arm agreement pattern computed at
-deployment is indistinguishable from a two-arm pattern computed on the labelled sample, so shipping
-one set of reliabilities for every voting set would produce numbers that look entirely reasonable and
-describe a vote that never happened. 03E estimates each set separately and the manifest records which
-one a run is using.
+## What the run key is, and what it deliberately is not
+
+The key hashes the **recipe**: the task, the configuration name and the context length. Those
+determine the weights, given the seed fixed upstream, so a refit that reproduces a model
+byte-for-byte does not discard three hours of work.
+
+The artifact path and a fingerprint of its contents are **recorded rather than keyed**. A checkpoint
+replaced by hand therefore surfaces in the drift report instead of being silently honoured -- which
+would mix two models under one name -- or silently discarded, which would be safe and infuriating.
+
+One key per task rather than one per pass, because tasks finish independently: a crown moving on the
+broad taxonomy must not throw away a finished pass on amendments.
+
+## Failures are retryable
+
+A document whose parquet is missing or holds no text is recorded with a reason and excluded from the
+current pass. The next pass tries it again. A file unreadable because a mount hiccuped must not be
+blacklisted forever, and a file that is genuinely empty simply reappears in the report every time,
+which is honest rather than tidy.
+
+## Where the engine boundary sits
+
+The transformer returns finished predictions, because a class is what it was trained to emit.
+
+The keyword engine does not. `keyword_apply.py` answers one question -- which terms of this lexicon
+occur in this document -- and the rule turning terms into a class lives once, in R, and is called
+identically by 03C when it measures the table's precision and by this document when it applies it.
+A second decision rule in a second language is what once put a hand-written substring search in front
+of a lexicon mined under stopword removal: the table committed on 36% of the corpus where it had
+published 52%, and nothing anywhere reported a fault.
 
 # Configuration
 
 ```{r}
 #| label: configure-paths
 .dir_prep <- init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare")
-.dir_orch <- init_create_script_dir(.dir_here = here::here(), .name_script = "03E-ClassifyOrchestrate")
+.dir_bert <- init_create_script_dir(.dir_here = here::here(), .name_script = "03B-ClassifyTrainBERT")
+.dir_kw   <- init_create_script_dir(.dir_here = here::here(), .name_script = "03C-ClassifyTrainKeyword")
 
 .lP <- list(
   Input = list(
-    # fs::path, not utils_file_path: the project helper creates what it names, and a corpus tree
-    # conjured into existence would report itself present while holding nothing.
-    Manifest  = fs::path(.dir_orch, "deployment", "manifest.json"), # written by 03E
-    Prepared  = fs::path(.dir_prep, "prepared.parquet"),            # labelled sample
-    # The same parsed-contract tree 03A drew the labelled sample from, restricted to Exhibit 10.
-    DirCorpus = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/Exhibit10/",
-    MetaData  = "../pMatDisc/2_output/01-GetEDGAR/Output/FullMetaData.parquet" # filer titles
+    Prepared  = fs::path(.dir_prep, "prepared.parquet"),
+    BertCrown = fs::path(.dir_bert, "model_final", "deployed.parquet"),
+    KwCatalog = fs::path(.dir_kw, "table", "catalogue.parquet"),
+    DirCorpus = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/Exhibit10/"
   ),
-  Cache = list(
-    CorpusFiles = utils_file_path(.dir_main, "Cache", "CorpusFiles.parquet") # DocID to Path index
-  ),
-  Output = list(
-    # One store for every configuration, scoped by a RunKey column rather than by directory. Two
-    # passes therefore coexist and are compared with a query; nothing reading it may omit that
-    # filter.
-    Store  = utils_file_path(.dir_main, "labels") |> fs::path("labels.duckdb"),
-    Export = utils_file_path(.dir_main, "labels") # parquet lands here, one file per run key
-  ),
+  Runs = list(Bert = fs::path(.dir_bert, "runs")),
+  Cache = list(CorpusFiles = utils_file_path(.dir_main, "Cache", "CorpusFiles.parquet")),
+  Store = list(Path = utils_file_path(.dir_main, "store", "labels.duckdb")),
+  Output = list(Release = utils_file_path(.dir_main, "release")),
   Engine = list(
-    # The same interpreter and the same engine directory 03B trains through. here::here rather than
-    # a tilde path: system2 does not expand ~, so a tilde reaches the shell literally and fails with
-    # exit 127 four hours into a corpus pass.
-    Python = here::here("contracts-engine", ".venv", "bin", "python"),
-    Script = here::here("contracts-engine", "classify_apply.py") # companion to classify_train.py
+    Python  = "contracts-engine/.venv/bin/python",
+    Bert    = "contracts-engine/classify_apply.py",
+    Keyword = "contracts-engine/keyword_apply.py"
   ),
   Param = list(
-    BatchSize = 32L,    # documents per forward pass
-    ChunkSize = 2500L, # documents per output file; a corpus pass should not be one write
-    IndexRerun = FALSE, # TRUE re-walks the tree; FALSE reuses the cached index
-    # The switch that decides whether this document is a rehearsal or the release. An integer draws
-    # that many documents at random from the whole tree and writes them to a separate directory; NULL
-    # labels the corpus. Set an integer, read the numbers, then set NULL.
-    Limit = 50000L,
-    # Selects a non-default variant of any kind, e.g. c(transformer = "L256"). NULL applies what the
-    # manifest marked. The catalogue exists so a caller with throughput figures can trade accuracy
-    # against cost, so this is a supported choice rather than an escape hatch -- but every row it
-    # produces is recorded as a departure and is not comparable with rows produced under the
-    # defaults.
-    Prefer = NULL
+    Tasks = c("ClassDetailed", "ClassBroad", "AmendType"),
+    # NULL takes the length 03B crowned for each task. An integer overrides it for every task, which
+    # is the cost decision: the longer window is a second full pass over the corpus, and 03E measures
+    # what it buys on the labelled sample.
+    # One or more context lengths. Both is a legitimate plan rather than a mistake: the store keys
+    # every run on its own length, so 256 and 512 coexist without mixing, and the export writes one
+    # file per length. The keyword table has no context length and is shared by both.
+    MaxLen     = 256L,
+    NWords     = NULL,   # NULL takes the truncation window 03C marked as default
+    BatchSize  = 32L,
+    ChunkSize  = 5000L,  # documents per engine invocation; see the benchmark below
+    # Chunks between progress lines during a pass. The first and last always report, so a short run
+    # is never silent. This counts CHUNKS, not minutes, so the cadence moves with ChunkSize: at 5,000
+    # documents a chunk every fifth chunk is roughly every six minutes, and at 500 it is roughly
+    # every forty seconds. Set it to 1L to see every chunk.
+    ReportEvery = 5L,
+    Rehearsal  = 2000L,  # documents in the timing sample, fixed so timings stay comparable
+    # The grid the benchmark prices. Both context lengths, because the whole point is what the longer
+    # one costs; one batch size, because widening this multiplies the runs and the store remembers
+    # every combination measured, so it can be widened later without repeating anything.
+    BenchLens  = c(256L, 512L),
+    BenchBatch = 32L,
+    Rewalk     = FALSE   # walk the corpus tree again rather than reading the cached index
   )
 )
 ```
 
-Nothing here is cached. The expensive work is the model passes themselves, and those are checkpointed
-by writing labelled chunks as they complete, which is a resumable design rather than a cache: an
-interrupted run restarts at the first chunk that has no output file.
+`MaxLen` is the one parameter here that is a decision rather than a setting. 03E compares the two
+lengths on the labelled sample; this document decides what to pay for on 1.1 million documents. Set
+it to `NULL` to take each task's own crown instead.
+
+`ChunkSize` matters more than it looks. `classify_apply.py` loads the tokenizer and the model on every
+invocation, so a small chunk pays that cost hundreds of times over. The benchmark below measures it
+rather than assuming a value.
 
 ```{r}
-#| label: load-manifest
-man <- mc_manifest(.path = .lP$Input$Manifest)
-mc_report_manifest(.man = man)
-```
+#| label: load-inputs
+if (!fs::file_exists(.lP$Input$Prepared)) cli::cli_abort("Run 03A before this document")
+tab_prep   <- arrow::read_parquet(file = .lP$Input$Prepared)
+bert_crown <- arrow::read_parquet(file = .lP$Input$BertCrown)
+kw_cat     <- arrow::read_parquet(file = .lP$Input$KwCatalog)
+tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
 
-Read that block before anything else. Every line of it is a decision someone made once and validated,
-and a run applying the wrong quarter's configuration should be visible in the first screen of output
-rather than in the released labels.
+con <- app_connect(.path = .lP$Store$Path)
 
-The corpus is an index here, not a table. The labelled sample fits in memory and the corpus does not:
-1.1 million contracts of full text is hundreds of gigabytes, so what is held throughout is one row
-per document with its path and filer title, and text is read one chunk at a time and discarded. Any
-code that treats corpus text as a column runs out of memory somewhere past the first hundred
-thousand documents.
-
-```{r}
-#| label: load-documents
-tab_prep <- arrow::read_parquet(file = .lP$Input$Prepared)
-
-tab_index <- mc_corpus_index(
-  .dir_corpus = .lP$Input$DirCorpus,     # the parsed-contract tree, Exhibit 10 only
-  .path_meta  = .lP$Input$MetaData,      # supplies DocDesc, the filer's own title
-  .path_cache = .lP$Cache$CorpusFiles,   # walking a million files is cached, not repeated
-  .rerun      = .lP$Param$IndexRerun,    # TRUE after new contracts have been parsed
-  .limit      = .lP$Param$Limit,         # NULL labels the corpus; an integer rehearses
-  .seed       = 42L,                     # a limited run draws the same documents each time
-  .tab_prep   = tab_prep                 # flags documents the model was trained on
+n_corpus <- app_corpus_load(
+  .con        = con,                        # the store
+  .dir_corpus = .lP$Input$DirCorpus,        # the parsed-contract tree, Exhibit 10 only
+  .path_cache = .lP$Cache$CorpusFiles,      # walking a million paths is cached, not repeated
+  .rewalk     = .lP$Param$Rewalk            # TRUE after the corpus has grown
 )
-
-# The store, and the key everything in it is scoped by. Disconnected in the last chunk of this
-# document, after every read: a connection closed while anything downstream still needs it fails at
-# whichever query happens to run next, which is nowhere near the line that closed it.
-run_key <- mc_run_key(.man = man)
-con     <- mc_db_open(.path = .lP$Output$Store)
-
-tab_index |>
-  dplyr::summarise(
-    Documents = dplyr::n(),
-    InSample  = sum(InSample),
-    WithDesc  = sum(!is.na(DocDesc))
-  ) |>
-  tbl_say(.title = paste0("Corpus to label, run key ", run_key))
 ```
 
-Labels go to a DuckDB store keyed on `(RunKey, DocID, Task)`. What is already done is therefore a
-property of the documents rather than of the file they landed in, which matters because a
-chunk-per-file layout is only sound while *chunk seven* means the same seven thousand documents in
-every run -- and a changed chunk size, a changed sample cap, new contracts shifting every boundary,
-or a process killed mid-write all break that without changing a filename. Every one of those failures
-is silent, and the symptom is a coverage table that reconciles because the missing documents are
-inside somebody else's file.
-
-`RunKey` hashes the arms and their parameters, so re-rendering the orchestration stage without
-changing what it pins does not orphan a half-finished pass, while a configuration that does change
-gets its own scope in the same table. Chunking is now nothing but a transaction size: it identifies
-nothing, so it can change freely, and an interrupted insert rolls back rather than leaving half a
-chunk behind.
-
-A capped run is consequently a partial corpus pass rather than a separate object. It draws from the
-whole tree, its labels are valid under the same configuration, and an uncapped run afterwards picks
-up whatever it missed.
-
-`InSample` marks documents the transformer was trained on. They are still part of the corpus and
-still get labels, but anyone measuring accuracy on them would be measuring training accuracy, so the
-flag travels with the release rather than the documents being quietly dropped.
-
-# A rehearsal on one chunk
-
-Before a corpus pass, one chunk end to end. It exercises every arm and the flag lookup, and it costs
-seconds -- which is the right price for discovering that a model directory moved or that the keyword
-lexicon has a column the applier does not expect.
+The corpus index lives in the store rather than in a parquet beside it. That is what makes "which
+documents still need labelling" a single anti-join instead of a set operation across two storage
+layers, and it is why the store can answer the three questions above without help.
 
 ```{r}
-#| label: rehearse-chunk
-labelled_head <- mc_classify(
-  .docs       = mc_read_chunk(dplyr::slice_head(tab_index, n = 200L)), # text read here, not held
-  .manifest   = man,                                   # every default comes from here
-  .tasks      = "ClassDetailed",                       # one task for the rehearsal
-  .prefer     = .lP$Param$Prefer,                      # NULL applies what the manifest marked
-  .voting_set = NULL,                                  # NULL takes the manifest default
-  .tab_prep   = tab_prep,                              # only used if the generative arm runs
-  .in_sample  = tab_prep$DocID,                        # marks documents the arms were fitted on
-  .python     = .lP$Engine$Python,                     # inference environment
-  .script     = .lP$Engine$Script,                     # inference script
-  .batch_size = .lP$Param$BatchSize                    # documents per forward pass
-)
+#| label: check-docid
+# The labelled sample and the corpus must use the same identifier, or nothing downstream joins. This
+# is cheap to assert and expensive to discover late: a mismatch produces a perfectly ordinary table
+# of labels that merges onto nothing.
+# Written to a temporary table and joined, rather than passed as a bound list. A list parameter is
+# backend-specific syntax, and this check exists to catch a problem rather than to become one.
+DBI::dbWriteTable(con, "tmp_labelled", tibble::tibble(DocID = tab_prep$DocID),
+                  temporary = TRUE, overwrite = TRUE)
+n_match <- DBI::dbGetQuery(
+  con, "SELECT COUNT(*) AS n FROM corpus c INNER JOIN tmp_labelled t ON t.DocID = c.DocID"
+)$n[[1]]
 
-mc_report_run(.tab = labelled_head)
+tibble::tibble(
+  Check = c("Labelled documents", "Found in the corpus index", "Corpus documents"),
+  n     = c(nrow(tab_prep), n_match, n_corpus)
+) |>
+  tbl_out(.title = "Do the identifiers line up?")
+
+if (n_match < nrow(tab_prep)) {
+  cli::cli_alert_warning(
+    "{nrow(tab_prep) - n_match} labelled document{?s} {?is/are} absent from the corpus index."
+  )
+}
 ```
 
 ```{r}
-#| label: rehearse-inspect
-labelled_head |>
-  dplyr::select(DocID, dplyr::starts_with("Bert_"), dplyr::starts_with("Kw_"), Tier) |>
-  head(10) |>
-  tbl_say(.title = "First ten documents, as every arm saw them")
-```
+#| label: build-specs
+# WHAT WILL RUN, resolved before anything runs. Each row is one engine, one task, one configuration,
+# and the key everything it writes is scoped by.
+# A list rather than a vector so NULL survives as one element meaning "each task's own crown", which
+# c() would flatten away.
+lens_ <- if (is.null(.lP$Param$MaxLen)) list(NULL) else as.list(.lP$Param$MaxLen)
 
-There is no label in that table, and there is not meant to be. Every routing rule 03E searched is a
-deterministic function of these columns -- a cascade is "take the terminal's first choice, override
-where the gated arm committed above the floor", which on a finished table is one `mutate` -- and
-inference over the corpus is hours against seconds for the rule. Deciding the label here would buy
-nothing and would foreclose changing one's mind without a second corpus pass, so the label is derived
-downstream and this stage ships the evidence for it.
-
-Read the two `Score2` columns as different objects. `Bert_Score2` is softmax mass over categories;
-`Kw_Score2` is a Wilson lower bound on training precision, and it is `NA` wherever only one class
-matched at all. They occupy the same slot because they answer the same question of their own arm, not
-because they are comparable across arms.
-
-`Kw_Pred1` reading `(none)` is the keyword table declining rather than failing. The published table
-holds its precision by abstaining, so its share of committed documents on this corpus is the figure
-to check against the coverage 03C promised.
-
-# The corpus pass
-
-Chunked, and each chunk written as it completes. A corpus pass is measured in hours, so a failure at
-document nine hundred thousand should cost one chunk rather than the run, and a restart should
-resume rather than begin again.
-
-```{r}
-#| label: apply-corpus
-mc_corpus_pass(
-  .index      = tab_index,               # what this run drew
-  .con        = con,                     # the label store
-  .run_key    = run_key,                 # scopes what counts as already done
-  .chunk_size = .lP$Param$ChunkSize,     # documents per transaction, identifying nothing
-  .fn = function(.docs) {
-    mc_classify(
-      .docs       = .docs,              # this chunk, text and all
-      .manifest   = man,                # every default comes from here
-      .tasks      = NULL,               # NULL labels every task the manifest carries
-      .prefer     = .lP$Param$Prefer,   # NULL applies what the manifest marked
-      .tab_prep   = tab_prep,           # only used if the generative arm runs
-      .in_sample  = tab_prep$DocID,     # marks documents the arms were fitted on
-      .python     = .lP$Engine$Python,  # inference environment
-      .script     = .lP$Engine$Script,  # inference script
-      .batch_size = .lP$Param$BatchSize,# documents per forward pass
-      .quiet      = TRUE                # the progress bar is the only output a long pass needs
+spec_bert <- purrr::map(.lP$Param$Tasks, function(.t) {
+  purrr::map(lens_, function(.m) {
+    app_pick_model(
+      .dir_bert    = .dir_bert,        # where 03B deployed its models
+      .tab_overall = tab_overall,      # supplies the context length and the score
+      .crown       = bert_crown,       # what 03B crowned per task
+      .task        = .t,               # the task
+      .max_len     = .m                # NULL takes that task's crown
     )
-  }
-)
+  }) |>
+    purrr::list_rbind()
+}) |>
+  purrr::list_rbind() |>
+  dplyr::mutate(Engine = "bert",
+                RunKey = purrr::pmap_chr(list(Task, ConfigName, MaxLen),
+                                         \(.t, .c, .m) app_run_key("bert", .t, .c, .m)))
+
+spec_kw <- purrr::map(.lP$Param$Tasks, function(.t) {
+  app_pick_lexicon(
+    .dir_kw    = .dir_kw,              # where 03C published its tables
+    .catalogue = kw_cat,               # what it marked
+    .task      = .t,                   # the task
+    .n_words   = .lP$Param$NWords      # NULL takes the marked window
+  )
+}) |>
+  purrr::list_rbind() |>
+  dplyr::mutate(Engine = "keyword",
+                RunKey = purrr::pmap_chr(list(Task, ConfigName, NWords),
+                                         \(.t, .c, .w) app_run_key("keyword", .t, .c, .w)))
+
+specs <- dplyr::bind_rows(spec_bert, spec_kw)
+
+specs |>
+  dplyr::select(Engine, Task, RunKey, dplyr::any_of(c("MaxLen", "NWords", "Tau")), ConfigName) |>
+  tbl_out(.title = "What this run will apply")
 ```
 
 ```{r}
-#| label: apply-throughput
-mc_report_throughput(
-  .con       = con,                            # timings live beside the labels
-  .run_key   = run_key,                        # this configuration's chunks only
-  # The whole tree, not this run's index. Under a cap the two differ by exactly the cap, and the
-  # projection is the number a night gets planned around.
-  .n_corpus  = attr(tab_index, "nCorpus"),     # documents a full pass would cover
-  .n_tasks   = 3L,                             # tasks a full pass would label
-  .n_indexed = nrow(tab_index)                 # this run's draw, so inherited timings are named
-)
+#| label: report-status
+#| results: asis
+app_report_status(.tab = app_status(.con = con, .specs = specs), .n_corpus = n_corpus)
 ```
 
-`FullPassHrs` prices the whole tree whatever this run was capped at, so it is directly the figure to
-plan around; the rate behind it is measured on this machine under this configuration. Set `Limit` to
-`NULL` once that number is acceptable.
+# Benchmark
 
-Timings accumulate in the labels directory, which is what lets a resumed pass keep the measurements
-it already paid for. The cost is that a chunk size changed between runs leaves both regimes in one
-average, and the report says so rather than presenting the blend as a rate.
+Before a pass that runs for hours, a pass that runs for minutes. It answers three questions.
+
+**Does the seam work at all** -- a checkpoint on disk, a Python interpreter, a parquet round trip,
+labels coming back.
+
+**What does each setting cost** -- the context length above all. Attention is quadratic in sequence
+length, so 512 is not twice 256 but somewhere between twice and four times, and the only way to know
+which is to measure it on this machine with these documents.
+
+**What would the corpus cost** -- the rate projected forward. On a short run this is pessimistic: the
+first chunk on Apple silicon pays for kernel compilation and never pays again.
+
+Two properties make this safe to run on every render. **It writes no labels** -- the predictions are
+produced and discarded -- so it is free to price a context length nobody intends to deploy, and it
+cannot consume the queue the real pass will work through. And **it is keyed on what it varied**, so a
+combination already measured is read back rather than run again: minutes on the first render, seconds
+afterwards.
+
+```{r}
+#| label: benchmark-grid
+# THE GRID IS THE STUDY DESIGN, so it is written here rather than assembled inside a function. Every
+# deployed context length for every task: the cost question is what the longer window is worth, and it
+# cannot be answered by timing only the one that ships.
+grid_bench <- purrr::map(.lP$Param$Tasks, function(.t) {
+  purrr::map(.lP$Param$BenchLens, function(.m) {
+    app_pick_model(
+      .dir_bert    = .dir_bert,
+      .tab_overall = tab_overall,
+      .crown       = bert_crown,
+      .task        = .t,
+      .max_len     = .m                       # an explicit length, not the crown
+    )
+  }) |>
+    purrr::list_rbind()
+}) |>
+  purrr::list_rbind() |>
+  tidyr::expand_grid(BatchSize = .lP$Param$BenchBatch) |>
+  dplyr::mutate(Engine = "bert")
+
+bench_docs <- app_bench_docs(.con = con, .n = .lP$Param$Rehearsal)
+```
+
+The sample is the same documents every time, taken in identifier order from the corpus rather than
+from what is outstanding. A grid comparing two lengths on two different samples measures the samples
+as much as the lengths, and the effect being looked for is a factor of two at most.
+
+```{r}
+#| label: benchmark-run
+#| results: asis
+bench <- app_benchmark(
+  .con        = con,                   # the store, which remembers what has been measured
+  .docs       = bench_docs,            # the fixed sample
+  .grid       = grid_bench,            # task by context length by batch size
+  .python     = .lP$Engine$Python,
+  .script     = .lP$Engine$Bert,
+  .chunk_size = .lP$Param$ChunkSize    # so the model-load cost is timed as it would be paid
+)
+
+app_report_benchmark(.tab = bench, .n_corpus = n_corpus)
+```
+
+The context length is passed explicitly and never allowed to default. A model applied at a length it
+was not fitted under encodes its input differently from its training data, produces perfectly ordinary
+labels, and says so nowhere.
+
+# The transformer
+
+Three tasks, each at the context length resolved above. The pass writes every chunk before reading the
+next, so an interruption costs the chunk in flight and nothing else.
+
+The broad label is produced by its own model rather than rolled up from the detailed prediction. 03B
+publishes the roll-up and 03E found the two routes equivalent, so the roll-up remains available; what
+running the model buys is a second, independent opinion on every document, which the roll-up cannot
+give because it is a function of the first.
+
+```{r}
+#| label: pass-bert
+#| results: asis
+run_bert <- purrr::map(seq_len(nrow(spec_bert)), function(.i) {
+  s_ <- spec_bert[.i, ]
+  app_pass(
+    .con        = con,
+    .spec       = s_,
+    .label_fn   = function(.d) list(Labels = app_bert_chunk(
+      .docs       = .d,
+      .artifact   = s_$Artifact,
+      .max_len    = s_$MaxLen,
+      .python     = .lP$Engine$Python,
+      .script     = .lP$Engine$Bert,
+      .batch_size = .lP$Param$BatchSize
+    )),
+    .chunk_size   = .lP$Param$ChunkSize,
+    .limit        = NULL,                       # NULL takes everything outstanding
+    .report_every = .lP$Param$ReportEvery       # chunks between progress lines
+  ) |>
+    dplyr::mutate(Engine = "bert", Task = s_$Task, .before = 1)
+}) |>
+  purrr::list_rbind()
+
+app_report_timing(.tab = run_bert, .n_corpus = n_corpus)
+```
+
+# The keyword table
+
+Two steps per chunk, and the split is the point. `keyword_apply.py` reports which terms of the
+published lexicon occur in each document, under the analyzer the table was mined with. `kw_decide()`
+turns those terms into a class, at the threshold 03C published, using the same function that measured
+the table's precision.
+
+Both are stored. The labels are what a reader conditions on; the hits are the evidence trail, and they
+are what lets a revised threshold be applied by re-running the decision rule over stored rows instead
+of the lexicon over the corpus.
+
+```{r}
+#| label: pass-keyword
+#| results: asis
+run_kw <- purrr::map(seq_len(nrow(spec_kw)), function(.i) {
+  s_       <- spec_kw[.i, ]
+  classes_ <- sort(unique(tab_prep[[s_$Task]]))
+  app_pass(
+    .con        = con,
+    .spec       = s_,
+    .label_fn   = function(.d) app_keyword_chunk(
+      .docs    = .d,
+      .spec    = s_,             # carries the window, stopword regime and threshold it was mined at
+      .classes = classes_,       # the task's categories, from the labelled sample
+      .python  = .lP$Engine$Python,
+      .script  = .lP$Engine$Keyword
+    ),
+    .chunk_size   = .lP$Param$ChunkSize,
+    .limit        = NULL,
+    .report_every = .lP$Param$ReportEvery       # chunks between progress lines
+  ) |>
+    dplyr::mutate(Engine = "keyword", Task = s_$Task, .before = 1)
+}) |>
+  purrr::list_rbind()
+
+app_report_timing(.tab = run_kw, .n_corpus = n_corpus)
+```
 
 # Results
 
 ```{r}
 #| label: results-summary
-# Scoped by run key, always. The store holds every configuration ever run against it, so a read that
-# omitted the filter would silently pool two sets of arms into one table and every statistic below
-# would describe a classifier that never existed.
-tab_labels <- mc_db_labels(.con = con, .run_key = run_key)
-
-tab_labels |>
-  dplyr::summarise(nDocs = dplyr::n_distinct(DocID), .by = Task) |>
-  tbl_say(.title = "Documents labelled, per task")
+#| results: asis
+app_summary(.con = con, .specs = specs) |>
+  tbl_out(
+    .title = "What each run produced",
+    .pct   = "Coverage",
+    .notes = c(
+      Coverage = paste("Share of the corpus index carrying a label from this run. The transformer",
+                       "commits everywhere, so anything below one is a document it could not read.",
+                       "The keyword table abstains by design and its coverage is a property of the",
+                       "lexicon rather than a fault."),
+      MeanTop1 = paste("Mean top-class probability. For the keyword table this is Power, a Wilson",
+                       "lower bound on the firing term's training precision, and is not comparable",
+                       "with a softmax.")
+    )
+  )
 ```
-
-## Coverage
-
-A pass drops documents whose parquet is missing or holds no text, rather than stopping a run measured
-in days. That is the right trade and it leaves a hole, so the hole is measured here rather than left
-to be inferred by subtracting one table from another. The reconciliation survives a restart, which
-the per-chunk warnings do not: on a resumed render the chunks that dropped documents are skipped and
-report nothing at all.
-
-The labelled sample is carried through the same reconciliation because it is the one set of documents
-whose contents are known. If it reaches the output at the corpus rate, the loss is a property of the
-archive and the released labels are missing a random slice. If it reaches at a different rate, the
-loss is selective, and a dataset missing a describable kind of document is a different object from
-one missing an arbitrary one.
-
-```{r}
-#| label: results-coverage
-mc_report_coverage(
-  .tab_index  = tab_index,   # what this run drew
-  .tab_labels = tab_labels,  # what came back
-  .tab_prep   = tab_prep     # the one set whose contents are known
-)
-
-# The identifiers, not just the count: a count says how much is missing and a list says what, and the
-# path travels with it so the claim is checkable against the archive rather than taken on trust.
-arrow::write_parquet(
-  x    = mc_missing(.tab_index = tab_index, .tab_labels = tab_labels),
-  sink = fs::path(.lP$Output$Export, paste0("missing_", run_key, ".parquet"))
-)
-```
-
-The corpus will not look like the labelled sample, and it should not: the sample was drawn to support
-estimation, with thin categories deliberately over-represented so they could be learnt at all. A gap
-is expected. What a gap cannot distinguish on its own is whether it comes from that sampling design
-or from the model drifting toward frequent categories on documents unlike anything it trained on --
-and those have very different consequences for the released labels.
-
-The confidence tiers separate the two. If documents the arms agreed on look like the labelled sample
-while the ones they disagreed on carry the skew, the drift sits on uncertain documents and the flag
-is already isolating it. If every tier is skewed alike, the difference is composition, the labels are
-unaffected, and what carries the sample's composition is the reliability estimate rather than the
-classifier.
 
 ```{r}
 #| label: results-distribution
-dist_det <- mc_distribution(
-  .tab_labels = tab_labels,     # the corpus pass
-  .tab_prep   = tab_prep,       # the labelled sample
-  .label_col  = "ClassDetailed" # the only task carrying a flag
-)
-
-mc_report_distribution(.tab = dist_det)
+#| results: asis
+purrr::walk(seq_len(nrow(spec_bert)), function(.i) {
+  s_ <- spec_bert[.i, ]
+  tbl_out(
+    .tab   = app_distribution(.con = con, .spec = s_),
+    .title = paste0("Corpus composition -- ", s_$Task),
+    .pct   = c("Share", "MeanTop1"),
+    .notes = c(MeanTop1 = "Mean top-class probability within the category.")
+  )
+})
 ```
 
+Read the composition against the labelled sample's own distribution. The sample was drawn to cover the
+categories rather than to mirror the corpus, so the two are not expected to match -- but a category
+that is common in the sample and near-absent here, or the reverse, is worth understanding before the
+labels are used.
+
 ```{r}
-#| label: results-confidence
-tab_labels |>
-  dplyr::filter(!is.na(Tier)) |>
-  dplyr::count(Task, VotingSet, Tier, name = "nDocs") |>
-  dplyr::mutate(Share = tbl_pct(nDocs / sum(nDocs)), .by = Task) |>
-  tbl_say(.title = "Confidence tiers across the corpus")
+#| label: results-failures
+#| results: asis
+fail <- app_failures(.con = con)
+if (nrow(fail) == 0L) {
+  cli::cli_alert_success("No document failed.")
+} else {
+  tbl_out(
+    .tab   = fail,
+    .title = "Documents that could not be labelled",
+    .notes = c(Reason = paste("Recorded, not blacklisted. These documents return to the queue on the",
+                              "next pass, so a transient read failure resolves itself and a genuinely",
+                              "empty file simply reappears here."))
+  )
+}
 ```
 
-If the tier distribution here differs markedly from 03E's on the labelled sample, the flag is
-behaving differently outside the data it was estimated on, and its reliability numbers should be
-treated with more caution than the table suggests. That comparison belongs in the paper.
+# The released file
 
-## What the corpus looks like
+The store is the archive: long, keyed by run, holding every term hit and every timing. This is the
+deliverable -- one row per document, one column per thing a reader needs, in the shape a merge wants.
 
-Everything below is measured **without labels**, which is the only kind of statement available at
-this scale and is less limiting than it sounds. Two arms trained on different evidence, a taxonomy
-with a known hierarchy, and a runner-up beside every first choice give three independent handles on
-where the released labels carry weight and where they are close calls -- none of which needs the
-truth for a single corpus document.
+**One file per context length.** The store keys every run on its own length, so 256 and 512 coexist
+without mixing, and each produces its own release. The keyword table has no context length and is
+shared by both.
 
-None of it substitutes for the validated estimate. Agreement is not accuracy: two arms can be wrong
-together, and the keyword arm shares vocabulary with the transformer's early layers. Read these as a
-map of where to look.
+Both engines ship, and their scores are named apart. `BertClassDetailedProb` is a softmax probability
+over classes; `KwClassDetailedPower` is a Wilson lower bound on the firing term's training precision.
+Both live between zero and one and neither is the other, so naming both of them `Prob` would put two
+incomparable quantities in adjacent columns and invite the comparison 03E ruled out.
+
+Where the lexicon was silent -- or where its top two classes tied, which the decision rule treats as a
+refusal rather than something to break -- the keyword columns are `NA` rather than a sentinel. Carried
+through as a category it would grow a phantom class holding half the corpus in every tabulation.
 
 ```{r}
-#| label: stats-profile-detailed
-mc_report_task_profile(.tab = tab_labels, .task = "ClassDetailed")
+#| label: release-write
+#| results: asis
+releases <- purrr::map(lens_, function(.m) {
+  specs_ <- if (is.null(.m)) specs else {
+    specs |> dplyr::filter(.data$Engine == "keyword" | .data$MaxLen == .m)
+  }
+  rel_ <- app_release(
+    .con      = con,                  # the store
+    .specs    = specs_,               # this length's transformer runs plus the shared lexicon
+    .tab_prep = tab_prep,             # supplies the detailed-to-broad mapping
+    .tasks    = .lP$Param$Tasks       # column-block order in the released file
+  )
+  app_write_release(
+    .tab      = rel_,
+    .con      = con,
+    .specs    = specs_,
+    .dir      = .lP$Output$Release,
+    .max_len  = .m,                   # stamped into the file name
+    .n_corpus = n_corpus              # for the completeness statement
+  )
+  rel_
+})
 ```
 
-```{r}
-#| label: stats-profile-broad
-mc_report_task_profile(.tab = tab_labels, .task = "ClassBroad")
-```
+Rows are documents carrying **every** transformer label. One reached by the detailed pass and not yet
+by the broad one leaves rather than arriving with a hole: a file where a cross-tabulation silently
+drops rows reports a number computed on a subset while a reader believes they are looking at the
+corpus. What is left out is counted above rather than hidden, which is the same information without
+the trap.
+
+A release written while a pass is still running is stamped `_partial` in its file name. It is a
+well-formed file either way, and nothing inside it would otherwise say how much of the corpus it
+covers.
 
 ```{r}
-#| label: stats-profile-amend
-mc_report_task_profile(.tab = tab_labels, .task = "AmendType")
-```
-
-### The two taxonomies against each other
-
-The broad task is predicted independently of the detailed one, and the taxonomy fixes which broad
-parent each detailed category belongs to. Those two facts can be checked against one another on every
-released document: where the independently-predicted parent differs from the parent of the predicted
-detailed category, at least one of the two is wrong.
-
-It bounds joint error from below and nothing from above -- both predictions can be wrong the same way
--- but it is measured on the corpus rather than on 4,398 documents, and it says *which* parents the
-two taxonomies pull apart on.
-
-```{r}
-#| label: stats-hierarchy
-mc_hierarchy_agreement(.tab = tab_labels, .map = mc_taxonomy_map(.tab_prep = tab_prep)) |>
-  dplyr::mutate(Coherent = tbl_pct(Coherent)) |>
-  tbl_say(.title = "Detailed prediction's parent against the independent broad prediction")
-```
-
-### The taxonomy, filled in
-
-One row per detailed category, under its broad parent, with what each arm found and how the two
-taxonomies disagree. Read down the hierarchy rather than down a ranking: a category the classifier
-never predicted keeps its row at zero, and an absent category and a zero are different findings.
-
-The two arms have two denominators. The keyword table abstains by design -- on the amendment task as
-well as the detailed one -- so `nKw` counts documents it was willing to speak about and is not a
-smaller estimate of the same quantity as `nBert`. `KwCommit` carries that gap so it is attributable
-rather than mysterious.
-
-`Incoherent` is the disagreement between the two taxonomies, localised. Each of those documents has an
-independently-predicted broad class that is not this row's parent, so at least one of the two
-predictions is wrong -- which the hierarchy establishes without a single label.
-
-```{r}
-#| label: stats-hierarchy-table
-mc_report_hierarchy_table(
-  .tab = tab_labels,                              # every task, every arm
-  .map = mc_taxonomy_map(.tab_prep = tab_prep)    # the hierarchy, read off the sample that defines it
-)
-```
-
-```{r}
-#| label: stats-amend
-mc_amend_profile(.tab = tab_labels) |>
-  dplyr::mutate(Amended = tbl_pct(Amended)) |>
-  tbl_say(.title = "Amendment share, by detailed category")
-```
-
-### The second guess
-
-The runner-up is the only statement about alternatives available without labels, and at corpus scale
-the recurring first-to-second pairs are the taxonomy's fault lines: two categories the model
-repeatedly cannot separate are two a reader should not treat as cleanly distinct, whichever way any
-single document went.
-
-Read `MeanMargin` alongside the count. A pair recurring at a margin of 0.9 is the model being certain
-about many similar documents; the same pair at 0.05 is a coin toss it keeps making the same way, and
-only the second is a fault line.
-
-```{r}
-#| label: stats-second-detailed
-mc_second_guess(.tab = tab_labels, .task = "ClassDetailed") |>
-  dplyr::mutate(Share = tbl_pct(Share), Close = tbl_pct(Close),
-                MeanMargin = sprintf("%.3f", MeanMargin)) |>
-  tbl_say(.title = "ClassDetailed: most frequent first-to-runner-up pairs")
-```
-
-```{r}
-#| label: stats-second-broad
-mc_second_guess(.tab = tab_labels, .task = "ClassBroad", .n = 8L) |>
-  dplyr::mutate(Share = tbl_pct(Share), Close = tbl_pct(Close),
-                MeanMargin = sprintf("%.3f", MeanMargin)) |>
-  tbl_say(.title = "ClassBroad: most frequent first-to-runner-up pairs")
-```
-
-### When the arms disagree
-
-A disagreement in which the keyword table names the category the transformer ranked *second* is a
-different object from one in which it names something the transformer never considered. The first is
-two arms splitting a close call; the second is a genuine conflict, and only the second is worth
-anyone's time.
-
-```{r}
-#| label: stats-near-miss
-mc_near_miss(.tab = tab_labels) |>
-  dplyr::mutate(ShareOfCommitted = tbl_pct(ShareOfCommitted), IsRunnerUp = tbl_pct(IsRunnerUp),
-                MeanMargin = sprintf("%.3f", MeanMargin)) |>
-  tbl_say(.title = "Disagreements, and how many are the transformer's runner-up")
-```
-
-# Validation
-
-The deployed classifier applied to the labelled sample must reproduce what 03E measured. Any gap is a
-deployment fault -- a wrong checkpoint, a different context length, a lexicon that moved -- rather
-than a modelling result, and it is the one check that catches an artifact mismatch the manifest's
-existence test cannot.
-
-```{r}
-#| label: validation-roundtrip
-round_trip <- mc_classify(
-  .docs     = tab_prep |>
-    dplyr::select(DocID, Text, dplyr::any_of("DocDesc")) |>
-    dplyr::slice_head(n = 1000L), # the labelled sample already carries its text
-  .manifest = man,                # the deployed configuration
-  .tasks     = "ClassDetailed",    # the headline task
-  .prefer    = .lP$Param$Prefer,   # NULL applies what the manifest marked
-  .tab_prep  = tab_prep,           # only used if the generative arm runs
-  .in_sample = tab_prep$DocID,     # every document here is in sample, by construction
-  .python    = .lP$Engine$Python,  # inference environment
-  .script    = .lP$Engine$Script   # inference script
-)
-
-# Scored on the terminal arm's first choice, which is what the estimating stage scored while nothing
-# routed. Scoring a derived label here would test a rule this stage does not apply.
-round_trip |>
-  dplyr::inner_join(
-    tab_prep |> dplyr::select(DocID, TrueLabel = ClassDetailed),
-    by = dplyr::join_by(DocID)
-  ) |>
-  dplyr::summarise(
-    nDocs       = dplyr::n(),
-    BertCorrect = mean(Bert_Pred1 == TrueLabel),
-    KwCommits   = mean(Kw_Pred1 != "(none)"),
-    KwCorrect   = mean(Kw_Pred1[Kw_Pred1 != "(none)"] == TrueLabel[Kw_Pred1 != "(none)"])
-  ) |>
-  dplyr::mutate(dplyr::across(-nDocs, tbl_pct)) |>
-  tbl_say(.title = "Deployed arms on labelled documents")
-```
-
-`BertCorrect` will sit **above** the cross-validated estimate, and that is expected rather than
-reassuring: the deployed model was refit on every labelled document, so these are documents it has
-seen. It is a plumbing check, not a performance claim. The honest figure for the paper remains 03E's
-nested estimate, and quoting this one instead would be reporting training accuracy.
-
-`KwCommits` is the check with real content. The keyword table promised a coverage at a published
-precision, and that promise was measured under the truncation window the table was mined at. If the
-share committed here departs from what 03C published, the applier is reading a different amount of
-text than the miner did, and the published precision does not hold on this corpus.
-
-# Overview
-
-Everything above in one place: what the manifest committed this run to, what the run produced, and
-how each arm behaved on the documents it was asked about. Nothing here is new.
-
-## What ran
-
-```{r}
-#| label: overview-manifest
-mc_report_manifest(.man = man)
-```
-
-## What came back
-
-```{r}
-#| label: overview-run
-mc_report_run(.tab = tab_labels)
-```
-
-## Where the arms agreed
-
-```{r}
-#| label: fig-agreement-corpus
-#| fig-height: !expr plot_height(4)
-#| fig-cap: "Share of the corpus on which each pair of arms made the same first choice, by task.
-#|   Read against the keyword arm's commitment share: two arms cannot agree where one abstains."
-mc_plot_agreement(.tab = tab_labels)
-```
-
-## What each arm committed to
-
-```{r}
-#| label: fig-margin-corpus
-#| fig-height: !expr plot_height(6)
-#| fig-cap: "Distribution of the transformer's decision margin -- first choice minus runner-up -- by
-#|   task. Mass at one is clean separation; weight near zero is documents where a different seed
-#|   would plausibly have produced a different released label."
-mc_plot_margin(.tab = tab_labels)
-```
-
-```{r}
-#| label: fig-second-guess-detailed
-#| fig-height: !expr plot_height(12, .square = TRUE)
-#| fig-cap: "Where each detailed category's documents send their runner-up, as a share of that
-#|   category. A confusion matrix built without labels: the off-diagonal mass is the taxonomy's own
-#|   ambiguity rather than any document's truth."
-mc_plot_second_guess(.tab = tab_labels, .task = "ClassDetailed")
-```
-
-```{r}
-#| label: fig-commitment-corpus
-#| fig-height: !expr plot_height(3)
-#| fig-cap: "Share of documents each arm committed to, by task. The transformer always answers, so
-#|   the gap between the bars is the keyword table declining rather than failing."
-mc_plot_commitment(.tab = tab_labels)
-```
-
-The store is a working file, not the deliverable. Parquet goes beside it because the regression stage
-reads flat files, and because DuckDB's on-disk format has changed across versions before -- a single
-database holding the only copy of a pass measured in days is a worse artifact than a file anything can
-open. It costs seconds against that pass.
-
-```{r}
-#| label: deploy-export
-mc_db_export(
-  .con     = con,                                                       # the store
-  .run_key = run_key,                                                   # this configuration only
-  .path    = fs::path(.lP$Output$Export, paste0("labels_", run_key, ".parquet"))
+#| label: release-schema
+#| results: asis
+tbl_out(
+  .tab   = app_release_schema(.tab = releases[[1]]),
+  .title = "What the released columns mean",
+  .notes = c(Column = paste("Read from the released table rather than typed, so a column added",
+                            "upstream cannot go undocumented."))
 )
 ```
 
 ```{r}
-#| label: deploy-disconnect
-# LAST EXECUTABLE CHUNK, and it has to stay last. A connection closed while anything below still
-# reads from it fails at whichever query runs next, which is nowhere near the line that closed it.
+#| label: disconnect
+# LAST, and it has to be: everything above reads the store, and the release is the last thing that
+# does. Closing before it produced an "Invalid connection" several frames deep in the engine rather
+# than a sentence saying the store was shut.
 DBI::dbDisconnect(con, shutdown = TRUE)
 ```
 
 # Next
 
-The released dataset is these labels plus the manifest that produced them. Both have to be archived
-together: labels without the manifest cannot be reproduced, and the manifest without the labels is a
-recipe nobody ran.
+The store holds raw labels: one row per document per run, with the top two classes and their
+probabilities, and the term hits behind every keyword decision. Nothing is exported yet.
 
-Set `Limit` to `NULL` once the rehearsal reads sensibly, and note that the capped run is not wasted:
-it drew from the whole tree under this same configuration, so its labels are already in the store and
-the uncapped run simply picks up the documents it did not reach. Raising the cap in stages and
-finishing with `NULL` is a supported way to work through the corpus, not a sequence of false starts.
-
-Two things remain open and belong in the paper rather than in code. Whether the generative arm is
-worth enabling for the release is a cost decision that 03E's voting-set comparison answers
-empirically -- if the three-family flag separates the corpus no better than the two-family one, it is
-not worth the hours. And the corpus tier distribution against the labelled sample's is the evidence
-for how far the confidence flag can be trusted outside the data that produced it.
+The release above is what a merge wants. What remains is downstream: whether the concurrence flag is
+worth conditioning on in the regressions is a question for the analysis rather than for this document,
+and the manifest beside each file is what lets that analysis be re-run against a different context
+length without re-labelling anything.

@@ -1,5 +1,5 @@
 ---
-title: "Entity Extraction -- Running Every Engine Over the Classified Sample (04A)"
+title: "Entity Extraction -- Freezing the Inputs and Running Every Engine (04A)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -22,7 +22,7 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+options(cli.num_colors = 1, cli.width = 120) # plain ASCII; ANSI codes paste as garbage
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -41,10 +41,11 @@ source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 source("1_code/_Commons/_NER.R", encoding = "UTF-8")
 
-# The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING: 03A
-# registers its category vocabulary and aliases the table helpers at SOURCE time, not inside a
-# function, so sourcing it first throws part-way through the file and every function defined below
-# the failure silently never exists. A file's top-level statements are part of its interface.
+# The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING: the
+# level registry is rebuilt empty every time _Plots.R is sourced, so a library that registers a
+# vocabulary must be sourced after it -- and 03A registers its taxonomy at SOURCE time rather than
+# inside a function, so a failure part-way through that file leaves every function below it silently
+# undefined. A file's top-level statements are part of its interface.
 source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
 source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
 
@@ -73,91 +74,62 @@ source(file = .path_fun, encoding = "UTF-8")
 
 # Purpose
 
-Four quantities are wanted from each contract: who the parties are, when the agreement runs from and
-to, where the parties are, and what it is worth. None of them is read directly. Each is assembled
-from spans that an extraction engine proposed, and every engine proposes many spans that are not the
-thing being looked for. This document runs every available engine over the 4,400 hand-classified
-contracts, stores every span it proposed, and describes what came back.
+04A freezes one canonical text per contract, runs every entity extractor over the whole of it, and
+folds the results into one DuckDB store. It then answers three questions and no others: **what came
+back, where in the document it sits, and how far the engines agree with each other.**
 
-It does not choose between the engines, and the reason is worth stating plainly because it shapes the
-whole family. The classification pipeline had 4,400 hand labels, so a configuration could be scored
-and ranked. **There are no entity labels.** Without them the only measurable quantity here is
-*yield*: candidates per document, documents with a hit. Yield does not order engines. An engine
-returning twice as many organisations is either recovering parties the others miss or admitting twice
-as much noise, and nothing in this document can tell those apart. Ranking on yield would reliably
-select whichever engine matches most loosely.
+Nothing is selected, filtered or ranked here.
 
-What the absence of labels still permits is a question that turns out to be more useful at this
-stage: **where do the engines differ?** Two models whose outputs are nested carry one model's worth
-of information and the choice between them is free. Two models that disagree cannot both be right,
-and the size of the disagreement bounds how much any later choice between them can be worth.
+## Why it only describes
 
-Read the agreement table by family rather than by pair. Three of the nine combinations are the same
-spaCy pipeline at three capacities, so their mutual agreement is one implementation agreeing with
-itself. Across genuinely independent methods the corroboration is far thinner than the pooled figure
-suggests, and that is the number 04B has to work with.
+The 03 family had 4,400 hand labels and could compute macro-F1. **There are no entity labels.**
+Without them the only measurable quantity at this stage is yield, and yield does not order engines:
+a higher count is either better recall or worse precision, and the two are indistinguishable until
+something external exists to score against. So this document answers "what is there, and where do
+the engines differ", and leaves "which engine is right" to 04B, which scores against facts EDGAR
+recorded independently of any contract's text.
 
 ## The one decision that cannot be undone later
 
-An offset is an integer into a specific string. Every candidate in the store, every context window
-a rule is matched in, and every span rehydrated for manual checking indexes *that* string. If two
-scripts disagree about what a document's text is, every offset in the project is quietly wrong,
-`is.na()` catches nothing, and the numbers look entirely normal.
+Offsets are integers into a specific string. Every candidate in the store and every rehydrated span
+indexes *that* string. If two scripts disagree about what a document's text is, every offset in the
+project is quietly wrong and nothing errors. 04A therefore writes `sample_text.parquet` and is the
+only script permitted to define it; everything downstream reads that file and never reconstructs the
+text.
 
-The two available candidates for that string are not identical. 03A built its `Text` column by
-concatenating a document's parquet rows with newlines, so any document stored in more than one row
-has a prepared text that differs from its on-disk `TextRaw`. This document therefore derives the
-canonical text from `prepared.parquet` and writes it once, as `sample_text.parquet`. The two are then
-the same string by construction rather than by assumption, and no later script reconstructs text.
+## One store, and the grid inside it is ragged
 
-## Two settings that are frozen by the first run
+There is one store and every engine reads the whole document. An earlier design carried a second
+store holding the same engines over a truncated head, to price a truncation that was then not
+adopted; both are gone.
 
-The store's completeness ledger records that a document was processed by an engine. It does not
-record which labels were requested, and it does not record whether the text was truncated first. A
-store built under one truncation and re-run under another therefore does nothing at all and reports
-success. Both settings are consequently fixed here, and a manifest records them so that a later
-mismatch is visible rather than silent.
+The store is **engine by the labels that engine can emit**, not a full crossing. spaCy is the only
+multi-label statistical engine and the only source of `PERSON`; LexNLP excludes persons and places
+by policy; the four ported paper extractors each emit exactly one label. Empty cells in the tables
+below mean *this engine does not do that*, not *this failed*. The shape is declared once in
+`ner_label_policy()` and reproduced in the manifest, so it can be checked rather than assumed.
 
-**No truncation.** The paper's original extraction read the first 250 words, on the argument that
-parties appear in the preamble. That is true of parties and false of everything else: expiry dates
-sit in the term clause, governing law sits near the signature block, and payment amounts sit in the
-schedules. Truncating at extraction discards that evidence irreversibly, whereas keeping it costs
-only compute on a 4,400-document sample. The positional evidence this produces is what tells 04B
-where the corpus pass may safely be capped, which is a better basis for that cap than inheriting a
-number from the earlier design.
+## The ledger is blind to labels, which is why the manifest records them
 
-**All labels each engine supports.** Organisations, places, dates and money, subject to what each
-engine can emit.
+The ledger knows that engine E has seen document D. It does not know which labels were asked for.
+Add a label to the policy and re-render, and every combination is already marked done: the store
+reports itself complete while holding output built under the previous label set.
 
-## Two stores
+That is not hypothetical. `PERSON` was absent from the spaCy policy for the whole of the first pass
+and nothing in this document could see it, because the manifest recorded only that a policy existed
+rather than what it said. It now records the **resolved** set per engine, so a policy edit moves the
+fingerprint, and a moved fingerprint clears the affected engines so they extract again.
 
-The same blindness has a second consequence. Because the ledger cannot tell a full-text extraction
-from a truncated one, a single store cannot hold both: the second would be skipped as already done
-and the document would report success. Measuring what truncation costs therefore needs its own
-store, with its own manifest, and that is what the section on cost builds.
+Roughly half of Exhibit 10 material contracts are employment, indemnity or award documents whose
+counterparty is an individual rather than a company, so a family that reads only organisations
+reports the largest part of the sample as having one party. That is why the label is worth the
+re-extraction.
 
-The two questions truncation raises are answered differently, and only one of them needs that
-store. What a head window would COST in recall is already answered by the full-text extraction,
-because every candidate carries its offsets and the share falling inside any window is a query.
-What truncation SAVES in time is not, because a truncated pass is not a filtered full pass -- the
-engines see a document that stops mid-sentence, and the gazetteer can lose the jurisdiction that
-licensed a place two lines further down. That has to be run to be known.
+## What is not here
 
-## What is missing, and why one engine is absent
-
-Geography is the weakest channel in this extraction and the one a referee has asked about directly,
-so it is worth saying what the gazetteer contributes and why it is not simply a dictionary match.
-
-The lookup holds 181,810 place names, 31,925 of which are also English dictionary words. Matching
-them all is useless -- Enterprise, Superior, Mobile, Reading and Bath are all US populated places --
-and excluding them all is worse than it sounds: every single-word US state name is in the
-dictionary, so a blanket exclusion removes forty of the fifty states, Delaware and California among
-them, and leaves a state-level geography consisting of the ten whose names happen to run to two
-words. The extractor keeps those names and gates them on context instead: states and countries are
-self-evidencing, a distinctive place name needs a jurisdiction within a couple of hundred
-characters, and a place name that is also an ordinary word needs one immediately adjacent, with
-only punctuation between. That last rule is what separates the city from the street it stands on,
-since an address block puts a state within forty characters of every token in it.
+Engine and rule scoring against the EDGAR anchors is 04B. Field resolution is 04C. The corpus pass
+is 04D. The reusable engine seam and the store itself live in `_Commons/_NER.R` and are shared with
+04D; everything specific to *this* sample carries the `ent_` prefix.
 
 # Configuration
 
@@ -179,29 +151,20 @@ since an address block puts a state within forty characters of every token in it
     Anchors = utils_file_path(.dir_main, "sample_anchors.parquet")    # labels, folds, EDGAR facts
   ),
   Store = list(
-    NerDB        = utils_file_path(.dir_main, "Store", "EntityCandidates.duckdb"),
-    Manifest     = utils_file_path(.dir_main, "Store", "manifest.parquet"),
-    # The head-window store. Separate file and separate manifest, because the ledger cannot
-    # distinguish a truncated extraction from a full one.
-    NerDBHead    = utils_file_path(.dir_main, "StoreHead", "EntityCandidatesHead.duckdb"),
-    ManifestHead = utils_file_path(.dir_main, "StoreHead", "manifest.parquet"),
-    # Append-only record of what each engine cost, shared by both stores.
-    TimingLog    = utils_file_path(.dir_main, "Store", "timings.parquet")
+    NerDB    = utils_file_path(.dir_main, "Store", "EntityCandidates.duckdb"),
+    Manifest = utils_file_path(.dir_main, "Store", "manifest.parquet")
   ),
   Params = list(
-    RefCombo     = "spacy:en_core_web_trf",   # engine the per-class fingerprint is printed for
-    DocsPerRun   = 2500L,                     # R-side corpus slice; bounds Python memory
-    OffsetSample = 2000L,                     # candidates rehydrated per engine in Validation
-    HeadWords    = 512L,                      # word budget the head window should correspond to
-    CorpusDocs   = 1135840L                   # Exhibit-10 documents in the full corpus, for costing
+    DocsPerRun   = 2500L,   # R-side slice size; bounds Python-side memory
+    OffsetSample = 2000L    # candidates rehydrated per engine in Validation
   )
 )
 
 # These two cannot live in .lP. Assigning NULL to a list element removes the element rather than
 # storing it, so .lP$Params$MaxChars would silently vanish and the call site would read NULL from a
 # name that was never set -- indistinguishable from a typo.
-.max_chars_extract <- NULL   # NULL = no truncation; see Purpose. Changing this invalidates the store.
-.labels_extract    <- NULL   # NULL = each engine's own supported label set
+.max_chars_extract <- NULL   # NULL = no truncation. Changing this invalidates the store.
+.labels_extract    <- NULL   # NULL = the per-engine policy in ner_label_policy()
 
 fs::file_exists(c(.lP$Input$Prepared, .lP$Input$MetaData))
 ```
@@ -213,80 +176,48 @@ the document where the path is declared.
 
 Two files come out of this section, and every later script in the family reads them rather than
 reaching back to 03A. The first is the canonical text. The second is everything known about a
-document from outside its own text.
+document from outside its own text -- its labels, its fold, and the EDGAR facts 04B turns into
+recall floors.
 
 ```{r}
 #| label: write-canonical-text
 ent_write_text(
-  .path_prepared = .lP$Input$Prepared,   # 03A's output, including its Text column
-  .path_out      = .lP$Sample$Text       # the string every offset in this family indexes
+  .path_prepared = .lP$Input$Prepared,  # 03A's table; the Text column, renamed to TextRaw
+  .path_out      = .lP$Sample$Text      # written on every render, deliberately
 )
 ```
 
-There is deliberately no reuse guard on that write. Skipping it when the file already exists would
-disable the run manifest at the moment it matters: the manifest fingerprints this file, so a changed
-sample behind a reused text file would produce an unchanged fingerprint and report agreement while
-the store was built on documents that are no longer in the sample. Copying one column of 4,400 rows
-costs seconds, which is far less than that failure.
-
-The anchors are the reason this section is not merely bookkeeping. A contract's filer, its CIK, its
-filing date and its registered addresses are facts recorded by EDGAR and never derived from the
-contract text. They can therefore test an extraction without anyone annotating anything: the filer
-must be a party to its own contract, the signing date cannot post-date the filing, and a joint filing
-must name both filers. 04B turns those into recall floors. 04A only establishes that they are present
-and reports which are not, because an anchor discovered to be missing after the measurement has been
-built on it is an anchor that cannot be used.
+Rewritten rather than reused when present. Skipping the write would defeat the manifest exactly when
+it is needed: the manifest fingerprints this file, so a changed `prepared.parquet` behind a reused
+text file produces an unchanged fingerprint and reports a match while the store is stale.
 
 ```{r}
 #| label: build-sample
 tab_sample <- ent_build_sample(
-  .path_prepared = .lP$Input$Prepared,      # labels, folds; Text deliberately not read here
-  .path_meta     = .lP$Input$MetaData,      # document-level EDGAR facts, keyed on DocID
-  .path_landing  = .lP$Input$LandingPage,   # filing-level facts, keyed on HashIndex
-  .cols_anchor   = c(
-    "CIK",             # filer identity, and the join key to Compustat downstream
-    "CompanyName",     # the filer must appear among the extracted organisations
-    "DateFiled",       # a signing date cannot post-date this
-    "nCIK",            # joint filings: more than one filer
-    "MultFiler"        # the flag form of the same fact
-  ),
-  .cols_landing  = c(
-    "BusinessAddress", # the filer's own location, testable against extracted places
-    "MailingAddress"   # a second location for the same test
-  )
+  .path_prepared = .lP$Input$Prepared,     # labels, folds; Text deliberately not read here
+  .path_meta     = .lP$Input$MetaData,     # filer name, CIK, filing date, HashIndex
+  .path_landing  = .lP$Input$LandingPage,  # registered addresses, joined via HashIndex
+  .cols_anchor   = c("CIK", "CompanyName", "DateFiled", "nCIK", "MultFiler"),
+  .cols_landing  = c("BusinessAddress", "MailingAddress")
 )
 
 ent_write_anchors(
-  .tab      = tab_sample,          # labels, folds and whichever anchors resolved
-  .path_out = .lP$Sample$Anchors   # the table every later script joins entities to
+  .tab      = tab_sample,
+  .path_out = .lP$Sample$Anchors
 )
+
+ent_report_sample(.tab = tab_sample)
 ```
+
+An anchor column reported as missing costs 04B a recall floor and costs this document nothing, which
+is why it is a warning rather than an abort.
 
 # Extraction
 
 ## The engine set
 
-Nine combinations run. Each carries its own throughput settings, because the constraints differ in
-kind rather than degree: the CNN spaCy models parallelise across CPU processes, the transformer
-occupies one device and cannot be shared across processes, LexNLP runs in a container and its date
-grammar stalls pathologically on a small number of documents, and the four ported paper extractors
-are pattern matching, dictionary lookup, bracket matching and monetary patterns, with nothing to
-tune beyond their worker count.
-
-The last of those is not an entity extractor in the usual sense. `paper:redaction-v1` emits the
-bracketed redaction indicators the published analysis counted -- `[***]`, `[CONFIDENTIAL TREATMENT
-REQUESTED]`, `[INTENTIONALLY OMITTED]` -- as spans under the label `REDACT`. A count carries no
-position and so can say how much was withheld but not what; putting the indicators in the same
-coordinate system as the candidates turns "how far is this amount from the nearest redaction" into a
-window function. That is the only external evidence money admits, since a marker sits exactly where
-a commercially material figure used to be.
-
-The order is cheapest first. That is not cosmetic. The regex and the small spaCy model together
-produce the positional evidence and most of the per-class picture within minutes, so the document's
-substantive claims can be inspected and argued with long before the transformer finishes.
-
 ```{r}
-#| label: configure-engines
+#| label: declare-engines
 ner_tuning <- list(
   "paper:dateregex-v1"    = list(n_process =  1L, batch_size = NULL, timeout =   0L),
   "spacy:en_core_web_sm"  = list(n_process = 24L, batch_size =  16L, timeout = 600L),
@@ -302,433 +233,192 @@ ner_tuning <- list(
 lst_run_args <- ner_run_args(.tuning = ner_tuning)
 ```
 
-## What the store is already holding
-
-An extractor's model tag ends in a version, and bumping it is how a revised rule set is kept from
-being confused with the one it replaced. `ner_run()` honours that: a new version is a new
-combination, so it is extracted rather than skipped as already done. What it cannot do is remove the
-old one, because the ledger has no way to distinguish a version that was retired from one that
-simply was not asked for on this pass.
-
-The head-window store accumulated four money-regex versions this way, across the run in which the
-pattern set was being written. Nothing downstream read them, so no published number was affected,
-but the truncation comparison below reported three engines that no longer exist and the throughput
-ranking placed one of them above the version that ships.
-
-The reconciliation is therefore part of the document rather than a command someone remembers. It is
-idempotent: the first render removes the superseded versions and says which, and every later one
-reports that there are none. A combination the store holds and this run does not ask for is
-reported and **left alone** -- running a subset temporarily is ordinary, and wiping the rest of the
-store for it would be a worse trap than the one being fixed.
+The transformer runs at `n_process = 1` because a single Metal device cannot be shared across worker
+processes; the three CNN models stay on CPU and take twenty-four.
 
 ```{r}
-#| label: reconcile-store
+#| label: resolve-labels
+tab_labels <- ent_labels_resolved(
+  .run    = lst_run_args$.run,   # the nine declared combinations
+  .labels = .labels_extract      # NULL, so the per-engine policy applies
+)
+
+tbl_say(.tab = tab_labels, .title = "Labels each engine is asked for")
+```
+
+This is the ragged grid, written out. It is also what the manifest fingerprints, so the table above
+and the store's contents cannot disagree without the next chunk saying so.
+
+## Reconciling the store
+
+```{r}
+#| label: reconcile-superseded
 ent_report_superseded(
-  .db_path = .lP$Store$NerDB,      # the full-text store
+  .db_path = .lP$Store$NerDB,      # the one store
   .run     = lst_run_args$.run,    # what this run declares
   .clear   = TRUE                  # remove superseded versions; undeclared engines are kept
 )
-
-ent_report_superseded(
-  .db_path = .lP$Store$NerDBHead,  # the head-window store, where the versions accumulated
-  .run     = lst_run_args$.run,
-  .clear   = TRUE
-)
 ```
 
-## What the store is being built under
+An extractor's model tag ends in a version, and bumping it is how a revised rule set is kept from
+being confused with the one it replaced. `ner_run()` honours that -- a new version is a new
+combination, so it is extracted rather than skipped -- but it cannot remove the old one, because the
+ledger has no way to tell a retired version from one simply not asked for on this pass. A
+combination the store holds and this run does not declare is reported and **left alone**: running a
+subset temporarily is ordinary, and wiping the rest of the store for it would be the worse trap.
 
 ```{r}
-#| label: check-manifest
-tab_manifest <- ent_manifest_sync(
-  .path_manifest = .lP$Store$Manifest,
-  .manifest      = ent_manifest(
-    .path_text = .lP$Sample$Text,        # fingerprinted, so a changed sample is not a warm store
-    .run       = lst_run_args$.run,      # which engines
-    .labels    = .labels_extract,        # which labels
-    .max_chars = .max_chars_extract      # whether the text was truncated first
-  )
+#| label: clear-relabelled
+ent_clear_relabelled(
+  .db_path       = .lP$Store$NerDB,
+  .path_manifest = .lP$Store$Manifest,  # what the store was last built under
+  .resolved      = tab_labels           # what it is being asked for now
 )
-
-tbl_say(.tab = tab_manifest, .title = "Store fingerprint")
 ```
 
-Two kinds of row, and they call for opposite responses.
+Idempotent, and that is the whole point. On the render after a policy edit this removes the affected
+engines and they extract again; on every render after that it finds nothing and costs milliseconds.
+Leaving it as a command someone remembers to run is how the store came to be missing `PERSON`.
 
-A **fingerprint** row that fails means the store was built on different text, a different truncation
-or a different label set from the one now declared. The ledger cannot detect any of those, so the
-extraction below would skip every document and report success while answering the wrong question.
-Rename `Store/` aside and rebuild; nothing is deleted, so the superseded store remains available as
-a record of what was previously concluded.
+```{r}
+#| label: sync-manifest
+ent_manifest_sync(
+  .path_manifest = .lP$Store$Manifest,
+  .manifest      = ent_manifest(
+    .path_text = .lP$Sample$Text,      # fingerprints the inputs, not only the settings
+    .run       = lst_run_args$.run,
+    .labels    = .labels_extract,      # resolved to the actual per-engine sets before storing
+    .max_chars = .max_chars_extract
+  )
+) |>
+  tbl_say(.title = "Store settings against this run")
+```
 
-The **inventory** row is not a fingerprint. Which engines have been asked for says nothing about
-what is already stored, and adding one is the ordinary incremental case the ledger handles
-correctly: the new combo reports its documents missing and the rest report none. The manifest
-records the addition and stops mentioning it. Only a combo that has *disappeared* is worth a look,
-and then only because the store now holds more than this document describes.
+Two kinds of mismatch and they do not mean the same thing. A **fingerprint** row -- documents,
+characters, truncation, labels -- means the store answers a different question than the one now
+being asked, while reporting itself complete. An **inventory** row means the declared engine set
+moved, which is the ordinary incremental case the ledger handles correctly.
 
 ## Running
 
-The step is idempotent and resumable. Each combination asks the ledger which documents it has not yet
-seen, processes only those in slices, and appends. An interrupted run repeats only its unfinished
-slice, which is what makes a multi-hour extraction affordable inside a document that always executes.
-
-Engines are dispatched one at a time rather than as a set. The ledger behaves identically either
-way, and running them separately turns the same call into a measurement: what each engine costs is
-the input to every decision 04B has to make, and `ner_run()` on the whole set reports how much was
-extracted rather than how long any one engine took.
-
 ```{r}
-#| label: extract-entities
-tab_extract <- ent_time_engines(
-  .path_text    = .lP$Sample$Text,        # the canonical text, not the per-document tree
-  .db_path      = .lP$Store$NerDB,        # the full-text candidate store
-  .tuning       = ner_tuning,             # engines and their per-combo knobs, cheapest first
-  .labels       = .labels_extract,        # NULL = each engine's own supported set
-  .max_chars    = .max_chars_extract,     # NULL = full text; frozen by the manifest above
-  .docs_per_run = .lP$Params$DocsPerRun,  # slice size; bounds Python-side memory
-  .device       = "auto"                  # CNN models to CPU, transformer to Metal
+#| label: run-extraction
+.t0_extract <- Sys.time()
+
+tab_extract <- ner_run(
+  .inputs       = .lP$Sample$Text,            # the canonical text, and nothing else
+  .db_path      = .lP$Store$NerDB,
+  .run          = lst_run_args$.run,          # nine combinations, cheapest first
+  .labels       = .labels_extract,            # NULL = ner_label_policy() decides per engine
+  .max_chars    = .max_chars_extract,         # NULL = the whole document, every engine
+  .docs_per_run = .lP$Params$DocsPerRun,      # slice size; bounds Python-side memory
+  .device       = "auto",                     # CNN models to CPU, transformer to Metal
+  .n_process    = lst_run_args$.n_process,    # the three knobs ner_run_args() resolved per combo
+  .batch_size   = lst_run_args$.batch_size,
+  .timeout      = lst_run_args$.timeout
 )
 
-ent_timing_append(
-  .tab      = tab_extract,          # only rows where work actually happened are recorded
-  .path_log = .lP$Store$TimingLog   # append-only, so a re-measurement never erases the last one
-)
+tab_extract |>
+  dplyr::mutate(
+    Combo = dplyr::if_else(.data$Engine == .data$Model, .data$Engine,
+                           paste0(.data$Engine, ":", .data$Model)),
+    .before = 1
+  ) |>
+  dplyr::select(Combo, Missing, Docs, Candidates) |>
+  tbl_say(.title = "This run")
 
-tbl_say(.tab = dplyr::select(tab_extract, Combo, Missing, Docs, Candidates, Seconds),
-              .title = "This run")
+cli::cli_alert_info(
+  "Extraction took {round(as.numeric(difftime(Sys.time(), .t0_extract, units = 'mins')), 1)} \
+   minute{?s}."
+)
 ```
 
-Zeros in `Missing` are the expected steady state: on a second render every document is already in the
-ledger and the whole section costs seconds. A non-zero `Missing` with zero `Docs` is the failure to
-look for, because it means an engine was asked for work and returned none.
+The knobs are passed as the three resolved lists rather than as the tuning table, because `ner_run()`
+takes them that way and resolves each per combination internally. `ner_run_args()` exists to make
+that translation once.
 
-# Results
+Zeros in `Missing` are the expected steady state: on a second render every document is already in
+the ledger and this section costs seconds. The failure to look for is a non-zero `Missing` with zero
+`Docs`, which means an engine was asked for work and returned none.
+
+The elapsed line is the only timing this document keeps. It is here for one downstream decision:
+04D runs no spaCy engine at all, so putting `PERSON` on the corpus means adding one, and the cost of
+the transformer against the CNN models on 4,398 documents is what makes that decision arithmetic
+rather than guesswork.
+
+# Description
 
 ```{r}
-#| label: summarise-store
-.ov <- ent_overview(
-  .db_path  = .lP$Store$NerDB,     # the store just written
-  .inputs   = .lP$Sample$Text,     # supplies document lengths and relative positions
-  .id_col   = "DocID",
-  .text_col = "TextRaw",
-  .quiet    = FALSE
+#| label: describe-store
+.desc <- ent_describe(
+  .db_path   = .lP$Store$NerDB,
+  .path_text = .lP$Sample$Text   # supplies document lengths, so an offset becomes a position
 )
-
-ent_report_store(.ov = .ov)
 ```
+
+```{r}
+#| label: inspect-yield
+ent_report_yield(.desc = .desc)
+```
+
+Read `DistinctPerDoc` rather than `PerDoc`. Total spans measure how often an engine repeats itself;
+distinct spans measure how many things it found. A contract names a handful of parties and a handful
+of places, so a distinct median in the hundreds is an engine collecting mentions -- signatories,
+notice contacts, capitalised words -- rather than entities. The raw count cannot tell that apart
+from good recall.
+
+```{r}
+#| label: inspect-position
+ent_report_position(.desc = .desc)
+```
+
+Row percentages, so each engine and label is read against itself. Ten percent in every decile is a
+label scattered through the document. Mass at both ends is one named in the preamble and again at
+the signature block, which is what a party looks like and what an incidental mention does not.
+
+# Agreement
 
 ```{r}
 #| label: align-engines
-.al <- ent_alignment(
-  .db_path = .lP$Store$NerDB,   # overlapping spans are merged into mentions inside DuckDB
-  .quiet   = FALSE
-)
+.al <- ent_alignment(.db_path = .lP$Store$NerDB)
 
-ent_report_agreement(
-  .al = .al,   # consensus and directional containment
-  .n  = 12L    # the most complementary engine pairs, which is where 04B must sample
-)
+ent_report_agreement(.al = .al, .n = 12L)
 ```
 
-# Yield
+Within a document and a label, overlapping spans are merged into one mention and the contributing
+engines recorded. Agreement is **any overlap** rather than exact match, which is the right notion
+here: two engines that both found the organisation but disagreed about whether the comma belongs
+have agreed about the organisation.
 
-## What is expected before looking
-
-Stating the expectation first makes the check falsifiable rather than decorative, and makes it
-obvious when it was wrong.
-
-| Check | Expectation | If otherwise |
-|:--|:--|:--|
-| ORG per doc | Highest in merger and credit, lowest in employment | Party extraction is not measuring parties |
-| MONEY per doc | Concentrated in credit and leases, near zero in employment | Spans catch section numbers, not amounts |
-| REDACT per doc | Highest in licences and R&D, where royalties sit | Indicators are boilerplate, not withheld terms |
-| ORG position | Mass in the opening tenth | Preamble truncation discarded parties, not noise |
-| DATE position | Bimodal: preamble and signature block | Signing or expiry is not found at all |
-| GPE position | Opening and the governing-law clause | Places found are incidental, not party locations |
-| Amendments | Fewer ORG and MONEY per doc than originals | Amendments read as restating the original in full |
-
-The first row is a replication: the published extraction reports 4.2 partners for merger and debt
-agreements against 2 for employment, and those spans should reproduce it. The places row is the one
-that matters most. If the distribution is flat, the geographic variable as currently defined cannot
-be described as the location of the contracting parties, and 04C has to classify each place by its
-role rather than count them.
-
-## Yield by contract type
-
-The classification used is the hand-assigned category from 03A, not a predicted one, so the picture
-below is not contaminated by classifier error.
-
-```{r}
-#| label: profile-detailed
-.prof_detailed <- ent_profile_by_class(
-  .db_path       = .lP$Store$NerDB,           # candidates
-  .class_parquet = .lP$Sample$Anchors,        # the sample table written above
-  .class_col     = "ClassDetailed",           # 12 hand-assigned categories
-  .id_col        = "DocID",
-  .run           = NULL,                      # NULL profiles every engine in the store
-  .ref_combo     = .lP$Params$RefCombo,       # engine the printed fingerprint is taken from
-  .mentions      = .al$mentions,              # enables the cross-engine consensus view
-  .min_combos    = 2L,                        # "high confidence" = at least two engines agree
-  .quiet         = FALSE
-)
-
-ent_report_yield(
-  .prof      = .prof_detailed,
-  .ref_combo = .lP$Params$RefCombo
-)
-```
-
-Shading and numbers are different quantities in the figure below, and the reason is arithmetic:
-organisations run from 80 to 509 per document while money runs from 3 to 19, so a single ramp across
-the whole matrix renders three of the four columns uniformly white. Each cell is shaded by its share
-of the largest value in its own column and prints the raw value, which makes every column readable
-without changing a number. What is given up is comparability of shade across columns, which was
-never readable in the first place.
-
-The same treatment is switched off for the amendment panel further down, and it is worth saying why
-rather than leaving the two figures looking inconsistent. A share of the column maximum needs a
-distribution to rescale. With two rows the larger of them is the maximum by definition, so the top
-row would render uniformly darkest in every column and the figure would assert nothing at all.
-
-The table above ranks contract types partly by how long they are. Median document length differs by
-more than a factor of two across this taxonomy, so a type can lead every column for no reason beyond
-page count. Dividing by the text each type actually contains removes that, and reporting median
-length beside it keeps the size difference visible instead of absorbing it.
-
-```{r}
-#| label: profile-normalised
-tab_yield_norm <- ent_yield_by_class(
-  .db_path    = .lP$Store$NerDB,        # candidates
-  .path_text  = .lP$Sample$Text,        # per-document character counts, the denominator
-  .path_class = .lP$Sample$Anchors,     # the sample table written above
-  .class_col  = "ClassDetailed",        # 12 hand-assigned categories
-  .ref_combo  = .lP$Params$RefCombo     # one engine, else the columns are not comparable
-)
-
-ent_report_yield_norm(.tab = tab_yield_norm)
-```
-
-```{r}
-#| label: profile-amendment
-.prof_amend <- ent_profile_by_class(
-  .db_path       = .lP$Store$NerDB,
-  .class_parquet = .lP$Sample$Anchors,
-  .class_col     = "AmendType",               # Original against Amended
-  .id_col        = "DocID",
-  .run           = NULL,
-  .ref_combo     = .lP$Params$RefCombo,
-  .mentions      = NULL,                      # the consensus view is reported on the detailed cut only
-  .min_combos    = 2L,
-  .quiet         = FALSE
-)
-
-ent_report_yield(
-  .prof      = .prof_amend,
-  .ref_combo = .lP$Params$RefCombo
-)
-```
+Read the pairwise table by family rather than by pair. Four of the nine combinations are spaCy, so a
+mention found by four engines is usually one implementation agreeing with itself, and the family
+consensus table is the one that says how much genuinely independent corroboration exists.
 
 # Validation
-
-The round-trip below is the check the rest of the family rests on. Each sampled candidate is sliced
-back out of the canonical text at its own offsets and compared to the span the engine recorded. A
-share below one means the offsets index a string that is not the one on disk, in which case every
-context window 04B matches a rule in would be the wrong characters and no downstream number would
-mean anything.
 
 ```{r}
 #| label: validate-offsets
 tab_offsets <- ent_check_offsets(
-  .db_path   = .lP$Store$NerDB,             # candidates
-  .path_text = .lP$Sample$Text,             # the canonical text they claim to index
-  .n         = .lP$Params$OffsetSample      # candidates per engine, sampled deterministically
+  .db_path   = .lP$Store$NerDB,
+  .path_text = .lP$Sample$Text,          # cut at the stored offsets, compared to the stored span
+  .n         = .lP$Params$OffsetSample   # per engine, sampled deterministically by hash
 )
 
 ent_report_offsets(.tab = tab_offsets)
 ```
 
-# Cost of truncation
-
-Reading only the head of every document is the difference between a corpus pass that finishes
-overnight and one that does not. What it costs is two separate questions, and only the second needs
-work.
-
-The window is set in characters because that is what the extractors take, but it is reasoned about
-in words. The conversion is a property of the text rather than a constant: legal prose runs long
-words and dense citation, so a rate borrowed from general English would be wrong in the direction
-that matters. It is measured here instead.
-
-```{r}
-#| label: derive-head-cap
-tab_cap <- ent_head_cap(
-  .path_text = .lP$Sample$Text,        # the canonical text
-  .n_words   = .lP$Params$HeadWords,   # the word budget the cap should correspond to
-  .round_to  = 100L                    # round up, so the cap is a reportable number
-)
-
-.cap_head <- tab_cap$Cap
-```
-
-## What the window would keep
-
-This needs no extraction. Every candidate in the full-text store carries its offsets, so the share
-of them ending inside the cap is a count.
-
-```{r}
-#| label: measure-head-coverage
-tab_head_cov <- ent_head_coverage(
-  .db_path = .lP$Store$NerDB,   # the full-text store
-  .cap     = .cap_head          # the window derived above
-)
-```
-
-## What the window would save
-
-This does need extraction, into a store of its own. A truncated pass is not the full pass filtered
-to the same window: the engines see a document that stops mid-sentence, and the gazetteer can lose
-the jurisdiction that licensed a place two lines further down. Whether the two agree is itself the
-result, and it is reported below.
-
-```{r}
-#| label: extract-head-window
-tab_head_manifest <- ent_manifest_sync(
-  .path_manifest = .lP$Store$ManifestHead,
-  .manifest      = ent_manifest(
-    .path_text = .lP$Sample$Text,     # same text
-    .run       = lst_run_args$.run,   # same engines
-    .labels    = .labels_extract,     # same labels
-    .max_chars = .cap_head            # and the one thing that differs
-  )
-)
-
-tbl_say(.tab = tab_head_manifest, .title = "Head-store fingerprint")
-
-tab_time_head <- ent_time_engines(
-  .path_text    = .lP$Sample$Text,          # same input
-  .db_path      = .lP$Store$NerDBHead,      # a separate store; the ledger cannot tell caps apart
-  .tuning       = ner_tuning,               # same engines and knobs, so the comparison is paired
-  .labels       = .labels_extract,          # same labels
-  .max_chars    = .cap_head,                # the window
-  .docs_per_run = .lP$Params$DocsPerRun,
-  .device       = "auto"
-)
-
-ent_timing_append(
-  .tab      = tab_time_head,
-  .path_log = .lP$Store$TimingLog   # both stores write to one log, keyed by cap
-)
-```
-
-```{r}
-#| label: compare-head-full
-tab_head_cmp <- ent_head_vs_full(
-  .db_head = .lP$Store$NerDBHead,   # the truncated pass
-  .db_full = .lP$Store$NerDB,       # the full pass, filtered to the same window
-  .cap     = .cap_head
-)
-
-ent_report_head(
-  .tab_cap = tab_cap,
-  .tab_cov = tab_head_cov,
-  .tab_cmp = tab_head_cmp
-)
-```
-
-## What it costs to run
-
-```{r}
-#| label: report-timing
-tab_timing <- ent_timing_read(
-  .path_log    = .lP$Store$TimingLog,      # append-only measurement history
-  .corpus_docs = .lP$Params$CorpusDocs,    # documents in the full Exhibit-10 corpus
-  # The log keeps every measurement ever taken, including of extractor versions since superseded.
-  # A measurement that happened did happen, so the rows stay; what must not survive is a retired
-  # engine appearing in a throughput ranking as though it were a candidate for the corpus pass.
-  # Derived from the declared set on every read, so it holds however often this renders.
-  .run         = lst_run_args$.run
-)
-
-ent_report_timing(
-  .tab         = tab_timing,
-  .corpus_docs = .lP$Params$CorpusDocs
-)
-```
-
-Read the projection with its assumption in view. A capped pass does the same work on every document
-whatever its length, so its cost is linear in how many there are and the projection is fair. An
-uncapped pass does work proportional to text, so scaling it by document count assumes the corpus has
-the same length distribution as this sample, and the corpus tail is longer.
-
-# Robustness
-
-Three properties are worth reading off the ledger rather than assuming.
-
-**Timeouts.** LexNLP's date grammar stalls on a small number of very long documents, and running
-without truncation makes that more likely rather than less. A stalled extractor is skipped for that
-document, the document is still recorded, and its status is queryable, so the cost of a timeout is
-lost recall on a known and countable set rather than a silent gap.
-
-```{r}
-#| label: inspect-timeouts
-.ov$ledger |>
-  dplyr::filter(.data$Timeout > 0L) |>
-  dplyr::select(Combo, Docs, Timeout, Candidates) |>
-  dplyr::mutate(
-    PctOfDocs = tbl_pct(.data$Timeout / .data$Docs),
-    dplyr::across(c(Docs, Timeout, Candidates), as.integer)
-  ) |>
-  tbl_say(.title = "Documents with a skipped extractor")
-```
-
-**Length outliers.** Every pooled statistic in this document is candidate-weighted, so one document
-long enough to hold a percent of the sample's text carries a percent of the vote in the positional
-histogram and in every per-engine total. The upstream quality screens keep tabular filings out of
-the corpus; a document that passed them and still runs to several megabytes is worth identifying
-before its evidence is trusted.
-
-```{r}
-#| label: inspect-length-outliers
-tab_outliers <- ent_length_outliers(
-  .db_path    = .lP$Store$NerDB,      # candidates, for the share of the evidence
-  .path_text  = .lP$Sample$Text,      # lengths
-  .path_class = .lP$Sample$Anchors,   # what kind of contract each one is
-  .n          = 10L                   # the longest documents in the sample
-)
-
-ent_report_outliers(.tab = tab_outliers)
-```
-
-**Engine redundancy.** Three spaCy CNN models of increasing capacity are in the store. If their
-outputs are near-nested, they carry one model's worth of information between them and 04B's engine
-choice among them is free; if they are not, capacity is buying recall and the largest is worth its
-cost on the corpus pass.
-
-```{r}
-#| label: inspect-cnn-nesting
-ent_containment(.pairwise = .al$pairwise) |>
-  dplyr::filter(
-    stringr::str_detect(.data$ComboA, "en_core_web_(sm|md|lg)"),
-    stringr::str_detect(.data$ComboB, "en_core_web_(sm|md|lg)")
-  ) |>
-  dplyr::mutate(dplyr::across(c(InA, InB, Jaccard), \(.x) tbl_pct(.x))) |>
-  dplyr::select(Label, ComboA, ComboB, Both, InA, InB, Jaccard) |>
-  tbl_say(.title = "Containment among the spaCy CNN models")
-```
+This is the only quantity in the entire family that is *verified* rather than corroborated, and it
+has to be exactly 1.0. Below that, offsets index a string that is not the one on disk, and every
+number in 04B onwards is wrong without anything erroring: the party location, every context window,
+every rehydrated snippet.
 
 # Deployment
 
-Six artifacts leave this document, and nothing else in the family writes any of them. Only the
-first four are read downstream: the head-window store and the timing log exist to inform the
-truncation decision 04B makes, and are not themselves inputs to it.
-
 ```{r}
-#| label: deploy-artifacts
+#| label: write-artifacts
 tibble::tibble(
-  Artifact = c("Canonical text", "Sample anchors", "Candidate store", "Run manifest",
-               "Head-window store", "Timing log"),
-  Path     = c(.lP$Sample$Text, .lP$Sample$Anchors, .lP$Store$NerDB, .lP$Store$Manifest,
-               .lP$Store$NerDBHead, .lP$Store$TimingLog)
+  Artifact = c("Canonical text", "Sample anchors", "Candidate store", "Run manifest"),
+  Path     = c(.lP$Sample$Text, .lP$Sample$Anchors, .lP$Store$NerDB, .lP$Store$Manifest)
 ) |>
   dplyr::mutate(
     Exists = fs::file_exists(.data$Path),
@@ -738,163 +428,69 @@ tibble::tibble(
   tbl_say(.title = "Written by 04A")
 ```
 
+Everything downstream reads these four and nothing else. No later script reaches back to
+`prepared.parquet` or to the EDGAR exports.
+
 # Overview
-
-Everything already established, arranged so the parallel cases can be compared side by side.
-
-## Where candidates sit in the document
-
-The places panel is the one to read first. Mass at the opening and again around the governing-law
-clause supports describing extracted places as party locations; a flat distribution through the body
-does not, and settles the question the review raised against the published geography measure rather
-than in its favour.
-
-The vertical axis is each engine's own candidates, not a count. The engines differ in volume by more
-than an order of magnitude, so a count plot is a picture of which engine is loudest and the smaller
-arms are slivers along the axis; normalising each to its own total makes the shapes comparable,
-which is what agreeing about where an entity type lives actually means. Volume is reported per
-engine and per label in the store ledger above.
 
 ```{r}
 #| label: fig-positions
-#| fig-height: !expr ent_facet_height(length(.ent_labels))
-#| fig-cap: "Where each engine's candidates fall within the document, by entity type. Each profile
-#|   is normalised to its own engine's total, so the shapes are comparable across engines of very
-#|   different volume."
+#| fig-height: !expr ent_facet_height(length(plot_levels("Label")))
+#| fig-cap: "Where candidates sit in the document, by entity type. Each panel is one label and each
+#|   line one engine, as a density over relative position. Agreement on shape matters more than
+#|   agreement on level: two engines that put a label in the same place are describing the same
+#|   phenomenon at different sensitivities."
 ent_plot_positions(
-  .positions = .ov$positions,   # midpoint over document length, in code points
-  .bins      = 30L,
-  .by_combo  = TRUE,            # fill by engine, so disagreement about where a type lives is visible
-  .free_y    = TRUE             # counts differ by an order of magnitude across types
+  .positions = .desc$position   # decile shares, per engine and label
 )
 ```
 
-## How far the engines agree
-
-High values mean the engines are substitutes and the choice between them costs nothing. Low values
-mark the spans on which they disagree. Each panel shows only the engines eligible for that label:
-an extractor that cannot emit dates has not disagreed about them, and drawing it as an empty row
-would invite exactly that misreading.
-
-The panel to read carefully is ORG, and the thing to read is which cells are high. If the strong
-agreement sits entirely within the spaCy block, there is no independent corroboration for
-organisations at all, and 04B cannot lean on cross-engine consensus to rank them.
+The panel to read first is `ORG` against `PERSON`. A party type is named at the front and again at
+the signature block; a mention type is spread evenly. Where an engine's organisations are flat
+across the middle of the document it is collecting every company the contract refers to, not the
+ones that signed it -- which is a fact about that engine and not about the contracts.
 
 ```{r}
 #| label: fig-agreement
-#| fig-height: !expr ent_facet_height(length(.ent_labels), .square = TRUE)
-#| fig-cap: "Jaccard overlap between engines on merged mentions, by entity type. Read by family:
-#|   three spaCy models agreeing is one implementation agreeing with itself."
+#| fig-height: !expr ent_facet_height(length(plot_levels("Label")), .square = TRUE)
+#| fig-cap: "Pairwise agreement between engines, by entity type. Cells are the share of merged
+#|   mentions both engines found. Blank cells are pairs with no shared label."
 ent_plot_agreement(
-  .pairwise = .al$pairwise,
-  .accuracy = 0.01   # Jaccard reads as a ratio; the fill scale is fixed to [0, 1]
+  .pairwise = .al$pairwise   # one row per label and engine pair
 )
 ```
 
-## Yield per contract type
-
-Counts, not accuracies. The hit-rate panel carries a conclusion the candidate-count panel does not:
-a near-zero cell means the entity type is absent from that contract type in the text itself, so no
-later measurement can rescue a variable built on it. The amendment panel tests whether a document type
-known to be short and to incorporate its original by reference is read as such.
-
-::: {.panel-tabset}
-
-### Candidates per document
-
-```{r}
-#| label: fig-yield-detailed
-#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")), .square = TRUE)
-#| fig-cap: "Candidates per document, by hand-assigned contract type and entity type. Shading is
-#|   each cell's share of the largest value in its own column, so every entity type is legible; the
-#|   printed numbers are the raw counts."
-ent_plot_profile(
-  .profile   = .prof_detailed$profile,
-  .combo     = .lP$Params$RefCombo,   # one engine, else the panel is unreadable
-  .metric    = "CandPerDoc",
-  .key_class = "ClassDetailed",       # the vocabulary 03A registered; rows match the 03 family
-  .accuracy  = 0.1
-)
-```
-
-### Documents with a hit
-
-```{r}
-#| label: fig-yield-hitrate
-#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")), .square = TRUE)
-#| fig-cap: "Share of documents in which the entity type appears at all. A near-zero cell is an
-#|   absence no later measurement can repair."
-ent_plot_profile(
-  .profile   = .prof_detailed$profile,
-  .combo     = .lP$Params$RefCombo,
-  .metric    = "PctDocsWithHit",
-  .key_class = "ClassDetailed",
-  .accuracy  = 0.1
-)
-```
-
-### Amendments
-
-```{r}
-#| label: fig-yield-amendment
-#| fig-height: !expr plot_height(length(plot_levels("AmendType")))
-#| fig-cap: "Candidates per document, amendments against original agreements. Shaded on the raw
-#|   values: with two rows there is no distribution to rescale within a column."
-ent_plot_profile(
-  .profile   = .prof_amend$profile,
-  .combo     = .lP$Params$RefCombo,
-  .metric    = "CandPerDoc",
-  .key_class = "AmendType",           # the binary vocabulary, not the 12-class one
-  .accuracy  = 0.1
-)
-```
-
-:::
-
-## The whole extraction in one block
+Blocks of high agreement along the spaCy models are the expected shape and carry little information:
+they share weights and a tokeniser. The cells worth reading are spaCy against LexNLP, and either
+against the ported paper rules, because those are the only comparisons where two genuinely different
+methods are being asked the same question.
 
 ```{r}
 #| label: report-everything
 ent_report_all(
-  .tab_sample   = tab_sample,
-  .ov           = .ov,
-  .al           = .al,
-  .tab_offsets  = tab_offsets,
-  .prof         = .prof_detailed,
-  .ref_combo    = .lP$Params$RefCombo,
-  .tab_norm     = tab_yield_norm,
-  .tab_outliers = tab_outliers,
-  .tab_timing   = tab_timing,
-  .corpus_docs  = .lP$Params$CorpusDocs
+  .tab_sample  = tab_sample,
+  .ov          = ent_overview(
+    .db_path = .lP$Store$NerDB   # no .inputs: positions come from ent_describe(), already binned
+  ),
+  .desc        = .desc,
+  .al          = .al,
+  .tab_offsets = tab_offsets
 )
 ```
 
 # Next
 
-**04B** measures what this document declined to rank, and does it without anyone annotating a
-document. The anchors written here -- the filer, its registered addresses, the filing date -- are
-facts EDGAR recorded independently of the contract text, so they can be used as a partial ground
-truth: an engine that fails to return the filer among a contract's organisations has demonstrably
-missed a party. That gives a recall floor per engine per label, which is enough to choose one engine
-per label, and it does it on the whole sample rather than on a subsample anyone had to read.
+**04B** scores what is in this store against the facts EDGAR recorded independently: the filer's own
+name, its registered address, the filing date. That is the first point in the family where a
+statement about an engine can be more than descriptive.
 
-04B also settles the extraction window, using both numbers this page reports. What a head window
-KEEPS is already answered here, because every candidate carries its offsets and the share falling
-inside any cap is a query. What truncation SAVES is answered by the head-window store. Neither
-settles the cap alone: a window that halves the run and loses a third of the organisations is a bad
-trade, and which trade is acceptable depends on the recall floors 04B has yet to compute.
+**PERSON is new here and unmeasured.** Nothing above says whether the person spans are parties or
+signatories, and the two look identical in a yield table. The exhibit description names the
+individual in a large share of employment filings -- `EMPLOYMENT AGREEMENT - CHARLES R BLAND` -- and
+sits outside the body text in the same way the filer's name does, so it can serve as a recall floor
+for individuals in exactly the classes where the counterparty is one. That belongs in 04B.
 
-**04C** resolves the surviving spans into the four published variables -- parties, contract term,
-party locations, contract value -- and checks each against the anchors. It is where the geography
-question this page opens gets its answer, because a place occurrence has to be assigned a role
-before it can be counted as a party location.
-
-**04D** applies the settled policy to the full corpus. It runs the same engine wrappers over the
-same seam, pointed at documents that carry no labels.
-
-One limit of this document is worth carrying forward rather than rediscovering. The reference
-combination the yield figures are drawn for is the transformer, and it is chosen for panel
-completeness rather than for deployment: it is the only engine in the store emitting organisations,
-places, dates and money, so it is the only one whose fingerprint has a value in every cell. It is
-not the engine the corpus pass will use for most labels. The yield figures are a description of what
-is findable in each contract type, not a preview of what ships.
+**The corpus pass in 04D currently runs no spaCy engine at all.** Person names are available on this
+sample for free and on the corpus only at the cost of adding a spaCy model to that pass. Whether the
+CNN models are adequate for `PERSON` is a separate question from their showing on organisations, and
+this store now holds what is needed to answer it.

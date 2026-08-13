@@ -1,0 +1,357 @@
+---
+title: "Table rendering options -- a test bench"
+subtitle: "Nine ways to render the same table. Pick, mix, or reject."
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    theme: cosmo
+---
+
+```{r}
+#| label: setup
+#| include: false
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, comment = "", echo = TRUE)
+options(knitr.kable.NA = "-")
+```
+
+## What this is
+
+One table -- the per-category scores 03E prints for the transformer on `ClassDetailed` -- rendered
+nine ways. Every option is self-contained: read the code, look at the result, and say which parts you
+want. Whatever we keep becomes an extension of `tbl_render()` in `_Commons/_Tables.R`, so the runbooks
+stay free of per-table formatting.
+
+The data below is the real output from the last render, typed in so this file runs on its own.
+
+```{r}
+#| label: the-data
+tab <- tibble::tribble(
+  ~Category,                                   ~Support, ~nPredicted, ~Coverage, ~Accuracy, ~Precision, ~Recall, ~F1,
+  "Business Structure: Investment and Merger",      301L,        314L,     1.000,     0.973,      0.793,   0.827, 0.810,
+  "Business Structure: Peer Agreements",             71L,         61L,     1.000,     0.991,      0.770,   0.662, 0.712,
+  "Customer / Supplier",                            383L,        399L,     1.000,     0.978,      0.857,   0.893, 0.875,
+  "Employment: Compensation",                       702L,        695L,     1.000,     0.990,      0.974,   0.964, 0.969,
+  "Employment: Legal",                              723L,        721L,     1.000,     0.988,      0.964,   0.961, 0.963,
+  "Financial Instruments: Credit",                  659L,        644L,     1.000,     0.985,      0.961,   0.939, 0.950,
+  "Financial Instruments: Equity",                  301L,        295L,     1.000,     0.975,      0.824,   0.807, 0.815,
+  "Leases",                                         303L,        303L,     1.000,     0.997,      0.980,   0.980, 0.980,
+  "Licenses",                                       240L,        237L,     1.000,     0.993,      0.945,   0.933, 0.939,
+  "Other",                                          313L,        305L,     1.000,     0.984,      0.898,   0.875, 0.887,
+  "Purchases and Sales: Assets",                    319L,        333L,     1.000,     0.982,      0.862,   0.900, 0.880,
+  "R&D",                                             83L,         91L,     1.000,     0.992,      0.769,   0.843, 0.805,
+  "All categories",                                4398L,       4398L,     1.000,     0.915,      0.883,   0.882, 0.882
+)
+
+# The keyword arm, which abstains -- used by the options that show two engines at once.
+tab_kw <- tibble::tribble(
+  ~Category,                                   ~Coverage, ~Precision, ~Recall, ~F1,
+  "Business Structure: Investment and Merger",      0.402,      0.884,   0.355, 0.507,
+  "Business Structure: Peer Agreements",            0.239,      0.647,   0.155, 0.250,
+  "Customer / Supplier",                            0.462,      0.802,   0.371, 0.507,
+  "Employment: Compensation",                       0.681,      0.981,   0.668, 0.795,
+  "Employment: Legal",                              0.644,      0.958,   0.617, 0.751,
+  "Financial Instruments: Credit",                  0.611,      0.975,   0.596, 0.740,
+  "Financial Instruments: Equity",                  0.428,      0.860,   0.368, 0.516,
+  "Leases",                                         0.706,      0.995,   0.703, 0.824,
+  "Licenses",                                       0.475,      0.912,   0.433, 0.588,
+  "Other",                                          0.211,      0.667,   0.141, 0.233,
+  "Purchases and Sales: Assets",                    0.451,      0.847,   0.382, 0.527,
+  "R&D",                                            0.313,      0.769,   0.241, 0.367,
+  "All categories",                                 0.523,      0.858,   0.419, 0.550
+)
+
+n_body <- nrow(tab) - 1L   # every option treats the last row as a summary, not a category
+```
+
+---
+
+## Option 1 -- what we print today
+
+The fixed-width console block. Included as the baseline, not as a candidate.
+
+```{r}
+#| label: opt-1
+#| echo: false
+tab |>
+  dplyr::mutate(dplyr::across(c(Coverage, Accuracy, Precision, Recall),
+                              \(.x) paste0(formatC(100 * .x, format = "f", digits = 1), "%")),
+                F1 = sprintf("%.3f", F1)) |>
+  as.data.frame() |>
+  print(row.names = FALSE)
+```
+
+It survives copy-paste into an email, which is the one thing it does better than everything below.
+
+---
+
+## Option 2 -- plain `kable`, which is what `tbl_render()` does now
+
+```{r}
+#| label: opt-2
+tab |>
+  knitr::kable(digits = 3, format.args = list(big.mark = ",")) |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left")
+```
+
+Already better: right-aligned numbers, real column rules. But the summary row is indistinguishable
+from a category, and the percentages read as decimals.
+
+---
+
+## Option 3 -- percentages, striping, and the summary row set apart
+
+Three changes, each independent of the others.
+
+```{r}
+#| label: opt-3
+tab |>
+  dplyr::mutate(dplyr::across(c(Coverage, Accuracy, Precision, Recall),
+                              \(.x) scales::percent(.x, accuracy = 0.1))) |>
+  knitr::kable(digits = 3, format.args = list(big.mark = ","), align = "lrrrrrrr") |>
+  kableExtra::kable_styling(
+    full_width        = FALSE,
+    position          = "left",
+    bootstrap_options = c("striped", "hover", "condensed")
+  ) |>
+  kableExtra::row_spec(n_body, extra_css = "border-bottom: 1px solid #333;") |>
+  kableExtra::row_spec(n_body + 1L, bold = TRUE)
+```
+
+---
+
+## Option 4 -- grouped column headers
+
+The columns fall into three jobs -- how big is the category, how often was the engine right, and the
+summary score. Saying so in a header row removes most of the work of reading it.
+
+```{r}
+#| label: opt-4
+tab |>
+  dplyr::mutate(dplyr::across(c(Coverage, Accuracy, Precision, Recall),
+                              \(.x) scales::percent(.x, accuracy = 0.1))) |>
+  knitr::kable(digits = 3, format.args = list(big.mark = ","), align = "lrrrrrrr") |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("hover", "condensed")) |>
+  kableExtra::add_header_above(c(" " = 1, "Size" = 2, "Behaviour" = 2, "Quality" = 3)) |>
+  kableExtra::row_spec(n_body, extra_css = "border-bottom: 1px solid #333;") |>
+  kableExtra::row_spec(n_body + 1L, bold = TRUE)
+```
+
+---
+
+## Option 5 -- data bars in the score column
+
+The eye reads bar length faster than three decimals. `F1` keeps its number and gains a bar behind it.
+
+```{r}
+#| label: opt-5
+# The bar column is built from a NUMERIC column left untouched -- cell_spec and column_spec(image=)
+# both rewrite a cell, and applying them to the same one leaves raw html in the output.
+tab |>
+  dplyr::mutate(dplyr::across(c(Coverage, Accuracy, Precision, Recall),
+                              \(.x) scales::percent(.x, accuracy = 0.1)),
+                F1 = sprintf("%.3f", F1),
+                Score = "") |>
+  knitr::kable(format = "html", escape = FALSE, format.args = list(big.mark = ","),
+               align = "lrrrrrrrl") |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("hover", "condensed")) |>
+  kableExtra::column_spec(
+    9,
+    image = kableExtra::spec_pointrange(
+      x = tab$F1, xmin = 0, xmax = 1, vline = 0.882, width = 200, cex = 0.4
+    )
+  ) |>
+  kableExtra::row_spec(n_body + 1L, bold = TRUE)
+```
+
+The vertical rule sits at the model's own macro-F1, so a dot left of it is a category performing
+below the headline. Each cell is inline SVG rather than a linked file, so it survives `embed-resources`.
+
+**Two traps, both hit while building this file.** `cell_spec()` and `column_spec(image = ...)` each
+rewrite a cell, so applying both to the same column leaves raw html in the output -- the bar column
+here is a separate empty column for that reason. And any option using `cell_spec()` or an inline plot
+needs `format = "html"` passed to `kable()` explicitly: without it pandoc runs its smart-quote pass
+over the generated html and the span arrives as literal text with curly quotes.
+
+---
+
+## Option 6 -- colour instead of bars
+
+Same idea, less ink. The number is shaded by its own value, so the weak categories surface without a
+second visual channel.
+
+```{r}
+#| label: opt-6
+blues <- c("#bfd7ed", "#60a3d9", "#4682b4", "#0074b7", "#00416a")
+
+tab |>
+  dplyr::mutate(
+    dplyr::across(c(Coverage, Accuracy, Precision, Recall),
+                  \(.x) scales::percent(.x, accuracy = 0.1)),
+    F1 = kableExtra::cell_spec(
+      sprintf("%.3f", F1), "html", bold = TRUE, color = "white",
+      background = kableExtra::spec_color(tab$F1, end = 0.9,
+                                          option = "D", direction = 1)
+    )
+  ) |>
+  knitr::kable(format = "html", escape = FALSE, format.args = list(big.mark = ","),
+               align = "lrrrrrrr") |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("hover", "condensed")) |>
+  kableExtra::row_spec(n_body + 1L, bold = TRUE)
+```
+
+---
+
+## Option 7 -- house palette, shaded on one column only
+
+Option 6 with the project's own blues rather than viridis, and shading confined to the column the
+reader is meant to scan.
+
+```{r}
+#| label: opt-7
+ramp <- grDevices::colorRamp(c("#eaf2f9", "#003b73"))
+shade <- function(.x) {
+  m_ <- ramp(scales::rescale(.x, to = c(0, 1), from = c(0.6, 1)))
+  grDevices::rgb(m_[, 1], m_[, 2], m_[, 3], maxColorValue = 255)
+}
+
+tab |>
+  dplyr::mutate(
+    dplyr::across(c(Coverage, Accuracy, Precision, Recall),
+                  \(.x) scales::percent(.x, accuracy = 0.1)),
+    F1 = kableExtra::cell_spec(
+      sprintf("%.3f", F1), "html", bold = TRUE,
+      color = dplyr::if_else(tab$F1 > 0.88, "white", "#12263A"),
+      background = shade(tab$F1)
+    )
+  ) |>
+  knitr::kable(format = "html", escape = FALSE, format.args = list(big.mark = ","),
+               align = "lrrrrrrr") |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("hover", "condensed")) |>
+  kableExtra::add_header_above(c(" " = 1, "Size" = 2, "Behaviour" = 2, "Quality" = 3)) |>
+  kableExtra::row_spec(n_body, extra_css = "border-bottom: 1px solid #333;") |>
+  kableExtra::row_spec(n_body + 1L, bold = TRUE)
+```
+
+---
+
+## Option 8 -- two engines side by side
+
+The comparison 03E actually wants. Instead of three separate tables a reader holds in their head, one
+table with a spanning header per engine.
+
+```{r}
+#| label: opt-8
+# Renamed explicitly rather than relying on a join suffix: Coverage exists on one side only, so a
+# suffix would leave it unmarked while marking the columns that appear on both.
+dplyr::inner_join(
+  tab |> dplyr::select(Category, Support,
+                       BertPrecision = Precision, BertRecall = Recall, BertF1 = F1),
+  tab_kw |> dplyr::select(Category, KwCoverage = Coverage,
+                          KwPrecision = Precision, KwRecall = Recall, KwF1 = F1),
+  by = dplyr::join_by(Category)
+) |>
+  dplyr::mutate(
+    dplyr::across(c(BertPrecision, BertRecall, KwCoverage, KwPrecision, KwRecall),
+                  \(.x) scales::percent(.x, accuracy = 0.1)),
+    dplyr::across(c(BertF1, KwF1), \(.x) sprintf("%.3f", .x))
+  ) |>
+  stats::setNames(c("Category", "Support", "Precision", "Recall", "F1",
+                    "Coverage", "Precision", "Recall", "F1")) |>
+  knitr::kable(format.args = list(big.mark = ","), align = "lrrrrrrrr") |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("hover", "condensed")) |>
+  kableExtra::add_header_above(c(" " = 2, "Transformer" = 3, "Keyword table" = 4)) |>
+  kableExtra::row_spec(n_body, extra_css = "border-bottom: 1px solid #333;") |>
+  kableExtra::row_spec(n_body + 1L, bold = TRUE)
+```
+
+The keyword arm carries a `Coverage` column the transformer does not need, which is the asymmetry made
+visible rather than explained in a footnote.
+
+---
+
+## Option 9 -- footnotes instead of `cli` alerts
+
+Everything the console currently prints as three `i` lines under the table, attached to the columns it
+refers to.
+
+```{r}
+#| label: opt-9
+tab |>
+  dplyr::mutate(dplyr::across(c(Coverage, Accuracy, Precision, Recall),
+                              \(.x) scales::percent(.x, accuracy = 0.1))) |>
+  stats::setNames(c("Category", "Support", "nPredicted", "Coverage", "Accuracy[note]",
+                    "Precision", "Recall[note]", "F1")) |>
+  knitr::kable(format.args = list(big.mark = ","), align = "lrrrrrrr") |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("hover", "condensed")) |>
+  kableExtra::add_header_above(c(" " = 1, "Size" = 2, "Behaviour" = 2, "Quality" = 3)) |>
+  kableExtra::row_spec(n_body, extra_css = "border-bottom: 1px solid #333;") |>
+  kableExtra::row_spec(n_body + 1L, bold = TRUE) |>
+  kableExtra::add_footnote(
+    c(paste("One-vs-rest and dominated by correct rejections. A rare category reads near-perfect",
+            "while the engine misses most of its documents."),
+      paste("Counts an abstention as a miss, so it is comparable across engines. An arm that",
+            "declines on half the corpus scores low here whatever its precision on the rest.")),
+    notation = "number"
+  )
+```
+
+---
+
+## Option 10 -- long tables: fixed header and a scroll box
+
+Not needed for twelve categories. It is needed for the threshold tables in sections 3 and 4 once all
+three tasks and both arms are stacked.
+
+```{r}
+#| label: opt-10
+dplyr::bind_rows(tab, tab, tab) |>
+  dplyr::mutate(dplyr::across(c(Coverage, Accuracy, Precision, Recall),
+                              \(.x) scales::percent(.x, accuracy = 0.1))) |>
+  knitr::kable(format.args = list(big.mark = ","), align = "lrrrrrrr") |>
+  kableExtra::kable_styling(full_width = FALSE, position = "left",
+                            bootstrap_options = c("hover", "condensed")) |>
+  kableExtra::scroll_box(height = "300px", fixed_thead = TRUE)
+```
+
+---
+
+## What I would pick
+
+**Options 3 + 4 + 9 as the default**, everywhere: percentages formatted as percentages, numbers right
+aligned, grouped headers, the summary row separated by a rule and set in bold, and the caveats as
+footnotes rather than as `cli` lines the reader has to hold in their head while looking back up at the
+table.
+
+**Option 8 where two engines are being compared**, which in 03E is most places. It halves the number
+of tables and puts the comparison on one line per category instead of across three screens.
+
+**Option 7 sparingly** -- shading earns its place on the one column a reader is meant to scan and
+becomes noise on all of them. I would use it on `F1` in section 1 and nowhere else.
+
+**Option 5 is better than I expected.** It emits inline SVG rather than linked images, so it survives
+`embed-resources` and costs about 2 KB per row. It still does not survive to pdf, and it needs a
+dedicated column. Worth it for one table, not for every table.
+
+Everything above was rendered and checked in this container rather than written from memory, so the
+code runs as printed. What I could not check is how it looks against `_styles.css`, which is not in
+the copy of the repo I have -- if that file sets Times and horizontal rules only, `striped` and
+`hover` may fight it.
+
+Two things to decide before this goes into `_Commons/_Tables.R`:
+
+- **pdf.** Everything above is html. `bootstrap_options` and `extra_css` are ignored under LaTeX, and
+  `cell_spec` needs `format = "latex"`. If these documents are ever rendered to pdf the wrapper has to
+  branch on `knitr::is_latex_output()`. Cheap to write, but it doubles the surface, so it is worth
+  knowing whether pdf is a real target or not.
+- **`tbl_say()` vs `tbl_render()`.** 03E currently prints everything through `tbl_say()`, which is the
+  console formatter. Moving to kable means the tables stop being copy-pasteable as text. If you paste
+  console blocks into our chats to debug, that matters, and the answer might be `tbl_say()` while
+  working and `tbl_render()` for the version that gets read.

@@ -1,2194 +1,1243 @@
-# 03F-ClassifyApply: the shippable classifier (mc_*) ----
+# 03F-ClassifyApply: labelling the corpus (app_*) ------------------------------------------------------------------------
 #
-# WHAT THIS STAGE IS
-# One entry point, mc_classify(), that takes documents and returns labels plus a confidence flag.
-# Everything it does was decided upstream and validated on folds; this file executes those decisions
-# and makes none of its own.
+# WHAT THIS FILE DOES
+# Every decision has been made. 03B fitted a transformer per task and per context length and crowned
+# one of each; 03C published a keyword table per task and marked one; 03E measured what combining
+# them would buy and found the answer was nothing. This file makes none of those decisions again. It
+# reads what those stages deployed and runs it over the corpus.
 #
-# THE RULE THAT MAKES IT SAFE
-# Every default is read from the manifest 03E wrote, never written into a function signature. A
-# signature default is a second copy of a decision, and a second copy drifts: someone retunes the
-# transformer, the manifest updates, and the function keeps applying last quarter's context length
-# because nobody remembered it was written down twice. So mc_classify() ships with almost no defaults
-# of its own -- it reads them -- and an argument passed explicitly is recorded in the output as a
-# DEPARTURE from the validated configuration rather than silently honoured.
+# THE STORE IS THE DESIGN
+# A pass over a million documents does not complete in one sitting and must not start from zero when
+# it fails at ninety per cent. Everything lands in one DuckDB, scoped by a run key, and three
+# questions can be asked of it at any moment: what is done, what is missing, and what has changed
+# since the rows already there were written. The third is the one that is easy to leave out and the
+# one that silently corrupts a released dataset -- a table holding two context lengths under one
+# name looks exactly like a table holding one.
 #
-# That is also what makes the overrides safe to offer. A caller can run a different checkpoint or a
-# longer window; they simply cannot do so without it showing up in the result.
+# THE RUN KEY IS THE RECIPE, NOT THE ARTIFACT
+# It hashes the task, the configuration name and the context length. Those determine the weights
+# given the fixed seed upstream, so a byte-identical refit does not throw away three hours of work.
+# The artifact path and its fingerprint are RECORDED rather than keyed, so a checkpoint swapped by
+# hand surfaces in the drift report instead of being silently honoured or silently discarded.
 #
-# RESTARTING, AND WHY THE OUTPUT DIRECTORY IS NAMED FOR THE MANIFEST
-# A corpus pass is chunked and idempotent: a chunk whose output is present is skipped, so a run that
-# dies at chunk four hundred resumes rather than restarts. That is only safe while every chunk in a
-# directory was produced under the same configuration. Keyed on the directory name alone, a manifest
-# rewritten between two runs would leave the first run's chunks in place and the second would adopt
-# them -- silently mixing two configurations in one output, with nothing on the rows to say so. The
-# directory therefore carries the manifest's identity, and a new manifest means a new directory.
+# ONE KEY PER TASK, NOT ONE PER PASS
+# Tasks finish independently. Keying the whole pass would mean a crown moving on one task discards
+# the two that were already done.
 #
-# WHY THE GENERATIVE ARM IS OFF BY DEFAULT
-# It is the most independent vote available and the only arm that saw none of the labelled sample, so
-# it is the one that most improves the confidence flag. It is also hours of inference over a corpus
-# of this size rather than minutes. Pinned, therefore, and disabled: a caller who wants the
-# three-family flag asks for it and pays for it, and a caller who does not gets the two-family flag
-# together with reliability numbers estimated on the vote they actually ran. Shipping one set of
-# reliabilities for every voting set would be the quiet error here, because a two-arm pattern
-# computed at deployment is indistinguishable from a two-arm pattern computed on the labelled sample.
-#
-# WHAT COMES BACK, AND WHAT DOES NOT
-# One row per document per task, carrying what each arm said independently -- its first and second
-# choice and the score behind each -- plus the agreement tier and the reliability estimated for that
-# tier under that voting set.
-#
-# THERE IS NO Label COLUMN, and that is the design rather than an omission. Every routing rule the
-# orchestration stage searched is a deterministic function of the columns below: a cascade is "take
-# the terminal's choice, override where the gated arm committed above the floor", which on a finished
-# table is one mutate. Inference over the corpus is hours; applying a rule to a finished table is
-# seconds. Deciding the label at inference time therefore buys nothing and forecloses changing one's
-# mind, so the label is derived in a later step and this stage ships the evidence for it.
-#
-# Per-arm scores travel for a second reason: without them one can see that the arms agreed but not
-# which was more confident when they disagreed, and that is precisely the case worth inspecting.
-#
-# WHY ARM COLUMNS ARE NAMED FOR THE KIND
-# Bert_, Kw_, Llm_ rather than the arm's own name. An arm name is assigned relative to the inventory
-# it was built from and carries a positional suffix among siblings, so the same checkpoint answers to
-# different names in two runs whose inventories differ. A column name baked into several million rows
-# has to be stable across runs or every script written against the first output breaks silently
-# against the second. Exactly one arm of each kind runs, so the kind identifies it without ambiguity,
-# and the arm's real name, variant, configuration and validated score are written beside the labels
-# as a run record.
-#
-# THE TWO Score2 COLUMNS ARE NOT THE SAME KIND OF OBJECT
-# The transformer's is softmax mass over categories; the keyword table's is a Wilson lower bound on
-# training precision, and it is NA where only one class matched at all. The generative arm has no
-# runner-up: a constrained schema returns one label. They are named alike because they occupy the
-# same slot, not because they are comparable, and no downstream comparison across kinds is valid.
+# WHERE THE ENGINE BOUNDARY SITS, AND WHY IT SITS THERE
+# The transformer emits finished predictions, because a class is what it was trained to produce. The
+# keyword engine does NOT: it emits which terms occurred, and the decision rule that turns terms into
+# a class lives once, in R, and is called identically by the stage that measured the table's
+# precision and by this one. A second decision rule in a second language is what once put a
+# hand-written substring search in front of a lexicon mined under stopword removal -- the table
+# committed on 36% of the corpus where it had published 52%, and nothing anywhere reported a fault.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
-# locals; .data$ for existing columns, bare CamelCase for new; if (FALSE) dev blocks; cli/fs/here;
-# pure ASCII; stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
+# locals; if (FALSE) dev blocks; pure ASCII; parenthesised cli interpolation.
 
 if (FALSE) {
-  .path_manifest <- utils_file_path(.dir_orch, "deployment", "manifest.json")
-  .docs          <- arrow::read_parquet(.lP$Input$Corpus)
+  .con  <- app_connect(.path = .lP$Store$Path)
+  .task <- "ClassDetailed"
 }
 
-MC_NONE <- "(none)"
 
-#' A manifest parameter that has no safe default
+# 1. The store -----------------------------------------------------------------------------------------------------------
+# Six tables in one file. The corpus index lives here rather than in a parquet cache, which is what
+# makes "which documents still need labelling" a single anti-join instead of a set operation across
+# two storage layers.
+
+#' Open the label store, creating its schema on first use
 #'
-#' Some parameters describe the encoding an artifact was built under -- the transformer's context
-#' length, the keyword table's truncation window. Substituting a default for a missing one produces
-#' output that is wrong in a way nothing downstream can detect, because the result is a perfectly
-#' ordinary label. These stop the run instead.
+#' Every table is created if absent and left alone otherwise, so opening an existing store is not a
+#' destructive act and the same call serves the first run and the hundredth.
 #'
-#' @param .x The value read from the manifest.
-#' @param .name Parameter name, for the message.
-#' @param .kind Arm kind, for the message.
-#' @return .x, invisibly unchanged, or an abort.
-mc_require <- function(.x, .name, .kind) {
+#' @param .path Character. Path to the DuckDB file.
+#' @param .quiet Logical. Silence the engine's own progress bar.
+#' @return A DBI connection.
+app_connect <- function(.path, .quiet = TRUE) {
   if (FALSE) {
-    .x    <- NULL
-    .name <- "max_len"
-    .kind <- "transformer"
+    .path  <- .lP$Store$Path
+    .quiet <- TRUE
   }
-  if (is.null(.x) || length(.x) != 1L || is.na(.x)) {
-    cli::cli_abort(c(
-      "The manifest pins no {(.name)} for the {(.kind)} arm.",
-      "i" = "This parameter defines the encoding the artifact was built under, so there is no \\
-             default that is safe to assume.",
-      "i" = "Re-run 03E: its catalogue writes params for every arm it pins."
-    ))
-  }
-  .x
-}
+  fs::dir_create(fs::path_dir(.path))
+  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = .path)
 
-
-# 1. The manifest ----------------------------------------------------------------------------------
-
-#' Read a JSON field that should be a list of records, whatever auto_unbox did to it
-#'
-#' jsonlite writes a one-element array as a bare object under auto_unbox, so a task deploying a
-#' single arm has an `arms` field holding the arm itself rather than a list containing it. Iterating
-#' that yields the arm's FIELD NAMES instead of arm records, which produces no rows rather than an
-#' error -- the failure then surfaces several steps later as a missing column, naming nothing useful.
-#'
-#' Detected by looking for a signature field: a record has it, a list of records does not.
-#'
-#' @param .x The parsed field.
-#' @param .signature A field name every record carries.
-#' @return A list of records, possibly empty.
-mc_as_records <- function(.x, .signature) {
-  if (FALSE) {
-    .x         <- man_$tasks[[1]]$arms
-    .signature <- "arm"
-  }
-  if (is.null(.x)) return(list())
-  if (!is.list(.x)) return(list())
-  if (.signature %in% names(.x)) list(.x) else .x
-}
-
-#' Read and validate the deployment manifest
-#'
-#' Fails loudly and early rather than part way through a corpus. A manifest promising an artifact
-#' that is not on disk is the failure worth catching here: discovered mid-run it wastes hours, and
-#' discovered never it produces labels from whichever model happened to be lying around.
-#'
-#' @param .path Path to manifest.json.
-#' @return List with the manifest plus a resolved arms tibble.
-mc_manifest <- function(.path) {
-  if (FALSE) .path <- .lP$Input$Manifest
-  if (!fs::file_exists(.path)) {
-    cli::cli_abort(c("No manifest at {(.path)}.", "i" = "Run 03E to write one."))
-  }
-  man_ <- jsonlite::read_json(.path, simplifyVector = FALSE)
-
-  # Arms are nested inside each task, because each task crowned its own configuration: the detailed
-  # taxonomy deploys one checkpoint and the broad taxonomy another. A flat arm list would name one
-  # task's model for all of them, and the failure surfaces as a terminal with no predictions rather
-  # than as anything recognisable.
-  arms_ <- purrr::map(man_$tasks, function(.t) {
-    purrr::map(mc_as_records(.x = .t$arms, .signature = "arm"), function(.a) {
-      tibble::tibble(
-        LabelCol = .t$label_col %||% NA_character_,
-        Arm      = .a$arm %||% NA_character_,
-        Kind     = .a$kind %||% NA_character_,
-        # The variant is what a caller names to override the default -- L512, W1024, blind -- so it
-        # travels beside the arm rather than being parsed back out of it.
-        Variant  = .a$variant %||% NA_character_,
-        Default  = isTRUE(.a$default),
-        Enabled  = isTRUE(.a$enabled),
-        Artifact = as.character(fs::path_abs(.a$artifact %||% ".", start = here::here())),
-        Score    = .a$scored$value %||% NA_real_,
-        Measure  = .a$scored$measure %||% NA_character_,
-        Params   = list(.a$params)
-      )
-    }) |>
-      purrr::list_rbind()
-  }) |>
-    purrr::list_rbind()
-
-  # An empty result here is the one failure that would otherwise travel: every downstream step would
-  # report a missing column rather than a missing manifest section. Say what was actually found.
-  if (nrow(arms_) == 0L) {
-    cli::cli_abort(c(
-      "The manifest lists no arms.",
-      "i" = "Top-level keys: {names(man_)}",
-      "i" = "Keys under the first task: {names(man_$tasks[[1]])}",
-      "i" = "03E writes arms inside each task; re-run it if this manifest predates that."
-    ))
-  }
-
-  arms_ <- arms_ |>
-    dplyr::mutate(OnDisk = fs::file_exists(.data$Artifact) | fs::dir_exists(.data$Artifact))
-
-  # Only the arms this run would actually reach. A variant pinned for a caller who might one day
-  # prefer it is not a reason to abort a run that is not using it, but a DEFAULT that has gone
-  # missing is: it is what the next chunk would have been labelled with.
-  gone_ <- arms_ |> dplyr::filter(.data$Default, .data$Enabled, !.data$OnDisk)
-  if (nrow(gone_) > 0L) {
-    cli::cli_abort(c(
-      "The manifest marks artifacts as default that are no longer on disk: {gone_$Arm}",
-      "i" = "Re-run the stage that wrote them, or re-run 03E to record their current location."
-    ))
-  }
-  stray_ <- arms_ |> dplyr::filter(!.data$Default, !.data$OnDisk)
-  if (nrow(stray_) > 0L) {
-    cli::cli_alert_warning(
-      "{nrow(stray_)} pinned variant{?s} {?is/are} not on disk and cannot be selected with \\
-       {.arg .prefer}: {stray_$Arm}."
-    )
-  }
-  # The reliability table sits beside the manifest, so the path it was read from travels with it.
-  # Recovering it later from an attribute that may not be there is how a lookup silently reads the
-  # wrong file, or none.
-  list(Manifest = man_, Arms = arms_, Dir = as.character(fs::path_dir(.path)))
-}
-
-#' Print what the manifest commits this run to
-#'
-#' Read before a corpus pass rather than after. Everything below is a decision someone made once and
-#' validated, and the point of showing it is that a run applying the wrong quarter's configuration
-#' should be visible in the first screen of output rather than in the released labels.
-#'
-#' @param .man Output of mc_manifest().
-#' @return Invisibly .man.
-mc_report_manifest <- function(.man) {
-  if (FALSE) .man <- man
-  m_ <- .man$Manifest
-  cli::cli_h2("Deployment manifest")
-  cli::cli_alert_info(
-    "Version {m_$manifest_version}, written {m_$written_at} from {m_$sample$n_labelled} labelled \\
-     documents over {m_$sample$n_folds} folds."
-  )
-
-  purrr::map(m_$tasks, function(.t) {
-    tibble::tibble(
-      Task      = .t$label_col,
-      Policy    = .t$policy$label,
-      MacroF1   = .t$validated$macro_f1,
-      Accuracy  = .t$validated$accuracy
-    )
-  }) |>
-    purrr::list_rbind() |>
-    dplyr::mutate(Accuracy = tbl_pct(.data$Accuracy), MacroF1 = sprintf("%.3f", .data$MacroF1)) |>
-    tbl_say(.title = "Tasks, and what each scored when validated")
-
-  .man$Arms |>
-    dplyr::mutate(
-      Default = dplyr::if_else(.data$Default, "<-", ""),
-      Enabled = dplyr::if_else(.data$Enabled, "yes", "no"),
-      OnDisk  = dplyr::if_else(.data$OnDisk, "yes", "NO"),
-      Score   = sprintf("%.3f", .data$Score)
-    ) |>
-    dplyr::select(LabelCol, Kind, Variant, Default, Enabled, OnDisk, Score, Arm) |>
-    tbl_say(.title = "Arms, per task")
-
-  cli::cli_text("")
-  cli::cli_alert_info(
-    "The arrow marks what runs. Every other row is a variant a caller can select with \\
-     {.arg .prefer}, at the score shown; scores are comparable within a kind and not across kinds."
-  )
-
-  # A flag the manifest does not pin is not a flag this stage can attach. Saying so here rather than
-  # leaving four NA columns to be discovered in the output is the difference between a known gap and
-  # an apparent bug.
-  if (isTRUE(m_$confidence$shipped)) {
-    cli::cli_alert_info(
-      "Confidence flag estimated on {m_$confidence$label_col}, default voting set \\
-       {m_$confidence$default_set}. Other tasks ship without a tier: a concurrence flag needs more \\
-       than one deployable arm, and only that task has one."
-    )
-  } else {
-    cli::cli_alert_warning(
-      "This manifest pins NO confidence flag, so Tier, Reliability and VotingSet ship as NA on \\
-       every row. The per-arm columns are unaffected and the label a later step derives from them \\
-       is unaffected: the flag is a separate estimate, not an input to either."
-    )
-  }
-  invisible(.man)
-}
-
-
-#' Column prefix for an arm kind
-#'
-#' One place, because the widening below and anything reading the output have to agree, and a second
-#' inline mapping is how a reader ends up looking for Bert_Pred1 in a file that spells it
-#' transformer_Pred1.
-#'
-#' @param .kind Character vector of arm kinds.
-#' @return Character vector of column prefixes.
-mc_kind_prefix <- function(.kind) {
-  if (FALSE) .kind <- c("transformer", "keyword", "llm")
-  out_ <- c(transformer = "Bert", keyword = "Kw", llm = "Llm")[.kind]
-  if (anyNA(out_)) cli::cli_abort("No column prefix for arm kind {.val {unique(.kind[is.na(out_)])}}.")
-  unname(out_)
-}
-
-#' Identity of the configuration a corpus pass ran under
-#'
-#' Names the output directory. A corpus pass is resumable because a chunk already on disk is skipped,
-#' and that is only sound while every chunk in the directory came from the same manifest. Keyed on
-#' the directory name alone, a manifest rewritten between two runs leaves the first run's chunks in
-#' place for the second to adopt: two configurations in one output, with nothing on the rows saying
-#' so. A new manifest therefore means a new directory, and resuming into the wrong one is impossible
-#' rather than merely unlikely.
-#'
-#' Hashed over the arms and their parameters rather than over the file, so re-rendering the
-#' orchestration stage without changing what it pins does not orphan a half-finished pass.
-#'
-#' @param .man Output of mc_manifest().
-#' @return Character scalar, safe as a directory name.
-mc_run_key <- function(.man) {
-  if (FALSE) .man <- man
-  sig_ <- .man$Arms |>
-    dplyr::filter(.data$Enabled) |>
-    dplyr::arrange(.data$LabelCol, .data$Kind, .data$Arm) |>
-    dplyr::transmute(
-      .data$LabelCol, .data$Kind, .data$Arm, .data$Variant, .data$Default,
-      Params = purrr::map_chr(.data$Params, \(.p) paste(names(.p), unlist(.p), collapse = "|"))
-    )
-  paste0("run_", substr(rlang::hash(list(sig_, .man$Manifest$confidence$default_set)), 1L, 10L))
-}
-
-#' Which arm of each kind runs, for one task
-#'
-#' The manifest ships every deployable variant and marks one per kind. This resolves the marked one
-#' unless a caller names another, and returns exactly one arm per kind so the wide output has one
-#' column set per kind and never two.
-#'
-#' A departure is recorded rather than refused. The catalogue exists so that a caller with throughput
-#' figures can trade accuracy against cost -- a shorter context length at the same measured accuracy
-#' is a real saving -- and forbidding that would make the catalogue decorative. What it may not do is
-#' happen quietly, so the chosen variant travels on the result and a non-default choice is named in
-#' the console before a single document is read.
-#'
-#' @param .arms The manifest arm table from mc_manifest().
-#' @param .label_col Task.
-#' @param .prefer Named character vector, kind to variant, e.g. c(transformer = "L512"). NULL takes
-#'   every default.
-#' @param .quiet Logical. TRUE suppresses the departure notice, which is reported once at run level.
-#' @return Tibble of the arms to run, one per kind, with a logical Departed column.
-mc_arms <- function(.arms, .label_col, .prefer = NULL, .quiet = FALSE) {
-  if (FALSE) {
-    .arms      <- man$Arms
-    .label_col <- "ClassDetailed"
-    .prefer    <- c(transformer = "L512")
-    .quiet     <- FALSE
-  }
-  mine_ <- .arms |> dplyr::filter(.data$LabelCol == .label_col, .data$Enabled, .data$OnDisk)
-  if (nrow(mine_) == 0L) {
-    cli::cli_abort(c(
-      "No enabled arm is on disk for {(.label_col)}.",
-      "i" = "Pinned for this task: {.arms$Arm[.arms$LabelCol == .label_col]}"
-    ))
-  }
-
-  out_ <- purrr::map(unique(mine_$Kind), function(.k) {
-    cand_ <- mine_ |> dplyr::filter(.data$Kind == .k)
-    want_ <- if (!is.null(.prefer) && .k %in% names(.prefer)) .prefer[[.k]] else NA_character_
-    row_  <- if (!is.na(want_)) cand_ |> dplyr::filter(.data$Variant == want_) else
-             cand_ |> dplyr::filter(.data$Default)
-    if (nrow(row_) != 1L) {
-      cli::cli_abort(c(
-        "{(.label_col)}/{(.k)}: expected one arm, found {nrow(row_)}.",
-        "i" = if (!is.na(want_)) "Requested variant {.val {want_}}." else "No variant is marked default.",
-        "i" = "Available: {cand_$Variant}"
-      ))
+  # THE ENGINE DRAWS ITS OWN PROGRESS BAR, and it draws it over ours. Any query long enough to
+  # deserve one -- the anti-join over a million rows that decides what is still outstanding -- writes
+  # a bar to the terminal with carriage returns, and the elapsed-and-ETA line the pass emits is
+  # overwritten by it. What survives in a log is a row of blank space where a progress line should be,
+  # which reads as a run that has gone quiet.
+  #
+  # Two spellings, because the setting was renamed between DuckDB versions and this file should not
+  # care which one is installed. A version recognising neither is left with its bar rather than
+  # refused a connection: a cosmetic setting must not be able to stop the store from opening.
+  if (isTRUE(.quiet)) {
+    for (.sql in c("SET enable_progress_bar = false", "PRAGMA disable_progress_bar")) {
+      try(DBI::dbExecute(con_, .sql), silent = TRUE)
     }
-    row_ |> dplyr::mutate(Departed = !.data$Default)
+  }
+
+  DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS corpus (
+      DocID VARCHAR PRIMARY KEY, Path VARCHAR, DocType VARCHAR, YQ VARCHAR)")
+
+  # One row per run key. This is what makes drift reportable: the configuration behind rows already
+  # written is recorded beside them, so a changed setting can be named rather than merely detected.
+  DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS runs (
+      RunKey VARCHAR PRIMARY KEY, Engine VARCHAR, Task VARCHAR, ConfigName VARCHAR,
+      MaxLen INTEGER, NWords INTEGER, Tau DOUBLE, Artifact VARCHAR, Fingerprint VARCHAR,
+      StartedAt TIMESTAMP, UpdatedAt TIMESTAMP)")
+
+  DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS bert_labels (
+      RunKey VARCHAR, DocID VARCHAR, Top1Class VARCHAR, Top1Prob DOUBLE,
+      Top2Class VARCHAR, Top2Prob DOUBLE)")
+
+  # The evidence trail, and the reason the decision rule can be revised without re-reading a million
+  # documents: a changed threshold is a re-run of kw_decide() over these rows rather than a re-run of
+  # the lexicon over the corpus.
+  DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS keyword_hits (
+      RunKey VARCHAR, DocID VARCHAR, Term VARCHAR, Class VARCHAR, Power DOUBLE)")
+
+  DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS keyword_labels (
+      RunKey VARCHAR, DocID VARCHAR, Top1Class VARCHAR, Top1Prob DOUBLE,
+      Top2Class VARCHAR, Top2Prob DOUBLE, TopTerm VARCHAR)")
+
+  # Timing runs, kept apart from the labels they never write. A benchmark exists to be comparable
+  # across renders, so it is keyed on the parameters it varied and skipped once measured; and it
+  # exists to price combinations that will never ship, so its predictions are discarded rather than
+  # stored. Writing them would half-populate a run key nobody asked for and report it as partial.
+  DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS benchmarks (
+      BenchKey VARCHAR PRIMARY KEY, Engine VARCHAR, Task VARCHAR, ConfigName VARCHAR,
+      MaxLen INTEGER, BatchSize INTEGER, nDocs INTEGER, Seconds DOUBLE, DocsPerSecond DOUBLE,
+      MeasuredAt TIMESTAMP)")
+
+  # RETRYABLE BY CONSTRUCTION. A failure is recorded with its reason and excluded from the current
+  # pass, and the next pass tries again: a file missing because a mount hiccuped must not be
+  # blacklisted forever, and a file that is genuinely empty simply reappears in the report, which is
+  # honest rather than tidy.
+  DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS failures (
+      RunKey VARCHAR, DocID VARCHAR, Reason VARCHAR, SeenAt TIMESTAMP)")
+
+  con_
+}
+
+#' The key identifying one engine, one task, one configuration
+#'
+#' Hashes the recipe rather than the artifact. Two runs of the same configuration share a key and
+#' therefore resume each other; a different context length is a different key and cannot pool with
+#' what came before.
+#'
+#' @param .engine Character. "bert" or "keyword".
+#' @param .task Character. Label column.
+#' @param .config Character. Configuration name written upstream.
+#' @param .window Integer. Context length for the transformer, truncation window for the lexicon.
+#' @return Character. A twelve-character key.
+app_run_key <- function(.engine, .task, .config, .window) {
+  if (FALSE) {
+    .engine <- "bert"
+    .task   <- "ClassDetailed"
+    .config <- "ClassDetailed__nlpaueb-legal-bert-base-uncased__TText_L256_E6_B32_LR2e-05_W1_S42"
+    .window <- 256L
+  }
+  substr(digest::digest(paste(.engine, .task, .config, as.integer(.window), sep = "|"),
+                        algo = "xxhash64"), 1L, 12L)
+}
+
+#' A cheap fingerprint of the artifact behind a run
+#'
+#' Size and modification time of every file in the directory, hashed. Not part of the key, because a
+#' refit that reproduces the same weights should not invalidate a finished pass. Recorded, because a
+#' checkpoint replaced by hand should not pass unnoticed either.
+#'
+#' @param .path Character. File or directory.
+#' @return Character, or NA where the path is absent.
+app_fingerprint <- function(.path) {
+  if (FALSE) .path <- "2_output/03B/model_final/x__FINAL/model"
+  if (!fs::file_exists(.path) && !fs::dir_exists(.path)) return(NA_character_)
+  fils_ <- if (fs::dir_exists(.path)) fs::dir_ls(.path, recurse = TRUE, type = "file") else .path
+  if (length(fils_) == 0L) return(NA_character_)
+  info_ <- fs::file_info(fils_)
+  substr(digest::digest(paste(fs::path_file(fils_), info_$size, info_$modification_time,
+                              collapse = "|"), algo = "xxhash64"), 1L, 12L)
+}
+
+#' Record, or update, the configuration behind a run key
+#'
+#' Written before any label, so an interrupted pass still leaves behind a statement of what it was
+#' doing. The upsert is what lets a resumed pass refresh the fingerprint without losing the start
+#' time.
+#'
+#' @param .con Connection.
+#' @param .spec One-row tibble carrying RunKey, Engine, Task, ConfigName and the window columns.
+#' @return Invisibly .spec.
+app_run_register <- function(.con, .spec) {
+  if (FALSE) {
+    .con  <- con
+    .spec <- spec_bert[1, ]
+  }
+  now_ <- Sys.time()
+  old_ <- DBI::dbGetQuery(.con, "SELECT RunKey, StartedAt FROM runs WHERE RunKey = ?",
+                          params = list(.spec$RunKey))
+  row_ <- tibble::tibble(
+    RunKey      = .spec$RunKey,
+    Engine      = .spec$Engine,
+    Task        = .spec$Task,
+    ConfigName  = .spec$ConfigName,
+    MaxLen      = if ("MaxLen" %in% names(.spec)) as.integer(.spec$MaxLen) else NA_integer_,
+    NWords      = if ("NWords" %in% names(.spec)) as.integer(.spec$NWords) else NA_integer_,
+    Tau         = if ("Tau" %in% names(.spec)) as.numeric(.spec$Tau) else NA_real_,
+    Artifact    = .spec$Artifact,
+    Fingerprint = app_fingerprint(.path = .spec$Artifact),
+    StartedAt   = if (nrow(old_) == 1L) old_$StartedAt[[1]] else now_,
+    UpdatedAt   = now_
+  )
+  DBI::dbExecute(.con, "DELETE FROM runs WHERE RunKey = ?", params = list(.spec$RunKey))
+  DBI::dbAppendTable(.con, "runs", row_)
+  invisible(.spec)
+}
+
+#' Load the corpus index into the store, walking the tree only once
+#'
+#' A million paths is a slow walk and an unchanging one between renders, so it is done when the table
+#' is empty and skipped otherwise. `.rewalk` forces it, which is what a grown corpus needs.
+#'
+#' @param .con Connection.
+#' @param .dir_corpus Character. Root of the parsed-contract tree.
+#' @param .path_cache Character. Parquet the walk is cached to.
+#' @param .rewalk Logical. Walk again even if the table holds rows.
+#' @return Invisibly the number of documents in the index.
+app_corpus_load <- function(.con, .dir_corpus, .path_cache, .rewalk = FALSE) {
+  if (FALSE) {
+    .con         <- con
+    .dir_corpus  <- .lP$Input$DirCorpus
+    .path_cache  <- .lP$Cache$CorpusFiles
+    .rewalk      <- FALSE
+  }
+  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
+  if (n_ > 0L && !.rewalk) {
+    cli::cli_alert_info("Corpus index already loaded: {n_} document{?s}.")
+    return(invisible(n_))
+  }
+  if (!fs::dir_exists(.dir_corpus)) cli::cli_abort("No corpus tree at {.path {(.dir_corpus)}}.")
+
+  fils_ <- utils_list_project_files(
+    .dir_data = .dir_corpus, .path_out = .path_cache, .rerun = .rewalk
+  ) |>
+    dplyr::distinct(DocID, .keep_all = TRUE) |>
+    dplyr::select(DocID, Path, dplyr::any_of(c("DocType", "YQ")))
+  for (.c in c("DocType", "YQ")) if (!.c %in% names(fils_)) fils_[[.c]] <- NA_character_
+
+  DBI::dbExecute(.con, "DELETE FROM corpus")
+  DBI::dbAppendTable(.con, "corpus", fils_ |> dplyr::select(DocID, Path, DocType, YQ))
+  cli::cli_alert_success("Corpus index loaded: {nrow(fils_)} document{?s}.")
+  invisible(nrow(fils_))
+}
+
+#' Documents this run key still has to label
+#'
+#' The anti-join the store exists for. A document already labelled is excluded; one recorded as
+#' failed is excluded from THIS pass and returns to the queue on the next, which is what makes a
+#' transient read failure transient.
+#'
+#' @param .con Connection.
+#' @param .run_key Character.
+#' @param .table Character. Label table to check against.
+#' @param .limit Integer or NULL. Cap for a rehearsal; NULL takes everything outstanding.
+#' @return Tibble: DocID, Path.
+app_pending <- function(.con, .run_key, .table = "bert_labels", .limit = NULL) {
+  if (FALSE) {
+    .con     <- con
+    .run_key <- "a1b2c3d4e5f6"
+    .table   <- "bert_labels"
+    .limit   <- 2000L
+  }
+  sql_ <- paste0(
+    "SELECT c.DocID, c.Path FROM corpus c ",
+    "LEFT JOIN (SELECT DISTINCT DocID FROM ", .table, " WHERE RunKey = ?) d ON d.DocID = c.DocID ",
+    "LEFT JOIN (SELECT DISTINCT DocID FROM failures WHERE RunKey = ?) f ON f.DocID = c.DocID ",
+    "WHERE d.DocID IS NULL AND f.DocID IS NULL ORDER BY c.DocID"
+  )
+  if (!is.null(.limit)) sql_ <- paste0(sql_, " LIMIT ", as.integer(.limit))
+  tibble::as_tibble(DBI::dbGetQuery(.con, sql_, params = list(.run_key, .run_key)))
+}
+
+#' What is done, what is missing, and what has changed
+#'
+#' Three questions, one table. The third needs the runs table: a key with no rows is indistinguishable
+#' from a key that was never started unless the previous configuration for the same task is on record
+#' beside it, so drift is reported by naming the field that moved rather than by the absence of rows.
+#'
+#' @param .con Connection.
+#' @param .specs Tibble of the runs this document intends, one row per engine and task.
+#' @return Tibble: Engine, Task, RunKey, nDone, nFailed, nPending, Status, Note.
+app_status <- function(.con, .specs) {
+  if (FALSE) {
+    .con   <- con
+    .specs <- dplyr::bind_rows(spec_bert, spec_kw)
+  }
+  n_corpus_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
+  prev_     <- tibble::as_tibble(DBI::dbGetQuery(.con, "SELECT * FROM runs"))
+
+  purrr::map(seq_len(nrow(.specs)), function(.i) {
+    s_    <- .specs[.i, ]
+    tab_  <- if (identical(s_$Engine, "bert")) "bert_labels" else "keyword_labels"
+    done_ <- DBI::dbGetQuery(
+      .con, paste0("SELECT COUNT(DISTINCT DocID) AS n FROM ", tab_, " WHERE RunKey = ?"),
+      params = list(s_$RunKey))$n[[1]]
+    fail_ <- DBI::dbGetQuery(
+      .con, "SELECT COUNT(DISTINCT DocID) AS n FROM failures WHERE RunKey = ?",
+      params = list(s_$RunKey))$n[[1]]
+
+    # A run for the same engine and task under a DIFFERENT key is the previous configuration -- unless
+    # the caller intends to keep both, which is what running two context lengths side by side is.
+    # Excluding every key in the current specification is what tells a deliberate second run from a
+    # changed setting: the first is in the plan, the second is not.
+    old_ <- prev_ |>
+      dplyr::filter(.data$Engine == s_$Engine, .data$Task == s_$Task,
+                    !.data$RunKey %in% .specs$RunKey)
+    note_ <- if (nrow(old_) == 0L) {
+      ""
+    } else {
+      purrr::map_chr(seq_len(nrow(old_)), function(.j) {
+        o_    <- old_[.j, ]
+        diff_ <- c(
+          if (!identical(o_$ConfigName, s_$ConfigName)) "configuration",
+          if (!isTRUE(o_$MaxLen == s_$MaxLen) && !all(is.na(c(o_$MaxLen, s_$MaxLen)))) {
+            paste0("MaxLen ", o_$MaxLen, " -> ", s_$MaxLen)
+          },
+          if (!isTRUE(o_$NWords == s_$NWords) && !all(is.na(c(o_$NWords, s_$NWords)))) {
+            paste0("NWords ", o_$NWords, " -> ", s_$NWords)
+          }
+        )
+        paste0("supersedes ", o_$RunKey, " (", paste(diff_, collapse = ", "), ")")
+      }) |>
+        paste(collapse = "; ")
+    }
+
+    fp_now_ <- app_fingerprint(.path = s_$Artifact)
+    fp_old_ <- prev_$Fingerprint[prev_$RunKey == s_$RunKey]
+    if (length(fp_old_) == 1L && !is.na(fp_old_) && !identical(fp_old_, fp_now_)) {
+      note_ <- paste(c(note_, "ARTIFACT CHANGED under the same key"), collapse = "; ")
+    }
+
+    tibble::tibble(
+      Engine = s_$Engine, Task = s_$Task, RunKey = s_$RunKey,
+      nDone = done_, nFailed = fail_, nPending = n_corpus_ - done_ - fail_,
+      Status = dplyr::case_when(done_ == 0L                     ~ "not started",
+                                done_ + fail_ >= n_corpus_      ~ "complete",
+                                TRUE                            ~ "partial"),
+      Note = note_
+    )
   }) |>
     purrr::list_rbind()
+}
 
-  dep_ <- out_ |> dplyr::filter(.data$Departed)
-  if (nrow(dep_) > 0L && !.quiet) {
-    cli::cli_alert_warning(
-      "{(.label_col)}: running {nrow(dep_)} non-default variant{?s} ({dep_$Kind}/{dep_$Variant}). \\
-       The output records this; it is not comparable with rows produced under the defaults."
+#' Report the store's state before anything is run
+#' @param .tab Output of app_status().
+#' @param .n_corpus Integer. Documents in the index.
+#' @return Invisibly .tab.
+app_report_status <- function(.tab, .n_corpus) {
+  if (FALSE) {
+    .tab      <- status
+    .n_corpus <- 1.1e6
+  }
+  tbl_head("The store, before this run")
+  tbl_out(
+    .tab    = .tab,
+    .title  = "The store, before this run",
+    .groups = c(" " = 3, "Documents" = 3, " " = 2),
+    .notes  = c(
+      nPending = paste("Corpus minus done minus failed, for THIS run key. A failure is excluded from",
+                       "this pass and returns to the queue on the next, so a transient read error",
+                       "does not blacklist a document."),
+      Note     = paste("Names the configuration a key supersedes, where one exists. An artifact that",
+                       "changed under an UNCHANGED key is the dangerous case and is called out: the",
+                       "rows already written came from different weights.")
+    )
+  )
+  drift_ <- .tab |> dplyr::filter(nzchar(.data$Note))
+  if (nrow(drift_) > 0L) {
+    tbl_note(
+      "{nrow(drift_)} run{?s} differ{?s/} from what is already in the store. Rows under a superseded \\
+       key are not deleted -- they are simply not read, since every query is scoped by key -- so \\
+       nothing is lost and nothing is mixed.",
+      .type = "warn"
     )
   }
-  out_
+  tbl_note("The corpus index holds {(.n_corpus)} document{?s}.")
+  invisible(.tab)
 }
 
 
-# 2. The arms, applied -----------------------------------------------------------------------------
-# One function per kind, each returning the same three columns, so mc_classify() assembles them
-# without knowing which produced what. That is the same contract the run folders enforce upstream,
-# carried into inference.
+# 2. Reading text --------------------------------------------------------------------------------------------------------
 
-#' Apply the deployed transformer
+#' Read the text of one chunk of documents
 #'
-#' Shells out to classify_apply.py, the inference companion to the trainer, against the all-data
-#' refit the manifest points at. A separate script rather than a mode on classify_train.py: training
-#' assumes a label column at every step and inference assumes there is none, so a combined script
-#' would be mostly guards. What the two share is the encoding -- same tokenizer, same max_len, same
-#' fixed-width padding -- because a model is only as reproducible as the tokenisation it was fitted
-#' under.
+#' Text is read and discarded chunk by chunk rather than held: a million contracts do not fit in
+#' memory and nothing below needs them twice. A document whose parquet is missing or empty comes back
+#' with NA text and is recorded as a failure rather than stopping the pass.
 #'
-#' The label mapping is not passed across. The trainer writes id2label into the checkpoint config, so
-#' it travels with the weights; supplying it here would be a second source of truth, and the two
-#' would eventually disagree about which integer means which category while still emitting valid
-#' category names.
-#'
-#' @param .docs Documents (DocID, Text).
-#' @param .artifact Path to the saved model directory.
-#' @param .params Manifest parameters for this arm (max_len and so on).
-#' @param .script Inference script.
-#' @param .python Python binary.
-#' @param .batch_size Documents per forward pass.
-#' @param .out_dir Scratch directory for the parquet seam.
-#' @return Tibble: DocID, Pred, Score.
-mc_apply_bert <- function(.docs, .artifact, .params, .script, .python, .batch_size = 32L,
-                          .out_dir = fs::path(tempdir(), "mc-bert")) {
+#' @param .docs Tibble with DocID and Path.
+#' @return .docs with a Text column.
+app_read_text <- function(.docs) {
+  if (FALSE) .docs <- pending[1:10, ]
+  .docs |>
+    dplyr::mutate(Text = purrr::map_chr(.data$Path, clf_read_text))
+}
+
+#' Split a queue into chunks of a given size
+#' @param .docs Tibble.
+#' @param .size Integer. Documents per chunk.
+#' @return List of tibbles.
+app_chunks <- function(.docs, .size) {
   if (FALSE) {
-    .docs     <- dplyr::slice_head(tab_docs, n = 100L)
-    .artifact <- man$Arms$Artifact[man$Arms$Kind == "transformer"]
-    .params   <- man$Arms$Params[[1]]
+    .docs <- pending
+    .size <- 5000L
+  }
+  if (nrow(.docs) == 0L) return(list())
+  split(.docs, ceiling(seq_len(nrow(.docs)) / .size)) |> unname()
+}
+
+
+# 3. The transformer -----------------------------------------------------------------------------------------------------
+
+#' The model 03B deployed for one task, at a chosen context length
+#'
+#' Discovered from the deployment directory rather than rebuilt from a naming convention. 03B fits one
+#' model per task AND per context length and names each directory for the configuration it holds, so
+#' the set of deployable models is a directory listing joined to the metrics that crowned them.
+#'
+#' `.max_len` NULL takes the length 03B crowned for the task; an explicit value takes that length
+#' instead. The choice belongs to the caller because it is a cost decision -- the longer window is a
+#' second full pass over the corpus -- and 03E measures what it buys.
+#'
+#' @param .dir_bert Character. Output root of the training stage.
+#' @param .tab_overall Per-fold metrics from clf_load_overall(), supplying MaxLen and the score.
+#' @param .crown Tibble from deployed.parquet, naming what 03B crowned per task.
+#' @param .task Character. Label column.
+#' @param .max_len Integer or NULL.
+#' @return One-row tibble: Task, ConfigName, MaxLen, Artifact, MacroF1, Crowned.
+app_pick_model <- function(.dir_bert, .tab_overall, .crown, .task, .max_len = NULL) {
+  if (FALSE) {
+    .dir_bert    <- .dir_bert
+    .tab_overall <- tab_overall
+    .crown       <- bert_crown
+    .task        <- "ClassDetailed"
+    .max_len     <- 256L
+  }
+  root_ <- fs::path(.dir_bert, "model_final")
+  dirs_ <- if (fs::dir_exists(root_)) {
+    fs::dir_ls(root_, type = "directory", glob = "*__FINAL")
+  } else {
+    character(0)
+  }
+  dirs_ <- dirs_[fs::dir_exists(fs::path(dirs_, "model"))]
+  if (length(dirs_) == 0L) cli::cli_abort("No deployed models under {.path {as.character(root_)}}.")
+
+  found_ <- tibble::tibble(
+    ConfigName = sub("__FINAL$", "", fs::path_file(dirs_)),
+    Artifact   = as.character(fs::path(dirs_, "model"))
+  )
+
+  meta_ <- .tab_overall |>
+    dplyr::filter(!.data$Smoke, .data$LabelCol == .task) |>
+    dplyr::summarise(MaxLen = as.integer(dplyr::first(.data$MaxLen)),
+                     MacroF1 = mean(.data$F1_macro), .by = ConfigName)
+
+  cand_ <- found_ |>
+    dplyr::inner_join(meta_, by = dplyr::join_by(ConfigName)) |>
+    dplyr::mutate(Crowned = .data$ConfigName %in% .crown$ConfigName[.crown$LabelCol == .task])
+  if (nrow(cand_) == 0L) cli::cli_abort("No deployed model for {(.task)}.")
+
+  out_ <- if (is.null(.max_len)) {
+    cand_ |> dplyr::filter(.data$Crowned)
+  } else {
+    cand_ |> dplyr::filter(.data$MaxLen == as.integer(.max_len))
+  }
+  if (nrow(out_) == 0L) {
+    cli::cli_abort(c(
+      "No deployed model for {(.task)} at the requested context length.",
+      "i" = "Available: {paste(cand_$MaxLen, collapse = ', ')}"
+    ))
+  }
+  out_ |>
+    dplyr::slice_max(.data$MacroF1, n = 1L, with_ties = FALSE) |>
+    dplyr::transmute(Task = .task, ConfigName, MaxLen, Artifact, MacroF1, Crowned)
+}
+
+#' Label one chunk with the transformer
+#'
+#' Shells out to classify_apply.py, the inference companion to the trainer, so the deployed model is
+#' applied by the same code the folds were run through. The context length is passed explicitly and is
+#' never allowed to default: a model applied at a length it was not fitted under encodes its input
+#' differently from its training data, produces perfectly ordinary labels, and says so nowhere.
+#'
+#' @param .docs Tibble with DocID and Text.
+#' @param .artifact Character. Model directory.
+#' @param .max_len Integer. Context length the model was fitted at.
+#' @param .python,.script Interpreter and classify_apply.py.
+#' @param .batch_size Integer.
+#' @param .out_dir Character. Scratch directory for the exchange parquets.
+#' @return Tibble: DocID, Top1Class, Top1Prob, Top2Class, Top2Prob.
+app_bert_chunk <- function(.docs, .artifact, .max_len, .python, .script, .batch_size = 32L,
+                           .out_dir = fs::path(tempdir(), "app-bert")) {
+  if (FALSE) {
+    .docs       <- dplyr::slice_head(pending, n = 100L)
+    .artifact   <- pick$Artifact
+    .max_len    <- pick$MaxLen
+    .batch_size <- 32L
+  }
+  if (!fs::file_exists(.script)) {
+    cli::cli_abort(c("No inference script at {.path {(.script)}}.",
+                     "i" = "Expected the companion to classify_train.py."))
   }
   fs::dir_create(.out_dir)
   in_  <- fs::path(.out_dir, "input.parquet")
   out_ <- fs::path(.out_dir, "pred.parquet")
   arrow::write_parquet(.docs |> dplyr::select(DocID, Text), in_)
 
-  args_ <- c(
-    .script,
-    "--data", in_,
-    "--model-dir", .artifact,
-    "--text-col", "Text",
-    "--id-col", "DocID",
-    # From the manifest, never from a fallback. A model applied at a context length it was not
-    # fitted under encodes its input differently from its training data, produces perfectly ordinary
-    # labels, and says nothing about it anywhere. A missing parameter is a broken manifest, so it
-    # stops here rather than defaulting to whatever the shortest window happened to be.
-    "--max-len", as.character(mc_require(.params$max_len, "max_len", "transformer")),
-    "--batch-size", as.character(.batch_size)
+  res_ <- processx::run(
+    command = .python,
+    args    = c(.script,
+                "--data", in_, "--model-dir", .artifact, "--out", out_,
+                "--text-col", "Text", "--id-col", "DocID",
+                "--max-len", as.character(as.integer(.max_len)),
+                "--batch-size", as.character(as.integer(.batch_size)),
+                "--save-probs"),
+    error_on_status = FALSE, echo = FALSE
   )
-  args_ <- c(args_, "--out", out_)
-
-  # Exit 127 is the shell failing to find the interpreter, which is a configuration problem rather
-  # than an inference one and deserves a different message: a corpus pass that dies four hours in
-  # because a path was wrong should say so in the first line, not report a failed forward pass.
-  if (!fs::file_exists(.python)) {
-    cli::cli_abort(c(
-      "No Python interpreter at {(.python)}.",
-      "i" = "03B trains through {.path contracts-engine/.venv/bin/python}; point .lP$Engine$Python there."
-    ))
-  }
-  if (!fs::file_exists(.script)) {
-    cli::cli_abort(c(
-      "No inference script at {(.script)}.",
-      "i" = "Expected {.path contracts-engine/classify_apply.py}, the companion to classify_train.py."
-    ))
+  if (res_$status != 0L || !fs::file_exists(out_)) {
+    cli::cli_abort(c("classify_apply.py failed.", "i" = utils::tail(strsplit(res_$stderr, "\n")[[1]], 3)))
   }
 
-  # CAPTURED, not echoed. stdout = "" sends the child's output to this console, and a transformers
-  # script emits tqdm bars on stderr -- which redraw over a cli progress bar and leave a corpus pass
-  # looking like it is producing garbage. Capturing also means the output is available to quote when
-  # inference fails, where before it had already scrolled past.
-  out_lines_ <- suppressWarnings(
-    system2(.python, args = args_, stdout = TRUE, stderr = TRUE)
-  )
-  status_ <- attr(out_lines_, "status")
-  if (!is.null(status_) && !identical(as.integer(status_), 0L)) {
-    cli::cli_abort(c(
-      "Transformer inference failed (exit {status_}).",
-      "i" = "Last lines from the engine:",
-      utils::tail(out_lines_, 10L)
-    ))
-  }
+  pred_ <- arrow::read_parquet(out_)
+  fs::file_delete(c(in_, out_))
+  app_top2(.pred = pred_)
+}
 
-  # Top2 came in with the inference script's switch from argmax to topk. An older parquet has no
-  # such columns and still reads: the runner-up is then NA, which is the honest value for "this file
-  # does not record one" and is distinguishable from a genuine tie.
-  res_ <- arrow::read_parquet(out_)
-  res_ |>
+#' Reduce a probability matrix to the top two classes
+#'
+#' The full vector is not stored. It costs little and cannot be recovered without re-running
+#' inference, but the questions this dataset is for are answered by the label and the runner-up: how
+#' confident, and what was the alternative. Storing twelve columns per document to answer two
+#' questions is a decision that should be made deliberately rather than by default.
+#'
+#' @param .pred Output of classify_apply.py, with P_<Class> columns.
+#' @return Tibble: DocID, Top1Class, Top1Prob, Top2Class, Top2Prob.
+app_top2 <- function(.pred) {
+  if (FALSE) .pred <- arrow::read_parquet("pred.parquet")
+  pcols_ <- grep("^P_", names(.pred), value = TRUE)
+  if (length(pcols_) == 0L) {
+    cli::cli_abort("No P_<Class> columns; classify_apply.py must be called with --save-probs.")
+  }
+  .pred |>
+    dplyr::select(DocID, dplyr::all_of(pcols_)) |>
+    tidyr::pivot_longer(cols = dplyr::all_of(pcols_), names_to = "Class", values_to = "Prob") |>
+    dplyr::mutate(Class = sub("^P_", "", .data$Class)) |>
+    dplyr::slice_max(.data$Prob, n = 2L, by = DocID, with_ties = FALSE) |>
+    dplyr::mutate(Rank = dplyr::row_number(dplyr::desc(.data$Prob)), .by = DocID) |>
+    tidyr::pivot_wider(id_cols = DocID, names_from = "Rank",
+                       values_from = c("Class", "Prob"), names_sep = "") |>
+    dplyr::transmute(DocID, Top1Class = .data$Class1, Top1Prob = .data$Prob1,
+                     Top2Class = .data$Class2, Top2Prob = .data$Prob2)
+}
+
+
+# 4. The keyword table ---------------------------------------------------------------------------------------------------
+# Two steps, and the split is deliberate. keyword_apply.py answers which terms occur, because the
+# tokenisation is sklearn's analyzer and reproducing it elsewhere is what once put a hand-written
+# substring search in front of a mined lexicon. kw_decide() turns terms into a class, because that
+# rule has to be the same one 03C measured the table's precision with.
+
+#' The lexicon 03C published for one task, at a chosen truncation window
+#'
+#' @param .dir_kw Character. Output root of the keyword stage.
+#' @param .catalogue The published catalogue.
+#' @param .task Character. Label column.
+#' @param .n_words Integer or NULL. NULL takes the window 03C marked as default.
+#' @return One-row tibble: Task, ConfigName, NWords, Tau, Source, Stopwords, NgramMax, MinTokenLen,
+#'   Mode, PositiveClass, Artifact.
+app_pick_lexicon <- function(.dir_kw, .catalogue, .task, .n_words = NULL) {
+  if (FALSE) {
+    .dir_kw    <- .dir_kw
+    .catalogue <- kw_cat
+    .task      <- "ClassDetailed"
+    .n_words   <- NULL
+  }
+  mine_ <- .catalogue |> dplyr::filter(.data$Task == .task)
+  if (nrow(mine_) == 0L) cli::cli_abort("The catalogue lists no table for {(.task)}.")
+
+  out_ <- if (is.null(.n_words)) mine_ |> dplyr::filter(Default) else {
+    mine_ |> dplyr::filter(.data$NWords == as.integer(.n_words))
+  }
+  if (nrow(out_) != 1L) {
+    cli::cli_abort(c("No single published table for {(.task)} at the requested window.",
+                     "i" = "Available: {paste(mine_$NWords, collapse = ', ')}"))
+  }
+  out_ |>
     dplyr::transmute(
-      DocID,
-      Pred1  = .data$PredLabel,
-      Score1 = as.numeric(.data$Top1Prob),
-      Pred2  = if ("Top2Label" %in% names(res_)) as.character(.data$Top2Label) else NA_character_,
-      Score2 = if ("Top2Prob" %in% names(res_)) as.numeric(.data$Top2Prob) else NA_real_
+      Task, ConfigName, NWords = as.integer(NWords), Tau, Source, Stopwords,
+      NgramMax = as.integer(NgramMax), MinTokenLen = as.integer(MinTokenLen), Mode, PositiveClass,
+      Artifact = as.character(fs::path(.dir_kw, "table",
+                                       paste0(kw_table_stem(Task, NWords), ".parquet")))
     )
 }
 
-#' Apply the published keyword table
+#' Which terms fired, and what the decision rule made of them
 #'
-#' Pure string matching against the shipped lexicon, so it runs in R and needs no engine. Each term
-#' carries the training precision that earned its place; a document takes the class whose best
-#' matching term has the highest Power, and abstains where nothing clears the operating threshold.
+#' Returns both, because both are worth keeping: the hits are the evidence trail, and they are what
+#' lets a revised threshold be applied by re-running the decision rule over stored rows rather than
+#' the lexicon over the corpus.
 #'
-#' @param .docs Documents (DocID, Text, DocDesc).
-#' @param .artifact Path to the lexicon parquet.
-#' @param .params Manifest parameters (source, tau).
-#' @param .none Abstention sentinel.
-#' @return Tibble: DocID, Pred, Score.
-mc_apply_keyword <- function(.docs, .artifact, .params, .none = MC_NONE) {
+#' @param .docs Tibble with DocID and Text.
+#' @param .spec One row of app_pick_lexicon().
+#' @param .classes Character vector of the task's categories.
+#' @param .python,.script Interpreter and keyword_apply.py.
+#' @return List: Hits (DocID, Term, Class, Power) and Labels (DocID, Top1Class, ...).
+app_keyword_chunk <- function(.docs, .spec, .classes, .python, .script) {
   if (FALSE) {
-    .docs     <- dplyr::slice_head(tab_docs, n = 100L)
-    .artifact <- man$Arms$Artifact[man$Arms$Kind == "keyword"]
-    .params   <- list(source = "text", tau = 0.70)
+    .docs    <- dplyr::slice_head(pending, n = 100L)
+    .spec    <- pick_kw
+    .classes <- sort(unique(tab_prep$ClassDetailed))
   }
-  lex_ <- arrow::read_parquet(.artifact)
-  src_ <- .params$source %||% "text"
-  txt_ <- if (src_ == "docdesc") .docs$DocDesc else .docs$Text
+  lex_ <- arrow::read_parquet(.spec$Artifact)
 
-  # TRUNCATED TO THE WINDOW THE TABLE WAS MINED UNDER. The published precision is a property of the
-  # pair (lexicon, window): a table mined over the first 256 words earns its precision from preamble
-  # vocabulary, and run against whole documents it fires on later matches the mining never saw and
-  # never priced. The result is a table that quietly does not keep its promise, and the only symptom
-  # is a precision nobody measured. A window of zero means the miner read the whole document.
-  win_ <- as.integer(mc_require(.params$n_words, "n_words", "keyword"))
-  txt_ <- dplyr::coalesce(txt_, "")
-  if (win_ > 0L) {
-    txt_ <- stringi::stri_replace_all_regex(
-      str         = txt_,
-      pattern     = paste0("^((?:\\S+\\s+){", win_, "}).*$"),
-      replacement = "$1",
-      opts_regex  = stringi::stri_opts_regex(dotall = TRUE)
-    )
-  }
-
-  hay_ <- stringi::stri_trans_tolower(txt_)
-  hits_ <- purrr::map(seq_len(nrow(lex_)), function(.i) {
-    found_ <- stringi::stri_detect_fixed(hay_, paste0(" ", lex_$Term[[.i]], " "))
-    if (!any(found_)) return(NULL)
-    tibble::tibble(DocID = .docs$DocID[found_], Class = lex_$Class[[.i]],
-                   Power = as.numeric(lex_$Power[[.i]]))
-  }) |>
-    purrr::list_rbind()
-
-  base_ <- tibble::tibble(DocID = .docs$DocID, Pred1 = .none, Score1 = 0,
-                          Pred2 = NA_character_, Score2 = NA_real_)
-  if (nrow(hits_) == 0L) return(base_)
-
-  # Ranked by CLASS, not by term. A document matching four terms of one category and one of another
-  # has two candidate classes, not five candidate terms, and the runner-up worth recording is the
-  # second class. Where only one class matched at all there is no runner-up, and NA says so -- a
-  # zero there would read as a class scoring zero.
-  by_class_ <- hits_ |>
-    dplyr::slice_max(.data$Power, n = 1L, by = c(DocID, Class), with_ties = FALSE) |>
-    dplyr::arrange(.data$DocID, dplyr::desc(.data$Power)) |>
-    dplyr::mutate(Rank = dplyr::row_number(), .by = DocID) |>
-    dplyr::filter(.data$Rank <= 2L)
-
-  best_ <- by_class_ |>
-    tidyr::pivot_wider(id_cols = DocID, names_from = "Rank", values_from = c("Class", "Power"),
-                       names_sep = "")
-
-  # A chunk in which no document matched two classes produces no rank-2 columns at all, and the
-  # schema has to be the same in every chunk or the parquet set cannot be read as one dataset.
-  if (!"Class2" %in% names(best_)) best_$Class2 <- NA_character_
-  if (!"Power2" %in% names(best_)) best_$Power2 <- NA_real_
-
-  best_ <- best_ |>
-    dplyr::transmute(DocID, Pred1 = .data$Class1, Score1 = .data$Power1,
-                     Pred2 = .data$Class2, Score2 = .data$Power2)
-
-  base_ |>
-    dplyr::rows_update(best_, by = "DocID", unmatched = "ignore")
-}
-
-#' Apply the generative arm
-#'
-#' Off unless asked for, and the reason is cost rather than quality: this is the most independent
-#' vote available and hours of inference over a corpus of this size. The prompt is rebuilt from the
-#' recipe the manifest pinned, and worked examples are drawn from the whole labelled sample -- which
-#' is legitimate at deployment for the same reason the transformer's all-data refit is, since no
-#' corpus document is in that sample. The folds certified the recipe; deployment fits it on
-#' everything.
-#'
-#' @param .docs Documents (DocID, Text).
-#' @param .params Manifest parameters (model, shots and so on).
-#' @param .tab_prep Labelled sample, supplying the deployment example draw.
-#' @param .label_col Task.
-#' @param .none Abstention sentinel.
-#' A constrained schema returns one label, so there is no runner-up to record. NA rather than a
-#' repeat of the first choice or an empty string: the column means "this arm reports no second
-#' choice", which is a different statement from "the second choice was nothing".
-#'
-#' @param ... Passed to llm_classify() from 03D.
-#' @return Tibble: DocID, Pred1, Score1, Pred2, Score2.
-mc_apply_llm <- function(.docs, .params, .tab_prep, .label_col, .none = MC_NONE, ...) {
-  if (FALSE) {
-    .docs      <- dplyr::slice_head(tab_docs, n = 20L)
-    .params    <- list(model = "qwen3:8b", shots = 4L, n_chars = 6000L)
-    .tab_prep  <- tab_prep
-    .label_col <- "ClassDetailed"
-  }
-  labels_ <- llm_labels(.tab_prep = .tab_prep, .label_col = .label_col)
-  block_  <- llm_render_labels(.labels = labels_, .definitions = NULL, .guidance = "labels")
-
-  ex_ <- if ((.params$shots %||% 0L) > 0L) {
-    llm_render_examples(
-      .tab = llm_examples(
-        .tab_prep  = .tab_prep,
-        .label_col = .label_col,
-        # Every fold, because at deployment there is no held-out fold to protect: the documents being
-        # classified are not in this sample at all.
-        .folds     = sort(unique(.tab_prep$Fold)),
-        .per_class = .params$shots
-      ),
-      .label_col = .label_col
-    )
-  } else {
-    NULL
-  }
-
-  llm_classify(
-    .tab           = .docs |> dplyr::mutate(Fold = 0L, !!.label_col := NA_character_),
-    .label_col     = .label_col,
-    .labels        = labels_,
-    .labels_block  = block_,
-    .task_line     = .params$task_line %||% "Classify this contract into exactly one category.",
-    .examples      = ex_,
-    .model         = .params$model %||% "qwen3:8b",
-    .allow_abstain = isTRUE(.params$allow_abstain),
-    .n_chars       = .params$n_chars %||% 6000L,
-    .think         = isTRUE(.params$think),
-    ...
-  ) |>
-    dplyr::transmute(DocID, Pred1 = .data$PredLabel, Score1 = .data$Score,
-                     Pred2 = NA_character_, Score2 = NA_real_)
-}
-
-
-# 3. Routing and the flag --------------------------------------------------------------------------
-
-#' Apply a manifest routing policy to per-arm predictions
-#'
-#' The deployment counterpart of the orchestrator's policy application, reading its instructions from
-#' the manifest instead of a searched grid. Walks the cascade in order, honours a commitment that
-#' clears the floor, and falls through to the terminal.
-#'
-#' @param .arm_pred Long tibble: DocID, Arm, Pred, Score.
-#' @param .policy Manifest policy block for one task.
-#' @param .none Abstention sentinel.
-#' @return Tibble: DocID, Label, DecidedBy, Prob.
-#' NOT CALLED BY THIS STAGE. The label is derived in a later step from the finished table, because
-#' every policy in the search is a deterministic function of the per-arm columns shipped here and
-#' applying one to a finished table costs seconds against hours of inference. This function is the
-#' implementation that step uses, kept beside the arms it reads so the two cannot drift; it expects
-#' long per-arm rows (DocID, Arm, Pred1, Score1), which is the shape mc_apply_* returns before the
-#' widening below.
-mc_route <- function(.arm_pred, .policy, .none = MC_NONE) {
-  if (FALSE) {
-    .arm_pred <- arm_pred
-    .policy   <- man$Manifest$tasks$ClassDetailed$policy
-  }
-  order_ <- unlist(.policy$order) %||% character(0)
-
-  out_ <- .arm_pred |>
-    dplyr::filter(.data$Arm == .policy$terminal) |>
-    dplyr::transmute(DocID, Label = .data$Pred1, DecidedBy = .policy$terminal,
-                     Prob = .data$Score1)
-  if (nrow(out_) == 0L) cli::cli_abort("Terminal arm {(.policy$terminal)} produced no predictions.")
-  if (length(order_) == 0L) return(out_)
-
-  for (arm_ in rev(order_)) {
-    cand_ <- .arm_pred |>
-      dplyr::filter(.data$Arm == arm_, .data$Pred1 != .none, .data$Score1 >= .policy$floor) |>
-      dplyr::select(DocID, ArmPred = .data$Pred1, ArmScore = .data$Score1)
-    out_ <- out_ |>
-      dplyr::left_join(cand_, by = dplyr::join_by(DocID)) |>
-      dplyr::mutate(
-        DecidedBy = dplyr::if_else(is.na(.data$ArmPred), .data$DecidedBy, arm_),
-        Prob      = dplyr::coalesce(.data$ArmScore, .data$Prob),
-        Label     = dplyr::coalesce(.data$ArmPred, .data$Label),
-        ArmPred   = NULL, ArmScore = NULL
-      )
-  }
-  out_
-}
-
-#' Attach the agreement tier and its estimated reliability
-#'
-#' The tier is recomputed here from the voting arms, exactly as 03E computed it and using no labels,
-#' which is what makes it computable on a corpus at all. Reliability is looked up rather than
-#' estimated: a corpus has no truth to estimate it from, and a stage that appeared to derive one
-#' would be deriving something else.
-#'
-#' The lookup is keyed on the voting set as well as the tier. A run that leaves the generative arm
-#' off produces two-arm patterns, and those must be read against the two-arm reliabilities -- a
-#' two-arm pattern is indistinguishable from a three-arm one once computed, so nothing downstream
-#' could catch the mismatch.
-#'
-#' @param .wide One row per document, carrying RefPred: the terminal arm's first choice.
-#' @param .arm_pred Long per-arm predictions (DocID, Arm, Pred1, Score1, Pred2, Score2).
-#' @param .arms Arm names that voted.
-#' @param .reliability Tier reliability table from the manifest directory.
-#' @param .set_name Voting set applied.
-#' @param .none Abstention sentinel.
-#' @return .wide plus nCommit, nConcur, Tier, Reliability.
-mc_flag <- function(.wide, .arm_pred, .arms, .reliability, .set_name, .none = MC_NONE) {
-  if (FALSE) {
-    .wide        <- wide_
-    .arm_pred    <- arm_pred_
-    .arms        <- c("legal-bert:L256_E6_LR_CW1#8", "kw-text:W256")
-    .reliability <- rel_
-    .set_name    <- "core"
-  }
-  # Concurrence is measured against the TERMINAL's first choice rather than against a shipped label,
-  # because this stage ships no label. That is the same quantity the estimating stage computed while
-  # nothing routed, and it is the only one available before a routing rule has been chosen.
-  ref_ <- .wide |> dplyr::select(DocID, Ref = .data$RefPred)
-
-  pat_ <- .arm_pred |>
-    dplyr::filter(.data$Arm %in% .arms, .data$Pred1 != .none, !is.na(.data$Pred1)) |>
-    dplyr::inner_join(ref_, by = dplyr::join_by(DocID)) |>
-    dplyr::summarise(
-      nCommit = dplyr::n(),
-      nConcur = sum(.data$Pred1 == .data$Ref),
-      .by = DocID
-    ) |>
-    dplyr::mutate(
-      nDissent = .data$nCommit - .data$nConcur,
-      Tier = dplyr::case_when(
-        .data$nCommit <= 1L            ~ "sole",
-        .data$nDissent == 0L           ~ "unanimous",
-        .data$nConcur > .data$nDissent ~ "majority",
-        TRUE                           ~ "split"
-      )
-    )
-
-  rel_ <- .reliability |>
-    dplyr::filter(.data$SetName == .set_name) |>
-    dplyr::transmute(Tier = as.character(.data$Tier), Reliability = .data$Accuracy)
-
-  .wide |>
-    dplyr::left_join(pat_ |> dplyr::select(DocID, nCommit, nConcur, Tier),
-                     by = dplyr::join_by(DocID)) |>
-    tidyr::replace_na(list(nCommit = 0L, nConcur = 0L, Tier = "sole")) |>
-    dplyr::left_join(rel_, by = dplyr::join_by(Tier))
-}
-
-# 4. The entry point -------------------------------------------------------------------------------
-
-#' Classify documents using the deployed configuration
-#'
-#' The one function to call. Reads the manifest, runs the arm each kind marks as default, attaches
-#' the confidence flag where the manifest pins one, and returns one row per document per task.
-#'
-#' It does not route and it does not label. See the header: the label is a deterministic function of
-#' the columns returned here, so deriving it downstream costs seconds and keeps the choice open,
-#' where deciding it now would cost a second corpus pass to revisit.
-#'
-#' Every argument that is NULL takes its value from the manifest. Passing one explicitly is allowed
-#' and recorded: the returned table carries a Departures attribute naming what was overridden, so a
-#' result produced under a non-validated configuration says so rather than looking like any other.
-#'
-#' @param .docs Documents: DocID, Text, and DocDesc where the keyword arm uses it.
-#' @param .manifest Output of mc_manifest().
-#' @param .tasks Tasks to label. NULL takes every task the manifest carries.
-#' @param .prefer Named character vector, kind to variant, selecting a non-default artifact.
-#' @param .voting_set Voting set for the confidence flag. NULL takes the manifest default.
-#' @param .tab_prep Labelled sample, required only when the generative arm runs.
-#' @param .in_sample DocIDs of the labelled sample, marking rows the arms were fitted on. NULL
-#'   leaves InSample NA rather than asserting a document was unseen.
-#' @param .python,.script Inference binary and script for the transformer arm.
-#' @param .batch_size Documents per forward pass.
-#' @param .none Abstention sentinel.
-#' @param .quiet Logical. TRUE suppresses the per-task headers and the departure notice, which are
-#'   worth reading once and are noise once per chunk. Aborts are never suppressed: a run that cannot
-#'   proceed says so whatever this is set to.
-#' @param ... Passed to the generative arm.
-#' @return Tibble: DocID, Task, VotingSet, InSample, one Pred1/Score1/Pred2/Score2 set per arm kind,
-#'   nCommit, nConcur, Tier, Reliability. No Label: it is derived downstream. Carries a Departures
-#'   attribute.
-mc_classify <- function(.docs, .manifest, .tasks = NULL, .prefer = NULL, .voting_set = NULL,
-                        .tab_prep = NULL, .in_sample = NULL, .python = NULL, .script = NULL,
-                        .batch_size = 32L, .none = MC_NONE, .quiet = FALSE, ...) {
-  if (FALSE) {
-    .docs      <- dplyr::slice_head(tab_docs, n = 100L)
-    .manifest  <- man
-    .tasks     <- "ClassDetailed"
-    .prefer    <- NULL
-    .in_sample <- tab_prep$DocID
-    .quiet     <- FALSE
-  }
-  m_ <- .manifest$Manifest
-
-  dep_ <- c(
-    if (!is.null(.prefer))     "prefer",
-    if (!is.null(.voting_set)) "voting_set"
+  hits_ <- kw_hits_engine(
+    .lexicon       = lex_,
+    .docs          = .docs |> dplyr::mutate(DocDesc = NA_character_),
+    .source        = .spec$Source,
+    .n_words       = .spec$NWords,
+    .stopwords     = .spec$Stopwords,
+    .min_token_len = .spec$MinTokenLen,
+    .python        = .python,
+    .script        = .script
   )
-  # Reported once per call. Under a chunked pass that is once per chunk, which is why the run-level
-  # report reads the Departures attribute instead: the fact belongs to the run, not to each chunk.
-  if (length(dep_) > 0L && !.quiet) {
-    cli::cli_alert_warning(
-      "Departing from the validated configuration on: {dep_}. The result carries this in its \\
-       Departures attribute; it is not comparable with rows produced under the manifest."
+
+  # The decision rule, called exactly as 03C calls it when it measures the table's precision. A second
+  # rule here would be a second answer to the same question, and the published precision would then
+  # describe a system nobody runs.
+  dec_ <- kw_decide(
+    .hits           = hits_,
+    .docs           = .docs |> dplyr::select(DocID),
+    .classes        = .classes,
+    .tau            = .spec$Tau,
+    .mode           = .spec$Mode,
+    .positive_class = if (is.na(.spec$PositiveClass)) NULL else .spec$PositiveClass,
+    .probs          = FALSE
+  )
+
+  # Class and Power are guaranteed rather than selected optionally: the hits table has a fixed schema
+  # and an append missing a column fails at the write, several chunks after the cause.
+  for (.c in c("Class", "Power")) {
+    if (!.c %in% names(hits_)) hits_[[.c]] <- if (identical(.c, "Power")) NA_real_ else NA_character_
+  }
+
+  list(
+    Hits = hits_ |>
+      dplyr::select(DocID, Term, Class, Power),
+    Labels = dec_$Pred |>
+      dplyr::transmute(DocID, Top1Class = .data$PredLabel, Top1Prob = .data$Score,
+                       Top2Class = .data$Pred2, Top2Prob = .data$Score2, TopTerm)
+  )
+}
+
+
+#' A duration a human can read at a glance
+#'
+#' Seconds up to a minute and a half, then minutes, then hours. A pass over this corpus runs for hours
+#' and a progress line reporting 20,847 seconds makes a reader do arithmetic while they are trying to
+#' decide whether to wait.
+#'
+#' @param .secs Numeric. Seconds.
+#' @return Character.
+app_duration <- function(.secs) {
+  if (FALSE) .secs <- 20847
+  if (!is.finite(.secs) || .secs < 0) return("--")
+  if (.secs <   90) return(sprintf("%.0fs", .secs))
+  if (.secs < 5400) return(sprintf("%.1fm", .secs / 60))
+  sprintf("%.1fh", .secs / 3600)
+}
+
+#' Key for one timing measurement
+#'
+#' Everything that changes the number is in the key, so a grid already measured is skipped and a grid
+#' widened by one setting measures only the setting that was added.
+#'
+#' @param .engine,.task,.config Character.
+#' @param .max_len,.batch,.n_docs Integer.
+#' @return Character.
+app_bench_key <- function(.engine, .task, .config, .max_len, .batch, .n_docs) {
+  if (FALSE) {
+    .engine  <- "bert"
+    .task    <- "ClassDetailed"
+    .config  <- "cfgA"
+    .max_len <- 256L
+    .batch   <- 32L
+    .n_docs  <- 2000L
+  }
+  substr(digest::digest(paste(.engine, .task, .config, as.integer(.max_len), as.integer(.batch),
+                              as.integer(.n_docs), sep = "|"), algo = "xxhash64"), 1L, 12L)
+}
+
+#' A fixed sample of documents to time against
+#'
+#' The SAME documents every time, ordered by identifier. A benchmark comparing two context lengths on
+#' two different samples measures the samples as much as the lengths, and the difference this grid
+#' exists to detect is a factor of two at most.
+#'
+#' Drawn from the corpus rather than from what is outstanding, so a benchmark run after a pass has
+#' begun times the same work as one run before it.
+#'
+#' @param .con Connection.
+#' @param .n Integer. Documents to draw.
+#' @return Tibble: DocID, Path, Text.
+app_bench_docs <- function(.con, .n) {
+  if (FALSE) {
+    .con <- con
+    .n   <- 2000L
+  }
+  docs_ <- DBI::dbGetQuery(
+    .con, paste0("SELECT DocID, Path FROM corpus ORDER BY DocID LIMIT ", as.integer(.n))
+  ) |>
+    tibble::as_tibble() |>
+    app_read_text()
+  out_ <- docs_ |> dplyr::filter(!is.na(.data$Text), nzchar(trimws(.data$Text)))
+  if (nrow(out_) == 0L) cli::cli_abort("No readable text in the first {(.n)} corpus documents.")
+  if (nrow(out_) < nrow(docs_)) {
+    cli::cli_alert_info(
+      "{nrow(docs_) - nrow(out_)} of {nrow(docs_)} sample document{?s} had no text; timing the rest."
     )
   }
-
-  tasks_ <- .tasks %||% purrr::map_chr(m_$tasks, "label_col")
-
-  # The flag ships only if the manifest pins one. Reading shipped rather than inferring it from an
-  # empty set keeps the two possible states apart: a manifest that pins no flag, and a manifest whose
-  # flag this run could not compute. Both give NA columns; only the second is a problem.
-  shipped_   <- isTRUE(m_$confidence$shipped)
-  set_       <- if (shipped_) .voting_set %||% m_$confidence$default_set else NA_character_
-  vote_      <- if (shipped_) unlist(m_$confidence$sets[[set_]]) else character(0)
-  flag_task_ <- if (shipped_) m_$confidence$label_col %||% tasks_[[1]] else NA_character_
-
-  rel_ <- if (shipped_) {
-    path_rel_ <- fs::path(.manifest$Dir, m_$confidence$reliability)
-    if (!fs::file_exists(path_rel_)) cli::cli_abort("No reliability table at {path_rel_}")
-    arrow::read_parquet(path_rel_)
-  } else {
-    NULL
-  }
-
-  out_ <- purrr::map(tasks_, function(.task) {
-    # Arms are resolved per task, because each task crowned its own configuration. Resolving once
-    # outside this loop is what put the detailed task's model in front of the broad task's policy.
-    arms_run_ <- mc_arms(.arms = .manifest$Arms, .label_col = .task, .prefer = .prefer,
-                         .quiet = .quiet)
-
-    term_ <- m_$tasks[[.task]]$policy$terminal
-    if (!term_ %in% arms_run_$Arm) {
-      cli::cli_abort(c(
-        "Task {(.task)} pins terminal {(term_)}, which is not among the arms this run would apply.",
-        "i" = "Running: {arms_run_$Arm}",
-        "i" = "A terminal absent from the run is a reference nothing can be compared against."
-      ))
-    }
-
-    if (!.quiet) {
-      cli::cli_h2(
-        "Labelling {(.task)}: {nrow(.docs)} document{?s} through {nrow(arms_run_)} arm{?s}"
-      )
-    }
-
-    arm_pred_ <- purrr::map(seq_len(nrow(arms_run_)), function(.i) {
-      a_ <- arms_run_[.i, ]
-      p_ <- a_$Params[[1]] %||% list()
-      res_ <- switch(a_$Kind,
-        transformer = mc_apply_bert(
-          .docs = .docs, .artifact = a_$Artifact, .params = p_,
-          .script = .script, .python = .python, .batch_size = .batch_size
-        ),
-        keyword = mc_apply_keyword(.docs = .docs, .artifact = a_$Artifact, .params = p_,
-                                   .none = .none),
-        llm = mc_apply_llm(.docs = .docs, .params = p_, .tab_prep = .tab_prep,
-                           .label_col = .task, .none = .none, ...),
-        cli::cli_abort("Unknown arm kind {(a_$Kind)}")
-      )
-      res_ |> dplyr::mutate(Arm = a_$Arm, Kind = a_$Kind)
-    }) |>
-      purrr::list_rbind()
-
-    # Widened on KIND, not on arm name. See the header: an arm name carries a positional suffix
-    # relative to the inventory it was named in, and a column name written into several million rows
-    # has to survive a re-render of the stage that produced it.
-    wide_ <- arm_pred_ |>
-      dplyr::mutate(Col = mc_kind_prefix(.kind = .data$Kind)) |>
-      dplyr::select(DocID, Col, Pred1, Score1, Pred2, Score2) |>
-      tidyr::pivot_wider(id_cols = DocID, names_from = "Col",
-                         values_from = c("Pred1", "Score1", "Pred2", "Score2"),
-                         names_glue = "{Col}_{.value}")
-
-    wide_ <- .docs |>
-      dplyr::select(DocID) |>
-      dplyr::left_join(wide_, by = dplyr::join_by(DocID)) |>
-      dplyr::left_join(
-        arm_pred_ |> dplyr::filter(.data$Arm == term_) |>
-          dplyr::select(DocID, RefPred = .data$Pred1),
-        by = dplyr::join_by(DocID)
-      )
-
-    flagged_ <- if (shipped_ && identical(.task, flag_task_) && all(vote_ %in% arm_pred_$Arm)) {
-      mc_flag(.wide = wide_, .arm_pred = arm_pred_, .arms = vote_,
-              .reliability = rel_, .set_name = set_, .none = .none)
-    } else {
-      if (shipped_ && identical(.task, flag_task_) && !.quiet) {
-        cli::cli_alert_warning(
-          "Voting set {(set_)} needs {length(setdiff(vote_, arm_pred_$Arm))} arm{?s} this run is \\
-           not producing; {(.task)} ships without a tier."
-        )
-      }
-      wide_ |>
-        dplyr::mutate(nCommit = NA_integer_, nConcur = NA_integer_,
-                      Tier = NA_character_, Reliability = NA_real_)
-    }
-
-    # Every column exists on every task whether or not it could be filled, so the corpus reads as one
-    # dataset and a later pass that starts shipping the flag changes values rather than schema.
-    flagged_ |>
-      dplyr::mutate(
-        Task      = .task,
-        VotingSet = if (identical(.task, flag_task_)) set_ else NA_character_,
-        InSample  = if (is.null(.in_sample)) NA else .data$DocID %in% .in_sample,
-        .after = DocID
-      ) |>
-      dplyr::select(-RefPred)
-  }) |>
-    purrr::list_rbind()
-
-  attr(out_, "Departures") <- dep_
-  attr(out_, "Manifest")   <- m_$written_at
   out_
 }
 
-#' Report what a classification run produced
-#' @param .tab Output of mc_classify().
-#' @return Invisibly .tab.
-mc_report_run <- function(.tab) {
-  if (FALSE) .tab <- labelled
-  cli::cli_h2("Labelling summary")
-  # Commitment per kind, because that is what varies: the transformer always answers and the keyword
-  # table answers where its terms fire, so the gap between the two columns IS the keyword arm's
-  # coverage on this corpus -- the one number a published-table promise can be checked against.
-  pref_ <- intersect(c("Bert", "Kw", "Llm"), sub("_Pred1$", "", grep("_Pred1$", names(.tab), value = TRUE)))
-  .tab |>
-    dplyr::summarise(
-      nDocs = dplyr::n_distinct(.data$DocID),
-      dplyr::across(dplyr::all_of(paste0(pref_, "_Pred1")),
-                    \(.x) mean(!is.na(.x) & .x != MC_NONE), .names = "{.col}_commit"),
-      .by = c(Task, VotingSet)
-    ) |>
-    dplyr::rename_with(\(.x) sub("_Pred1_commit$", " commits", .x)) |>
-    dplyr::mutate(dplyr::across(dplyr::ends_with(" commits"), tbl_pct)) |>
-    tbl_say()
-
-  # A task with no flag has no tier, and printing NA% for it invites reading a missing measurement
-  # as a bad one. Those rows are dropped and named instead.
-  flagged_ <- .tab |> dplyr::filter(!is.na(.data$Tier))
-  if (nrow(flagged_) > 0L) {
-    flagged_ |>
-      dplyr::summarise(nDocs = dplyr::n(), Reliability = dplyr::first(.data$Reliability),
-                       .by = c(Task, Tier)) |>
-      dplyr::mutate(Reliability = tbl_pct(.data$Reliability)) |>
-      dplyr::arrange(.data$Task, .data$Tier) |>
-      tbl_say(.title = "Confidence tiers")
+#' Time one engine configuration, without writing a single label
+#'
+#' The predictions are produced and thrown away. That is what makes the grid free to price a context
+#' length nobody intends to deploy, and what keeps a timing run from consuming the queue the real pass
+#' is going to work through.
+#'
+#' Already-measured combinations are skipped, so this chunk costs minutes on the first render and
+#' seconds afterwards -- which is what lets it run on every render rather than hiding behind a switch.
+#'
+#' @param .con Connection.
+#' @param .docs Output of app_bench_docs().
+#' @param .grid Tibble: Engine, Task, ConfigName, Artifact, MaxLen, BatchSize.
+#' @param .python,.script Interpreter and classify_apply.py.
+#' @param .chunk_size Integer. Documents per engine invocation, so the model-load cost is timed as it
+#'   would be paid.
+#' @return Tibble of every row in the grid, measured or recalled.
+app_benchmark <- function(.con, .docs, .grid, .python, .script, .chunk_size = 5000L) {
+  if (FALSE) {
+    .con        <- con
+    .docs       <- bench_docs
+    .grid       <- grid_bench
+    .chunk_size <- 5000L
   }
-  no_flag_ <- setdiff(unique(.tab$Task), unique(flagged_$Task))
-  if (length(no_flag_) > 0L) {
+  have_ <- tibble::as_tibble(DBI::dbGetQuery(.con, "SELECT * FROM benchmarks"))
+
+  purrr::map(seq_len(nrow(.grid)), function(.i) {
+    g_   <- .grid[.i, ]
+    key_ <- app_bench_key(g_$Engine, g_$Task, g_$ConfigName, g_$MaxLen, g_$BatchSize, nrow(.docs))
+    hit_ <- have_ |> dplyr::filter(.data$BenchKey == key_)
+    if (nrow(hit_) == 1L) {
+      return(hit_ |> dplyr::mutate(Measured = "recalled"))
+    }
+
     cli::cli_alert_info(
-      "{length(no_flag_)} task{?s} ship{?s/} without a tier ({no_flag_}): the manifest pins no \\
-       flag, or the arms it votes with are not all running here."
+      "Timing {(g_$Engine)} / {(g_$Task)} at L{g_$MaxLen}, batch {g_$BatchSize} \\
+       on {nrow(.docs)} document{?s}."
+    )
+    t0_ <- Sys.time()
+    purrr::walk(app_chunks(.docs = .docs, .size = .chunk_size), function(.ch) {
+      invisible(app_bert_chunk(
+        .docs = .ch, .artifact = g_$Artifact, .max_len = g_$MaxLen,
+        .python = .python, .script = .script, .batch_size = g_$BatchSize
+      ))
+    })
+    secs_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+
+    row_ <- tibble::tibble(
+      BenchKey = key_, Engine = g_$Engine, Task = g_$Task, ConfigName = g_$ConfigName,
+      MaxLen = as.integer(g_$MaxLen), BatchSize = as.integer(g_$BatchSize),
+      nDocs = nrow(.docs), Seconds = secs_, DocsPerSecond = nrow(.docs) / max(secs_, 1e-9),
+      MeasuredAt = Sys.time()
+    )
+    DBI::dbAppendTable(.con, "benchmarks", row_)
+    row_ |> dplyr::mutate(Measured = "new")
+  }) |>
+    purrr::list_rbind()
+}
+
+#' Report the timing grid and what each setting would cost over the corpus
+#' @param .tab Output of app_benchmark().
+#' @param .n_corpus Integer. Documents in the index.
+#' @return Invisibly .tab.
+app_report_benchmark <- function(.tab, .n_corpus) {
+  if (FALSE) {
+    .tab      <- bench
+    .n_corpus <- 1.1e6
+  }
+  out_ <- .tab |>
+    dplyr::mutate(HoursPerTask = .n_corpus / .data$DocsPerSecond / 3600) |>
+    dplyr::arrange(.data$Task, .data$MaxLen, .data$BatchSize)
+
+  tbl_head("What each setting would cost over the corpus")
+  tbl_out(
+    .tab    = out_ |> dplyr::select(Task, MaxLen, BatchSize, nDocs, Seconds, DocsPerSecond,
+                                    HoursPerTask, Measured),
+    .title  = "What each setting would cost over the corpus",
+    .groups = c(" " = 3, "Measured on the sample" = 3, " " = 2),
+    .digits = 1L,
+    .notes  = c(
+      DocsPerSecond = paste("Over the whole run including reading and writing, not inference alone,",
+                            "because that is what the wall clock is made of."),
+      HoursPerTask  = paste("This rate projected to every document in the index, for ONE task. Three",
+                            "tasks cost three times this unless they share a pass."),
+      Measured      = paste("A row reading recalled was measured on an earlier render and read back",
+                            "rather than run again. Nothing here writes a label, so re-running costs",
+                            "time and changes nothing.")
+    )
+  )
+
+  wide_ <- out_ |>
+    dplyr::summarise(Hours = mean(.data$HoursPerTask), .by = MaxLen) |>
+    dplyr::arrange(.data$MaxLen)
+  if (nrow(wide_) == 2L) {
+    tbl_note(
+      "The longer window costs {sprintf('%.1fx', wide_$Hours[2] / wide_$Hours[1])} the shorter one \\
+       per task -- {sprintf('%.1f', wide_$Hours[1])} hours against \\
+       {sprintf('%.1f', wide_$Hours[2])}. Read that against what 03E measured the length to be worth \\
+       on the labelled sample: the question is not which window is better but whether the better one \\
+       is worth the difference."
     )
   }
+  invisible(out_)
+}
 
-  dep_ <- attr(.tab, "Departures")
-  cli::cli_text("")
-  if (length(dep_) > 0L) {
-    cli::cli_alert_warning("Produced under departures from the manifest: {dep_}.")
-  } else {
-    cli::cli_alert_success("Produced entirely under the validated configuration.")
+
+# 5. The pass ------------------------------------------------------------------------------------------------------------
+
+#' Label the outstanding documents for one run, chunk by chunk
+#'
+#' Every chunk is written before the next is read, which is what makes an interrupted pass resumable
+#' rather than merely restartable. A chunk that fails as a whole is recorded document by document and
+#' the pass continues: one unreadable file must not cost a million labelled ones.
+#'
+#' @param .con Connection.
+#' @param .spec One row of the run specification.
+#' @param .label_fn Function of one chunk, returning a list with Labels and optionally Hits.
+#' @param .chunk_size Integer. Documents per call to the engine.
+#' @param .limit Integer or NULL. Cap the queue, for a rehearsal.
+#' @param .report_every Integer. Chunks between progress lines. The first and last chunks always
+#'   report, so a short run is never silent and a long one confirms early that it is alive. Note that
+#'   this counts CHUNKS, so the cadence in minutes moves with .chunk_size: at five thousand documents
+#'   a chunk every fifth chunk is roughly every six minutes, and at five hundred it is roughly every
+#'   forty seconds.
+#' @return Tibble: nDocs, nChunks, Seconds, DocsPerSecond.
+app_pass <- function(.con, .spec, .label_fn, .chunk_size = 5000L, .limit = NULL,
+                     .report_every = 5L) {
+  if (FALSE) {
+    .con        <- con
+    .spec       <- spec_bert[1, ]
+    .label_fn   <- function(.d) list(Labels = app_bert_chunk(.d, "x", 256L, "python3", "s.py"))
+    .chunk_size   <- 5000L
+    .limit        <- 2000L
+    .report_every <- 5L
   }
+  tab_ <- if (identical(.spec$Engine, "bert")) "bert_labels" else "keyword_labels"
+  app_run_register(.con = .con, .spec = .spec)
+
+  queue_ <- app_pending(.con = .con, .run_key = .spec$RunKey, .table = tab_, .limit = .limit)
+  if (nrow(queue_) == 0L) {
+    cli::cli_alert_info("{(.spec$Engine)} / {(.spec$Task)}: nothing outstanding.")
+    return(tibble::tibble(nDocs = 0L, nChunks = 0L, Seconds = 0, DocsPerSecond = NA_real_))
+  }
+
+  chunks_ <- app_chunks(.docs = queue_, .size = .chunk_size)
+  cli::cli_alert_info(
+    "{(.spec$Engine)} / {(.spec$Task)}: {nrow(queue_)} document{?s} in {length(chunks_)} chunk{?s}."
+  )
+  t0_   <- Sys.time()
+  done_ <- 0L
+
+  # A plain loop rather than a walk, because the progress line needs a running count and an
+  # accumulator reaching out of a closure is a worse way to say the same thing.
+  for (.i in seq_along(chunks_)) {
+    ch_    <- app_read_text(.docs = chunks_[[.i]])
+    done_  <- done_ + nrow(chunks_[[.i]])
+    bad_ <- ch_ |> dplyr::filter(is.na(.data$Text) | !nzchar(trimws(.data$Text)))
+    ok_  <- ch_ |> dplyr::filter(!is.na(.data$Text), nzchar(trimws(.data$Text)))
+
+    if (nrow(bad_) > 0L) {
+      DBI::dbAppendTable(.con, "failures", tibble::tibble(
+        RunKey = .spec$RunKey, DocID = bad_$DocID, Reason = "no text", SeenAt = Sys.time()))
+    }
+    if (nrow(ok_) > 0L) {
+      res_ <- tryCatch(.label_fn(ok_), error = function(e) {
+        cli::cli_alert_danger("Chunk {(.i)} failed: {conditionMessage(e)}")
+        NULL
+      })
+      if (is.null(res_)) {
+        DBI::dbAppendTable(.con, "failures", tibble::tibble(
+          RunKey = .spec$RunKey, DocID = ok_$DocID, Reason = "engine error", SeenAt = Sys.time()))
+      } else {
+        DBI::dbAppendTable(.con, tab_,
+                           res_$Labels |> dplyr::mutate(RunKey = .spec$RunKey, .before = 1))
+        if (!is.null(res_$Hits) && nrow(res_$Hits) > 0L) {
+          DBI::dbAppendTable(.con, "keyword_hits",
+                             res_$Hits |> dplyr::mutate(RunKey = .spec$RunKey, .before = 1))
+        }
+      }
+    }
+
+    # PROGRESS IS REPORTED WHATEVER HAPPENED TO THE CHUNK, including one that failed entirely: a run
+    # that goes quiet is indistinguishable from a run that has hung, and the difference matters at
+    # three in the morning.
+    #
+    # The rate is cumulative rather than per-chunk, so it self-corrects. The first chunk on Apple
+    # silicon pays for kernel compilation and never pays again, and an estimate built on it alone
+    # would promise hours that never materialise; averaged over everything done so far it settles
+    # within a few chunks.
+    if (.i %% .report_every == 0L || .i == 1L || .i == length(chunks_)) {
+      now_     <- Sys.time()
+      elapsed_ <- as.numeric(difftime(now_, t0_, units = "secs"))
+      rate_    <- done_ / max(elapsed_, 1e-9)
+      left_    <- nrow(queue_) - done_
+      eta_     <- left_ / max(rate_, 1e-9)
+      cli::cli_alert_info(
+        "  chunk {(.i)}/{length(chunks_)} | {done_}/{nrow(queue_)} docs | \\
+         {app_duration(elapsed_)} elapsed | {round(rate_)}/s | \\
+         {if (left_ == 0L) 'done' else paste0('ETA ', app_duration(eta_), ' (~', \\
+          format(now_ + eta_, '%H:%M'), ')')}"
+      )
+    }
+  }
+
+  secs_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+  app_run_register(.con = .con, .spec = .spec)
+  tibble::tibble(nDocs = nrow(queue_), nChunks = length(chunks_), Seconds = secs_,
+                 DocsPerSecond = nrow(queue_) / max(secs_, 1e-9))
+}
+
+#' Report a set of pass timings and what they imply for the whole corpus
+#' @param .tab Timings, bound across runs, carrying Engine and Task.
+#' @param .n_corpus Integer. Documents in the index.
+#' @return Invisibly .tab.
+app_report_timing <- function(.tab, .n_corpus) {
+  if (FALSE) {
+    .tab      <- timings
+    .n_corpus <- 1.1e6
+  }
+  tbl_head("Throughput, and what a full pass would cost")
+  tbl_out(
+    .tab = .tab |>
+      dplyr::mutate(FullPassHours = .n_corpus / .data$DocsPerSecond / 3600),
+    .title  = "Throughput, and what a full pass would cost",
+    .digits = 1L,
+    .notes  = c(
+      DocsPerSecond = paste("Measured over the whole pass including reading and writing, not over",
+                            "inference alone, because that is what the wall clock is made of."),
+      FullPassHours = paste("This rate projected to every document in the index. On a short",
+                            "rehearsal it is pessimistic: the first chunk pays for kernel",
+                            "compilation on Apple silicon and never recurs.")
+    )
+  )
   invisible(.tab)
 }
 
 
-# 5. The corpus ------------------------------------------------------------------------------------
-# The labelled sample fits in memory; the corpus does not. 1.1 million contracts of full text is
-# hundreds of gigabytes, so nothing here loads text for more than one chunk at a time. What IS held
-# throughout is the index -- one row per document with its path and filer title -- which is three
-# small columns and comfortably resident.
+# 6. The released file ---------------------------------------------------------------------------------------------------
+# The store is an archive: long, keyed by run, holding every hit and every timing. This is the
+# deliverable: one row per document, one column per thing a reader needs, in the shape a merge wants.
 #
-# That is the difference between this stage and every stage before it. Upstream, a document's text
-# was a column. Here it is a file read on demand and discarded, and any code that treats it as a
-# column will exhaust memory somewhere past the first hundred thousand documents.
+# BOTH ENGINES SHIP, AND THEIR SCORES ARE NAMED APART. The transformer's is a softmax probability over
+# classes; the keyword table's is Power, a Wilson lower bound on the firing term's training precision.
+# Both live in [0, 1] and neither is the other, so calling both of them Prob would put two
+# incomparable quantities in adjacent columns under one name and invite the comparison 03E ruled out.
+#
+# ABSTENTION BECOMES NA. The decision rule emits a sentinel where no term fired, and also where the
+# top two classes tied -- a deliberate refusal to break it. Carried into the release as a category, it
+# would grow a phantom class holding half the corpus in every tabulation.
+#
+# ONLY DOCUMENTS WITH EVERY TRANSFORMER LABEL. A file holding a detailed label and a missing broad one
+# is a file where a cross-tabulation silently drops rows and reports a number computed on a subset
+# while a reader believes they are looking at the corpus. What is left out is counted rather than
+# hidden, which is the same information without the trap.
 
-#' Build the corpus index: one row per document, with its path and filer title
+#' Stop with a sentence rather than a stack trace when the store is shut
 #'
-#' Walks the parsed-contract tree once and caches the result, because enumerating a million files
-#' takes minutes and the answer changes only when new contracts are parsed. Text is deliberately NOT
-#' read here -- the index carries where each document lives, and the chunk loop reads it.
+#' A closed connection surfaces from the engine as "Invalid connection" with a context of
+#' `rapi_prepare`, twenty frames below the call that caused it, and says nothing about which call that
+#' was. Every function here reads the store, and the only way to arrive with a shut one is to have
+#' disconnected too early, so the check names that.
 #'
-#' A limit draws a seeded random sample rather than the first n rows. The tree is organised by
-#' quarter, so the first n documents are the oldest n documents, and a rehearsal on the oldest
-#' quarter of EDGAR would say very little about a classifier that has to work across twenty years of
-#' drafting conventions.
-#'
-#' @param .dir_corpus Root of the parsed-contract tree.
-#' @param .path_meta Metadata parquet supplying DocDesc.
-#' @param .path_cache Where the file index is cached.
-#' @param .rerun Logical. Rebuild the index rather than reusing the cache.
-#' @param .limit Documents to keep, or NULL for the whole corpus.
-#' @param .seed Fixed, so a limited run draws the same documents every time.
-#' @param .tab_prep Optional labelled sample; where supplied, adds an InSample flag.
-#' @return Tibble: DocID, Path, DocDesc, InSample.
-mc_corpus_index <- function(.dir_corpus, .path_meta, .path_cache, .rerun = FALSE, .limit = NULL,
-                            .seed = 42L, .tab_prep = NULL) {
+#' @param .con Connection.
+#' @param .what Character. What was being attempted, for the message.
+#' @return Invisibly TRUE, or aborts.
+#' @keywords internal
+app_require_con <- function(.con, .what = "read the store") {
   if (FALSE) {
-    .dir_corpus <- .lP$Input$DirCorpus
-    .path_meta  <- .lP$Input$MetaData
-    .path_cache <- .lP$Cache$CorpusFiles
-    .limit      <- 2000L
+    .con  <- con
+    .what <- "build the release"
   }
-  if (!fs::dir_exists(.dir_corpus)) cli::cli_abort("No corpus tree at {(.dir_corpus)}")
-
-  idx_ <- utils_list_project_files(
-    .dir_data = .dir_corpus,  # root of the parsed-contract tree
-    .path_out = .path_cache,  # where the index is cached
-    .rerun    = .rerun        # FALSE reuses an existing index
-  ) |>
-    dplyr::select(DocID, Path) |>
-    dplyr::mutate(Path = unname(.data$Path))
-  cli::cli_alert_info("Corpus index: {nrow(idx_)} document{?s}")
-
-  # DocDesc is the filer's own title. The keyword arm can key on it, and it costs one small join.
-  if (fs::file_exists(.path_meta)) {
-    idx_ <- idx_ |>
-      dplyr::left_join(
-        arrow::open_dataset(sources = .path_meta) |>
-          dplyr::select(DocID, DocDesc) |>
-          dplyr::collect(),
-        by = dplyr::join_by(DocID)
-      )
-  } else {
-    cli::cli_alert_warning("No metadata at {(.path_meta)}; DocDesc will be missing.")
-    idx_ <- idx_ |> dplyr::mutate(DocDesc = NA_character_)
-  }
-
-  # Documents that trained the model are still part of the corpus and still get labels, but a user
-  # measuring anything on them would be measuring training accuracy. Flagged, not dropped.
-  idx_ <- idx_ |>
-    dplyr::mutate(
-      InSample = if (is.null(.tab_prep)) FALSE else .data$DocID %in% .tab_prep$DocID
-    )
-
-  # The size of the TREE, recorded before any cap is applied. Once the index has been sampled its own
-  # row count describes the draw, and a throughput projection multiplied by that would price the
-  # preview and present it as the corpus pass. Carried as an attribute rather than a column because
-  # it is a property of the index, not of each of its million rows.
-  n_all_ <- nrow(idx_)
-
-  if (!is.null(.limit) && .limit < nrow(idx_)) {
-    idx_ <- withr::with_seed(.seed, dplyr::slice_sample(idx_, n = .limit))
-    cli::cli_alert_warning(
-      "Limited to {nrow(idx_)} of {n_all_} document{?s}, drawn at random across the whole tree. \\
-       Labels from a limited run are written to a separate directory so they cannot be mistaken \\
-       for a corpus pass, and the throughput projection still prices the full tree."
-    )
-  }
-  attr(idx_, "nCorpus") <- n_all_
-  idx_
-}
-
-#' Read the text for one chunk of the index
-#'
-#' The only place text enters memory, and it leaves again when the chunk is written. Documents whose
-#' parquet is missing or empty are dropped rather than aborting a pass measured in days.
-#'
-#' The count is RETURNED, not printed. A warning per chunk is invisible twice over: once among a
-#' thousand progress lines, and again on a resumed render, where the chunks that dropped documents
-#' were skipped and say nothing at all. Reconciling indexed against labelled at the end is the only
-#' account that survives a restart.
-#'
-#' @param .chunk Rows of the corpus index.
-#' @return The chunk with a Text column, minus unreadable documents, carrying an nDropped attribute.
-mc_read_chunk <- function(.chunk) {
-  if (FALSE) .chunk <- dplyr::slice_head(tab_index, n = 100L)
-  out_ <- .chunk |>
-    dplyr::mutate(Text = purrr::map_chr(.data$Path, clf_read_text))
-  keep_ <- !is.na(out_$Text) & nzchar(out_$Text)
-  out_  <- out_[keep_, ]
-  attr(out_, "nDropped") <- sum(!keep_)
-  out_
-}
-
-# 6. The label store ------------------------------------------------------------------------------
-# WHAT IS DONE IS A PROPERTY OF THE DOCUMENTS, NOT OF THE FILENAME THEY LANDED IN.
-#
-# The previous layout wrote one parquet per chunk and treated the presence of labels_0007.parquet as
-# proof that chunk seven was finished. That is only true while "chunk seven" means the same documents
-# in every run, and four ordinary things break it without changing a filename: a different chunk size,
-# a different sample seed or cap, new contracts shifting every boundary after the insertion point, and
-# a process killed mid-write leaving a truncated file that exists. Each failure is silent, and the
-# symptom is a coverage table that reconciles because the missing documents are sitting inside
-# somebody else's file.
-#
-# Keying on DocID removes the class of failure rather than detecting it. The work outstanding is an
-# anti-join, so chunking happens AFTER the filter and is nothing but a transaction size -- change it
-# freely, mid-run if you like. An interrupted insert rolls back and those documents reappear in the
-# work list, where a truncated parquet would have reported itself complete.
-#
-# RunKey scopes it. A document is only labelled under a configuration, so "done" means done under
-# this manifest and these arms; two configurations coexist in one table and are compared with a
-# query rather than a directory diff. Everything reading the store must filter on it, which is why
-# nothing here returns rows without one.
-#
-# A capped run is now simply a partial corpus pass. It draws from the whole tree, its labels are
-# valid under the same configuration, and an uncapped run afterwards picks up what it missed -- so
-# the separate preview directory is gone, having existed only to stop chunk numbers colliding.
-#
-# R owns this file. Python writes parquet and R reads it; the language seam is unchanged.
-
-#' Open the label store, creating its tables if this is the first run
-#'
-#' @param .path Path to the DuckDB file.
-#' @return A DBI connection. The caller disconnects.
-mc_db_open <- function(.path) {
-  if (FALSE) .path <- .lP$Output$Store
-  fs::dir_create(fs::path_dir(.path))
-  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.path))
-  DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS timings (
-      RunKey    VARCHAR,
-      Chunk     INTEGER,
-      nDocs     INTEGER,
-      nTasks    INTEGER,
-      Seconds   DOUBLE,
-      WrittenAt TIMESTAMP)")
-  con_
-}
-
-#' Documents already labelled under one configuration
-#'
-#' @param .con Connection from mc_db_open().
-#' @param .run_key Configuration identity from mc_run_key().
-#' @return Character vector of DocIDs, empty where the table does not yet exist.
-mc_db_done <- function(.con, .run_key) {
-  if (FALSE) {
-    .con     <- con
-    .run_key <- run_key
-  }
-  if (!DBI::dbExistsTable(.con, "labels")) return(character())
-  DBI::dbGetQuery(
-    .con,
-    "SELECT DISTINCT DocID FROM labels WHERE RunKey = ?",
-    params = list(.run_key)
-  )$DocID
-}
-
-#' Append one chunk of labels, in a transaction
-#'
-#' The transaction is the point. A pass killed part-way leaves the store as it was, so the documents
-#' in flight reappear in the work list rather than half-appearing in the output.
-#'
-#' A column set that does not match the table aborts. It means the arms changed -- a generative arm
-#' enabled, a kind dropped -- and appending anyway would leave the store holding two shapes under one
-#' name, with only the row order to say which was which.
-#'
-#' @param .con Connection from mc_db_open().
-#' @param .tab Labels for one chunk, from mc_classify().
-#' @param .run_key Configuration identity.
-#' @return Invisibly the number of rows written.
-mc_db_append <- function(.con, .tab, .run_key) {
-  if (FALSE) {
-    .con     <- con
-    .tab     <- out_
-    .run_key <- run_key
-  }
-  out_ <- .tab |> dplyr::mutate(RunKey = .run_key, .before = 1L)
-
-  if (!DBI::dbExistsTable(.con, "labels")) {
-    DBI::dbWriteTable(.con, "labels", out_)
-    return(invisible(nrow(out_)))
-  }
-  have_ <- DBI::dbListFields(.con, "labels")
-  if (!setequal(have_, names(out_))) {
+  if (!DBI::dbIsValid(.con)) {
     cli::cli_abort(c(
-      "This chunk's columns do not match the label store.",
-      "i" = "Only in the store: {setdiff(have_, names(out_))}",
-      "i" = "Only in this chunk: {setdiff(names(out_), have_)}",
-      "i" = "The arms changed. Start a run under the new configuration rather than mixing shapes."
+      "The store is closed, so it is not possible to {(.what)}.",
+      "i" = "The disconnect chunk runs last for exactly this reason. If a section was added below \
+             it, move it above."
     ))
   }
-  DBI::dbWithTransaction(.con, {
-    DBI::dbAppendTable(.con, "labels", out_[have_])
-  })
-  invisible(nrow(out_))
+  invisible(TRUE)
 }
 
-#' Record what one chunk cost
-#' @param .con Connection from mc_db_open().
-#' @param .run_key Configuration identity.
-#' @param .chunk Chunk index within this pass.
-#' @param .n_docs Documents labelled.
-#' @param .seconds Wall time.
-#' @param .n_tasks Tasks labelled; a chunk costs one model pass for each.
-#' @return Invisibly NULL.
-mc_db_timing <- function(.con, .run_key, .chunk, .n_docs, .seconds, .n_tasks) {
+#' The released table: one row per document, both engines side by side
+#'
+#' @param .con Connection.
+#' @param .specs Run specification, filtered to the runs this file is built from.
+#' @param .tab_prep Prepared sample, supplying the detailed-to-broad mapping for the consistency flag.
+#' @param .tasks Character vector of tasks, in the order their column blocks should appear.
+#' @param .none Character. Abstention sentinel the decision rule emits, converted to NA.
+#' @return Tibble, one row per document carrying every task's block.
+app_release <- function(.con, .specs, .tab_prep, .tasks, .none = "(none)") {
   if (FALSE) {
-    .con     <- con
-    .run_key <- run_key
-    .chunk   <- 1L
-    .n_docs  <- 5000L
-    .seconds <- 180
-    .n_tasks <- 3L
+    .con      <- con
+    .specs    <- dplyr::filter(specs, is.na(MaxLen) | MaxLen == 256L)
+    .tab_prep <- tab_prep
+    .tasks    <- .lP$Param$Tasks
   }
-  DBI::dbAppendTable(.con, "timings", tibble::tibble(
-    RunKey    = .run_key,
-    Chunk     = as.integer(.chunk),
-    nDocs     = as.integer(.n_docs),
-    nTasks    = as.integer(.n_tasks),
-    Seconds   = as.numeric(.seconds),
-    WrittenAt = Sys.time()
-  ))
-  invisible(NULL)
-}
+  app_require_con(.con = .con, .what = "build the release")
 
-#' Read one configuration's labels back
-#' @param .con Connection from mc_db_open().
-#' @param .run_key Configuration identity.
-#' @return Tibble of labels, RunKey dropped.
-mc_db_labels <- function(.con, .run_key) {
-  if (FALSE) {
-    .con     <- con
-    .run_key <- run_key
-  }
-  if (!DBI::dbExistsTable(.con, "labels")) {
-    cli::cli_abort("No labels have been written yet: the store holds no table.")
-  }
-  DBI::dbGetQuery(.con, "SELECT * FROM labels WHERE RunKey = ?", params = list(.run_key)) |>
-    tibble::as_tibble() |>
-    dplyr::select(-RunKey)
-}
+  # Joined in R rather than in one long pivot query. The frames are a few million rows of short
+  # strings and the machine has room for them; a generated pivot across six run keys would be faster
+  # and unreadable, and this is the code that decides what a released dataset looks like.
+  blocks_ <- purrr::map(.tasks, function(.t) {
+    kb_ <- .specs |> dplyr::filter(.data$Engine == "bert",    .data$Task == .t)
+    kk_ <- .specs |> dplyr::filter(.data$Engine == "keyword", .data$Task == .t)
+    if (nrow(kb_) != 1L) cli::cli_abort("Expected exactly one transformer run for {(.t)}.")
 
-#' Export one configuration's labels to parquet
-#'
-#' The store is a working file, not the deliverable. Two reasons to write parquet beside it: the
-#' regression stage reads flat files, and DuckDB's on-disk format has changed across versions before
-#' -- a single database holding the only copy of a pass measured in days is a worse artifact than a
-#' file anything can open. Seconds against that pass, so it is not a trade.
-#'
-#' @param .con Connection from mc_db_open().
-#' @param .run_key Configuration identity.
-#' @param .path Destination parquet.
-#' @return Invisibly .path.
-mc_db_export <- function(.con, .run_key, .path) {
-  if (FALSE) {
-    .con     <- con
-    .run_key <- run_key
-    .path    <- .lP$Output$Export
-  }
-  fs::dir_create(fs::path_dir(.path))
-  DBI::dbExecute(
-    .con,
-    paste0("COPY (SELECT * EXCLUDE RunKey FROM labels WHERE RunKey = ?) ",
-           "TO '", as.character(.path), "' (FORMAT PARQUET)"),
-    params = list(.run_key)
-  )
-  cli::cli_alert_success("Exported to {.path {as.character(.path)}}")
-  invisible(.path)
-}
-
-#' Label every document in the index that this configuration has not labelled yet
-#'
-#' THE WORK LIST IS AN ANTI-JOIN, so chunking happens after the filter rather than before it. The
-#' progress bar therefore counts only outstanding work by construction, not because a partition was
-#' computed carefully, and the chunk size can change between runs -- or mid-run -- without meaning
-#' anything, because it identifies nothing.
-#'
-#' A PROGRESS BAR RATHER THAN A LINE PER CHUNK. A thousand chunks is a thousand lines, which pushes
-#' every warning off the top of the log and, in a rendered document, buries the findings under the
-#' mechanics. Everything worth keeping is reported once at the end.
-#'
-#' @param .index Corpus index to label.
-#' @param .con Connection from mc_db_open().
-#' @param .run_key Configuration identity from mc_run_key().
-#' @param .chunk_size Documents per transaction, and therefore how often the progress bar advances.
-#'   It identifies nothing, so it can be lowered freely for a livelier bar or raised for fewer
-#'   commits; a chunk measured in minutes is a bar that moves in minutes.
-#' @param .fn Function taking a chunk with text and returning its labels. It must not print: cli
-#'   output interleaved with a progress bar redraws over it. mc_classify() takes .quiet for this.
-#' @return Invisibly a tibble: Indexed, Done, Chunks, Written, Dropped, Empty.
-mc_corpus_pass <- function(.index, .con, .run_key, .chunk_size, .fn) {
-  if (FALSE) {
-    .index      <- tab_index
-    .con        <- con
-    .run_key    <- run_key
-    .chunk_size <- 5000L
-    .fn         <- function(.docs) mc_classify(.docs = .docs, .manifest = man, .quiet = TRUE)
-  }
-  done_ <- mc_db_done(.con = .con, .run_key = .run_key)
-  todo_ <- .index |> dplyr::filter(!.data$DocID %in% done_)
-
-  cli::cli_alert_info(
-    "{length(done_)} of {nrow(.index)} indexed document{?s} already labelled under this \\
-     configuration; {nrow(todo_)} to go."
-  )
-  base_ <- tibble::tibble(
-    Indexed = nrow(.index), Done = length(done_), Chunks = 0L, Written = 0L, Dropped = 0L, Empty = 0L
-  )
-  if (nrow(todo_) == 0L) {
-    cli::cli_alert_success("Nothing to do: this configuration has labelled the whole index.")
-    return(invisible(base_))
-  }
-  chunks_ <- split(todo_, ceiling(seq_len(nrow(todo_)) / .chunk_size))
-
-  tally_ <- new.env(parent = emptyenv())
-  tally_$written <- 0L
-  tally_$dropped <- 0L
-  tally_$empty   <- 0L
-
-  # Captured once and closed over. Reaching for the calling frame by depth instead would depend on
-  # how many frames purrr puts between that closure and this one, which is purrr's business and not
-  # a promise it makes.
-  env_ <- rlang::current_env()
-  cli::cli_progress_bar(
-    name   = "Labelling",
-    total  = nrow(todo_),
-    format = "{cli::pb_name} {cli::pb_bar} {cli::pb_percent} | {cli::pb_current}/{cli::pb_total} docs | ETA {cli::pb_eta}",
-    .envir = env_
-  )
-  # DRAWN IMMEDIATELY, and this is not cosmetic. cli redraws a bar only when something calls update,
-  # and it suppresses the first draw for two seconds after creation. One update per chunk against
-  # chunks measured in minutes therefore means the bar is created, never drawn, and first appears
-  # when the first chunk finishes -- which looks exactly like a run that has hung.
-  cli::cli_progress_update(set = 0L, force = TRUE, .envir = env_)
-
-  # Counted in DOCUMENTS. Chunks are a transaction size and now identify nothing, so a bar measured
-  # in them reports a unit the reader did not choose and cannot compare between runs.
-  purrr::iwalk(chunks_, function(.chunk, .i) {
-    on.exit(cli::cli_progress_update(inc = nrow(.chunk), .envir = env_), add = TRUE)
-
-    # Text enters memory here and leaves when the chunk is committed. Reading the whole corpus first
-    # would be simpler to write and impossible to run.
-    t0_   <- Sys.time()
-    docs_ <- mc_read_chunk(.chunk = .chunk)
-    drop_ <- attr(docs_, "nDropped")
-    tally_$dropped <- tally_$dropped + if (is.null(drop_)) 0L else drop_
-    if (nrow(docs_) == 0L) {
-      tally_$empty <- tally_$empty + 1L
-      return(invisible(NULL))
-    }
-
-    out_ <- .fn(docs_)
-    mc_db_append(.con = .con, .tab = out_, .run_key = .run_key)
-    mc_db_timing(
-      .con     = .con,
-      .run_key = .run_key,
-      .chunk   = as.integer(.i),
-      .n_docs  = dplyr::n_distinct(out_$DocID),
-      .seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs")),
-      .n_tasks = dplyr::n_distinct(out_$Task)
-    )
-    tally_$written <- tally_$written + 1L
-    invisible(NULL)
-  })
-  cli::cli_progress_done(.envir = env_)
-
-  out_ <- base_ |>
-    dplyr::mutate(Chunks = length(chunks_), Written = tally_$written,
-                  Dropped = tally_$dropped, Empty = tally_$empty)
-  cli::cli_h2("Corpus pass")
-  tbl_say(.tab = out_)
-  cli::cli_text("")
-  if (tally_$dropped > 0L) {
-    cli::cli_alert_warning(
-      "{tally_$dropped} document{?s} had no readable text and were dropped. This count covers the \\
-       chunks written now; the coverage reconciliation below is the figure that survives a restart."
-    )
-  }
-  invisible(out_)
-}
-
-#' Which indexed documents reached the output, and which did not
-#'
-#' A corpus pass drops documents whose parquet is missing or empty rather than aborting a run
-#' measured in days, which is the right trade and leaves a hole nobody is told about: the per-chunk
-#' warnings scroll past, and on a resumed render they do not print at all because the chunks that
-#' dropped them were skipped. Two numbers in two different tables are then the only evidence, and
-#' subtracting one from the other is not a check anybody performs.
-#'
-#' Reconciled against the LABELLED SAMPLE as well as the index. The sample is the one set of
-#' documents whose contents are known, so if it survives at the corpus rate the loss is a property of
-#' the archive; if it survives at a different rate, the loss is selective and the released labels are
-#' missing a describable kind of document rather than a random slice.
-#'
-#' @param .tab_index The corpus index this run drew.
-#' @param .tab_labels The labels read back from disk.
-#' @param .tab_prep Labelled sample, or NULL to reconcile the index alone.
-#' @return Tibble: Set, Indexed, Labelled, Missing, Reached.
-mc_coverage <- function(.tab_index, .tab_labels, .tab_prep = NULL) {
-  if (FALSE) {
-    .tab_index  <- tab_index
-    .tab_labels <- tab_labels
-    .tab_prep   <- tab_prep
-  }
-  got_ <- unique(.tab_labels$DocID)
-
-  rows_ <- list(
-    tibble::tibble(
-      Set      = "Corpus index",
-      Indexed  = dplyr::n_distinct(.tab_index$DocID),
-      Labelled = sum(unique(.tab_index$DocID) %in% got_)
-    )
-  )
-  if (!is.null(.tab_prep)) {
-    # Only the sampled documents this run actually drew. Counting the whole sample against a capped
-    # index would report the cap as a loss.
-    in_idx_ <- intersect(unique(.tab_prep$DocID), unique(.tab_index$DocID))
-    rows_ <- c(rows_, list(tibble::tibble(
-      Set      = "Labelled sample, within this index",
-      Indexed  = length(in_idx_),
-      Labelled = sum(in_idx_ %in% got_)
-    )))
-  }
-
-  purrr::list_rbind(rows_) |>
-    dplyr::mutate(
-      Missing = .data$Indexed - .data$Labelled,
-      Reached = dplyr::if_else(.data$Indexed > 0L, .data$Labelled / .data$Indexed, NA_real_)
-    )
-}
-
-#' The indexed documents that produced no row
-#'
-#' Written out rather than counted, because a count says how much is missing and a list says what.
-#' The path travels with the identifier so the claim is checkable against the archive instead of
-#' being taken on trust.
-#'
-#' @param .tab_index The corpus index this run drew.
-#' @param .tab_labels The labels read back from disk.
-#' @return Tibble: DocID, Path, and whatever else the index carried.
-mc_missing <- function(.tab_index, .tab_labels) {
-  if (FALSE) {
-    .tab_index  <- tab_index
-    .tab_labels <- tab_labels
-  }
-  .tab_index |> dplyr::filter(!.data$DocID %in% unique(.tab_labels$DocID))
-}
-
-#' Report coverage, and say what a shortfall would mean
-#'
-#' @param .tab_index The corpus index this run drew.
-#' @param .tab_labels The labels read back from disk.
-#' @param .tab_prep Labelled sample, or NULL.
-#' @return Invisibly the coverage tibble.
-mc_report_coverage <- function(.tab_index, .tab_labels, .tab_prep = NULL) {
-  if (FALSE) {
-    .tab_index  <- tab_index
-    .tab_labels <- tab_labels
-    .tab_prep   <- tab_prep
-  }
-  cov_ <- mc_coverage(.tab_index = .tab_index, .tab_labels = .tab_labels, .tab_prep = .tab_prep)
-
-  cli::cli_h2("Coverage: indexed against labelled")
-  cov_ |>
-    dplyr::mutate(Reached = tbl_pct(.data$Reached)) |>
-    tbl_say()
-
-  n_miss_ <- cov_$Missing[[1]]
-  cli::cli_text("")
-  if (n_miss_ == 0L) {
-    cli::cli_alert_success("Every indexed document produced a row.")
-    return(invisible(cov_))
-  }
-  cli::cli_alert_warning(
-    "{n_miss_} indexed document{?s} produced no row: the file was missing or held no text."
-  )
-
-  # Comparing the two rates is the whole point of carrying the sample through. Equal rates mean the
-  # loss is a property of the archive; unequal rates mean it is selective, and a released dataset
-  # missing a describable kind of document is a different object from one missing a random slice.
-  if (nrow(cov_) > 1L) {
-    gap_ <- abs(cov_$Reached[[2]] - cov_$Reached[[1]])
-    if (is.finite(gap_) && gap_ > 0.02) {
-      cli::cli_alert_danger(
-        "The labelled sample reaches the output at {tbl_pct(cov_$Reached[[2]])} against \\
-         {tbl_pct(cov_$Reached[[1]])} for the index. The loss is selective, not incidental."
-      )
-    } else {
-      cli::cli_alert_info(
-        "The labelled sample reaches the output at the index's rate, so the loss is a property of \\
-         the archive rather than of any kind of document."
-      )
-    }
-  }
-  invisible(cov_)
-}
-
-#' Report measured throughput and project the remaining work
-#'
-#' The rate is per DOCUMENT-TASK, not per document, because a chunk costs one model pass for each
-#' task it labels: quoting a per-document figure from a three-task run would understate a one-task
-#' run by a factor of three and overstate nothing, which is the wrong direction for a number someone
-#' plans a night around.
-#'
-#' The projection must be against the WHOLE TREE, never against the index this run happened to hold.
-#' A capped run indexes only its own draw, so passing that count back projects the preview and labels
-#' it a corpus pass -- understated by exactly the factor the cap imposed, which is the one thing the
-#' cap guarantees will be large. The measured RATE is correct either way; only the multiplier is
-#' wrong, so this is a reporting fault rather than a measurement one, and correspondingly invisible.
-#'
-#' @param .con Connection from mc_db_open().
-#' @param .run_key Configuration identity.
-#' @param .n_corpus Documents in the FULL corpus, not in a limited index.
-#' @param .n_tasks Tasks a full pass would label.
-#' @param .n_indexed Documents this run indexed, or NULL. Compared against what was timed, so
-#'   timings inherited from an earlier run are named rather than quietly averaged in.
-#' @return Invisibly the timing tibble, or NULL where nothing has been timed.
-mc_report_throughput <- function(.con, .run_key, .n_corpus, .n_tasks = 3L, .n_indexed = NULL) {
-  if (FALSE) {
-    .con       <- con
-    .run_key   <- run_key
-    .n_corpus  <- attr(tab_index, "nCorpus")
-    .n_tasks   <- 3L
-    .n_indexed <- nrow(tab_index)
-  }
-  tab_ <- DBI::dbGetQuery(
-    .con, "SELECT * FROM timings WHERE RunKey = ?", params = list(.run_key)
-  ) |>
-    tibble::as_tibble()
-  if (nrow(tab_) == 0L) {
-    cli::cli_alert_info("Nothing timed yet; label at least one chunk to measure this machine.")
-    return(invisible(NULL))
-  }
-
-  secs_  <- sum(tab_$Seconds)
-  units_ <- sum(tab_$nDocs * tab_$nTasks)
-  rate_  <- units_ / secs_
-
-  cli::cli_h2("Measured throughput")
-  tbl_say(
-    .tab = tibble::tibble(
-      Chunks      = nrow(tab_),
-      Documents   = sum(tab_$nDocs),
-      DocTasks    = units_,
-      Minutes     = round(secs_ / 60, 1),
-      PerSecond   = round(rate_, 1),
-      Corpus      = .n_corpus,
-      FullPassHrs = round(.n_corpus * .n_tasks / rate_ / 3600, 1)
-    )
-  )
-  cli::cli_text("")
-  cli::cli_alert_info(
-    "Rate is per document-task: a chunk costs one model pass for each task it labels, so a \\
-     per-document figure from a {max(tab_$nTasks)}-task run would misprice a one-task run."
-  )
-  cli::cli_alert_info(
-    "FullPassHrs projects the {(.n_corpus)} documents in the corpus at this rate, whatever this \\
-     run was capped at."
-  )
-
-  # Timings accumulate in the directory across runs, which is what lets a resumed pass keep the
-  # measurements it already paid for. It also means a chunk size changed between runs leaves both
-  # regimes in one average, and an average over two regimes describes neither.
-  if (dplyr::n_distinct(tab_$nDocs) > 2L) {
-    cli::cli_alert_warning(
-      "These timings span {dplyr::n_distinct(tab_$nDocs)} chunk sizes, so the rate averages more \\
-       than one regime. DELETE FROM timings for this run key to re-measure cleanly; the labels are \\
-       a separate table and are not affected."
-    )
-  }
-  if (!is.null(.n_indexed) && sum(tab_$nDocs) > .n_indexed) {
-    cli::cli_alert_warning(
-      "{sum(tab_$nDocs)} documents are timed here against {(.n_indexed)} in this run's index, so \\
-       earlier runs are contributing. The rate stands; the chunk count is not this run's."
-    )
-  }
-  invisible(tab_)
-}
-
-
-# 6b. Corpus statistics --------------------------------------------------------------------------
-# Everything here is measured WITHOUT LABELS, which is the only kind of statement available at corpus
-# scale and is more informative than it sounds. Two arms trained on different evidence, a taxonomy
-# with a known hierarchy, and a runner-up beside every first choice give three independent handles on
-# where the released labels are load-bearing and where they are close calls -- none of which requires
-# knowing the truth for a single corpus document.
-#
-# None of it is a substitute for the validated estimate. Agreement is not accuracy: two arms can be
-# wrong together, and the keyword arm shares vocabulary with the transformer's first layers. Read
-# these as a map of where to look, not as a score.
-
-#' Detailed category to broad parent, read off the labelled sample
-#'
-#' The hierarchy is a property of the taxonomy, so it is taken from the sample that defines it rather
-#' than restated here. Aborts if a detailed category reaches more than one parent: the corpus check
-#' below is only meaningful while the map is a function.
-#'
-#' @param .tab_prep Labelled sample carrying ClassDetailed and ClassBroad.
-#' @return Tibble: ClassDetailed, ClassBroad.
-mc_taxonomy_map <- function(.tab_prep) {
-  if (FALSE) .tab_prep <- tab_prep
-  map_ <- .tab_prep |>
-    dplyr::distinct(.data$ClassDetailed, .data$ClassBroad) |>
-    dplyr::filter(!is.na(.data$ClassDetailed), !is.na(.data$ClassBroad))
-  dup_ <- map_ |> dplyr::count(.data$ClassDetailed) |> dplyr::filter(.data$n > 1L)
-  if (nrow(dup_) > 0L) {
-    cli::cli_abort(c(
-      "{nrow(dup_)} detailed categor{?y/ies} reach more than one broad parent: {dup_$ClassDetailed}.",
-      "i" = "The hierarchy check below assumes each detailed category has exactly one parent."
-    ))
-  }
-  map_
-}
-
-#' What each arm said, per category, for one task
-#'
-#' ShareKw is computed over the documents the keyword arm COMMITTED to, not over all of them. Divided
-#' by the whole corpus it would fall with coverage and read as a composition difference, when what it
-#' describes is the composition of the subset the table was willing to speak about.
-#'
-#' @param .tab Output of a corpus pass.
-#' @param .task Task to profile.
-#' @param .margin Score gap below which a first choice counts as a close call.
-#' @return Tibble: Category, nBert, ShareBert, ShareKw, KwCommit, Agree, MeanScore, CloseCall.
-mc_task_profile <- function(.tab, .task, .margin = 0.10) {
-  if (FALSE) {
-    .tab    <- tab_labels
-    .task   <- "ClassDetailed"
-    .margin <- 0.10
-  }
-  d_ <- .tab |> dplyr::filter(.data$Task == .task)
-  n_ <- nrow(d_)
-
-  kw_n_ <- sum(d_$Kw_Pred1 != MC_NONE & !is.na(d_$Kw_Pred1))
-  kw_   <- d_ |>
-    dplyr::filter(.data$Kw_Pred1 != MC_NONE, !is.na(.data$Kw_Pred1)) |>
-    dplyr::count(Category = .data$Kw_Pred1, name = "nKw") |>
-    dplyr::mutate(ShareKw = .data$nKw / kw_n_)
-
-  # Renamed BEFORE the grouping, not inside it: .by is tidyselect and takes a selection, where
-  # group_by() takes expressions. A rename there is silently a different kind of thing.
-  d_ |>
-    dplyr::rename(Category = "Bert_Pred1") |>
-    dplyr::summarise(
-      nBert     = dplyr::n(),
-      MeanScore = mean(.data$Bert_Score1, na.rm = TRUE),
-      CloseCall = mean((.data$Bert_Score1 - .data$Bert_Score2) < .margin, na.rm = TRUE),
-      # Agreement only where the keyword arm committed: a document it declined is not one the two
-      # disagreed about.
-      nBoth     = sum(.data$Kw_Pred1 != MC_NONE & !is.na(.data$Kw_Pred1)),
-      Agree     = if (any(.data$Kw_Pred1 != MC_NONE, na.rm = TRUE)) {
-        mean((.data$Kw_Pred1 == .data$Category)[.data$Kw_Pred1 != MC_NONE], na.rm = TRUE)
-      } else {
-        NA_real_
-      },
-      .by = Category
+    bert_ <- DBI::dbGetQuery(
+      .con, "SELECT DocID, Top1Class, Top1Prob, Top2Class, Top2Prob
+             FROM bert_labels WHERE RunKey = ?", params = list(kb_$RunKey)
     ) |>
-    dplyr::mutate(ShareBert = .data$nBert / n_, KwCommit = .data$nBoth / .data$nBert) |>
-    dplyr::full_join(kw_, by = dplyr::join_by(Category)) |>
-    dplyr::arrange(dplyr::desc(.data$ShareBert)) |>
-    dplyr::select(Category, nBert, ShareBert, ShareKw, KwCommit, Agree, MeanScore, CloseCall)
-}
+      tibble::as_tibble() |>
+      stats::setNames(c("DocID", paste0("Bert", .t), paste0("Bert", .t, "Prob"),
+                        paste0("Bert", .t, "2"), paste0("Bert", .t, "2Prob")))
 
-#' Report one task's per-category profile
-#' @param .tab Output of a corpus pass.
-#' @param .task Task to profile.
-#' @param .margin Close-call threshold.
-#' @return Invisibly the profile.
-mc_report_task_profile <- function(.tab, .task, .margin = 0.10) {
-  if (FALSE) {
-    .tab    <- tab_labels
-    .task   <- "ClassDetailed"
-    .margin <- 0.10
-  }
-  out_ <- mc_task_profile(.tab = .tab, .task = .task, .margin = .margin)
-  cli::cli_h2("{(.task)}: what each arm said, by category")
-  out_ |>
-    dplyr::mutate(
-      dplyr::across(c(ShareBert, ShareKw, KwCommit, Agree, CloseCall), tbl_pct),
-      MeanScore = sprintf("%.3f", .data$MeanScore)
+    if (nrow(kk_) != 1L) return(bert_)
+
+    kw_ <- DBI::dbGetQuery(
+      .con, "SELECT DocID, Top1Class, Top1Prob, TopTerm
+             FROM keyword_labels WHERE RunKey = ?", params = list(kk_$RunKey)
     ) |>
-    tbl_say()
-  cli::cli_text("")
-  cli::cli_alert_info(
-    "ShareKw is over the documents the keyword arm committed to; KwCommit and Agree are within the \\
-     transformer's category. A category with high CloseCall is one the transformer separates weakly \\
-     from its runner-up, which is where a released label is worth checking."
-  )
-  invisible(out_)
-}
-
-#' Do the two taxonomies agree with each other on the corpus
-#'
-#' The broad task is predicted independently of the detailed one, and the taxonomy says which broad
-#' parent each detailed category belongs to. Those two facts can be checked against each other on
-#' every document without a single label: where the independently-predicted parent differs from the
-#' parent of the predicted detailed category, at least one of the two is wrong.
-#'
-#' It is a lower bound on joint error and an upper bound on nothing -- both can be wrong the same way
-#' -- but it is measured on the released documents rather than on 4,398 of them, and it localises
-#' disagreement to the categories where the two taxonomies pull apart.
-#'
-#' @param .tab Output of a corpus pass.
-#' @param .map Output of mc_taxonomy_map().
-#' @return Tibble: Parent, nDocs, Coherent, plus a Total row.
-mc_hierarchy_agreement <- function(.tab, .map) {
-  if (FALSE) {
-    .tab <- tab_labels
-    .map <- mc_taxonomy_map(.tab_prep = tab_prep)
-  }
-  det_ <- .tab |>
-    dplyr::filter(.data$Task == "ClassDetailed") |>
-    dplyr::select(DocID, Detailed = .data$Bert_Pred1)
-  brd_ <- .tab |>
-    dplyr::filter(.data$Task == "ClassBroad") |>
-    dplyr::select(DocID, Broad = .data$Bert_Pred1)
-
-  both_ <- det_ |>
-    dplyr::inner_join(brd_, by = dplyr::join_by(DocID)) |>
-    dplyr::left_join(.map, by = dplyr::join_by(Detailed == ClassDetailed)) |>
-    dplyr::filter(!is.na(.data$ClassBroad)) |>
-    dplyr::mutate(Coherent = .data$ClassBroad == .data$Broad)
-
-  by_ <- both_ |>
-    dplyr::summarise(nDocs = dplyr::n(), Coherent = mean(.data$Coherent), .by = ClassBroad) |>
-    dplyr::rename(Parent = "ClassBroad") |>
-    dplyr::arrange(dplyr::desc(.data$nDocs))
-
-  dplyr::bind_rows(
-    by_,
-    tibble::tibble(Parent = "All", nDocs = nrow(both_), Coherent = mean(both_$Coherent))
-  )
-}
-
-#' One row per document, with every task's answer from every arm side by side
-#'
-#' The corpus output is long in Task, which is right for storage and wrong for any question that
-#' crosses tasks. Three tasks labelled the same documents, so the interesting facts -- whether the two
-#' taxonomies cohere, whether amendments concentrate anywhere -- live in the join, not in any one
-#' task's rows.
-#'
-#' @param .tab Output of a corpus pass.
-#' @return Tibble: DocID and one column per task and arm.
-mc_by_document <- function(.tab) {
-  if (FALSE) .tab <- tab_labels
-  one_ <- function(.task, .prefix) {
-    .tab |>
-      dplyr::filter(.data$Task == .task) |>
-      dplyr::select(DocID, Bert = "Bert_Pred1", Kw = "Kw_Pred1") |>
-      dplyr::rename_with(\(.x) paste0(.prefix, .x), -DocID)
-  }
-  one_("ClassDetailed", "Det") |>
-    dplyr::inner_join(one_("ClassBroad", "Brd"), by = dplyr::join_by(DocID)) |>
-    dplyr::inner_join(one_("AmendType", "Amd"), by = dplyr::join_by(DocID))
-}
-
-#' The taxonomy, filled in with what the corpus pass found
-#'
-#' Rows are the hierarchy itself -- every detailed category under its broad parent -- so the table is
-#' read down the taxonomy rather than down a ranking, and a category the classifier never predicted
-#' still occupies its row. An absent category and a zero are different findings, and a table sorted by
-#' size cannot show the first.
-#'
-#' TWO ARMS, TWO DENOMINATORS. The keyword table abstains by design, on the amendment task as well as
-#' the detailed one, so nKw counts documents it was willing to speak about and is not a smaller
-#' estimate of the same quantity as nBert. The commit share is carried alongside so the gap is
-#' attributable rather than mysterious.
-#'
-#' Incoherent counts documents whose independently-predicted broad class is not this category's
-#' parent. It is the disagreement between the two taxonomies localised to where it happens, and it
-#' needs no labels: the hierarchy alone says the two predictions cannot both be right.
-#'
-#' @param .tab Output of a corpus pass.
-#' @param .map Output of mc_taxonomy_map().
-#' @return Tibble: Broad, Detailed, nBert, nKw, KwCommit, nAmendBert, nAmendKw, Incoherent, Coherent.
-mc_hierarchy_table <- function(.tab, .map) {
-  if (FALSE) {
-    .tab <- tab_labels
-    .map <- mc_taxonomy_map(.tab_prep = tab_prep)
-  }
-  doc_ <- mc_by_document(.tab = .tab)
-
-  bert_ <- doc_ |>
-    dplyr::left_join(.map, by = dplyr::join_by(DetBert == ClassDetailed)) |>
-    dplyr::summarise(
-      nBert      = dplyr::n(),
-      nAmendBert = sum(.data$AmdBert != "Original", na.rm = TRUE),
-      # The parent the taxonomy assigns against the parent predicted on its own evidence.
-      Incoherent = sum(.data$ClassBroad != .data$BrdBert, na.rm = TRUE),
-      .by = DetBert
-    ) |>
-    dplyr::rename(Detailed = "DetBert")
-
-  kw_ <- doc_ |>
-    dplyr::filter(.data$DetKw != MC_NONE, !is.na(.data$DetKw)) |>
-    dplyr::summarise(
-      nKw      = dplyr::n(),
-      nAmendKw = sum(.data$AmdKw != "Original" & .data$AmdKw != MC_NONE, na.rm = TRUE),
-      .by = DetKw
-    ) |>
-    dplyr::rename(Detailed = "DetKw")
-
-  # The MAP is the spine, not either arm's output: a category neither arm ever predicted belongs in
-  # this table at zero, and joining onto an arm would delete exactly the rows worth noticing.
-  .map |>
-    dplyr::rename(Broad = "ClassBroad", Detailed = "ClassDetailed") |>
-    dplyr::left_join(bert_, by = dplyr::join_by(Detailed)) |>
-    dplyr::left_join(kw_, by = dplyr::join_by(Detailed)) |>
-    dplyr::mutate(
-      dplyr::across(c(nBert, nKw, nAmendBert, nAmendKw, Incoherent), \(.x) dplyr::coalesce(.x, 0L)),
-      KwCommit  = dplyr::if_else(.data$nBert > 0L, .data$nKw / .data$nBert, NA_real_),
-      Coherent  = dplyr::if_else(.data$nBert > 0L, 1 - .data$Incoherent / .data$nBert, NA_real_),
-      AmendBert = dplyr::if_else(.data$nBert > 0L, .data$nAmendBert / .data$nBert, NA_real_)
-    ) |>
-    dplyr::arrange(.data$Broad, dplyr::desc(.data$nBert))
-}
-
-#' Report the taxonomy table, and its roll-up to the broad classes
-#' @param .tab Output of a corpus pass.
-#' @param .map Output of mc_taxonomy_map().
-#' @return Invisibly the detailed table.
-mc_report_hierarchy_table <- function(.tab, .map) {
-  if (FALSE) {
-    .tab <- tab_labels
-    .map <- mc_taxonomy_map(.tab_prep = tab_prep)
-  }
-  out_ <- mc_hierarchy_table(.tab = .tab, .map = .map)
-
-  cli::cli_h2("The taxonomy, as the corpus filled it in")
-  out_ |>
-    dplyr::mutate(
-      dplyr::across(c(KwCommit, AmendBert, Coherent), tbl_pct)
-    ) |>
-    dplyr::select(Broad, Detailed, nBert, nKw, KwCommit, nAmendBert, nAmendKw, AmendBert,
-                  Incoherent, Coherent) |>
-    tbl_say()
-
-  cli::cli_h2("Rolled up to the broad classes")
-  out_ |>
-    dplyr::summarise(
-      Detailed   = dplyr::n(),
-      nBert      = sum(.data$nBert),
-      nKw        = sum(.data$nKw),
-      nAmendBert = sum(.data$nAmendBert),
-      nAmendKw   = sum(.data$nAmendKw),
-      Incoherent = sum(.data$Incoherent),
-      .by = Broad
-    ) |>
-    dplyr::mutate(
-      KwCommit  = .data$nKw / .data$nBert,
-      AmendBert = .data$nAmendBert / .data$nBert,
-      Coherent  = 1 - .data$Incoherent / .data$nBert
-    ) |>
-    dplyr::arrange(dplyr::desc(.data$nBert)) |>
-    dplyr::mutate(dplyr::across(c(KwCommit, AmendBert, Coherent), tbl_pct)) |>
-    tbl_say()
-
-  cli::cli_text("")
-  cli::cli_alert_info(
-    "nKw and nAmendKw count documents the keyword table committed to; KwCommit is that share, so \\
-     the two arms' counts are not two estimates of one quantity."
-  )
-  cli::cli_alert_info(
-    "Incoherent counts documents whose independently-predicted broad class is not this row's parent. \\
-     At least one of the two predictions is wrong on each; the hierarchy says so without labels."
-  )
-  invisible(out_)
-}
-
-#' Which pairs of categories the model treats as near-substitutes
-#'
-#' The runner-up is the only statement about alternatives available without labels, and at corpus
-#' scale the recurring first-to-second pairs are the taxonomy's real fault lines: two categories the
-#' model repeatedly cannot separate are two categories a reader should not treat as cleanly distinct,
-#' whichever way any single document went.
-#'
-#' Weighted by MARGIN as well as by count. A pair that recurs at a margin of 0.9 is the model being
-#' certain about many similar documents; the same pair at 0.05 is a coin toss it happens to keep
-#' making the same way, and only the second is a fault line.
-#'
-#' @param .tab Output of a corpus pass.
-#' @param .task Task to profile.
-#' @param .n Pairs to report.
-#' @return Tibble: First, Second, nDocs, Share, MeanMargin, Close.
-mc_second_guess <- function(.tab, .task, .n = 12L) {
-  if (FALSE) {
-    .tab  <- tab_labels
-    .task <- "ClassDetailed"
-    .n    <- 12L
-  }
-  d_ <- .tab |>
-    dplyr::filter(.data$Task == .task, !is.na(.data$Bert_Pred2))
-  if (nrow(d_) == 0L) {
-    return(tibble::tibble(First = character(), Second = character(), nDocs = integer(),
-                          Share = numeric(), MeanMargin = numeric(), Close = numeric()))
-  }
-  d_ |>
-    dplyr::mutate(Margin = .data$Bert_Score1 - .data$Bert_Score2) |>
-    dplyr::rename(First = "Bert_Pred1", Second = "Bert_Pred2") |>
-    dplyr::summarise(
-      nDocs      = dplyr::n(),
-      MeanMargin = mean(.data$Margin, na.rm = TRUE),
-      Close      = mean(.data$Margin < 0.10, na.rm = TRUE),
-      .by = c(First, Second)
-    ) |>
-    dplyr::mutate(Share = .data$nDocs / nrow(d_)) |>
-    dplyr::arrange(dplyr::desc(.data$nDocs)) |>
-    dplyr::slice_head(n = .n) |>
-    dplyr::select(First, Second, nDocs, Share, MeanMargin, Close)
-}
-
-#' When the arms disagree, is the keyword arm picking the transformer's runner-up
-#'
-#' A disagreement in which the keyword table names the category the transformer ranked second is a
-#' different object from one in which it names something the transformer never considered. The first
-#' is two arms splitting a close call; the second is a genuine conflict, and only the second is worth
-#' a reader's time.
-#'
-#' @param .tab Output of a corpus pass.
-#' @return Tibble: Task, nDisagree, ShareOfCommitted, IsRunnerUp, MeanMargin.
-mc_near_miss <- function(.tab) {
-  if (FALSE) .tab <- tab_labels
-  .tab |>
-    dplyr::filter(.data$Kw_Pred1 != MC_NONE, !is.na(.data$Kw_Pred1)) |>
-    dplyr::mutate(Disagree = .data$Kw_Pred1 != .data$Bert_Pred1) |>
-    dplyr::summarise(
-      nCommitted       = dplyr::n(),
-      nDisagree        = sum(.data$Disagree),
-      ShareOfCommitted = mean(.data$Disagree),
-      IsRunnerUp       = if (any(.data$Disagree)) {
-        mean((.data$Kw_Pred1 == .data$Bert_Pred2)[.data$Disagree], na.rm = TRUE)
-      } else {
-        NA_real_
-      },
-      MeanMargin = if (any(.data$Disagree)) {
-        mean((.data$Bert_Score1 - .data$Bert_Score2)[.data$Disagree], na.rm = TRUE)
-      } else {
-        NA_real_
-      },
-      .by = Task
-    )
-}
-
-#' Amendment status crossed with the detailed category
-#'
-#' Three tasks labelled the same documents, so they can be read against each other. Whether
-#' amendments concentrate in particular contract types is a fact about the corpus that nothing in the
-#' per-task tables shows, and it is the kind of thing a user of the released data will want before
-#' conditioning on either column.
-#'
-#' @param .tab Output of a corpus pass.
-#' @return Tibble: Category, nDocs, Amended.
-mc_amend_profile <- function(.tab) {
-  if (FALSE) .tab <- tab_labels
-  det_ <- .tab |>
-    dplyr::filter(.data$Task == "ClassDetailed") |>
-    dplyr::select(DocID, Category = .data$Bert_Pred1)
-  amd_ <- .tab |>
-    dplyr::filter(.data$Task == "AmendType") |>
-    dplyr::select(DocID, Amend = .data$Bert_Pred1)
-
-  det_ |>
-    dplyr::inner_join(amd_, by = dplyr::join_by(DocID)) |>
-    dplyr::summarise(
-      nDocs   = dplyr::n(),
-      Amended = mean(.data$Amend != "Original"),
-      .by = Category
-    ) |>
-    dplyr::arrange(dplyr::desc(.data$nDocs))
-}
-
-# 7. Composition -----------------------------------------------------------------------------------
-# The corpus does not have to look like the labelled sample, and it will not: the sample was drawn to
-# support estimation, with the thin categories deliberately over-represented so they could be learnt
-# at all. A gap is therefore expected. What the gap CANNOT distinguish on its own is whether it comes
-# from that sampling design or from the model drifting toward frequent categories on documents unlike
-# anything it trained on -- and those have very different consequences for the released labels.
-#
-# The confidence tiers separate them. If documents the arms agreed on look like the labelled sample
-# while the ones they did not agree on carry the skew, the drift is on the uncertain documents and
-# the flag is already isolating it. If every tier is skewed alike, the difference is composition and
-# the labels are fine.
-
-#' Category composition: labelled sample, corpus, and each confidence tier
-#'
-#' Composition is taken over the TERMINAL ARM'S FIRST CHOICE, not over a released label, because this
-#' stage releases none. That is the right comparison anyway: it is the same quantity the labelled
-#' sample was scored on, and it does not move when a routing rule is chosen later.
-#'
-#' @param .tab_labels Output of a corpus pass.
-#' @param .tab_prep Labelled sample.
-#' @param .label_col Task to compare.
-#' @param .column Prediction column standing for the corpus composition.
-#' @return Tibble: Label, SampleShare, CorpusShare, one column per tier.
-mc_distribution <- function(.tab_labels, .tab_prep, .label_col = "ClassDetailed",
-                            .column = "Bert_Pred1") {
-  if (FALSE) {
-    .tab_labels <- tab_labels
-    .tab_prep   <- tab_prep
-    .label_col  <- "ClassDetailed"
-    .column     <- "Bert_Pred1"
-  }
-  sample_ <- .tab_prep |>
-    dplyr::filter(!is.na(.data[[.label_col]])) |>
-    dplyr::count(Label = .data[[.label_col]], name = "nSample") |>
-    dplyr::mutate(SampleShare = .data$nSample / sum(.data$nSample))
-
-  corp_ <- .tab_labels |>
-    dplyr::filter(.data$Task == .label_col) |>
-    dplyr::count(Label = .data[[.column]], name = "nCorpus") |>
-    dplyr::mutate(CorpusShare = .data$nCorpus / sum(.data$nCorpus))
-
-  tiers_ <- .tab_labels |>
-    dplyr::filter(.data$Task == .label_col, !is.na(.data$Tier)) |>
-    dplyr::count(Tier, Label = .data[[.column]], name = "n") |>
-    dplyr::mutate(Share = .data$n / sum(.data$n), .by = Tier) |>
-    dplyr::select(Tier, Label, Share) |>
-    tidyr::pivot_wider(names_from = Tier, values_from = Share, values_fill = 0)
-
-  sample_ |>
-    dplyr::select(Label, SampleShare) |>
-    dplyr::full_join(corp_ |> dplyr::select(Label, CorpusShare), by = dplyr::join_by(Label)) |>
-    dplyr::full_join(tiers_, by = dplyr::join_by(Label)) |>
-    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), \(.x) tidyr::replace_na(.x, 0))) |>
-    dplyr::arrange(dplyr::desc(.data$CorpusShare))
-}
-
-#' Every pair of arms, and how often they made the same first choice
-#'
-#' Agreement is measured only where BOTH arms committed, because a pair cannot disagree about a
-#' document one of them declined. Measured over all documents instead, an abstaining arm's agreement
-#' would fall as its coverage fell and would read as a quality difference rather than a coverage one.
-#'
-#' @param .tab Output of a corpus pass.
-#' @return Tibble: Task, Pair, nBoth, Agree.
-mc_agreement <- function(.tab) {
-  if (FALSE) .tab <- tab_labels
-  pref_ <- sub("_Pred1$", "", grep("_Pred1$", names(.tab), value = TRUE))
-  if (length(pref_) < 2L) {
-    return(tibble::tibble(Task = character(), Pair = character(), nBoth = integer(),
-                          Agree = numeric()))
-  }
-  pairs_ <- utils::combn(pref_, 2L, simplify = FALSE)
-
-  purrr::map(pairs_, function(.p) {
-    a_ <- paste0(.p[[1]], "_Pred1")
-    b_ <- paste0(.p[[2]], "_Pred1")
-    .tab |>
+      tibble::as_tibble() |>
       dplyr::mutate(
-        Both  = !is.na(.data[[a_]]) & !is.na(.data[[b_]]) &
-                .data[[a_]] != MC_NONE & .data[[b_]] != MC_NONE,
-        Same  = .data[[a_]] == .data[[b_]]
+        # The sentinel and a tied top pair are both refusals, and both arrive here as the sentinel.
+        Top1Class = dplyr::if_else(.data$Top1Class == .none, NA_character_, .data$Top1Class),
+        Top1Prob  = dplyr::if_else(is.na(.data$Top1Class), NA_real_, .data$Top1Prob),
+        TopTerm   = dplyr::if_else(is.na(.data$Top1Class), NA_character_, .data$TopTerm)
       ) |>
-      dplyr::summarise(
-        Pair  = paste(.p, collapse = " vs "),
-        nBoth = sum(.data$Both),
-        Agree = if (any(.data$Both)) mean(.data$Same[.data$Both]) else NA_real_,
-        .by = Task
+      stats::setNames(c("DocID", paste0("Kw", .t), paste0("Kw", .t, "Power"),
+                        paste0("Kw", .t, "Term")))
+
+    bert_ |>
+      dplyr::left_join(kw_, by = dplyr::join_by(DocID)) |>
+      dplyr::mutate(
+        !!paste0(.t, "Flag") := dplyr::case_when(
+          is.na(.data[[paste0("Kw", .t)]])                      ~ "unchecked",
+          .data[[paste0("Kw", .t)]] == .data[[paste0("Bert", .t)]] ~ "confirmed",
+          TRUE                                                  ~ "contradicted"
+        )
       )
-  }) |>
-    purrr::list_rbind() |>
-    dplyr::arrange(.data$Task, .data$Pair)
+  })
+
+  # INNER joins across tasks, which is what makes every row complete. A document reached by the
+  # detailed pass and not yet by the broad one leaves rather than arriving with a hole.
+  out_ <- purrr::reduce(blocks_, \(.a, .b) dplyr::inner_join(.a, .b, by = dplyr::join_by(DocID)))
+
+  if (all(c("ClassDetailed", "ClassBroad") %in% .tasks)) {
+    map_ <- .tab_prep |>
+      dplyr::filter(!is.na(.data$ClassDetailed), !is.na(.data$ClassBroad)) |>
+      dplyr::distinct(BertClassDetailed = .data$ClassDetailed, Parent = .data$ClassBroad)
+    out_ <- out_ |>
+      dplyr::left_join(map_, by = dplyr::join_by(BertClassDetailed)) |>
+      dplyr::mutate(HierConsistent = .data$Parent == .data$BertClassBroad, Parent = NULL)
+  }
+  out_ |> dplyr::arrange(.data$DocID)
 }
 
-#' Share of documents each arm committed to
+#' Write the release and the manifest that makes it reproducible
 #'
-#' @param .tab Output of a corpus pass.
-#' @return Tibble: Task, Arm, Commit.
-mc_commitment <- function(.tab) {
-  if (FALSE) .tab <- tab_labels
-  cols_ <- grep("_Pred1$", names(.tab), value = TRUE)
-  .tab |>
-    dplyr::summarise(
-      dplyr::across(dplyr::all_of(cols_), \(.x) mean(!is.na(.x) & .x != MC_NONE)),
-      .by = Task
-    ) |>
-    tidyr::pivot_longer(cols = dplyr::all_of(cols_), names_to = "Arm", values_to = "Commit") |>
-    dplyr::mutate(Arm = sub("_Pred1$", "", .data$Arm))
-}
-
-#' Distribution of the transformer's decision margin, by task
+#' Two files, and the second is not optional. Labels without a record of what produced them are
+#' unreproducible: in a year nobody will know which checkpoint, at which context length, wrote a
+#' given column, and the file itself cannot say.
 #'
-#' The margin is the whole confidence story available without labels. A mass piled at one is a model
-#' separating its categories cleanly; weight near zero is documents where a different seed would have
-#' produced a different released label, and their share is the honest answer to how much of the
-#' corpus is a coin toss.
+#' A release built while a run is still going gets `_partial` in its name. It is a well-formed file
+#' either way -- every column populated, merges without a murmur -- and nothing inside it says it
+#' covers two per cent of the corpus. The stamp is what stops a partial file being mistaken for a
+#' finished one six months later.
 #'
-#' @param .tab Output of a corpus pass.
-#' @return A ggplot.
-mc_plot_margin <- function(.tab) {
-  if (FALSE) .tab <- tab_labels
-  .tab |>
-    dplyr::filter(!is.na(.data$Bert_Score2)) |>
-    dplyr::mutate(Margin = .data$Bert_Score1 - .data$Bert_Score2) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Margin)) +
-    ggplot2::geom_histogram(bins = 50L, boundary = 0, fill = .plot_ink) +
-    ggplot2::facet_wrap(facets = ggplot2::vars(.data$Task), ncol = 1L, scales = "free_y",
-                        drop = FALSE) +
-    ggplot2::scale_x_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, 0.02))) +
-    plot_scale_y_count() +
-    ggplot2::labs(x = "First choice minus runner-up", y = "Documents") +
-    plot_theme(.grid = "y")
-}
-
-#' Where each category's mass goes when it is not first
-#'
-#' Rows are the first choice, columns the runner-up, shaded by the share of that category's documents
-#' -- so it reads like a confusion matrix built without any labels at all. Fixed at zero to one so
-#' three tasks can be compared, and every level kept whether or not it has data: a category that never
-#' appears as a runner-up is a finding, and dropping it would present that finding as absence.
-#'
-#' @param .tab Output of a corpus pass.
-#' @param .task Task to plot.
-#' @return A ggplot.
-mc_plot_second_guess <- function(.tab, .task) {
+#' @param .tab Output of app_release().
+#' @param .con Connection, for the run records.
+#' @param .specs The runs this release was built from.
+#' @param .dir Character. Destination directory.
+#' @param .stem Character. File stem; the context length and any partial stamp are appended.
+#' @param .max_len Integer or NULL. Stamped into the name, because two context lengths produce two
+#'   releases and a reader must be able to tell them apart without opening either.
+#' @param .n_corpus Integer. Documents in the index, for the completeness report.
+#' @return Invisibly a one-row tibble naming both files.
+app_write_release <- function(.tab, .con, .specs, .dir, .stem = "contract_labels",
+                              .max_len = NULL, .n_corpus = NA_integer_) {
   if (FALSE) {
-    .tab  <- tab_labels
-    .task <- "ClassDetailed"
+    .tab      <- release
+    .con      <- con
+    .specs    <- specs_256
+    .dir      <- .lP$Output$Release
+    .max_len  <- 256L
+    .n_corpus <- n_corpus
   }
-  d_ <- .tab |>
-    dplyr::filter(.data$Task == .task, !is.na(.data$Bert_Pred2))
-  lv_ <- sort(unique(c(d_$Bert_Pred1, d_$Bert_Pred2)))
+  app_require_con(.con = .con, .what = "write the release manifest")
+  fs::dir_create(.dir)
+  status_  <- app_status(.con = .con, .specs = .specs)
+  partial_ <- any(status_$Status != "complete")
 
-  d_ |>
-    dplyr::rename(First = "Bert_Pred1", Second = "Bert_Pred2") |>
-    dplyr::summarise(n = dplyr::n(), .by = c(First, Second)) |>
-    dplyr::mutate(Share = .data$n / sum(.data$n), .by = First) |>
+  name_ <- paste0(.stem,
+                  if (!is.null(.max_len)) paste0("_L", as.integer(.max_len)) else "",
+                  if (partial_) "_partial" else "")
+  path_ <- fs::path(.dir, paste0(name_, ".parquet"))
+  man_  <- fs::path(.dir, paste0(name_, "_manifest.parquet"))
+
+  arrow::write_parquet(.tab, path_)
+
+  runs_ <- DBI::dbGetQuery(.con, "SELECT * FROM runs") |>
+    tibble::as_tibble() |>
+    dplyr::filter(.data$RunKey %in% .specs$RunKey) |>
+    dplyr::left_join(status_ |> dplyr::select(RunKey, nDone, nFailed, Status),
+                     by = dplyr::join_by(RunKey)) |>
     dplyr::mutate(
-      First  = factor(.data$First, levels = lv_),
-      Second = factor(.data$Second, levels = lv_)
-    ) |>
-    plot_heatmap(
-      .x       = "Second",       # runner-up
-      .y       = "First",        # first choice
-      .fill    = "Share",        # share of that category's documents
-      .pct     = TRUE,           # shares read as percentages
-      .limits  = c(0, 1)         # fixed, so three tasks are comparable
+      Release   = name_,
+      # STAMPED IN UTC, because the two timestamps beside it are. StartedAt and UpdatedAt round-trip
+      # through the store, which normalises to UTC; Sys.time() written straight out carries local wall
+      # clock with no zone attached. Subtracting one from the other then gives a duration quietly
+      # wrong by the offset -- two hours here -- and nothing in the file says so.
+      WrittenAt = as.POSIXct(Sys.time(), tz = "UTC"),
+      # Counts arrive from the engine as int64 and land in R as numeric. A manifest reporting 28985.0
+      # documents is not wrong, it is just not a count.
+      nDone     = as.integer(.data$nDone),
+      nFailed   = as.integer(.data$nFailed),
+      nReleased = nrow(.tab),
+      # The denominator, so the file describes itself. A year from now 28,985 out of 1,462,939 is
+      # immediately legible where 28,985 on its own is a number needing a second document.
+      nCorpus   = as.integer(.n_corpus)
     )
-}
+  arrow::write_parquet(runs_, man_)
 
-#' Pairwise agreement across the corpus
-#' @param .tab Output of a corpus pass.
-#' @return A ggplot.
-mc_plot_agreement <- function(.tab) {
-  if (FALSE) .tab <- tab_labels
-  mc_agreement(.tab = .tab) |>
-    dplyr::filter(!is.na(.data$Agree)) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Agree, y = .data$Pair)) +
-    ggplot2::geom_col(fill = .plot_ink, width = 0.7) +
-    ggplot2::geom_text(
-      mapping = ggplot2::aes(label = tbl_pct(.data$Agree)),
-      hjust   = -0.18,
-      size    = (.plot_base - 3) / ggplot2::.pt,
-      family  = .plot_font
-    ) +
-    ggplot2::facet_wrap(facets = ggplot2::vars(.data$Task), ncol = 1L, drop = FALSE) +
-    ggplot2::scale_x_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, 0.12))) +
-    ggplot2::labs(x = "Agreement where both arms committed", y = NULL) +
-    plot_theme()
-}
+  tbl_head("The released file")
+  tibble::tibble(
+    File = c(fs::path_file(path_), fs::path_file(man_)),
+    Rows = c(nrow(.tab), nrow(runs_)),
+    Cols = c(ncol(.tab), ncol(runs_)),
+    MB   = round(as.numeric(fs::file_size(c(path_, man_))) / 1024^2, 1)
+  ) |>
+    tbl_out(.title = "The released file")
 
-#' Commitment share across the corpus
-#' @param .tab Output of a corpus pass.
-#' @return A ggplot.
-mc_plot_commitment <- function(.tab) {
-  if (FALSE) .tab <- tab_labels
-  mc_commitment(.tab = .tab) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Commit, y = .data$Arm)) +
-    ggplot2::geom_col(fill = .plot_ink, width = 0.7) +
-    ggplot2::geom_text(
-      mapping = ggplot2::aes(label = tbl_pct(.data$Commit)),
-      hjust   = -0.18,
-      size    = (.plot_base - 3) / ggplot2::.pt,
-      family  = .plot_font
-    ) +
-    ggplot2::facet_wrap(facets = ggplot2::vars(.data$Task), ncol = 1L, drop = FALSE) +
-    ggplot2::scale_x_continuous(limits = c(0, 1), expand = ggplot2::expansion(mult = c(0, 0.12))) +
-    ggplot2::labs(x = "Share of documents committed to", y = NULL) +
-    plot_theme()
-}
-
-#' Report composition, and the distance of each tier from the labelled sample
-#'
-#' Total variation distance is the summary: half the sum of absolute share differences, which is the
-#' largest share of documents any single reweighting could move. Zero means identical composition,
-#' one means disjoint. Read the tiers against each other rather than against any absolute standard --
-#' the question is not whether a tier differs from the sample but whether the tiers differ from each
-#' other, because only the second is evidence about the model.
-#'
-#' @param .tab Output of mc_distribution().
-#' @return Invisibly the distance tibble.
-mc_report_distribution <- function(.tab) {
-  if (FALSE) .tab <- dist_det
-
-  cli::cli_h2("Category composition")
-  .tab |>
-    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), tbl_pct)) |>
-    tbl_say()
-
-  cols_ <- setdiff(names(.tab), c("Label", "SampleShare"))
-  tvd_ <- purrr::map(cols_, function(.c) {
-    tibble::tibble(
-      Set = .c,
-      TVD = 0.5 * sum(abs(.tab[[.c]] - .tab$SampleShare))
+  if (is.finite(.n_corpus)) {
+    tbl_note(
+      "{nrow(.tab)} of {(.n_corpus)} corpus document{?s} carry every transformer label and are in this \\
+       file; {(.n_corpus - nrow(.tab))} are not, because at least one pass has not reached them or \\
+       could not read them."
     )
-  }) |>
-    purrr::list_rbind() |>
-    dplyr::arrange(.data$TVD)
-
-  cli::cli_text("")
-  tvd_ |>
-    dplyr::mutate(TVD = sprintf("%.3f", .data$TVD)) |>
-    tbl_say(.title = "Distance from the labelled sample's composition")
-  cli::cli_text("")
-
-  agree_ <- tvd_$TVD[tvd_$Set == "unanimous"]
-  other_ <- tvd_$TVD[tvd_$Set %in% c("sole", "split")]
-  if (length(agree_) == 1L && length(other_) > 0L) {
-    if (agree_ < min(other_)) {
-      cli::cli_alert_info(
-        "Documents the arms agreed on sit closer to the labelled sample than the ones they did not. \\
-         That is the signature of drift concentrated on uncertain documents, which the flag is \\
-         already isolating -- the skew travels with low confidence rather than with the corpus."
-      )
-    } else {
-      cli::cli_alert_info(
-        "Every tier is skewed alike, so the difference is composition rather than model behaviour: \\
-         the labelled sample over-represents thin categories by design and the corpus does not. \\
-         The labels are unaffected; the reliability estimates carry the sample's composition and \\
-         that belongs in the text."
-      )
-    }
   }
-  invisible(tvd_)
+  if (partial_) {
+    tbl_note(
+      "At least one run is still incomplete, so this release is stamped {.val {name_}}. It is a \\
+       well-formed file and it does not cover the corpus.",
+      .type = "warn"
+    )
+  }
+  tbl_note(
+    "The manifest names the configuration, the context length and the artifact fingerprint behind \\
+     every column. It is the half of the release that makes the other half reproducible, and it \\
+     travels with it."
+  )
+  invisible(tibble::tibble(Labels = as.character(path_), Manifest = as.character(man_)))
 }
 
-# Local null-coalescing helper (base R gained %||% in 4.4; this keeps the file self-contained).
-`%||%` <- function(.x, .y) if (is.null(.x)) .y else .x
+#' What the released columns mean
+#'
+#' Written from the table rather than typed, so a column added upstream cannot go undocumented.
+#'
+#' @param .tab Output of app_release().
+#' @return Tibble: Column, Meaning.
+app_release_schema <- function(.tab) {
+  if (FALSE) .tab <- release
+  tibble::tibble(Column = names(.tab)) |>
+    dplyr::mutate(
+      Meaning = dplyr::case_when(
+        .data$Column == "DocID"                    ~ "Document identifier; the merge key.",
+        .data$Column == "HierConsistent"           ~ "Does the detailed label's parent equal the broad label?",
+        grepl("Flag$", .data$Column)               ~ "confirmed / contradicted / unchecked by the lexicon.",
+        grepl("^Kw.*Term$", .data$Column)          ~ "The term that fired; NA where the lexicon was silent.",
+        grepl("^Kw.*Power$", .data$Column)         ~ paste("Wilson lower bound on that term's",
+                                                            "training precision. NOT a probability."),
+        grepl("^Kw", .data$Column)                 ~ "Keyword label; NA where the lexicon was silent or tied.",
+        grepl("^Bert.*2Prob$", .data$Column)       ~ "Softmax probability of the runner-up class.",
+        grepl("^Bert.*2$", .data$Column)           ~ "Runner-up class.",
+        grepl("^Bert.*Prob$", .data$Column)        ~ "Softmax probability of the released label.",
+        grepl("^Bert", .data$Column)               ~ "The released label.",
+        TRUE                                       ~ ""
+      )
+    )
+}
+
+# 7. Results -------------------------------------------------------------------------------------------------------------
+
+#' What each run produced, read back from the store
+#' @param .con Connection.
+#' @param .specs The run specification.
+#' @return Tibble: Engine, Task, nLabelled, Coverage, MeanTop1, nFailed.
+app_summary <- function(.con, .specs) {
+  if (FALSE) {
+    .con   <- con
+    .specs <- dplyr::bind_rows(spec_bert, spec_kw)
+  }
+  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
+  purrr::map(seq_len(nrow(.specs)), function(.i) {
+    s_   <- .specs[.i, ]
+    tab_ <- if (identical(s_$Engine, "bert")) "bert_labels" else "keyword_labels"
+    q_   <- DBI::dbGetQuery(.con, paste0(
+      "SELECT COUNT(DISTINCT DocID) AS nLab, AVG(Top1Prob) AS MeanTop1 FROM ", tab_,
+      " WHERE RunKey = ? AND Top1Class IS NOT NULL"), params = list(s_$RunKey))
+    f_ <- DBI::dbGetQuery(.con, "SELECT COUNT(DISTINCT DocID) AS n FROM failures WHERE RunKey = ?",
+                          params = list(s_$RunKey))$n[[1]]
+    tibble::tibble(Engine = s_$Engine, Task = s_$Task, nLabelled = q_$nLab[[1]],
+                   Coverage = q_$nLab[[1]] / max(n_, 1L), MeanTop1 = q_$MeanTop1[[1]], nFailed = f_)
+  }) |>
+    purrr::list_rbind()
+}
+
+#' How the corpus distributes across the categories of one run
+#' @param .con Connection.
+#' @param .spec One row of the run specification.
+#' @return Tibble: Class, nDocs, Share, MeanTop1.
+app_distribution <- function(.con, .spec) {
+  if (FALSE) {
+    .con  <- con
+    .spec <- spec_bert[1, ]
+  }
+  tab_ <- if (identical(.spec$Engine, "bert")) "bert_labels" else "keyword_labels"
+  DBI::dbGetQuery(.con, paste0(
+    "SELECT Top1Class AS Class, COUNT(*) AS nDocs, AVG(Top1Prob) AS MeanTop1 FROM ", tab_,
+    " WHERE RunKey = ? GROUP BY Top1Class ORDER BY nDocs DESC"), params = list(.spec$RunKey)) |>
+    tibble::as_tibble() |>
+    dplyr::mutate(Share = .data$nDocs / sum(.data$nDocs), .after = nDocs)
+}
+
+#' Why documents failed, and how many
+#' @param .con Connection.
+#' @return Tibble: RunKey, Reason, nDocs.
+app_failures <- function(.con) {
+  if (FALSE) .con <- con
+  DBI::dbGetQuery(.con, "SELECT RunKey, Reason, COUNT(DISTINCT DocID) AS nDocs
+                         FROM failures GROUP BY RunKey, Reason ORDER BY nDocs DESC") |>
+    tibble::as_tibble()
+}

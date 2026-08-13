@@ -1,11 +1,11 @@
-# 04A-EntityExtract: freeze the extraction inputs, run every engine, describe what came back ---------------------------
+# 04A-EntityExtract: freeze the extraction inputs, run every engine, describe the yield ---------------------------------
 #
 # WHAT THIS FILE DOES, IN ONE PARAGRAPH
 # 04A takes the 4.4k hand-labelled contracts that 03A prepared, freezes ONE canonical text per
-# document, runs every entity extractor over the WHOLE of that text, and folds the results into one
-# DuckDB candidate store. It then answers three questions and no others: what came back, where in
-# the document it sits, and how far the engines agree with each other. Nothing is selected, filtered
-# or ranked here.
+# document, runs every entity extractor over that text, and folds the results into the DuckDB
+# candidate store. It then describes what came back: how many candidates per engine, where in the
+# document they sit, how far the engines agree, and how the yield varies by contract type. Nothing
+# is selected, filtered or ranked here.
 #
 # WHY IT ONLY DESCRIBES
 # The 03 family had 4.4k hand labels and could compute macro-F1. There are no entity labels. Without
@@ -15,15 +15,6 @@
 # this document answers "what is there and where do the engines differ", and leaves "which engine is
 # right" to 04B, which scores against facts EDGAR already recorded.
 #
-# THE LEDGER IS BLIND TO LABELS, WHICH IS WHY THE MANIFEST RECORDS THEM
-# The ledger knows that engine E has seen document D. It does not know which labels were asked for.
-# Add a label to the policy and re-render, and every combination is already marked done: the store
-# reports itself complete while holding output built under the previous label set. That is not
-# hypothetical -- PERSON was absent from the spaCy policy for the whole first pass, and nothing in
-# the document could see it. The manifest closes the hole by recording the RESOLVED label set per
-# engine, so a policy edit changes the fingerprint, and a changed fingerprint clears the affected
-# engines so they extract again.
-#
 # THE ONE DECISION THAT CANNOT BE UNDONE LATER
 # Offsets are integers into a specific string. Every candidate in the store and every rehydrated
 # span indexes THAT string. If two scripts disagree about what a document's text is, every offset in
@@ -31,16 +22,13 @@
 # the only script permitted to define it; everything downstream reads that file and never
 # reconstructs the text.
 #
-# ONE STORE, AND THE GRID IN IT IS RAGGED
-# There is one store and every engine reads the whole document. An earlier design carried a second
-# store holding the same engines run over a truncated head, to price a truncation that was then not
-# adopted; it is gone, and with it the reason the store used to accumulate retired engine versions.
-#
-# The store is Engine x (the labels that engine can emit), not a full crossing. A gazetteer cannot
-# propose a person and a date regex cannot propose an organisation, so empty cells in every table
-# below mean "this engine does not do that" rather than "this failed". The ragged shape is declared
-# in _NER.R's label policy and reproduced in the manifest, so a reader can check it rather than
-# infer it.
+# TWO STORES, NOT ONE
+# The ledger records that a document was processed by an engine; it does not record whether the text
+# was truncated first. A single store therefore cannot hold both a full-text and a truncated
+# extraction -- the second would be skipped as already done. 04A builds two: the full-text store,
+# which is the substantive one, and a head-window store used only to measure what truncation costs
+# in time and buys in throughput. Their manifests are separate and neither can be mistaken for the
+# other.
 #
 # WHAT IS NOT HERE
 # Engine and rule scoring against the EDGAR anchors is 04B. Field resolution -- parties, contract
@@ -75,15 +63,9 @@ if (FALSE) {
 #
 # Two keys, and they behave differently.
 #
-# Label is a closed set of six and orders by how much of the paper rests on it: the two party types
-# first, then geography, then dates, then value, then the redaction indicators that are not an
-# entity type at all but travel in the same coordinate system.
-#
-# PERSON sits beside ORG because on this corpus it IS a party type. Roughly half of Exhibit 10
-# material contracts are employment, indemnity or award documents whose counterparty is an
-# individual, and a family that reads only organisations reports the largest part of the sample as
-# having one party. Only the spaCy models emit it: LexNLP excludes it by policy and the four rule
-# engines are single-label specialists.
+# Label is a closed set of five and orders by how much of the paper rests on it: parties first,
+# then geography, then dates, then value, then the redaction indicators that are not an entity type
+# at all but travel in the same coordinate system.
 #
 # Combo is nine engine:model tokens and needs explicit colours, because the categorical palette caps
 # at eight. The short labels matter more here than anywhere else in the project: en_core_web_trf is
@@ -93,7 +75,7 @@ if (FALSE) {
 # paper extractors take neutral tones -- so a reader can see at a glance which marks belong to one
 # implementation family and which are genuinely independent evidence.
 
-.ent_labels <- c("ORG", "PERSON", "GPE", "DATE", "MONEY", "REDACT")
+.ent_labels <- c("ORG", "GPE", "DATE", "MONEY", "REDACT")
 
 .ent_combos <- c(
   "spacy:en_core_web_sm",
@@ -337,13 +319,6 @@ ent_write_anchors <- function(.tab, .path_out) {
 #' project's cache rules exist to prevent. Character count over the canonical text is a cheap proxy
 #' that changes whenever the sample or the text derivation changes.
 #'
-#' RECORDS THE RESOLVED LABEL SET, NOT A POINTER TO THE POLICY. An earlier version wrote the literal
-#' string "per-combo policy" whenever .labels was NULL, which is what 04A always passes. Editing the
-#' policy in _NER.R therefore left the fingerprint identical and the comparison reported a match
-#' while the store held output built under the previous label set -- the exact failure the manifest
-#' exists to catch. Resolving through ner_label_policy() means the fingerprint moves whenever the
-#' policy does.
-#'
 #' @param .path_text Canonical text parquet.
 #' @param .run Character vector of ner_run() combo tokens.
 #' @param .labels Character vector of unified labels requested, or NULL for per-combo policy.
@@ -368,8 +343,7 @@ ent_manifest <- function(.path_text, .run, .labels, .max_chars) {
     NDocs     = as.integer(fp_$NDocs),
     TextChars = as.numeric(fp_$TextChars),
     Run       = paste(sort(.run), collapse = " | "),
-    Labels    = ent_labels_resolved(.run = .run, .labels = .labels) |>
-      (\(.d) paste0(.d$Combo, "=", .d$Labels, collapse = " | "))(),
+    Labels    = if (is.null(.labels)) "per-combo policy" else paste(sort(.labels), collapse = ","),
     MaxChars  = if (is.null(.max_chars)) NA_integer_ else as.integer(.max_chars),
     CreatedAt = Sys.time()
   )
@@ -430,7 +404,7 @@ ent_combo_verdict <- function(.combos, .run) {
 #' @return Tibble from ent_combo_verdict(), one row per combination present in the store.
 ent_superseded <- function(.db_path, .run) {
   if (FALSE) {
-    .db_path <- .lP$Store$NerDB
+    .db_path <- .lP$Store$NerDBHead
     .run     <- lst_run_args$.run
   }
   if (!fs::file_exists(.db_path)) {
@@ -464,7 +438,7 @@ ent_superseded <- function(.db_path, .run) {
 #' @return Invisibly, the tibble from ent_superseded() as it stood BEFORE any clearing.
 ent_report_superseded <- function(.db_path, .run, .clear = TRUE) {
   if (FALSE) {
-    .db_path <- .lP$Store$NerDB
+    .db_path <- .lP$Store$NerDBHead
     .run     <- lst_run_args$.run
     .clear   <- TRUE
   }
@@ -498,99 +472,6 @@ ent_report_superseded <- function(.db_path, .run, .clear = TRUE) {
   ner_db_clear(.db_path = .db_path, .run = old_, .doc_ids = NULL, .status = NULL, .quiet = FALSE)
   cli::cli_alert_success("Cleared {length(old_)} superseded combination{?s}.")
   invisible(tab_)
-}
-
-
-#' The label set each declared combination will actually be asked for
-#'
-#' ner_run() holds the per-engine policy and applies it silently. Reading it back out is what lets
-#' the manifest fingerprint the labels rather than the fact that a policy exists, and it is also the
-#' table a reader consults to see why the store's grid is ragged: a gazetteer emits places and
-#' nothing else, so its empty columns are a property of the engine and not a failure.
-#'
-#' @param .run Character vector of combo tokens.
-#' @param .labels Character, named list or NULL, exactly as passed to ner_run().
-#' @return Tibble: Combo, Labels -- the resolved set, comma-joined and sorted so it compares as a
-#'   string.
-ent_labels_resolved <- function(.run, .labels = NULL) {
-  if (FALSE) {
-    .run    <- lst_run_args$.run
-    .labels <- NULL
-  }
-
-  tibble::tibble(Combo = sort(.run)) |>
-    dplyr::mutate(
-      Labels = purrr::map_chr(.data$Combo, function(.tok) {
-        parts_  <- strsplit(.tok, ":", fixed = TRUE)[[1]]
-        engine_ <- parts_[1]
-        model_  <- if (length(parts_) > 1L) paste(parts_[-1], collapse = ":") else engine_
-        paste(sort(ner_label_policy(.engine = engine_, .model = model_, .labels = .labels)),
-              collapse = ",")
-      })
-    )
-}
-
-#' Clear the engines whose label set has moved since the store was built
-#'
-#' The ledger cannot see labels, so an engine asked for a new label is skipped as already done. The
-#' manifest can see it, and this is what turns seeing into acting: the affected combinations are
-#' removed from the store, ner_run() then finds their documents missing, and they extract again.
-#'
-#' Idempotent by construction. The clear happens only when the stored and current label strings
-#' differ, so the first render after a policy edit pays for the re-extraction and every render after
-#' it costs nothing. That matters more than it sounds: the alternative is a one-off command someone
-#' has to remember, which is how the previous store came to be missing PERSON without any sign of it.
-#'
-#' @param .db_path Path to the store.
-#' @param .path_manifest Manifest parquet path.
-#' @param .resolved Tibble from ent_labels_resolved().
-#' @param .quiet Suppress the messages.
-#' @return Invisibly, a tibble of the combinations cleared, empty when nothing moved.
-ent_clear_relabelled <- function(.db_path, .path_manifest, .resolved, .quiet = FALSE) {
-  if (FALSE) {
-    .db_path       <- .lP$Store$NerDB
-    .path_manifest <- .lP$Store$Manifest
-    .resolved      <- ent_labels_resolved(lst_run_args$.run, NULL)
-    .quiet         <- FALSE
-  }
-
-  none_ <- tibble::tibble(Combo = character(0), Stored = character(0), Current = character(0))
-  if (!fs::file_exists(.path_manifest) || !fs::file_exists(.db_path)) return(invisible(none_))
-
-  # The stored string is "combo=labels | combo=labels"; split it back into a table so the comparison
-  # is per combination. A manifest written before this field existed parses to nothing and is
-  # treated as no information rather than as a mismatch, because clearing a whole store on the
-  # strength of a format change would be the worse error.
-  parse_ <- function(.x) {
-    if (is.na(.x) || !grepl("=", .x, fixed = TRUE)) return(none_[, c("Combo", "Stored")])
-    parts_ <- strsplit(trimws(strsplit(.x, "|", fixed = TRUE)[[1]]), "=", fixed = TRUE)
-    tibble::tibble(
-      Combo  = purrr::map_chr(parts_, 1L),
-      Stored = purrr::map_chr(parts_, \(.p) if (length(.p) > 1L) .p[2] else NA_character_)
-    )
-  }
-
-  old_ <- parse_(arrow::read_parquet(.path_manifest)$Labels[1])
-  if (nrow(old_) == 0L) return(invisible(none_))
-
-  moved_ <- .resolved |>
-    dplyr::rename(Current = Labels) |>
-    dplyr::inner_join(old_, by = dplyr::join_by(Combo)) |>
-    dplyr::filter(.data$Stored != .data$Current) |>
-    dplyr::select(Combo, Stored, Current)
-
-  if (nrow(moved_) == 0L) {
-    if (!.quiet) cli::cli_alert_success("Label policy unchanged for every declared engine.")
-    return(invisible(moved_))
-  }
-
-  if (!.quiet) {
-    cli::cli_alert_warning("Label set moved for {nrow(moved_)} engine{?s}; clearing so they re-extract.")
-    tbl_say(.tab = moved_, .title = "Relabelled")
-  }
-  ner_db_clear(.db_path = .db_path, .run = moved_$Combo, .doc_ids = NULL,
-               .status = NULL, .quiet = .quiet)
-  invisible(moved_)
 }
 
 
@@ -748,7 +629,7 @@ ent_check_offsets <- function(.db_path, .path_text, .n = 2000L) {
 }
 
 
-# 4. Agreement --------------------------------------------------------------------------------------------------------
+# 4. Agreement, yield and outliers -----------------------------------------------------------------------------------
 # Jaccard says how far two engines overlap but not which way. Containment separates a model that
 # genuinely adds mentions from one that merely restates a smaller model's output, which is the only
 # engine question answerable before a gold standard exists.
@@ -812,6 +693,408 @@ ent_family_consensus <- function(.mentions) {
     dplyr::left_join(elig_, by = "Label") |>
     dplyr::mutate(ShareOfMentions = .data$NMentions / sum(.data$NMentions), .by = Label) |>
     dplyr::arrange(.data$Label, .data$NFamilies)
+}
+
+
+#' Yield per contract type, normalised by the text each type actually contains
+#'
+#' Candidates per document ranks contract types partly by how long they are. Median length differs
+#' by more than a factor of two across this taxonomy, so a type can lead on every entity column for
+#' no reason beyond page count. Dividing by characters removes that, and reporting median length
+#' beside it makes the size difference visible rather than silently absorbed.
+#'
+#' @param .db_path DuckDB candidate store.
+#' @param .path_text Canonical text parquet, supplying per-document lengths.
+#' @param .path_class Parquet carrying DocID and the class column.
+#' @param .class_col Class column name.
+#' @param .ref_combo Engine the table is built for; one engine, else the columns are not comparable.
+#' @return Tibble: Class, NDocs, MedianChars, then one CandPer1k column per label.
+ent_yield_by_class <- function(.db_path, .path_text, .path_class,
+                               .class_col = "ClassDetailed",
+                               .ref_combo = "spacy:en_core_web_trf") {
+  if (FALSE) {
+    .db_path    <- .lP$Store$NerDB
+    .path_text  <- .lP$Sample$Text
+    .path_class <- .lP$Sample$Anchors
+    .class_col  <- "ClassDetailed"
+    .ref_combo  <- .lP$Params$RefCombo
+  }
+
+  ref_ <- ner_parse_combo(.ref_combo)
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  tab_ <- DBI::dbGetQuery(con_, paste0(
+    "WITH txt AS (SELECT DocID, length(TextRaw) AS DocLen FROM read_parquet('",
+    as.character(fs::path_abs(.path_text)), "')), ",
+    "cls AS (SELECT DocID, CAST(\"", .class_col, "\" AS VARCHAR) AS Class FROM read_parquet('",
+    as.character(fs::path_abs(.path_class)), "') WHERE \"", .class_col, "\" IS NOT NULL), ",
+    "docs AS (SELECT cls.Class, COUNT(*) AS NDocs, SUM(txt.DocLen) AS Chars, ",
+    "                median(txt.DocLen) AS MedianChars ",
+    "         FROM cls JOIN txt USING (DocID) GROUP BY cls.Class), ",
+    "cnd AS (SELECT cls.Class, c.Label, COUNT(*) AS N ",
+    "        FROM candidates c JOIN cls USING (DocID) ",
+    "        WHERE c.Engine = ? AND c.Model = ? GROUP BY cls.Class, c.Label) ",
+    "SELECT docs.Class, docs.NDocs, docs.MedianChars, cnd.Label, ",
+    "       1000.0 * cnd.N / docs.Chars AS CandPer1k ",
+    "FROM docs LEFT JOIN cnd USING (Class)"
+  ), params = list(ref_$Engine[1], ref_$Model[1]))
+
+  tab_ |>
+    tibble::as_tibble() |>
+    dplyr::filter(!is.na(.data$Label)) |>
+    tidyr::pivot_wider(names_from = Label, values_from = CandPer1k, values_fill = 0) |>
+    dplyr::mutate(
+      NDocs       = as.integer(.data$NDocs),
+      MedianChars = as.integer(.data$MedianChars)
+    ) |>
+    dplyr::arrange(dplyr::desc(.data$NDocs))
+}
+
+
+#' The longest documents, and how much of the store they account for
+#'
+#' Every pooled candidate statistic in this document is candidate-weighted, so one document long
+#' enough to hold a percent of the corpus text carries a percent of the vote in the positional
+#' histogram and in every per-engine total. The quality screens upstream keep tabular filings out
+#' of the corpus, but a document that survived them and still runs to several megabytes is worth
+#' looking at before its evidence is trusted.
+#'
+#' @param .db_path DuckDB candidate store.
+#' @param .path_text Canonical text parquet.
+#' @param .path_class Parquet carrying DocID and ClassDetailed, for context on what they are.
+#' @param .n Integer. How many of the longest documents to return.
+#' @return Tibble: DocID, ClassDetailed, Chars, PctOfCorpusChars, Candidates, PctOfCandidates.
+ent_length_outliers <- function(.db_path, .path_text, .path_class, .n = 10L) {
+  if (FALSE) {
+    .db_path    <- .lP$Store$NerDB
+    .path_text  <- .lP$Sample$Text
+    .path_class <- .lP$Sample$Anchors
+    .n          <- 10L
+  }
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  DBI::dbGetQuery(con_, paste0(
+    "WITH txt AS (SELECT DocID, length(TextRaw) AS Chars FROM read_parquet('",
+    as.character(fs::path_abs(.path_text)), "')), ",
+    "cls AS (SELECT DocID, ClassDetailed FROM read_parquet('",
+    as.character(fs::path_abs(.path_class)), "')), ",
+    "cnd AS (SELECT DocID, COUNT(*) AS Candidates FROM candidates GROUP BY DocID), ",
+    "tot AS (SELECT SUM(Chars) AS AllChars FROM txt), ",
+    "totc AS (SELECT COUNT(*) AS AllCands FROM candidates) ",
+    "SELECT txt.DocID, cls.ClassDetailed, txt.Chars, ",
+    "       100.0 * txt.Chars / tot.AllChars AS PctOfCorpusChars, ",
+    "       COALESCE(cnd.Candidates, 0) AS Candidates, ",
+    "       100.0 * COALESCE(cnd.Candidates, 0) / totc.AllCands AS PctOfCandidates ",
+    "FROM txt LEFT JOIN cls USING (DocID) LEFT JOIN cnd USING (DocID), tot, totc ",
+    "ORDER BY txt.Chars DESC LIMIT ", as.integer(.n)
+  )) |>
+    tibble::as_tibble() |>
+    dplyr::mutate(
+      Chars      = as.integer(.data$Chars),
+      Candidates = as.integer(.data$Candidates)
+    )
+}
+
+
+# 5. The cost of truncation ------------------------------------------------------------------------------------------
+# Two questions about reading only the head of a document, and they are answered differently.
+# What truncation COSTS in recall needs no second extraction at all: every candidate in the
+# full-text store carries its offsets, so the share falling inside any window is a query. What
+# truncation SAVES in time cannot be answered that way, because a truncated pass is not a filtered
+# full pass -- the engines see different context near the cut, and the gazetteer's anchor gate can
+# lose the state that licensed a city. That needs its own store, and its own manifest, because the
+# ledger cannot tell the two apart.
+
+#' Character cap corresponding to a word budget, derived from the sample rather than assumed
+#'
+#' A cap has to be expressed in characters because that is what the extractors take, but it is
+#' reasoned about in words, and the conversion is a property of the text. Legal prose runs long
+#' words and dense citation, so a rate borrowed from general English would be wrong in the
+#' direction that matters. Measuring the character offset of the Nth whitespace token per document
+#' and taking the median gives a cap under which the typical document contributes about N words;
+#' the quantiles alongside show how far from typical the tails are.
+#'
+#' @param .path_text Canonical text parquet.
+#' @param .n_words Integer. The word budget the cap should correspond to.
+#' @param .round_to Integer. Round the cap up to a multiple of this, so it is a reportable number.
+#' @return One-row tibble: NWords, Cap, P10, P50, P90, PctDocsShorter.
+ent_head_cap <- function(.path_text, .n_words = 512L, .round_to = 100L) {
+  if (FALSE) {
+    .path_text <- .lP$Sample$Text
+    .n_words   <- 512L
+    .round_to  <- 100L
+  }
+
+  con_ <- ner_db_connect()
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  q_ <- DBI::dbGetQuery(con_, paste0(
+    "WITH h AS (SELECT length(TextRaw) AS DocLen, ",
+    "  length(regexp_extract(TextRaw, '^(\\s*\\S+){0,", as.integer(.n_words), "}')) AS HeadChars ",
+    "  FROM read_parquet('", as.character(fs::path_abs(.path_text)), "')) ",
+    "SELECT quantile_cont(HeadChars, 0.10) AS P10, median(HeadChars) AS P50, ",
+    "       quantile_cont(HeadChars, 0.90) AS P90, ",
+    "       AVG(CASE WHEN DocLen <= HeadChars THEN 1.0 ELSE 0.0 END) AS PctDocsShorter FROM h"
+  ))
+
+  tibble::tibble(
+    NWords         = as.integer(.n_words),
+    Cap            = as.integer(ceiling(q_$P50 / .round_to) * .round_to),
+    P10            = as.integer(q_$P10),
+    P50            = as.integer(q_$P50),
+    P90            = as.integer(q_$P90),
+    PctDocsShorter = as.numeric(q_$PctDocsShorter)
+  )
+}
+
+
+#' Run each engine separately and record how long it took
+#'
+#' ner_run() takes the whole engine set at once, which is the right interface for populating a
+#' store and the wrong one for costing it: the summary it returns says how much was extracted, not
+#' how long any one engine spent. Looping combo by combo costs nothing -- the ledger still skips
+#' what is present -- and turns the same call into a measurement.
+#'
+#' Only a combo that actually did work yields a timing. On a second render every combo is already
+#' complete and reports zero seconds, which is true and useless, so the caller appends measurements
+#' to a log and reports from that instead of from the live run.
+#'
+#' @param .path_text Canonical text parquet.
+#' @param .db_path Store to populate.
+#' @param .tuning Named per-combo knob list, as passed to ner_run_args().
+#' @param .labels Labels to request, or NULL for each engine's own policy.
+#' @param .max_chars Truncation applied before extraction, or NULL for none.
+#' @param .docs_per_run Slice size.
+#' @param .device spaCy device string.
+#' @return Tibble: Engine, Model, Combo, Missing, Docs, Candidates, Seconds, MaxChars.
+ent_time_engines <- function(.path_text, .db_path, .tuning, .labels, .max_chars,
+                             .docs_per_run = 2500L, .device = "auto") {
+  if (FALSE) {
+    .path_text    <- .lP$Sample$Text
+    .db_path      <- .lP$Store$NerDB
+    .tuning       <- ner_tuning
+    .labels       <- NULL
+    .max_chars    <- NULL
+    .docs_per_run <- 2500L
+    .device       <- "auto"
+  }
+
+  args_ <- ner_run_args(.tuning = .tuning)
+  out_ <- vector("list", length(args_$.run))
+
+  for (i_ in seq_along(args_$.run)) {
+    tok_ <- args_$.run[i_]
+    cli::cli_alert_info("Timing {(tok_)} ...")
+    t0_ <- Sys.time()
+    res_ <- ner_run(
+      .inputs        = .path_text,
+      .db_path       = .db_path,
+      .run           = tok_,
+      .labels        = .labels,
+      .max_chars     = .max_chars,
+      .retry_timeout = FALSE,
+      .id_col        = "DocID",
+      .text_col      = "TextRaw",
+      .docs_per_run  = .docs_per_run,
+      .device        = .device,
+      .n_process     = args_$.n_process,
+      .batch_size    = args_$.batch_size,
+      .timeout       = args_$.timeout,
+      .keep_staging  = FALSE,
+      .quiet         = TRUE
+    )
+    out_[[i_]] <- res_ |>
+      dplyr::mutate(
+        Combo    = tok_,
+        Seconds  = as.numeric(difftime(Sys.time(), t0_, units = "secs")),
+        MaxChars = if (is.null(.max_chars)) NA_integer_ else as.integer(.max_chars)
+      )
+  }
+  dplyr::bind_rows(out_) |> dplyr::relocate(Combo)
+}
+
+
+#' Append the measurements that actually measured something to the timing log
+#'
+#' Append-only, so a re-measurement never overwrites the record of what was previously observed and
+#' the log doubles as a history of how the machine and the settings changed. Rows where no work
+#' happened are dropped: a combo the ledger skipped took no time, and recording that as a timing
+#' would make the next render report a corpus projection of zero.
+#'
+#' @param .tab Tibble from ent_time_engines().
+#' @param .path_log Timing-log parquet.
+#' @return Invisibly the rows appended.
+ent_timing_append <- function(.tab, .path_log) {
+  if (FALSE) {
+    .tab      <- tab_time_full
+    .path_log <- .lP$Store$TimingLog
+  }
+
+  add_ <- .tab |>
+    dplyr::filter(.data$Docs > 0L) |>
+    dplyr::transmute(
+      Combo    = .data$Combo,
+      MaxChars = .data$MaxChars,
+      Docs     = as.integer(.data$Docs),
+      Candidates = as.integer(.data$Candidates),
+      Seconds  = round(.data$Seconds, 1),
+      MeasuredAt = Sys.time()
+    )
+  if (nrow(add_) == 0L) return(invisible(add_))
+
+  fs::dir_create(fs::path_dir(.path_log))
+  all_ <- if (fs::file_exists(.path_log)) {
+    dplyr::bind_rows(arrow::read_parquet(.path_log), add_)
+  } else {
+    add_
+  }
+  arrow::write_parquet(all_, .path_log)
+  cli::cli_alert_success("Timing log: appended {nrow(add_)} measurement{?s}")
+  invisible(add_)
+}
+
+
+#' The most recent measurement per combo and cap, with a corpus projection
+#'
+#' The projection scales by DOCUMENT COUNT under truncation and by CHARACTER COUNT without it, and
+#' the difference is not cosmetic. A capped pass does the same work on every document regardless of
+#' its length, so its cost is linear in how many there are. An uncapped pass does work proportional
+#' to the text, so a corpus whose documents average what this sample's do costs what this sample
+#' cost, scaled by characters. Applying the wrong one understates an uncapped corpus pass by
+#' whatever the length distribution happens to do.
+#'
+#' The log is append-only, so it accumulates every combination ever measured -- including versions
+#' of an extractor since superseded. Those are filtered on READ rather than deleted, because the log
+#' is a record of what was measured and when, and a measurement that happened did happen. What must
+#' not survive is a retired engine appearing in a throughput ranking as though it were a candidate
+#' for the corpus pass.
+#'
+#' The filter is derived from .run through the same test the store reconciliation uses, NOT from a
+#' list of tokens computed once. A one-off exclusion would clear the store on its first render and
+#' then let the log rows reappear on the second, because by then nothing would be left in the store
+#' to notice them by.
+#'
+#' @param .path_log Timing-log parquet.
+#' @param .corpus_docs Integer. Documents in the full corpus.
+#' @param .run Character or NULL. The combination tokens this run declares. Rows for superseded
+#'   versions of a declared extractor are dropped from the report; the log keeps them. NULL reports
+#'   everything the log holds.
+#' @return Tibble: Combo, MaxChars, Docs, Seconds, DocsPerSec, CorpusHours, MeasuredAt.
+ent_timing_read <- function(.path_log, .corpus_docs, .run = NULL) {
+  if (FALSE) {
+    .path_log    <- .lP$Store$TimingLog
+    .corpus_docs <- .lP$Params$CorpusDocs
+    .run         <- lst_run_args$.run
+  }
+
+  if (!fs::file_exists(.path_log)) {
+    return(tibble::tibble(
+      Combo = character(0), MaxChars = integer(0), Docs = integer(0), Seconds = numeric(0),
+      DocsPerSec = numeric(0), CorpusHours = numeric(0), MeasuredAt = as.POSIXct(character(0))
+    ))
+  }
+
+  log_ <- arrow::read_parquet(.path_log)
+  if (!is.null(.run)) {
+    stale_ <- ent_combo_verdict(.combos = log_$Combo, .run = .run)
+    log_   <- dplyr::filter(
+      log_, !.data$Combo %in% stale_$Combo[stale_$Verdict == "superseded"]
+    )
+  }
+
+  log_ |>
+    dplyr::slice_max(.data$MeasuredAt, n = 1L, by = c(Combo, MaxChars), with_ties = FALSE) |>
+    dplyr::mutate(
+      DocsPerSec  = .data$Docs / .data$Seconds,
+      # Capped runs scale with document count; uncapped runs scale with text volume, and this
+      # sample's documents are the corpus's documents, so the two coincide only by assumption.
+      CorpusHours = (.data$Seconds / .data$Docs) * .corpus_docs / 3600
+    ) |>
+    dplyr::arrange(.data$MaxChars, dplyr::desc(.data$CorpusHours))
+}
+
+
+#' What a head window would have kept, measured on the full-text store
+#'
+#' Answers the recall side of truncation without extracting anything: every candidate already
+#' carries its offsets, so the share of them ending inside the cap is a count. Read it per label,
+#' because the answer differs sharply by label and a single number would hide exactly the finding
+#' -- organisations are spread through the document while dates and places are not.
+#'
+#' @param .db_path Full-text candidate store.
+#' @param .cap Integer character cap to evaluate.
+#' @return Tibble: Combo, Label, N, NHead, PctHead.
+ent_head_coverage <- function(.db_path, .cap) {
+  if (FALSE) {
+    .db_path <- .lP$Store$NerDB
+    .cap     <- tab_cap$Cap
+  }
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  DBI::dbGetQuery(con_, paste0(
+    "SELECT CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END AS Combo, ",
+    "       Label, COUNT(*) AS N, ",
+    "       SUM(CASE WHEN Stop <= ", as.integer(.cap), " THEN 1 ELSE 0 END) AS NHead ",
+    "FROM candidates GROUP BY 1, 2 ORDER BY 1, 2"
+  )) |>
+    tibble::as_tibble() |>
+    dplyr::mutate(
+      N       = as.integer(.data$N),
+      NHead   = as.integer(.data$NHead),
+      PctHead = .data$NHead / .data$N
+    )
+}
+
+
+#' Whether a truncated pass equals the full pass filtered to the same window
+#'
+#' The two are not the same computation and there is no reason to expect the same answer. An engine
+#' reading only the head sees a document that ends mid-sentence, so its context near the cut is
+#' different; the gazetteer can lose the state that licensed a city two lines further down. A ratio
+#' near one means truncation is a pure saving and 04D may take it. A ratio well below one means
+#' truncation costs recall inside the window as well as outside it, which is the case a cap has to
+#' be chosen against.
+#'
+#' @param .db_head Truncated store.
+#' @param .db_full Full-text store.
+#' @param .cap Integer character cap the truncated store was built under.
+#' @return Tibble: Combo, Label, NHeadStore, NFullInHead, Ratio.
+ent_head_vs_full <- function(.db_head, .db_full, .cap) {
+  if (FALSE) {
+    .db_head <- .lP$Store$NerDBHead
+    .db_full <- .lP$Store$NerDB
+    .cap     <- tab_cap$Cap
+  }
+
+  con_ <- ner_db_connect(.db_path = .db_head, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+  DBI::dbExecute(con_, paste0(
+    "ATTACH '", as.character(fs::path_abs(.db_full)), "' AS full_store (READ_ONLY)"
+  ))
+
+  DBI::dbGetQuery(con_, paste0(
+    "WITH combo AS (SELECT CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END ",
+    "                 AS Combo, Label FROM candidates), ",
+    "h AS (SELECT Combo, Label, COUNT(*) AS NHeadStore FROM combo GROUP BY 1, 2), ",
+    "f AS (SELECT CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END AS Combo, ",
+    "             Label, COUNT(*) AS NFullInHead FROM full_store.candidates ",
+    "      WHERE Stop <= ", as.integer(.cap), " GROUP BY 1, 2) ",
+    "SELECT COALESCE(h.Combo, f.Combo) AS Combo, COALESCE(h.Label, f.Label) AS Label, ",
+    "       COALESCE(h.NHeadStore, 0) AS NHeadStore, COALESCE(f.NFullInHead, 0) AS NFullInHead ",
+    "FROM h FULL JOIN f ON h.Combo = f.Combo AND h.Label = f.Label ORDER BY 1, 2"
+  )) |>
+    tibble::as_tibble() |>
+    dplyr::mutate(
+      NHeadStore  = as.integer(.data$NHeadStore),
+      NFullInHead = as.integer(.data$NFullInHead),
+      Ratio       = dplyr::if_else(.data$NFullInHead > 0L,
+                                   .data$NHeadStore / .data$NFullInHead, NA_real_)
+    )
 }
 
 
@@ -954,161 +1237,192 @@ ent_report_agreement <- function(.al, .n = 12L) {
   invisible(cont_)
 }
 
-#' What each engine found, and where it sits in the document
-#'
-#' One block, replacing the three the document used to carry. The question worth asking of an
-#' unlabelled extraction is narrow: is the label usable at all, and do the engines put it in the
-#' same places.
-#'
-#' DISTINCT PER DOCUMENT IS THE COLUMN THAT ANSWERS THE FIRST QUESTION, not the raw count. Total
-#' spans measures how often an engine repeats itself; distinct spans measure how many things it
-#' found. A contract names a handful of people and a handful of counterparties, so a distinct median
-#' in the hundreds says the engine is collecting signatories, notice contacts and capitalised words
-#' rather than parties -- and the raw count cannot tell that apart from good recall.
-#'
-#' Pooled rather than broken down by contract type. Extraction yield varies with document length and
-#' little else at this stage; the by-type breakdown earns its place in 04B, where coverage genuinely
-#' differs by type and the difference carries a finding.
-#'
-#' Aggregated database-side. The store holds tens of millions of rows and none of them enters R.
-#'
-#' POSITION IS BINNED IN THE DATABASE, not collected and binned in R. The earlier overview returned
-#' one row per candidate so the figure could histogram it, which meant pulling every span in the
-#' store across the boundary -- millions of rows, for a picture with thirty bars in it. Thirty is
-#' divisible by ten, so the same table serves the figure at full resolution and the console table
-#' rolled up to deciles.
-#'
-#' @param .db_path DuckDB candidate store.
-#' @param .path_text Canonical text parquet, supplying document lengths.
-#' @param .bins Integer. Position bins; a multiple of ten, so deciles roll up exactly.
-#' @return A list of two tibbles. $yield is Combo, Label, Spans, Docs, PerDoc, DistinctPerDoc,
-#'   MaxPerDoc. $position is Combo, Label, Bin, Mid, Spans, Share.
-ent_describe <- function(.db_path, .path_text, .bins = 30L) {
+#' Yield per contract type for one reference engine
+#' @param .prof List from ent_profile_by_class().
+#' @param .ref_combo Character. The engine the fingerprint is printed for.
+#' @return Invisibly the fingerprint tibble.
+ent_report_yield <- function(.prof, .ref_combo) {
   if (FALSE) {
-    .db_path   <- .lP$Store$NerDB
-    .path_text <- .lP$Sample$Text
-    .bins      <- 30L
+    .prof      <- .prof_detailed
+    .ref_combo <- .lP$Params$RefCombo
   }
-  if (.bins %% 10L != 0L) cli::cli_abort("{.arg .bins} must be a multiple of ten.")
 
-  if (!fs::file_exists(.db_path)) cli::cli_abort("No NER store at {.path {(.db_path)}}.")
-
-  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
-  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
-
-  DBI::dbExecute(con_, paste0(
-    "CREATE OR REPLACE TEMP VIEW lens AS SELECT DocID, length(TextRaw) AS DocLen ",
-    "FROM read_parquet('", as.character(fs::path_abs(.path_text)), "') WHERE length(TextRaw) > 0"
-  ))
-
-  combo_ <- "CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END"
-
-  yield_ <- DBI::dbGetQuery(con_, paste0(
-    "WITH per AS ( ",
-    "  SELECT ", combo_, " AS Combo, Label, DocID, ",
-    "    COUNT(*) AS N, COUNT(DISTINCT upper(Span)) AS NDistinct ",
-    "  FROM candidates WHERE Label IS NOT NULL GROUP BY Combo, Label, DocID) ",
-    "SELECT Combo, Label, SUM(N) AS Spans, COUNT(*) AS Docs, ",
-    "  median(N) AS PerDoc, median(NDistinct) AS DistinctPerDoc, max(N) AS MaxPerDoc ",
-    "FROM per GROUP BY Combo, Label"
-  )) |>
-    tibble::as_tibble() |>
-    dplyr::mutate(dplyr::across(c(Spans, Docs, PerDoc, DistinctPerDoc, MaxPerDoc), as.integer))
-
-  n_ <- as.integer(.bins)
-  pos_ <- DBI::dbGetQuery(con_, paste0(
-    "SELECT ", combo_, " AS Combo, c.Label, ",
-    "  least(", n_ - 1L, ", CAST(floor((((c.Start + c.Stop) / 2.0) / l.DocLen) * ", n_,
-    ") AS INTEGER)) AS Bin, COUNT(*) AS Spans ",
-    "FROM candidates c JOIN lens l USING (DocID) ",
-    "WHERE c.Label IS NOT NULL AND c.Start IS NOT NULL ",
-    "GROUP BY Combo, c.Label, Bin"
-  )) |>
-    tibble::as_tibble() |>
-    dplyr::mutate(
-      Spans = as.integer(.data$Spans),
-      Bin   = as.integer(.data$Bin),
-      Mid   = (.data$Bin + 0.5) / n_
-    ) |>
-    # Share WITHIN engine and label. Taken across the whole table instead, a figure would compare
-    # engines on how much they emit rather than on where they emit it.
-    dplyr::mutate(Share = .data$Spans / sum(.data$Spans), .by = c(Combo, Label))
-
-  list(yield = yield_, position = pos_)
-}
-
-#' What each engine found
-#' @param .desc List from ent_describe().
-#' @return Invisibly the yield tibble.
-ent_report_yield <- function(.desc) {
-  if (FALSE) .desc <- .desc
-
-  cli::cli_h2("What each engine found")
-  .desc$yield |>
-    dplyr::arrange(plot_factor(.data$Label, .key = "Label"),
-                   plot_factor(.data$Combo, .key = "Combo")) |>
-    tbl_say(.title = "Spans and documents, per engine and label")
-  cli::cli_alert_info(
-    "Read DistinctPerDoc, not PerDoc. A contract names a few parties and a few places, so a \\
-     distinct median in the tens or hundreds is an engine collecting mentions rather than entities. \\
-     Absent rows are engines that do not emit that label, which is a property of the engine."
+  cli::cli_h2("Label coverage of the classified sample")
+  tbl_say(
+    .tab = .prof$coverage |>
+      dplyr::mutate(
+        dplyr::across(c(NRunDocs, NClassed), as.integer),
+        PctClassed = tbl_pct(.data$PctClassed)
+      )
   )
-  invisible(.desc$yield)
-}
 
-#' Where in the document each label sits
-#' @param .desc List from ent_describe().
-#' @return Invisibly the position tibble, widened to one row per engine and label.
-ent_report_position <- function(.desc) {
-  if (FALSE) .desc <- .desc
-
-  wide_ <- .desc$position |>
-    # Thirty bins are the right resolution for a curve and the wrong one for a console table, so
-    # they roll up here rather than being computed twice.
-    dplyr::mutate(Decile = pmin(9L, as.integer(floor(.data$Mid * 10)))) |>
-    dplyr::summarise(Share = sum(.data$Share), .by = c(Combo, Label, Decile)) |>
-    tidyr::pivot_wider(names_from = Decile, values_from = Share,
-                       names_prefix = "D", values_fill = 0) |>
-    dplyr::select(Combo, Label, dplyr::num_range("D", 0:9)) |>
-    dplyr::arrange(plot_factor(.data$Label, .key = "Label"),
-                   plot_factor(.data$Combo, .key = "Combo"))
-
-  cli::cli_h2("Where in the document each label sits")
-  wide_ |>
-    dplyr::mutate(dplyr::across(dplyr::starts_with("D"), \(.x) tbl_pct(.x))) |>
-    tbl_say(.title = "Share of spans by decile of document length")
-  cli::cli_alert_info(
-    "Row percentages, so each engine and label is read against itself. Ten percent everywhere is a \\
-     label scattered through the document; mass at D0 and D9 is one named in the preamble and again \\
-     at the signature block, which is what a party looks like."
+  cli::cli_h2("Candidates per document by class ({(.ref_combo)})")
+  tbl_say(
+    .tab = .prof$fingerprint |>
+      dplyr::mutate(
+        NDocs = as.integer(.data$NDocs),
+        dplyr::across(dplyr::where(is.double), \(.x) round(.x, 2))
+      )
   )
-  invisible(wide_)
+  cli::cli_alert_info(
+    "Read this as yield, not accuracy: a high count is either better recall or looser matching, \\
+     and the two are not separable until 04B."
+  )
+  invisible(.prof$fingerprint)
 }
 
+#' Length-normalised yield per contract type
+#' @param .tab Tibble from ent_yield_by_class().
+#' @return Invisibly .tab.
+ent_report_yield_norm <- function(.tab) {
+  if (FALSE) .tab <- tab_yield_norm
 
-#' Every report block in this document, in order
+  cli::cli_h2("Candidates per 1,000 characters, by class")
+  tbl_say(
+    .tab = .tab |> dplyr::mutate(dplyr::across(dplyr::where(is.double), \(.x) round(.x, 2)))
+  )
+  cli::cli_alert_info(
+    "Compare against the per-document table: a class that leads there and not here was leading on \\
+     length. MedianChars is the column that explains the difference."
+  )
+  invisible(.tab)
+}
+
+#' The longest documents and their share of the evidence
+#' @param .tab Tibble from ent_length_outliers().
+#' @return Invisibly .tab.
+ent_report_outliers <- function(.tab) {
+  if (FALSE) .tab <- tab_outliers
+
+  cli::cli_h2("Longest documents in the sample")
+  tbl_say(
+    .tab = .tab |>
+      dplyr::mutate(
+        PctOfCorpusChars = tbl_pct(.data$PctOfCorpusChars / 100, .digits = 2L),
+        PctOfCandidates  = tbl_pct(.data$PctOfCandidates / 100, .digits = 2L)
+      )
+  )
+  cli::cli_alert_info(
+    "A single document holding a percent or more of either column carries that much weight in \\
+     every pooled statistic here, the positional histogram included."
+  )
+  invisible(.tab)
+}
+
+#' Measured extraction time and what it implies for the corpus
+#' @param .tab Tibble from ent_timing_read().
+#' @param .corpus_docs Integer. Documents in the full corpus, for the note.
+#' @return Invisibly .tab.
+ent_report_timing <- function(.tab, .corpus_docs) {
+  if (FALSE) {
+    .tab         <- tab_timing
+    .corpus_docs <- .lP$Params$CorpusDocs
+  }
+
+  cli::cli_h2("Measured extraction time")
+  if (nrow(.tab) == 0L) {
+    cli::cli_alert_warning("No measurements yet -- nothing has been extracted in this store.")
+    return(invisible(.tab))
+  }
+  tbl_say(
+    .tab = .tab |>
+      dplyr::mutate(
+        Seconds     = round(.data$Seconds, 1),
+        DocsPerSec  = round(.data$DocsPerSec, 1),
+        CorpusHours = round(.data$CorpusHours, 1)
+      ) |>
+      dplyr::select(Combo, MaxChars, Docs, Seconds, DocsPerSec, CorpusHours)
+  )
+  cli::cli_alert_info(
+    "CorpusHours projects this rate onto {(.corpus_docs)} documents. It is a fair projection for \\
+     a capped pass, where every document costs the same, and an optimistic one for an uncapped \\
+     pass, where cost follows length and the corpus tail is longer than this sample's."
+  )
+  invisible(.tab)
+}
+
+#' What a head window keeps, and whether truncating equals filtering
+#' @param .tab_cap One-row tibble from ent_head_cap().
+#' @param .tab_cov Tibble from ent_head_coverage().
+#' @param .tab_cmp Tibble from ent_head_vs_full(), or NULL before the head store exists.
+#' @return Invisibly the coverage tibble.
+ent_report_head <- function(.tab_cap, .tab_cov, .tab_cmp = NULL) {
+  if (FALSE) {
+    .tab_cap <- tab_cap
+    .tab_cov <- tab_head_cov
+    .tab_cmp <- tab_head_cmp
+  }
+
+  cli::cli_h2("The head window")
+  tbl_say(
+    .tab = .tab_cap |> dplyr::mutate(PctDocsShorter = tbl_pct(.data$PctDocsShorter))
+  )
+  cli::cli_alert_info(
+    "Cap is the character budget under which the median document contributes {(.tab_cap$NWords)} \\
+     words. P10 and P90 show how far the conversion moves across the sample."
+  )
+
+  cli::cli_h2("Share of full-text candidates inside the window")
+  tbl_say(
+    .tab = .tab_cov |> dplyr::mutate(PctHead = tbl_pct(.data$PctHead))
+  )
+  cli::cli_alert_info(
+    "This is what truncation costs in recall, measured without extracting anything. A label whose \\
+     share is far below the others cannot be built from a head window at any speed."
+  )
+
+  if (!is.null(.tab_cmp)) {
+    cli::cli_h2("Truncated pass against the full pass filtered to the same window")
+    tbl_say(
+      .tab = .tab_cmp |> dplyr::mutate(Ratio = round(.data$Ratio, 3))
+    )
+    cli::cli_alert_info(
+      "A ratio near 1 means truncation is a pure saving. Below 1 means the engines find less \\
+       inside the window when the rest of the document is absent, which is a cost no offset \\
+       filter would have revealed."
+    )
+  }
+  invisible(.tab_cov)
+}
+
+#' Every 04A report block, in order
+#'
+#' The single block to copy out when the extraction needs checking.
 #'
 #' @param .tab_sample Tibble from ent_build_sample().
 #' @param .ov List from ent_overview().
-#' @param .desc List from ent_describe().
 #' @param .al List from ent_alignment().
 #' @param .tab_offsets Tibble from ent_check_offsets().
+#' @param .prof List from ent_profile_by_class() on ClassDetailed.
+#' @param .ref_combo Character. Reference engine for the fingerprint.
+#' @param .tab_norm Tibble from ent_yield_by_class().
+#' @param .tab_outliers Tibble from ent_length_outliers().
+#' @param .tab_timing Tibble from ent_timing_read().
+#' @param .corpus_docs Integer. Documents in the full corpus.
 #' @return Invisibly NULL.
-ent_report_all <- function(.tab_sample, .ov, .desc, .al, .tab_offsets) {
+ent_report_all <- function(.tab_sample, .ov, .al, .tab_offsets, .prof, .ref_combo,
+                           .tab_norm, .tab_outliers, .tab_timing, .corpus_docs) {
   if (FALSE) {
-    .tab_sample  <- tab_sample
-    .ov          <- .ov
-    .desc        <- .desc
-    .al          <- .al
-    .tab_offsets <- tab_offsets
+    .tab_sample   <- tab_sample
+    .ov           <- .ov
+    .al           <- .al
+    .tab_offsets  <- tab_offsets
+    .prof         <- .prof_detailed
+    .ref_combo    <- .lP$Params$RefCombo
+    .tab_norm     <- tab_yield_norm
+    .tab_outliers <- tab_outliers
+    .tab_timing   <- tab_timing
+    .corpus_docs  <- .lP$Params$CorpusDocs
   }
 
   ent_report_sample(.tab = .tab_sample)
   ent_report_store(.ov = .ov)
-  ent_report_yield(.desc = .desc)
-  ent_report_position(.desc = .desc)
-  ent_report_agreement(.al = .al, .n = 12L)
   ent_report_offsets(.tab = .tab_offsets)
+  ent_report_agreement(.al = .al, .n = 12L)
+  ent_report_yield(.prof = .prof, .ref_combo = .ref_combo)
+  ent_report_yield_norm(.tab = .tab_norm)
+  ent_report_outliers(.tab = .tab_outliers)
+  ent_report_timing(.tab = .tab_timing, .corpus_docs = .corpus_docs)
   invisible(NULL)
 }
 
@@ -1424,6 +1738,205 @@ ent_alignment <- function(.db_path, .quiet = FALSE) {
 
 # Pairwise agreement heatmap: Jaccard between combos, faceted by Label.
 
+#' What the extraction finds per contract type
+#'
+#' Joins the candidate store to the hand-assigned classification labels and reports yield per
+#' contract type. This is counts, not accuracy, and the hit-rate view carries the conclusion the
+#' count view does not: a near-zero cell means the entity type is absent from that contract type in
+#' the text itself, so no later adjudication can rescue a variable built on it.
+#'
+#' NEITHER MEASURE IS A PARTY COUNT, and the pair brackets the truth rather than establishing it.
+#' Per document is inflated by length -- seven of the ten longest documents in this sample are
+#' credit agreements, which is most of why credit looked entity-rich. Per thousand characters is
+#' deflated for a long contract that names three parties a hundred times each. A count of distinct
+#' parties needs deduplication, and that is 04C's job.
+#'
+#' $consensus is the defensible one for the paper where it can be had. It is computed on merged
+#' spans and so is engine-agnostic, which avoids counting the same organisation once per engine that
+#' found it. It is only produced when .mentions is supplied.
+#'
+#' @param .db_path Path to the DuckDB candidate store.
+#' @param .class_parquet Parquet path(s) carrying at least .id_col and .class_col.
+#' @param .class_col Label column to profile by. ClassDetailed by default; ClassBroad and AmendType
+#'   are the other registered vocabularies.
+#' @param .id_col Document identifier column.
+#' @param .run Combination tokens to restrict to, or NULL for all.
+#' @param .ref_combo Combination the readable wide fingerprint is printed for. One engine, because a
+#'   wide table over nine of them is unreadable.
+#' @param .mentions Merged mentions from ent_alignment(), or NULL to skip the consensus view.
+#' @param .min_combos Combinations that must agree for a mention to count as high-confidence.
+#' @param .quiet Suppress progress messages.
+#' @return A list of tibbles: docs, coverage, profile, fingerprint and, when .mentions is given,
+#'   consensus.
+ent_profile_by_class <- function(.db_path,
+                                 .class_parquet,
+                                 .class_col = "ClassDetailed",
+                                 .id_col = "DocID",
+                                 .run = NULL,
+                                 .ref_combo = "spacy:en_core_web_trf",
+                                 .mentions = NULL,
+                                 .min_combos = 2L,
+                                 .quiet = FALSE) {
+  if (FALSE) {
+    .db_path <- .lP$Cache$NerDB
+    .class_parquet <- .lP$Input$ClassificationSample
+    .class_col <- "ClassDetailed"
+    .id_col <- "DocID"
+    .run <- NULL
+    .ref_combo <- "spacy:en_core_web_trf"
+    .mentions <- NULL # or .al$mentions from ent_alignment()
+    .min_combos <- 2L
+    .quiet <- FALSE
+  }
+
+  if (!fs::file_exists(.db_path)) cli::cli_abort("No NER store at {.path {(.db_path)}}.")
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  add_combo_ <- function(.df) {
+    dplyr::mutate(.df, Combo = dplyr::if_else(Engine == Model, Engine, paste0(Engine, ":", Model)))
+  }
+
+  # Class map: DocID -> Class. Validate the column exists, fail loudly with the
+  # available names if .class_col is wrong (cheap LIMIT 0 schema probe).
+  files_ <- ner_input_files(.class_parquet)
+  files_sql_ <- paste0("'", files_, "'", collapse = ", ")
+  avail_ <- names(DBI::dbGetQuery(con_, paste0(
+    "SELECT * FROM read_parquet([", files_sql_, "]) LIMIT 0"
+  )))
+  if (!.class_col %in% avail_) {
+    cli::cli_abort(c(
+      "Class column {.val {(.class_col)}} not found in {.arg .class_parquet}.",
+      "i" = "Available columns: {paste(avail_, collapse = ', ')}"
+    ))
+  }
+  DBI::dbExecute(con_, paste0(
+    "CREATE OR REPLACE TEMP VIEW ner_class AS ",
+    "SELECT \"", .id_col, "\" AS DocID, CAST(\"", .class_col, "\" AS VARCHAR) AS Class ",
+    "FROM read_parquet([", files_sql_, "]) ",
+    "WHERE \"", .class_col, "\" IS NOT NULL"
+  ))
+  class_ <- dplyr::tbl(con_, "ner_class")
+  class_tbl_ <- dplyr::collect(class_) # small (~n docs); reused for the .mentions join
+
+  runs_ <- dplyr::tbl(con_, "runs")
+  cand_ <- dplyr::tbl(con_, "candidates")
+
+  # Optional combo filter (restricts both ledger and candidates).
+  if (!is.null(.run)) {
+    combos_ <- purrr::map(.run, ner_parse_combo) |>
+      dplyr::bind_rows() |>
+      dplyr::distinct()
+    duckdb::duckdb_register(con_, "ner_prof_combos", as.data.frame(combos_))
+    on.exit(duckdb::duckdb_unregister(con_, "ner_prof_combos"), add = TRUE, after = FALSE)
+    keep_ <- dplyr::tbl(con_, "ner_prof_combos")
+    runs_ <- dplyr::semi_join(runs_, keep_, by = c("Engine", "Model"))
+    cand_ <- dplyr::semi_join(cand_, keep_, by = c("Engine", "Model"))
+  }
+
+  # Per-class processed-doc count (the denominator). One row per (DocID, Class);
+  # combos all cover the same doc set, so this is combo-independent.
+  docs_ <- runs_ |>
+    dplyr::distinct(DocID) |>
+    dplyr::inner_join(class_, by = "DocID") |>
+    dplyr::group_by(Class) |>
+    dplyr::summarise(NDocs = dplyr::n_distinct(DocID), .groups = "drop") |>
+    dplyr::collect() |>
+    dplyr::arrange(dplyr::desc(NDocs))
+
+  n_run_docs_ <- runs_ |>
+    dplyr::summarise(n = dplyr::n_distinct(DocID)) |>
+    dplyr::pull(n)
+  n_classed_ <- sum(docs_$NDocs)
+  coverage_ <- tibble::tibble(
+    NRunDocs   = as.integer(n_run_docs_),
+    NClassed   = as.integer(n_classed_),
+    PctClassed = if (n_run_docs_ > 0L) n_classed_ / n_run_docs_ else NA_real_
+  )
+
+  # Per Class x Combo x Label.
+  prof_ <- cand_ |>
+    dplyr::inner_join(class_, by = "DocID") |>
+    dplyr::group_by(Class, Engine, Model, Label) |>
+    dplyr::summarise(
+      Candidates  = dplyr::n(),
+      DocsWithHit = dplyr::n_distinct(DocID),
+      .groups = "drop"
+    ) |>
+    dplyr::collect() |>
+    dplyr::left_join(docs_, by = "Class") |>
+    dplyr::mutate(
+      CandPerDoc     = Candidates / NDocs,
+      PctDocsWithHit = DocsWithHit / NDocs
+    ) |>
+    add_combo_() |>
+    dplyr::relocate(Class, Combo, Engine, Model, Label) |>
+    dplyr::arrange(Class, Combo, dplyr::desc(Candidates))
+
+  # Readable fingerprint: one reference combo, Class x Label, CandPerDoc.
+  ref_ <- ner_parse_combo(.ref_combo)
+  fingerprint_ <- prof_ |>
+    dplyr::filter(Engine == ref_$Engine[1], Model == ref_$Model[1]) |>
+    dplyr::select(Class, Label, CandPerDoc) |>
+    tidyr::pivot_wider(names_from = Label, values_from = CandPerDoc, values_fill = 0) |>
+    dplyr::left_join(docs_, by = "Class") |>
+    dplyr::relocate(Class, NDocs) |>
+    dplyr::arrange(dplyr::desc(NDocs))
+  if (nrow(fingerprint_) == 0L && !.quiet) {
+    cli::cli_alert_warning("Reference combo {.val {(.ref_combo)}} not present -> empty fingerprint.")
+  }
+
+  # High-confidence (>= .min_combos engines agree) per-type rate, from merged
+  # mentions. Engine-agnostic, so no double counting across engines.
+  consensus_ <- NULL
+  if (!is.null(.mentions)) {
+    consensus_ <- .mentions |>
+      dplyr::filter(NCombos >= .min_combos) |>
+      dplyr::inner_join(class_tbl_, by = "DocID") |>
+      dplyr::group_by(Class, Label) |>
+      dplyr::summarise(
+        HiConfMentions = dplyr::n(),
+        DocsWithHit    = dplyr::n_distinct(DocID),
+        .groups = "drop"
+      ) |>
+      dplyr::left_join(docs_, by = "Class") |>
+      dplyr::mutate(
+        HiConfPerDoc   = HiConfMentions / NDocs,
+        PctDocsWithHit = DocsWithHit / NDocs
+      ) |>
+      dplyr::arrange(Class, dplyr::desc(HiConfMentions))
+  }
+
+  if (!.quiet) {
+    pct_classed_ <- scales::label_percent(0.1)(coverage_$PctClassed)
+    cons_msg_    <- if (is.null(.mentions)) " (pass .mentions for the consensus view)" else ""
+    cli::cli_alert_success(
+      paste0("Profiled {nrow(docs_)} class(es) over {coverage_$NClassed} classified ",
+             "doc(s) ({pct_classed_} of the ledger){cons_msg_}.")
+    )
+    if (!is.na(coverage_$PctClassed) && coverage_$PctClassed < 0.9) {
+      pct_unclassed_ <- scales::label_percent(0.1)(1 - coverage_$PctClassed)
+      cli::cli_alert_warning(paste0("{pct_unclassed_} of ledger docs have no class -- check ",
+                                    "{.arg .class_parquet} / {.arg .class_col} coverage."))
+    }
+  }
+
+  list(
+    docs        = docs_,
+    coverage    = coverage_,
+    profile     = prof_,
+    fingerprint = fingerprint_,
+    consensus   = consensus_
+  )
+}
+
+
+# Heatmap of the per-class fingerprint: Class (rows) x Label (cols), filled by the
+# chosen metric. .profile is ent_profile_by_class()$profile. Pass .combo to pick one
+# engine:model (else it facets across combos). .metric: CandPerDoc | PctDocsWithHit.
+
+
 # 8. Figures ---------------------------------------------------------------------------------------------------------
 # Three shapes, all drawn through the shared design layer so that an entity figure and a
 # classification figure are the same object rendered from different data. Two of the three are the
@@ -1486,26 +1999,34 @@ ent_facet_height <- function(.n_panels, .n_cols = 3L, .rows_per_panel = 6L, .squ
 #' @param .free_y Logical. Independent vertical scales per facet. Even as densities the labels
 #'   differ in concentration, so a shared scale flattens the flatter panels.
 #' @return A ggplot.
-ent_plot_positions <- function(.positions, .by_combo = TRUE, .free_y = TRUE) {
+ent_plot_positions <- function(.positions, .bins = 30L, .by_combo = TRUE, .free_y = TRUE) {
   if (FALSE) {
-    .positions <- .desc$position
+    .positions <- .ov$positions
+    .bins      <- 30L
     .by_combo  <- TRUE
     .free_y    <- TRUE
   }
   if (is.null(.positions) || nrow(.positions) == 0L) {
-    cli::cli_abort("No positions to plot; {.arg .positions} is ent_describe()$position.")
+    cli::cli_abort("No positions to plot: pass {.arg .inputs} to ent_overview().")
   }
 
-  # Already binned, and already shared within engine and label, by ent_describe(). Re-deriving the
-  # share here would be a second definition of the same quantity, and the two would drift.
-  dat_ <- if (.by_combo) {
-    dplyr::mutate(.positions, PlotLabel = plot_factor(.data$Label, .key = "Label"))
-  } else {
-    .positions |>
-      dplyr::summarise(Spans = sum(.data$Spans), .by = c(Label, Bin, Mid)) |>
-      dplyr::mutate(Share = .data$Spans / sum(.data$Spans), .by = Label) |>
-      dplyr::mutate(PlotLabel = plot_factor(.data$Label, .key = "Label"))
-  }
+  # Binned in R rather than by geom_histogram(), because the share has to be taken WITHIN each
+  # engine and label. Left to the geom, ggplot would normalise across the whole panel and the
+  # figure would silently become the count plot again.
+  brk_  <- seq(0, 1, length.out = .bins + 1L)
+  grp_  <- if (.by_combo) c("Label", "Combo") else "Label"
+
+  dat_ <- .positions |>
+    dplyr::mutate(Bin = cut(.data$Rel, breaks = brk_, include.lowest = TRUE, labels = FALSE)) |>
+    dplyr::summarise(N = dplyr::n(), .by = dplyr::all_of(c(grp_, "Bin"))) |>
+    dplyr::mutate(
+      Share = .data$N / sum(.data$N),
+      .by   = dplyr::all_of(grp_)
+    ) |>
+    dplyr::mutate(
+      Mid       = brk_[.data$Bin] + diff(brk_)[1] / 2,
+      PlotLabel = plot_factor(.data$Label, .key = "Label")
+    )
 
   p_ <- if (.by_combo) {
     dat_ |>
@@ -1582,4 +2103,118 @@ ent_plot_agreement <- function(.pairwise, .accuracy = 0.01) {
       .drop     = "both"          # per panel, with the free scales below
     ) +
     ggplot2::facet_wrap(~Label, scales = "free")
+}
+
+#' Yield per contract type and entity label
+#'
+#' One combination at a time. A wide matrix faceted over nine engines is unreadable at the project's
+#' fixed width, and the comparison this figure is for is across contract types rather than across
+#' engines -- that comparison is what ent_plot_agreement() is for.
+#'
+#' THE SHADING AND THE NUMBERS ARE DIFFERENT QUANTITIES, deliberately. Organisations run from 80 to
+#' 509 per document while money runs from 3 to 19, so one ramp across the whole matrix renders three
+#' of the four columns uniformly white and the figure carries one column of information. Each cell
+#' is therefore shaded by its share of the largest value IN ITS OWN LABEL, and prints the raw value.
+#' Every column becomes legible and no number changes; what is lost is comparability of shade
+#' across columns, which was never readable anyway.
+#'
+#' Two guards on that. The rescaling is switched off below .min_rows, because a share of the column
+#' maximum needs a distribution to rescale and a two-row matrix has none. And the ramp is fixed to
+#' the observed range rather than to the unit interval, because the smallest class over the largest
+#' is around a sixth, so a unit-interval ramp spends its lower third on values that never occur and
+#' pushes the whole matrix into the dark half.
+#'
+#' The contract-type axis is keyed on the classification vocabulary 03A registered, so the rows
+#' appear in the same order and under the same short names as every figure in the 03 family. That is
+#' the point of a shared registry: a reader does not have to re-learn an ordering between documents.
+#'
+#' A label the chosen engine cannot emit is dropped rather than drawn as an empty column, on the
+#' same argument as the agreement figure: the transformer emits no redaction markers, and a blank
+#' REDACT column reads as "no contract type contains any" rather than "this engine does not look".
+#'
+#' @param .profile The profile tibble from ent_profile_by_class().
+#' @param .combo Combination token to draw, or NULL to facet over all of them.
+#' @param .metric Which quantity to fill by. CandPerDoc is inflated by document length;
+#'   PctDocsWithHit is not, and is the one carrying the conclusion about absence.
+#' @param .key_class Registration key for the contract-type axis, matching the .class_col the
+#'   profile was built with.
+#' @param .accuracy Numeric. Rounding for the printed cell values.
+#' @param .min_rows Integer. Rows below which the within-column rescaling is switched off. Share of
+#'   the column maximum sets the largest cell in every column to one, so on a two-row matrix the top
+#'   row is uniformly darkest by construction. The threshold is a floor on having a distribution to
+#'   rescale, not a tuned value.
+#' @return A ggplot.
+ent_plot_profile <- function(.profile, .combo = NULL,
+                             .metric = c("CandPerDoc", "PctDocsWithHit"),
+                             .key_class = "ClassDetailed", .accuracy = 0.1,
+                             .min_rows = 4L) {
+  if (FALSE) {
+    .profile   <- .prof_detailed$profile
+    .combo     <- "spacy:en_core_web_trf"
+    .metric    <- "CandPerDoc"
+    .key_class <- "ClassDetailed"
+    .accuracy  <- 0.1
+    .min_rows  <- 4L
+  }
+  .metric <- match.arg(.metric)
+  if (is.null(.profile) || nrow(.profile) == 0L) cli::cli_abort("Empty {.arg .profile}.")
+
+  dat_ <- .profile
+  if (!is.null(.combo)) dat_ <- dplyr::filter(dat_, .data$Combo == .combo)
+  if (nrow(dat_) == 0L) cli::cli_abort("No rows for combination {.val {(.combo)}}.")
+
+  is_pct_ <- identical(.metric, "PctDocsWithHit")
+
+  # RESCALING NEEDS ENOUGH ROWS TO HAVE A DISTRIBUTION. Share of the column maximum sets the largest
+  # cell in every column to one, so on a two-row matrix the top row is uniformly darkest by
+  # construction and carries no information at all -- which is exactly what it did to the amendment
+  # figure. Below the floor the raw value is shaded directly, which is readable at that size because
+  # a two-row column has nothing to bury.
+  n_rows_  <- dplyr::n_distinct(dat_$Class)
+  rescale_ <- !is_pct_ && n_rows_ >= .min_rows
+
+  dat_ <- dat_ |>
+    dplyr::mutate(Value = .data[[.metric]]) |>
+    dplyr::mutate(
+      Shade = if (rescale_) .data$Value / max(.data$Value, na.rm = TRUE) else .data$Value,
+      .by   = Label
+    )
+
+  # A hit rate has an absolute scale and is fixed to it. A rescaled share does not use its full
+  # range -- the floor here is the smallest class over the largest, around a sixth -- so fixing the
+  # ramp to the unit interval spends a third of it on values that never occur and renders the whole
+  # matrix in the dark half. Fixing it to the observed range instead spreads the contrast over the
+  # values actually present.
+  lim_ <- if (is_pct_) {
+    c(0, 1)
+  } else if (rescale_) {
+    range(dat_$Shade, na.rm = TRUE)
+  } else {
+    NULL
+  }
+
+  p_ <- dat_ |>
+    plot_heatmap(
+      .tab        = _,
+      .x          = "Label",
+      .y          = "Class",
+      .fill       = "Shade",        # within-label share where there are rows enough to warrant it
+      .cell_label = if (rescale_) "Value" else NULL,  # the raw count is what gets printed
+      .key_x      = "Label",
+      .key_y      = .key_class,     # the vocabulary 03A registered, so rows match the 03 family
+      .short      = TRUE,
+      .label      = TRUE,
+      .pct        = is_pct_,
+      .accuracy   = if (is_pct_) 0.01 else .accuracy,
+      .angle      = 0,              # five short labels; rotation would cost legibility for nothing
+      .limits     = lim_,
+      # x only: a label this engine cannot emit is absent, not empty. The contract types stay
+      # whatever happens, because a category holding no documents is a finding and not a gap.
+      .drop       = "x"
+    )
+
+  if (is.null(.combo) && dplyr::n_distinct(dat_$Combo) > 1L) {
+    p_ <- p_ + ggplot2::facet_wrap(~Combo)
+  }
+  p_
 }

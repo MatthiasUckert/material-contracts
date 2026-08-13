@@ -1,0 +1,641 @@
+---
+title: "Contract Classification -- Comparing the Arms (03E)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# Figure geometry is NOT set here -- it is declared once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,       # mandatory: cli writes through the message stream under knitr, so
+                         # message = FALSE would discard this document's entire output
+  warning  = FALSE,
+  comment  = ""          # drops the "##" prefix, so console blocks copy verbatim
+)
+
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+
+# HOW TABLES ARE RENDERED, set once for the whole document.
+#   "kable"   -- grouped headers, percentages, footnotes. What a reader of this document should meet.
+#   "console" -- fixed-width ASCII blocks that survive being pasted into a terminal or a chat, which
+#                is what a table is for while the analysis is being built.
+# Both paths receive the same specification from the same call, so the caveats below each table are
+# written once and appear either as numbered footnotes or as cli lines naming the column.
+options(mc.table_mode = "kable")
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+```
+
+```{r}
+#| label: setup-sources
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+
+# The shared design layer, sourced before anything that draws or prints.
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 03A owns the folds, the shared scoring layer and the category vocabulary, so every number below is
+# produced by the same code on the same splits and drawn with the same category order. The three
+# training stages are sourced for their path helpers and published catalogues; no engine is invoked.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword",
+         "03D-ClassifyLLM"),
+  .f = function(.s) {
+    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+           encoding = "UTF-8")
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),   # project root
+  .name_script = .name_script    # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),   # project root
+  .name_script = .name_script    # resolves to 1_code/03E-ClassifyOrchestrate.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+Three engines have labelled the same 4,398 documents on the same five folds. A transformer commits on
+every document. A keyword table commits only where a term it trusts fires, and declines the rest. A
+local language model commits everywhere, at a cost per document several orders of magnitude above the
+other two.
+
+This document puts all of them on one table and tells one story in five steps.
+
+0. **The transformer is fitted at two context lengths.** Which one ships, and what does the other
+   give? The length is that engine's cost knob, so both are on the table.
+1. **How good is each engine on its own**, category by category.
+2. **What perfect routing would give us.** It needs the truth and nobody can run it -- which is the
+   point. It is the absolute ceiling on every rule at once.
+3. **Can a clue we can actually see find the documents worth rerouting?** First clue: the transformer
+   is unsure.
+4. **Second clue:** the transformer's own two models contradict each other across the taxonomy.
+
+**Nothing is re-estimated here.** Every number comes from the `predictions.parquet` files the three
+training stages already wrote. No checkpoint is loaded, no lexicon is applied, no prompt is sent. What
+this document adds is the one thing none of those stages could do: each knows how good its own engine
+is, and none can see what the others said about any particular document.
+
+## Why these numbers are honest, and where they are not
+
+Each training stage cross-validated over five folds, so every label on the table came from a model
+that never saw that document. Any accuracy computed here is already out of sample.
+
+What is *not* protected is the choice of which threshold to quote. Sections 3 and 4 read the labels to
+decide where a swap would have helped, so the best row is optimistic. With a handful of fixed
+thresholds rather than a search that optimism is small and statable, and this document is an
+indication of whether combination is worth pursuing rather than a deployable rule.
+
+## Abstention is missing, not a category
+
+The keyword engine emits a sentinel where no term fired. It becomes `NA` on read, and that distinction
+runs through every metric below. An abstention is a miss for recall over the whole corpus and is
+excluded from precision, and **both numbers are reported side by side** rather than one standing in
+for the other. Reporting only the second is how a table covering a quarter of the corpus comes to look
+competitive with a model that answers everywhere.
+
+# Configuration
+
+```{r}
+#| label: configure-paths
+.dir_prep <- init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare")
+.dir_bert <- init_create_script_dir(.dir_here = here::here(), .name_script = "03B-ClassifyTrainBERT")
+.dir_kw   <- init_create_script_dir(.dir_here = here::here(), .name_script = "03C-ClassifyTrainKeyword")
+.dir_llm  <- init_create_script_dir(.dir_here = here::here(), .name_script = "03D-ClassifyLLM")
+
+.lP <- list(
+  Input = list(
+    Prepared  = fs::path(.dir_prep, "prepared.parquet"),
+    # What the two training stages crowned. This document reads those decisions and makes none of
+    # its own: a fourth opinion about which model is best would be a disagreement, not information.
+    BertCrown = fs::path(.dir_bert, "model_final", "deployed.parquet"),
+    KwCatalog = fs::path(.dir_kw, "table", "catalogue.parquet")
+  ),
+  Runs = list(
+    Bert = fs::path(.dir_bert, "runs"), # written by 03B
+    Kw   = fs::path(.dir_kw,   "runs"), # written by 03C
+    Llm  = fs::path(.dir_llm,  "runs")  # written by 03D; absent until that stage has run
+  ),
+  Param = list(
+    Tasks      = c("ClassDetailed", "ClassBroad", "AmendType"),
+    # Thresholds on the transformer's own probability. They look high because the distribution is:
+    # the softmax is massed against one, so a conventional 0.90 selects a few per cent of the corpus.
+    # The grid runs to 0.99 so the sweep reaches the region where the transformer is actually weak.
+    Thresholds = c(0.900, 0.925, 0.950, 0.960, 0.970, 0.980, 0.990)
+  )
+)
+```
+
+One configuration stands for each engine, read from what its stage deployed: **both** transformer
+context lengths 03B fitted, the keyword table 03C marked, and the best language-model configuration
+covering all five folds. Which length ships is 03B's decision and is read rather than remade; every
+comparison below measures against it, and Section 0 says what the other length would have given.
+
+The truncation windows the keyword stage published are its own cost knob and are compared in 03C.
+Repeating that here would be a second opinion about a question already answered.
+
+Nothing is cached. Every step is a group-by over a few thousand rows.
+
+Tables render either as styled html or as fixed-width console blocks, set by `mc.table_mode` in the
+setup chunk. The console path exists because a table is read on screen and pasted into discussion
+while an analysis is being built, and styled markup survives neither.
+
+```{r}
+#| label: load-prepared-sample
+#| results: asis
+if (!fs::file_exists(.lP$Input$Prepared)) cli::cli_abort("Run 03A before this document")
+tab_prep <- arrow::read_parquet(file = .lP$Input$Prepared)
+
+.dir_runs <- c(.lP$Runs$Bert, .lP$Runs$Kw, .lP$Runs$Llm)
+.dir_runs <- .dir_runs[fs::dir_exists(.dir_runs)]
+
+tibble::tibble(
+  Root  = c("BERT (03B)", "Keyword (03C)", "LLM (03D)"),
+  Path  = fs::path_rel(c(.lP$Runs$Bert, .lP$Runs$Kw, .lP$Runs$Llm), here::here()),
+  Found = fs::dir_exists(c(.lP$Runs$Bert, .lP$Runs$Kw, .lP$Runs$Llm))
+) |>
+  tbl_out(.title = "Runs roots feeding this document")
+
+if (length(.dir_runs) == 0L) cli::cli_abort("No runs on disk; run 03B before this document")
+```
+
+# The panel
+
+Which configuration stands for each engine is the study design, so it is assembled in the open.
+
+```{r}
+#| label: build-crowned
+#| results: asis
+# THE TRANSFORMER, AT BOTH CONTEXT LENGTHS. 03B fits one model per task AND per length under
+# model_final/, so the directories there are that stage's deployment decision and reading them gives
+# every length it deployed. The length is this engine's cost knob -- a second full pass over 1.1
+# million documents is not free -- so both travel and Section 0 compares them.
+bert_deployed <- clf_load_overall(.runs_roots = .lP$Runs$Bert) |>
+  dplyr::filter(!.data$Smoke, .data$ConfigName %in% orch_final_configs(.dir_bert = .dir_bert)) |>
+  dplyr::summarise(
+    LabelCol = dplyr::first(.data$LabelCol),
+    MaxLen   = as.integer(dplyr::first(.data$MaxLen)),
+    nFolds   = dplyr::n_distinct(.data$TestFold),
+    .by = ConfigName
+  ) |>
+  dplyr::filter(.data$nFolds >= 5L) |>
+  dplyr::transmute(Task = .data$LabelCol, Engine = paste0("Bert", .data$MaxLen), ConfigName)
+
+# WHICH LENGTH SHIPS. 03B crowns one per task and writes it beside the models; this document reads
+# that decision and never remakes it. Everything downstream measures against the crowned engine, so
+# a fourth opinion here would silently change what "the baseline" means.
+bert_crown <- arrow::read_parquet(file = .lP$Input$BertCrown)
+
+baselines <- bert_crown |>
+  dplyr::transmute(Task = .data$LabelCol, Baseline = paste0("Bert", as.integer(.data$MaxLen))) |>
+  dplyr::filter(.data$Task %in% .lP$Param$Tasks)
+
+# THE KEYWORD TABLE: the catalogue marks one published truncation window per task as the default.
+kw_cat <- arrow::read_parquet(file = .lP$Input$KwCatalog)
+
+# THE LANGUAGE MODEL: no artifact to read a decision off, so the best configuration covering all five
+# folds stands for the engine. Absent entirely where that stage has not run, which narrows the
+# analysis rather than stopping it.
+llm_best <- if (fs::dir_exists(.lP$Runs$Llm)) {
+  clf_load_overall(.runs_roots = .lP$Runs$Llm) |>
+    dplyr::filter(!.data$Smoke) |>
+    dplyr::summarise(
+      MacroF1  = mean(.data$F1_macro),
+      nFolds   = dplyr::n_distinct(.data$TestFold),
+      LabelCol = dplyr::first(.data$LabelCol),
+      .by = ConfigName
+    ) |>
+    dplyr::filter(.data$nFolds >= 5L) |>
+    dplyr::slice_max(.data$MacroF1, n = 1L, by = LabelCol, with_ties = FALSE) |>
+    dplyr::transmute(Task = .data$LabelCol, Engine = "Llm", ConfigName)
+} else {
+  tibble::tibble(Task = character(), Engine = character(), ConfigName = character())
+}
+
+tab_crowned <- dplyr::bind_rows(bert_deployed, llm_best,
+  kw_cat |> dplyr::filter(Default) |> dplyr::transmute(Task, Engine = "Kw", ConfigName)
+) |>
+  dplyr::filter(.data$Task %in% .lP$Param$Tasks) |>
+  dplyr::left_join(baselines, by = dplyr::join_by(Task)) |>
+  dplyr::mutate(Ships = dplyr::if_else(.data$Engine == .data$Baseline, "<-", ""), Baseline = NULL) |>
+  dplyr::arrange(.data$Task, .data$Engine)
+
+tbl_out(.tab = tab_crowned, .title = "The configuration standing for each engine")
+```
+
+```{r}
+#| label: build-panels
+# One panel per task. The keyword arm is silenced on AmendType outside "Amended": that engine mines
+# the positive class only and labels everything else "Original", which is the absence of evidence
+# wearing the name of a class. Left alone the arm appears to cover the whole corpus and every table
+# below would report a coverage it does not have.
+panels <- purrr::map(.lP$Param$Tasks, function(.t) {
+  orch_panel(
+    .long = orch_read(
+      .runs_roots = .dir_runs,                                        # every tree that exists
+      .configs    = tab_crowned |> dplyr::filter(Task == .t) |>
+        dplyr::select(Engine, ConfigName)                             # what stands for each engine
+    ),
+    .commit_only = if (.t == "AmendType") "Amended" else NULL         # see above
+  )
+}) |>
+  purrr::set_names(.lP$Param$Tasks)
+```
+
+The panel is the whole data structure: one row per document, one prediction and one score per engine,
+with `NA` where an engine declined. Every table and figure below is a group-by on it.
+
+# Section 0: The two context lengths
+
+The transformer is fitted at two truncation lengths and 03B crowns one per task. Both are on the
+panel, because the length is that engine's cost knob: applying the longer one to the corpus is a
+second full pass over 1.1 million documents, and a reader deciding whether to pay for it needs the
+two side by side rather than one of them and a note saying the other was close.
+
+Read the disagreement row against the aggregate. Two windows within a fraction of a point of each
+other can still part company on hundreds of documents, and that reads very differently from one of
+them simply being better: it means they are trading documents in both directions, and the cheaper one
+is then the sensible default.
+
+`EitherRight` on that row is the ceiling a perfect choice between the two would reach. Like every
+ceiling in this document it needs the label and nobody can obtain it.
+
+```{r}
+#| label: windows-all
+#| results: asis
+purrr::iwalk(panels, function(.p, .t) {
+  bert_ <- grep("^Bert", orch_engines(.tab = .p), value = TRUE)     # the lengths on this panel
+  if (length(bert_) < 2L) {
+    cli::cli_alert_info(
+      "{(.t)} has one context length on the panel, so there is nothing to compare."
+    )
+    return(invisible(NULL))
+  }
+  orch_report_windows(
+    .tab       = orch_windows(.tab = .p, .a = bert_[[1]], .b = bert_[[2]]),
+    .a         = bert_[[1]],                                        # the shorter length
+    .b         = bert_[[2]],                                        # the longer one
+    .crowned   = baselines$Baseline[baselines$Task == .t],          # what 03B deployed
+    .label_col = .t
+  )
+})
+```
+
+# Section 1: Each engine on its own
+
+Three reference tables per task. Read `Precision` against `Recall`: precision excludes abstentions,
+recall counts them as misses. An abstaining arm therefore shows high precision and low recall, which
+is the honest picture of a partial classifier. `RecallSel` is the same arm measured only where it
+committed, and describes it on its own terms.
+
+`Accuracy` at the category level is one-vs-rest and is dominated by correct rejections -- a rare
+category reads near-perfect while the engine misses most of its documents. It is reported because it
+is asked for, and it is not the column to read.
+
+```{r}
+#| label: perclass-all
+perclass <- purrr::map(panels, function(.p) {
+  purrr::map(orch_engines(.tab = .p), \(.e) orch_perclass(.tab = .p, .engine = .e)) |>
+    purrr::set_names(orch_engines(.tab = .p))
+})
+```
+
+## Detailed
+
+```{r}
+#| label: perclass-detailed
+#| results: asis
+purrr::iwalk(
+  .x = perclass$ClassDetailed,                                        # one table per engine
+  .f = \(.t, .e) orch_report_perclass(.tab = .t, .engine = .e, .label_col = "ClassDetailed")
+)
+```
+
+## Broad
+
+```{r}
+#| label: perclass-broad
+#| results: asis
+purrr::iwalk(
+  .x = perclass$ClassBroad,                                        # one table per engine
+  .f = \(.t, .e) orch_report_perclass(.tab = .t, .engine = .e, .label_col = "ClassBroad")
+)
+```
+
+## Amendment
+
+```{r}
+#| label: perclass-amendment
+#| results: asis
+purrr::iwalk(
+  .x = perclass$AmendType,                                        # one table per engine
+  .f = \(.t, .e) orch_report_perclass(.tab = .t, .engine = .e, .label_col = "AmendType")
+)
+```
+
+The same three engines in one row each, with the aggregate measures beside each other. Macro and
+micro answer different questions and the gap between them is the finding: micro weights every document
+equally and therefore reports the largest categories, macro weights every category equally and reports
+the problem this study is actually solving, where the smallest class has under forty documents.
+
+```{r}
+#| label: headline-all
+#| results: asis
+headlines <- purrr::map(panels, orch_headline)
+purrr::iwalk(headlines, \(.h, .t) orch_report_headline(.tab = .h, .label_col = .t))
+```
+
+# Section 2: Perfect routing
+
+A router can only relabel a document to something an engine already said. Taking the correct answer
+wherever any engine supplied one is therefore an upper bound on every rule at once, at every threshold
+and in every order.
+
+It uses the truth to choose and nobody can run it. Its job is to bound the two sections that follow:
+where the ceiling sits at the transformer's own accuracy there is nothing to find, and no clue however
+clever can find it.
+
+```{r}
+#| label: ceiling-all
+#| results: asis
+# The transformer first because it is the baseline, then the cheap arm, then the expensive one. The
+# order matters for the marginal column: it answers what each engine adds OVER what is already there,
+# which is the deployment question rather than the ranking one.
+ceilings <- purrr::imap(panels, function(.p, .t) {
+  base_ <- baselines$Baseline[baselines$Task == .t]
+  orch_ceiling(
+    .tab   = .p,                                                  # the panel
+    # The engine that ships goes first, because every gain below is measured against it. The rest
+    # follow cheapest-first, so the generative arm's marginal row answers what it adds over a corpus
+    # pass that has already happened.
+    .order = c(base_, setdiff(orch_engines(.tab = .p), base_))
+  )
+})
+
+purrr::iwalk(ceilings, \(.c, .t) orch_report_ceiling(.tab = .c, .label_col = .t))
+```
+
+# Section 3: Low transformer confidence
+
+The first clue anyone would reach for, and the free one: the transformer already emits a probability,
+and 03B showed it separates errors. So take the documents it is least sure about and hand them to
+another arm.
+
+The thresholds look high because the distribution is. The softmax is massed against one, so a floor at
+0.90 selects a few per cent of the corpus rather than a tenth of it -- and a conventional-looking grid
+stopping at 0.95 would test almost nothing and report a null earned by the size of the subset rather
+than by anything about the arms.
+
+Read `BertAcc` against `ArmAcc`: both are measured on the same documents and are directly comparable.
+`SubsetAccAfter` asks whether the swap helped those documents; `OverallAccAfter` asks whether it was
+worth doing. `Fixed` against `Broke` is the pair that says why.
+
+```{r}
+#| label: resolve-confidence
+resolve_conf <- purrr::imap(panels, function(.p, .t) {
+  base_  <- baselines$Baseline[baselines$Task == .t]
+  # Every engine except the one that ships, INCLUDING the other context length: sending the documents
+  # the crowned window is unsure about to the other window is a rule like any other, and it is the one
+  # a reader would ask about first given both are already measured.
+  chall_ <- setdiff(orch_engines(.tab = .p), base_)
+  purrr::map(chall_, function(.e) {
+    orch_resolve_conf(
+      .tab        = .p,                     # the panel
+      .engine     = .e,                     # the arm swapped in
+      .baseline   = base_,                  # whose probability defines the subsets
+      .thresholds = .lP$Param$Thresholds    # a document is in the subset below the value
+    ) |>
+      dplyr::mutate(Engine = .e, .before = 1)
+  }) |>
+    purrr::set_names(chall_)
+})
+```
+
+## Detailed
+
+```{r}
+#| label: resolve-conf-detailed
+#| results: asis
+purrr::iwalk(
+  .x = resolve_conf$ClassDetailed,                                    # one table per arm
+  .f = \(.t, .e) orch_report_swap(.tab = .t, .engine = .e, .label_col = "ClassDetailed")
+)
+```
+
+## Broad
+
+```{r}
+#| label: resolve-conf-broad
+#| results: asis
+purrr::iwalk(
+  .x = resolve_conf$ClassBroad,                                    # one table per arm
+  .f = \(.t, .e) orch_report_swap(.tab = .t, .engine = .e, .label_col = "ClassBroad")
+)
+```
+
+## Amendment
+
+```{r}
+#| label: resolve-conf-amendment
+#| results: asis
+purrr::iwalk(
+  .x = resolve_conf$AmendType,                                    # one table per arm
+  .f = \(.t, .e) orch_report_swap(.tab = .t, .engine = .e, .label_col = "AmendType")
+)
+```
+
+# Section 4: Broad and detailed disagree
+
+A second clue, independent of the first and of the keyword arm entirely. Two transformers were trained
+on the same folds: one predicts the detailed category, the other the broad one. Roll the detailed
+prediction up to its parent and the two can be compared. Where they disagree, one of them is wrong
+about the same document, and **that is visible without any label.**
+
+It also reaches documents the first clue cannot. The lexicon is silent on roughly half the corpus; the
+broad model answers on all of it.
+
+This is not the tautology it looks like. 03B publishes the broad label by rolling up the detailed
+prediction, so the *released* output is consistent by construction. The broad **model** still exists,
+still made its own prediction, and still disagrees. That disagreement is what is measured here.
+
+The section covers the detailed task only. `AmendType` has no hierarchy to be inconsistent with.
+
+```{r}
+#| label: hierarchy-flag
+#| results: asis
+# The two levels can ship different context lengths -- 03B crowns per task -- so each side names its
+# own baseline rather than assuming they match.
+base_det   <- baselines$Baseline[baselines$Task == "ClassDetailed"]
+base_broad <- baselines$Baseline[baselines$Task == "ClassBroad"]
+
+panel_hier <- orch_add_hierarchy(
+  .panel_det   = panels$ClassDetailed, # the labels under test
+  .panel_broad = panels$ClassBroad,    # the independent second opinion
+  .tab_prep    = tab_prep,             # supplies the detailed-to-broad mapping
+  .base_det    = base_det,             # the detailed engine that ships
+  .base_broad  = base_broad            # the broad engine that ships
+)
+
+orch_report_hierarchy_split(.tab = orch_hierarchy_split(.tab = panel_hier))
+```
+
+If the detailed label is markedly less accurate where the broad model disagrees, the clue has found
+documents worth a second opinion. Whether another arm can supply one is the next table.
+
+```{r}
+#| label: resolve-hierarchy
+#| results: asis
+resolve_hier <- purrr::map(
+  .x = setdiff(orch_engines(.tab = panel_hier), base_det),
+  .f = \(.e) orch_resolve_hier(.tab = panel_hier, .engine = .e, .baseline = base_det) |>
+    dplyr::mutate(Engine = .e, .before = 1)
+) |>
+  purrr::list_rbind()
+
+orch_report_swap(.tab = resolve_hier, .engine = "each arm", .label_col = "ClassDetailed")
+```
+
+# Overview
+
+Everything above as figures. Nothing here is new.
+
+## Per-category F1, engine by engine
+
+```{r}
+#| label: fig-perclass-detailed
+#| fig-height: !expr plot_height(2 + 1.5 * (nrow(perclass$ClassDetailed[[1]]) - 1))
+#| fig-cap: "F1 by category and engine, detailed taxonomy. Abstention counts as a miss, so an arm
+#|   that declines on half the corpus scores low here whatever its precision on the rest."
+orch_plot_perclass(.tabs = perclass$ClassDetailed, .key = "ClassDetailed")
+```
+
+```{r}
+#| label: fig-perclass-broad
+#| fig-height: !expr plot_height(2 + 1.5 * (nrow(perclass$ClassBroad[[1]]) - 1))
+#| fig-cap: "F1 by category and engine, broad taxonomy."
+orch_plot_perclass(.tabs = perclass$ClassBroad, .key = "ClassBroad")
+```
+
+```{r}
+#| label: fig-perclass-amendment
+#| fig-height: !expr plot_height(2 + 1.5 * (nrow(perclass$AmendType[[1]]) - 1))
+#| fig-cap: "F1 by category and engine, amendment task."
+orch_plot_perclass(.tabs = perclass$AmendType, .key = "AmendType")
+```
+
+## The ceiling
+
+::: {.panel-tabset}
+
+### Detailed
+
+```{r}
+#| label: fig-ceiling-detailed
+#| fig-height: !expr plot_height(3)
+#| fig-cap: "Accuracy a perfect router would reach as each engine is added, detailed taxonomy. The
+#|   dashed line is the transformer alone. Every rule is bounded by the top of this line."
+orch_plot_ceiling(
+  .tab  = ceilings$ClassDetailed,
+  .base = headlines$ClassDetailed$Accuracy[
+    headlines$ClassDetailed$Engine == baselines$Baseline[baselines$Task == "ClassDetailed"]
+  ]
+)
+```
+
+### Broad
+
+```{r}
+#| label: fig-ceiling-broad
+#| fig-height: !expr plot_height(3)
+#| fig-cap: "The routing ceiling, broad taxonomy."
+orch_plot_ceiling(
+  .tab  = ceilings$ClassBroad,
+  .base = headlines$ClassBroad$Accuracy[
+    headlines$ClassBroad$Engine == baselines$Baseline[baselines$Task == "ClassBroad"]
+  ]
+)
+```
+
+### Amendment
+
+```{r}
+#| label: fig-ceiling-amendment
+#| fig-height: !expr plot_height(3)
+#| fig-cap: "The routing ceiling, amendment task."
+orch_plot_ceiling(
+  .tab  = ceilings$AmendType,
+  .base = headlines$AmendType$Accuracy[
+    headlines$AmendType$Engine == baselines$Baseline[baselines$Task == "AmendType"]
+  ]
+)
+```
+
+:::
+
+## What each swap would do to the corpus
+
+Plotted as a change rather than a level. The quantity of interest is a fraction of a percentage point
+against a baseline above ninety, so on an accuracy axis every line would be flat and identical. Zero is
+the transformer, above it is better, below it is worse.
+
+::: {.panel-tabset}
+
+### Detailed
+
+```{r}
+#| label: fig-resolve-detailed
+#| fig-height: !expr plot_height(5)
+#| fig-cap: "Change in corpus accuracy from swapping in each arm below a confidence threshold,
+#|   detailed taxonomy. A line below zero at every threshold means the swap never pays."
+orch_plot_resolve(.tab = purrr::list_rbind(resolve_conf$ClassDetailed))
+```
+
+### Broad
+
+```{r}
+#| label: fig-resolve-broad
+#| fig-height: !expr plot_height(5)
+#| fig-cap: "Change in corpus accuracy from swapping, broad taxonomy."
+orch_plot_resolve(.tab = purrr::list_rbind(resolve_conf$ClassBroad))
+```
+
+### Amendment
+
+```{r}
+#| label: fig-resolve-amendment
+#| fig-height: !expr plot_height(5)
+#| fig-cap: "Change in corpus accuracy from swapping, amendment task."
+orch_plot_resolve(.tab = purrr::list_rbind(resolve_conf$AmendType))
+```
+
+:::
+
+# Next
+
+This document writes no artifacts. It is a measurement, and what to do with it is the next decision.
+If no clue finds documents worth rerouting, 03F applies the crowned models directly and needs nothing
+from here. If one does, the rule it implies is small enough to state in a sentence and 03F would carry
+it as a parameter rather than as a manifest.
+
+Whether the per-document agreement between engines is worth shipping as a reliability flag beside the
+released labels is a separate question, raised by the same tables and settled separately.
