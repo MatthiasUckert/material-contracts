@@ -148,7 +148,8 @@ is 04D. The reusable engine seam and the store itself live in `_Commons/_NER.R` 
   ),
   Sample = list(
     Text    = utils_file_path(.dir_main, "sample_text.parquet"),      # THE offset basis
-    Anchors = utils_file_path(.dir_main, "sample_anchors.parquet")    # labels, folds, EDGAR facts
+    Anchors = utils_file_path(.dir_main, "sample_anchors.parquet"),   # labels, folds, EDGAR facts
+    Tuning  = utils_file_path(.dir_main, "Cache", "tuning.parquet")   # measured settings, cached
   ),
   Store = list(
     NerDB    = utils_file_path(.dir_main, "Store", "EntityCandidates.duckdb"),
@@ -156,7 +157,13 @@ is 04D. The reusable engine seam and the store itself live in `_Commons/_NER.R` 
   ),
   Params = list(
     DocsPerRun   = 2500L,   # R-side slice size; bounds Python-side memory
-    OffsetSample = 2000L    # candidates rehydrated per engine in Validation
+    OffsetSample = 2000L,   # candidates rehydrated per engine in Validation
+    TuneDocs     = 200L,           # documents per cell in the batch-size sweep
+    TuneBatches  = c(8L, 32L, 128L),
+    TuneRerun    = FALSE,          # TRUE re-measures; the cache is blind to extractor edits
+    ExampleDocs  = 5L,      # contracts read by every engine, per label
+    ExampleSpans = 8L,      # distinct spans listed per engine before truncation
+    Seed         = 42L      # fixed, so the same contracts are read on every render
   )
 )
 
@@ -220,21 +227,36 @@ is why it is a warning rather than an abort.
 #| label: declare-engines
 ner_tuning <- list(
   "paper:dateregex-v1"    = list(n_process =  1L, batch_size = NULL, timeout =   0L),
-  "spacy:en_core_web_sm"  = list(n_process = 24L, batch_size =  16L, timeout = 600L),
-  "spacy:en_core_web_md"  = list(n_process = 24L, batch_size =  16L, timeout = 600L),
-  "spacy:en_core_web_lg"  = list(n_process = 24L, batch_size =  16L, timeout = 600L),
-  "lexnlp"                = list(n_process = 24L, batch_size =   8L, timeout =  60L),
+  "spacy:en_core_web_sm"  = list(n_process = 20L, batch_size =  16L, timeout = 600L),
+  "spacy:en_core_web_md"  = list(n_process = 20L, batch_size =  16L, timeout = 600L),
+  "spacy:en_core_web_lg"  = list(n_process = 20L, batch_size =  16L, timeout = 600L),
+  "lexnlp"                = list(n_process = 20L, batch_size =   8L, timeout = 240L),
   "spacy:en_core_web_trf" = list(n_process =  1L, batch_size = 128L, timeout = 600L),
-  "paper:gazetteer-v1"    = list(n_process = 16L, batch_size =   8L, timeout = 120L),
-  "paper:redaction-v1"    = list(n_process = 16L, batch_size =  64L, timeout =   0L),
-  "paper:moneyregex-v4"   = list(n_process = 16L, batch_size =  64L, timeout =   0L)
+  "paper:gazetteer-v1"    = list(n_process = 20L, batch_size =   8L, timeout = 120L),
+  "paper:redaction-v1"    = list(n_process = 20L, batch_size =  64L, timeout =   0L),
+  "paper:moneyregex-v4"   = list(n_process = 20L, batch_size =  64L, timeout =   0L)
 )
 
 lst_run_args <- ner_run_args(.tuning = ner_tuning)
 ```
 
 The transformer runs at `n_process = 1` because a single Metal device cannot be shared across worker
-processes; the three CNN models stay on CPU and take twenty-four.
+processes; everything else takes twenty.
+
+**Twenty rather than twenty-four, and the reason is the machine.** Measured throughput rises 1.60x
+from eight workers to sixteen and only 1.15x from sixteen to twenty-four, which is the shape of a
+28-core M3 Ultra: twenty performance cores and eight efficiency cores. Workers past the twentieth
+land on efficiency cores running at roughly a third the speed, so they add scheduling pressure and
+very little work. The Robustness section below measures the batch size, which is the knob that
+actually moves.
+
+**LexNLP's timeout is 240 seconds rather than 60, and that is the geoentity pass.** The timeout is
+applied per extractor per document, so it now has to cover a dictionary scan of roughly 440 entities
+and their aliases over the whole text. That averages about five seconds and scales with document
+length, so a quarter-million-character credit agreement runs an order of magnitude longer than the
+median contract. At 60 seconds the longest documents would be recorded as timeouts and their places
+lost -- and lost systematically in the longest agreements, which is the worst possible place for a
+missing-at-random assumption to fail.
 
 ```{r}
 #| label: resolve-labels
@@ -267,18 +289,14 @@ ledger has no way to tell a retired version from one simply not asked for on thi
 combination the store holds and this run does not declare is reported and **left alone**: running a
 subset temporarily is ordinary, and wiping the rest of the store for it would be the worse trap.
 
-```{r}
-#| label: clear-relabelled
-ent_clear_relabelled(
-  .db_path       = .lP$Store$NerDB,
-  .path_manifest = .lP$Store$Manifest,  # what the store was last built under
-  .resolved      = tab_labels           # what it is being asked for now
-)
-```
+Adding a label to an engine no longer forces a re-extraction of the ones already stored. The ledger
+is keyed on `(DocID, Engine, Model, Label)`, so a policy addition leaves the existing labels marked
+done and only the addition comes back as missing. `ner_run()` then groups documents by what they
+still need and dispatches one call per group -- on a fresh store that is one group asking for
+everything, and after an addition one group asking for the addition.
 
-Idempotent, and that is the whole point. On the render after a policy edit this removes the affected
-engines and they extract again; on every render after that it finds nothing and costs milliseconds.
-Leaving it as a command someone remembers to run is how the store came to be missing `PERSON`.
+That is the mechanism `PERSON` needed and did not have. It also removes the clear-and-re-extract
+step this document used to carry, along with the manifest field it had to own.
 
 ```{r}
 #| label: sync-manifest
@@ -287,7 +305,7 @@ ent_manifest_sync(
   .manifest      = ent_manifest(
     .path_text = .lP$Sample$Text,      # fingerprints the inputs, not only the settings
     .run       = lst_run_args$.run,
-    .labels    = .labels_extract,      # resolved to the actual per-engine sets before storing
+    .labels    = .labels_extract,      # recorded for the reader; the ledger enforces it
     .max_chars = .max_chars_extract
   )
 ) |>
@@ -376,6 +394,95 @@ Row percentages, so each engine and label is read against itself. Ten percent in
 label scattered through the document. Mass at both ends is one named in the preamble and again at
 the signature block, which is what a party looks like and what an incidental mention does not.
 
+```{r}
+#| label: inspect-contrast
+ent_contrast(
+  .tab = .desc$position,           # the binned shares above
+  .by  = c("Combo", "Label")       # pooled; the class cut follows below
+) |>
+  dplyr::arrange(plot_factor(.data$Label, .key = "Label"), dplyr::desc(.data$Contrast)) |>
+  dplyr::mutate(dplyr::across(c(EndShare, MidShare), \(.x) tbl_pct(.x)),
+                Contrast = round(.data$Contrast, 2)) |>
+  tbl_say(.title = "Ends of the document over its middle")
+```
+
+Ten decile shares collapse to one comparable number: the mean share in the first and last deciles
+over the mean share through the middle six. A uniform engine scores 1.0 by construction. The second
+and ninth deciles are excluded from the middle because they are shoulder -- a preamble spills into
+the second decile of a short document, a signature block into the ninth -- and counting them as
+middle would blunt the contrast being measured.
+
+This is the single number the engine choice turns on for a label with one job.
+
+## By contract type
+
+```{r}
+#| label: describe-by-class
+tab_class <- ent_describe_class(
+  .db_path      = .lP$Store$NerDB,
+  .path_text    = .lP$Sample$Text,
+  .path_anchors = .lP$Sample$Anchors   # supplies the contract type
+)
+```
+
+A pooled median hides an engine that behaves well on employment agreements and badly on credit
+agreements, which are the two the party rules will lean on hardest. Only the two quantities carrying
+the verdict are cut this way -- contrast, and distinct spans per document -- rather than the whole
+yield table cut twelve ways.
+
+```{r}
+#| label: inspect-class-grid
+purrr::walk(
+  .x = plot_levels("Label"),                        # every label, in the registered order
+  .f = function(.l) ent_report_class(.tab = tab_class, .label = .l)
+)
+```
+
+Read `Docs` in the stability table below before trusting any single cell here: a contrast computed
+over a handful of documents is a number about those documents.
+
+```{r}
+#| label: inspect-stability
+ent_report_stability(
+  .tab      = tab_class,
+  .min_docs = 30L    # classes thinner than this are excluded from the range, not from the grid
+)
+```
+
+This is the table that says whether a pooled decision is safe. An engine whose contrast runs 4.1 to
+4.9 across contract types can be crowned once; one running 1.2 to 8.0 cannot, and a large spread is
+a reason to defer the choice rather than to pick the higher median -- it usually means the label is
+doing two different jobs in two different kinds of contract.
+
+## The same contract, read by every engine
+
+```{r}
+#| label: inspect-examples
+purrr::walk(
+  .x = plot_levels("Label"),
+  .f = function(.l) {
+    ent_engine_examples(
+      .db_path      = .lP$Store$NerDB,
+      .path_text    = .lP$Sample$Text,
+      .path_anchors = .lP$Sample$Anchors,
+      .label        = .l,
+      .n            = .lP$Params$ExampleDocs,   # documents per label
+      .max_spans    = .lP$Params$ExampleSpans,  # distinct spans listed per engine
+      .seed         = .lP$Params$Seed
+    ) |>
+      ent_report_examples(.label = .l)
+  }
+)
+```
+
+A distinct count of five against thirty-eight is a number. The two lists side by side, from one
+contract, show *which* thirty-three the larger engine added -- and whether those are parties the
+selective engine missed or mentions it was right to leave out. No summary answers that.
+
+Documents are drawn from the middle two quartiles by span count rather than at random. The extremes
+are unrepresentative and unreadable: one contract in this sample yields 68,482 organisation spans,
+and a block nobody reads is worse than no block.
+
 # Agreement
 
 ```{r}
@@ -411,6 +518,52 @@ This is the only quantity in the entire family that is *verified* rather than co
 has to be exactly 1.0. Below that, offsets index a string that is not the one on disk, and every
 number in 04B onwards is wrong without anything erroring: the party location, every context window,
 every rehydrated snippet.
+
+# Robustness
+
+The knobs declared in Extraction are settings, not findings, and this is where they are checked.
+
+```{r}
+#| label: tune-batch-size
+purrr::walk(
+  .x = c("lexnlp", "paper:gazetteer-v1"),    # the two with real per-task cost
+  .f = function(.c) {
+    ent_report_tuning(
+      .combo      = .c,
+      .path_text  = .lP$Sample$Text,
+      .path_cache = .lP$Sample$Tuning,       # a sweep costs three minutes; it is not re-run blind
+      .rerun      = .lP$Params$TuneRerun,
+      .batches    = .lP$Params$TuneBatches,  # the grid; changing it re-measures automatically
+      .n          = .lP$Params$TuneDocs,     # documents per cell
+      .n_process  = 20L                      # held fixed; this measures the batch knob
+    )
+  }
+)
+```
+
+Batch size is the knob that moves, and it moves a great deal: LexNLP runs **4.6 times slower at a
+batch of 128 than at 8**. The pool hands out one task per batch, so a 200-document subsample at 128
+is two tasks for twenty workers and eighteen of them idle. Document length compounds it -- one
+contract in this sample runs to 876,000 characters, and a large batch strands whichever worker draws
+it while the rest finish early.
+
+`Candidates` must be identical down each table. Batch size decides how work is handed to workers and
+nothing else, so a differing count means a document was dropped or timed out rather than that a
+setting was better.
+
+**Worker count is deliberately not swept.** Throughput rises 1.60x from eight workers to sixteen and
+only 1.15x from sixteen to twenty-four, which is the shape of a 28-core M3 Ultra running out of its
+twenty performance cores. That is a fact about the machine rather than about the extraction, and
+re-learning it on every render would cost minutes to confirm something the hardware fixes.
+
+Each cell extracts into a scratch store that is deleted afterwards. Timing against the real store
+would be circular: the ledger would report the documents already done and the second batch size
+would be timed on no work at all.
+
+**The sweep is cached**, because three minutes on every render to re-confirm a setting is three
+minutes spent mostly in the cell already known to be worst. The key is the settings, so editing
+`TuneBatches`, `TuneDocs` or the worker count re-measures on its own. It is blind to the extractors'
+own code -- change a Python file and the stale timing survives, which is what `TuneRerun` is for.
 
 # Deployment
 
@@ -473,6 +626,7 @@ ent_report_all(
     .db_path = .lP$Store$NerDB   # no .inputs: positions come from ent_describe(), already binned
   ),
   .desc        = .desc,
+  .class       = tab_class,
   .al          = .al,
   .tab_offsets = tab_offsets
 )

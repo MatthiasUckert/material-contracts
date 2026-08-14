@@ -308,9 +308,6 @@ ner_dateregex <- function(
     .text_col = "TextRaw",
     .labels = "DATE", # full supported set
     .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
-    .timeout = 0L, # per-document cap in seconds (0 = off)
-    .chunk_size = 64L,
-    .n_process = 1L, # <=0 = all cores
     .overwrite = FALSE,
     .no_progress = FALSE,
     .engine_dir = here::here("contracts-engine"),
@@ -323,9 +320,6 @@ ner_dateregex <- function(
     .text_col <- "TextRaw"
     .labels <- "DATE"
     .max_chars <- NULL
-    .timeout <- 0L
-    .chunk_size <- 64L
-    .n_process <- 1L
     .overwrite <- FALSE
     .no_progress <- FALSE
     .engine_dir <- here::here("contracts-engine")
@@ -354,10 +348,7 @@ ner_dateregex <- function(
     "--output", .output,
     "--id-col", .id_col,
     "--text-col", .text_col,
-    "--label", .labels,
-    "--n-process", as.integer(.n_process),
-    "--chunk-size", as.integer(.chunk_size),
-    "--timeout", as.integer(.timeout)
+    "--label", .labels
   )
   if (!is.null(.max_chars)) args_ <- c(args_, "--max-chars", as.integer(.max_chars))
   if (isTRUE(.no_progress)) args_ <- c(args_, "--no-progress")
@@ -927,64 +918,35 @@ ner_run <- function(
     model_ <- combos_$Model[i_]
     key_em_ <- paste0(engine_, ":", model_)
 
-    # Resolve this combination's knobs once (broadcast scalar/vector or engine[:model])
-    labels_ <- ner_label_policy(.engine = engine_, .model = model_, .labels = .labels)
-    n_process_ <- ner_arg(.n_process, engine_, model_, .default = 16L)
-    batch_ <- ner_arg(.batch_size, engine_, model_, .default = 64L)
-    timeout_ <- ner_arg(.timeout, engine_, model_, .default = 0L)
-
-    miss_by_label_ <- ner_db_missing(
-      .db_path, .inputs, engine_, model_, .labels = labels_,
+    missing_ <- sort(ner_db_missing(
+      .db_path, .inputs, engine_, model_,
       .id_col = .id_col, .retry_timeout = .retry_timeout, .quiet = .quiet
-    )
-
-    # GROUP BY MISSING-LABEL SIGNATURE, then issue one call per group. Documents rarely differ in
-    # what they still need: on a fresh store every document is missing every label, and after a
-    # policy addition every document is missing exactly the addition. Both collapse to a single
-    # group. Dispatching per label instead would be simpler and would pay one extractor start per
-    # label per slice -- for LexNLP on the corpus that is four container starts where one would do,
-    # roughly two and a half hours bought for nothing.
-    sig_ <- tibble::tibble(DocID = unique(unlist(miss_by_label_, use.names = FALSE))) |>
-      dplyr::mutate(
-        Sig = purrr::map_chr(.data$DocID, function(.d) {
-          paste(names(miss_by_label_)[purrr::map_lgl(miss_by_label_, \(.v) .d %in% .v)],
-                collapse = ",")
-        })
-      ) |>
-      dplyr::filter(nzchar(.data$Sig))
-
-    if (nrow(sig_) == 0L) {
+    ))
+    if (length(missing_) == 0L) {
       summary_[[i_]] <- tibble::tibble(
         Engine = engine_, Model = model_, Missing = 0L, Docs = 0L, Candidates = 0L
       )
       next
     }
 
-    groups_ <- split(sig_$DocID, sig_$Sig)
-    if (!.quiet && length(groups_) > 1L) {
-      cli::cli_alert_info(
-        "{engine_}/{model_}: {length(groups_)} distinct missing-label group{?s}."
-      )
-    }
+    per_ <- if (is.null(.docs_per_run)) length(missing_) else as.integer(.docs_per_run)
+    slices_ <- split(missing_, ceiling(seq_along(missing_) / per_))
 
     stage_ <- fs::path(tmp_dir_, paste0("staging_", engine_, "_", model_, ".parquet"))
     input_ <- fs::path(tmp_dir_, paste0("input_", engine_, "_", model_, ".parquet"))
     docs_ <- 0L
     cands_ <- 0L
-    missing_ <- sig_$DocID
 
-    for (g_ in seq_along(groups_)) {
-
-    labels_ <- strsplit(names(groups_)[g_], ",", fixed = TRUE)[[1]]
-    grp_ids_ <- sort(groups_[[g_]])
-    per_ <- if (is.null(.docs_per_run)) length(grp_ids_) else as.integer(.docs_per_run)
-    slices_ <- split(grp_ids_, ceiling(seq_along(grp_ids_) / per_))
+    # Resolve this combo's knobs once (broadcast scalar/vector or engine[:model])
+    labels_ <- ner_label_policy(.engine = engine_, .model = model_, .labels = .labels)
+    n_process_ <- ner_arg(.n_process, engine_, model_, .default = 16L)
+    batch_ <- ner_arg(.batch_size, engine_, model_, .default = 64L)
+    timeout_ <- ner_arg(.timeout, engine_, model_, .default = 0L)
 
     for (s_ in seq_along(slices_)) {
       ids_ <- slices_[[s_]]
       if (!.quiet && length(slices_) > 1L) {
-        cli::cli_alert_info(paste0("{engine_}/{model_} [{paste(labels_, collapse = ',')}]: ",
-                                   "slice {s_}/{length(slices_)} ({length(ids_)} doc{?s})"))
+        cli::cli_alert_info("{engine_}/{model_}: slice {s_}/{length(slices_)} ({length(ids_)} doc{?s})")
       }
 
       if (!fs::file_exists(stage_)) {
@@ -1023,9 +985,7 @@ ner_run <- function(
         ner_dateregex(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars,
-          .timeout = timeout_, .chunk_size = batch_, .n_process = n_process_,
-          .no_progress = .no_progress, .quiet = .quiet
+          .labels = labels_, .max_chars = .max_chars, .no_progress = .no_progress, .quiet = .quiet
         )
       } else if (engine_ == "paper" && model_ == "moneyregex-v4") {
         ner_moneyregex(
@@ -1055,7 +1015,7 @@ ner_run <- function(
       # Identity guard: the parquet MUST stamp the combo we dispatched, else abort
       # (catches an extractor's ENGINE/MODEL constants drifting from the token).
       res_ <- ner_db_append(
-        .db_path, stage_, .labels = labels_,
+        .db_path, stage_,
         .expect_engine = engine_, .expect_model = model_,
         .retry_timeout = .retry_timeout, .quiet = .quiet
       )
@@ -1073,8 +1033,6 @@ ner_run <- function(
         fs::file_delete(del_[fs::file_exists(del_)])
       }
     }
-
-    }  # end missing-label group
 
     summary_[[i_]] <- tibble::tibble(
       Engine = engine_, Model = model_,
@@ -1192,48 +1150,21 @@ ner_db_init <- function(.db_path, .quiet = FALSE) {
     );
   ")
 
-  # runs = the completeness ledger and authoritative skip source. ONE ROW PER
-  # (DocID, Engine, Model, LABEL) ingested, with Status:
+  # runs = the completeness ledger and authoritative skip source. One row per
+  # (DocID, Engine, Model) ingested, with Status:
   #   success -- ran, found candidates;        no re-run
   #   nohit   -- ran clean, genuinely nothing;  no re-run
   #   timeout -- >=1 extractor/window skipped;  re-run candidate (.retry_timeout)
-  #
-  # LABEL IS IN THE KEY, AND ITS ABSENCE WAS THE MOST EXPENSIVE DEFECT IN THIS PROJECT. A ledger
-  # keyed only on the combination cannot tell "spaCy has seen this document" from "spaCy has seen
-  # this document AND WAS ASKED FOR PERSON": add a label to the policy and every combination is
-  # already marked done, so the store reports itself complete under a set it was never built with.
-  # PERSON was absent from the sample store for an entire pass that way, and adding GPE to LexNLP
-  # later forced a re-extraction of ORG, DATE and MONEY -- 74% of that engine's cost -- to obtain
-  # one label that had not been asked for.
-  #
-  # With Label in the key the diff is exact: what is missing is missing per label, a policy
-  # addition extracts only the addition, and the manifest needs no label fingerprint because
-  # nothing has to be cleared.
   DBI::dbExecute(con_, "
     CREATE TABLE IF NOT EXISTS runs (
       DocID     VARCHAR    NOT NULL,
       Engine    VARCHAR    NOT NULL,
       Model     VARCHAR    NOT NULL,
-      Label     VARCHAR    NOT NULL,
       Status    VARCHAR    NOT NULL CHECK (Status IN ('success', 'nohit', 'timeout')),
       CreatedAt TIMESTAMP  NOT NULL,
-      UNIQUE (DocID, Engine, Model, Label)
+      UNIQUE (DocID, Engine, Model)
     );
   ")
-
-  # A store written before Label entered the key cannot be reconciled: its ledger records that a
-  # combination ran without recording what it was asked for, which is precisely the information
-  # needed to backfill. Refusing is the honest response -- silently treating those rows as covering
-  # every label would reintroduce the defect the column exists to prevent.
-  cols_ <- DBI::dbGetQuery(con_, "SELECT * FROM runs LIMIT 0") |> names()
-  if (!"Label" %in% cols_) {
-    DBI::dbDisconnect(con_, shutdown = TRUE)
-    cli::cli_abort(c(
-      "Store at {.path {(.db_path)}} predates the label-level ledger.",
-      "x" = "Its {.field runs} table has no {.field Label} column.",
-      "i" = "Delete the store and its manifest, then re-extract."
-    ))
-  }
 
   if (!.quiet) {
     if (exists_) {
@@ -1266,13 +1197,12 @@ ner_db_init <- function(.db_path, .quiet = FALSE) {
 #' @param .retry_timeout Logical. TRUE deletes prior timeout rows for these documents first.
 #' @param .quiet Logical. Suppress the ingest message.
 #' @return Invisibly, a list of the row counts written.
-ner_db_append <- function(.db_path, .parquet, .labels,
+ner_db_append <- function(.db_path, .parquet,
                           .expect_engine = NULL, .expect_model = NULL,
                           .retry_timeout = FALSE, .quiet = FALSE) {
   if (FALSE) {
     .db_path <- file.path(.lP$Cache$NerTest, "test_store.duckdb")
     .parquet <- file.path(.lP$Cache$NerTest, "test_lexnlp.parquet")
-    .labels <- c("ORG", "DATE", "MONEY")
     .expect_engine <- "lexnlp"
     .expect_model <- "lexnlp"
     .retry_timeout <- FALSE
@@ -1317,54 +1247,28 @@ ner_db_append <- function(.db_path, .parquet, .labels,
     }
   }
 
-  # THE REQUESTED LABELS ARE AN ARGUMENT AND CANNOT BE INFERRED FROM THE PARQUET, which is the whole
-  # reason .labels exists. The staging file records what was FOUND; it is silent about what was
-  # ASKED FOR. A document requested for ORG and GPE that yielded only organisations needs two
-  # ledger rows -- ORG success, GPE nohit -- and without the requested set the second is
-  # underivable, so GPE would look missing on every subsequent render and re-extract forever.
-  labels_req_ <- sort(unique(as.character(.labels)))
-  if (length(labels_req_) == 0L) {
-    cli::cli_abort("{.arg .labels} must name the labels this extraction requested.")
-  }
-
-  # Per document and label: timeout (marker) > success (a real span of THAT label) > nohit.
-  # A timeout is a property of the document under the engine, not of one label -- the extractor was
-  # cut off, so nothing it was asked for can be called clean.
-  hits_ <- src_ |>
-    dplyr::filter(!is.na(Start)) |>
-    dplyr::distinct(DocID, Engine, Model, Label) |>
-    dplyr::collect() |>
-    dplyr::mutate(HasHit = TRUE)
-
-  tmo_ <- src_ |>
+  # Per-doc status from the parquet: timeout (marker) > success (real hit) > nohit
+  status_ <- src_ |>
     dplyr::group_by(DocID, Engine, Model) |>
     dplyr::summarise(
-      HasTimeout = max(dplyr::if_else(!is.na(LabelRaw) & LabelRaw %like% "timeout:%", 1L, 0L),
-                       na.rm = TRUE),
+      HasTimeout = max(dplyr::if_else(!is.na(LabelRaw) & LabelRaw %like% "timeout:%", 1L, 0L), na.rm = TRUE),
+      HasHit = max(dplyr::if_else(!is.na(Start), 1L, 0L), na.rm = TRUE),
       .groups = "drop"
     ) |>
-    dplyr::collect()
-
-  status_ <- tidyr::expand_grid(
-    dplyr::select(tmo_, DocID, Engine, Model, HasTimeout),
-    Label = labels_req_
-  ) |>
-    dplyr::left_join(hits_, by = dplyr::join_by(DocID, Engine, Model, Label)) |>
     dplyr::mutate(Status = dplyr::case_when(
-      .data$HasTimeout == 1L ~ "timeout",
-      !is.na(.data$HasHit)   ~ "success",
-      TRUE                   ~ "nohit"
+      HasTimeout == 1L ~ "timeout",
+      HasHit == 1L ~ "success",
+      TRUE ~ "nohit"
     )) |>
-    dplyr::select(DocID, Engine, Model, Label, Status)
+    dplyr::select(DocID, Engine, Model, Status)
 
-  # Which staged (document, label) pairs are new vs already present, and their existing status
+  # Which staged combos are new vs already-present (and their existing status)
   combos_ <- status_ |>
     dplyr::left_join(
-      dplyr::tbl(con_, "runs") |>
-        dplyr::select(DocID, Engine, Model, Label, OldStatus = Status) |>
-        dplyr::collect(),
-      by = dplyr::join_by(DocID, Engine, Model, Label)
-    )
+      dplyr::tbl(con_, "runs") |> dplyr::select(DocID, Engine, Model, OldStatus = Status),
+      by = c("DocID", "Engine", "Model")
+    ) |>
+    dplyr::collect()
 
   n_all_ <- nrow(combos_)
   new_ <- combos_ |> dplyr::filter(is.na(OldStatus))
@@ -1377,18 +1281,14 @@ ner_db_append <- function(.db_path, .parquet, .labels,
   }
 
   if (nrow(to_ingest_) == 0L) {
-    if (!.quiet) {
-      cli::cli_alert_info("All {n_all_} document-label pair(s) already in store -- nothing to append.")
-    }
+    if (!.quiet) cli::cli_alert_info("All {n_all_} doc combo(s) already in store -- nothing to append.")
     return(invisible(list(docs = 0L, candidates = 0L, retried = 0L)))
   }
 
   # Register the ingest scope (DocIDs) and the per-doc status to write into runs
-  duckdb::duckdb_register(con_, "ner_ingest_docs",
-                          data.frame(DocID = unique(to_ingest_$DocID)))
+  duckdb::duckdb_register(con_, "ner_ingest_docs", data.frame(DocID = to_ingest_$DocID))
   on.exit(duckdb::duckdb_unregister(con_, "ner_ingest_docs"), add = TRUE, after = FALSE)
-  duckdb::duckdb_register(con_, "ner_ingest_status",
-                          to_ingest_[c("DocID", "Engine", "Model", "Label", "Status")])
+  duckdb::duckdb_register(con_, "ner_ingest_status", to_ingest_[c("DocID", "Engine", "Model", "Status")])
   on.exit(duckdb::duckdb_unregister(con_, "ner_ingest_status"), add = TRUE, after = FALSE)
 
   engine_ <- to_ingest_$Engine[1]
@@ -1405,35 +1305,30 @@ ner_db_append <- function(.db_path, .parquet, .labels,
     DBI::dbExecute(con_, "
       DELETE FROM candidates
       WHERE Engine = ? AND Model = ?
-        AND EXISTS (SELECT 1 FROM ner_ingest_status i
-                    WHERE i.DocID = candidates.DocID AND i.Label = candidates.Label)
-        AND EXISTS (SELECT 1 FROM runs r
-                    WHERE r.DocID = candidates.DocID AND r.Engine = candidates.Engine
-                      AND r.Model = candidates.Model AND r.Label = candidates.Label
-                      AND r.Status = 'timeout')
+        AND DocID IN (SELECT DocID FROM ner_ingest_docs)
+        AND DocID IN (SELECT DocID FROM runs r WHERE r.Engine = candidates.Engine
+                        AND r.Model = candidates.Model AND r.Status = 'timeout')
     ", params = list(engine_, model_))
     DBI::dbExecute(con_, "
       DELETE FROM runs
       WHERE Engine = ? AND Model = ? AND Status = 'timeout'
-        AND EXISTS (SELECT 1 FROM ner_ingest_status i
-                    WHERE i.DocID = runs.DocID AND i.Label = runs.Label)
+        AND DocID IN (SELECT DocID FROM ner_ingest_docs)
     ", params = list(engine_, model_))
   }
 
   # candidates: real hits of the ingest scope only (markers + sentinels excluded)
   n_cand_ <- DBI::dbExecute(con_, "
     INSERT INTO candidates (DocID, Start, Stop, Span, Label, LabelRaw, Engine, Model)
-    SELECT s.DocID, s.Start, s.Stop, s.Span, s.Label, s.LabelRaw, s.Engine, s.Model
-    FROM ner_src s
-    WHERE s.Start IS NOT NULL
-      AND EXISTS (SELECT 1 FROM ner_ingest_status i
-                  WHERE i.DocID = s.DocID AND i.Label = s.Label)
+    SELECT DocID, Start, Stop, Span, Label, LabelRaw, Engine, Model
+    FROM ner_src
+    WHERE Start IS NOT NULL
+      AND DocID IN (SELECT DocID FROM ner_ingest_docs)
   ")
 
   # runs: one row per ingested doc combo, with its derived Status
   DBI::dbExecute(con_, "
-    INSERT INTO runs (DocID, Engine, Model, Label, Status, CreatedAt)
-    SELECT DocID, Engine, Model, Label, Status, now()::TIMESTAMP
+    INSERT INTO runs (DocID, Engine, Model, Status, CreatedAt)
+    SELECT DocID, Engine, Model, Status, now()::TIMESTAMP
     FROM ner_ingest_status
   ")
 
@@ -1442,7 +1337,7 @@ ner_db_append <- function(.db_path, .parquet, .labels,
 
   if (!.quiet) {
     msg_ <- paste0("Appended {n_cand_} candidate(s) over {nrow(to_ingest_)} of {n_all_} ",
-                   "document-label pair(s) from {.path {fs::path_file(.parquet)}}")
+                   "doc combo(s) from {.path {fs::path_file(.parquet)}}")
     if (n_retry_ > 0L) msg_ <- paste0(msg_, " (incl. {n_retry_} timeout retr{?y/ies})")
     cli::cli_alert_success(msg_)
   }
@@ -1462,14 +1357,13 @@ ner_db_append <- function(.db_path, .parquet, .labels,
 #' @param .retry_timeout Logical. TRUE counts prior timeouts as missing.
 #' @param .quiet Logical. Suppress the count message.
 #' @return Character vector of document identifiers.
-ner_db_missing <- function(.db_path, .inputs, .engine, .model, .labels,
+ner_db_missing <- function(.db_path, .inputs, .engine, .model,
                            .id_col = "DocID", .retry_timeout = FALSE, .quiet = FALSE) {
   if (FALSE) {
     .db_path <- file.path(.lP$Cache$NerTest, "test_store.duckdb")
     .inputs <- fil_sample_dirs$Path[20]
     .engine <- "spacy"
     .model <- "en_core_web_sm"
-    .labels <- c("ORG", "GPE")
     .id_col <- "DocID"
     .retry_timeout <- FALSE
     .quiet <- FALSE
@@ -1486,42 +1380,29 @@ ner_db_missing <- function(.db_path, .inputs, .engine, .model, .labels,
     "SELECT \"", .id_col, "\" AS DocID FROM read_parquet([", files_sql_, "])"
   ))
 
-  # Ledger rows counting as done for this combination: always success/nohit; when not retrying,
-  # timeout counts as done too, so a document that was cut off is not re-sent forever.
+  # Ledger rows that count as "done" for this combo: always success/nohit; when
+  # not retrying, timeout counts as done too (so it won't be re-sent).
   done_ <- dplyr::tbl(con_, "runs") |>
     dplyr::filter(Engine == !!.engine, Model == !!.model)
   if (isTRUE(.retry_timeout)) {
     done_ <- done_ |> dplyr::filter(Status != "timeout")
   }
-  done_ <- done_ |> dplyr::select(DocID, Label) |> dplyr::collect()
 
-  ids_ <- dplyr::tbl(con_, "ner_inputs") |> dplyr::distinct(DocID) |> dplyr::pull(DocID)
-  n_all_ <- length(ids_)
+  missing_ <- dplyr::tbl(con_, "ner_inputs") |>
+    dplyr::distinct(DocID) |>
+    dplyr::anti_join(done_, by = "DocID") |>
+    dplyr::pull(DocID)
 
-  # THE RETURN IS A LIST KEYED ON LABEL, not one vector, because the missing set genuinely differs
-  # per label: a policy addition leaves one label missing everywhere while the rest are complete,
-  # and collapsing that to "these documents need work" is what forced a full re-extraction to
-  # obtain a single label.
-  labels_ <- sort(unique(as.character(.labels)))
-  out_ <- purrr::map(labels_, function(.l) {
-    setdiff(ids_, done_$DocID[done_$Label == .l])
-  })
-  names(out_) <- labels_
+  n_all_ <- dplyr::tbl(con_, "ner_inputs") |>
+    dplyr::summarise(n = dplyr::n_distinct(DocID)) |>
+    dplyr::pull(n)
 
   if (!.quiet) {
     retry_msg_ <- if (isTRUE(.retry_timeout)) " (incl. timeout retries)" else ""
-    n_by_ <- purrr::map_int(out_, length)
-    if (length(unique(n_by_)) == 1L) {
-      cli::cli_alert_info(paste0("{(.engine)}/{(.model)}: {n_by_[[1]]} of {n_all_} ",
-                                 "doc(s) missing for each of {length(labels_)} label{?s}",
-                                 "{retry_msg_}."))
-    } else {
-      cli::cli_alert_info(paste0("{(.engine)}/{(.model)}: missing per label{retry_msg_} -- ",
-                                 paste0(names(n_by_), " ", n_by_, collapse = ", "),
-                                 " (of {n_all_})."))
-    }
+    cli::cli_alert_info(paste0("{(.engine)}/{(.model)}: {length(missing_)} of {n_all_} ",
+                               "doc(s) missing{retry_msg_}."))
   }
-  return(out_)
+  return(missing_)
 }
 #' Time a grid of combinations on a fixed input
 #'

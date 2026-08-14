@@ -25,7 +25,8 @@ unchanged, so all emitted offsets remain valid against the full original text.
 
 Maps LexNLP's built-in get_*_annotations extractors into the shared label vocabulary
 so output aligns with extract_spacy.py (identical schema). --label selects unified
-labels. GPE is gated off by policy (geography = spaCy + gazetteer, MasterDoc section 16):
+labels. GPE is ENABLED but expensive (see build_geo_locator); geography candidates are
+    LexNLP geoentities, the gazetteer and spaCy:
 the EXTRACTORS entry and --geo-config remain, but build_geo_locator raises until it
 is re-implemented. PERSON has no annotation API.
 
@@ -49,6 +50,11 @@ import warnings
 # LexNLP ships sklearn 0.23 pickles loaded under a newer sklearn -> benign version warning.
 warnings.filterwarnings("ignore", message="Trying to unpickle estimator")
 
+from lexnlp.extract.all_locales.languages import LANG_EN
+from lexnlp.extract.common.geoentity_detector import GeoEntityLocator
+from lexnlp.config.en import geoentities_config
+from lexnlp.extract.en.dict_entities import (DictionaryEntry, DictionaryEntryAlias,
+                                             prepare_alias_banlist_dict)
 from lexnlp.extract.en.entities.nltk_maxent import get_company_annotations
 from lexnlp.extract.en.dates import get_date_annotations
 from lexnlp.extract.en.money import get_money_annotations
@@ -58,10 +64,11 @@ from lexnlp.extract.en.ratios import get_ratio_annotations
 from lexnlp.extract.en.durations import get_duration_annotations
 
 COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
-GEO_CONFIG_DEFAULT = "/app/geoentities.csv"   # only relevant if the GPE path is re-enabled
+GEO_CONFIG_DEFAULT = "/app/geoentities.csv"   # LexPredict single-df format, baked into the image
+GEO_MIN_ALIAS_DEFAULT = 4                     # backstop only; the ISO columns are dropped outright
 
 _SELECTED = []        # [(label, raw, fn)], set in main() before the pool forks
-_GEO_LOCATOR = None    # GeoEntityLocator, built once if GPE is selected (currently gated)
+_GEO_LOCATOR = None    # GeoEntityLocator, built once in main() before the pool forks
 _TIMEOUT = 0           # per-extractor-per-doc seconds, set in main() before the fork
 
 
@@ -82,23 +89,60 @@ def _geo_extractor(text):
     return _GEO_LOCATOR.get_geoentity_annotations(text)
 
 
-def build_geo_locator(geo_config_path):
-    """Build the LexNLP GeoEntityLocator for the GPE path.
+def build_geo_locator(geo_config_path, min_alias_len=GEO_MIN_ALIAS_DEFAULT, iso_codes=False):
+    """Build the LexNLP GeoEntityLocator over the LexPredict geoentities CSV.
 
-    GPE via LexNLP is excluded by project policy: geography comes from spaCy GPE
-    + the gazetteer engine (MasterDoc section 16), because LexNLP's geoentity pass is the
-    throughput bottleneck (~5 s/doc). The orchestrator never requests GPE here, so
-    this is never reached in the current pipeline.
+    THIS IS NOT THE SLOW PATH, THOUGH IT WAS DOCUMENTED AS ONE. An earlier note here claimed the
+    geoentity pass cost ~5 s/doc and was the throughput bottleneck; measured on a 300-document
+    random draw at n_process=24 it runs at 64 doc/s, against 4.9 doc/s for ORG, DATE and MONEY
+    together. Geoentities are about 6% of this extractor's corpus bill. The expensive work is the
+    maxent company NER and the date grammar.
 
-    The original loader was dropped when GPE was excluded; this raises an explicit
-    error rather than the NameError the missing definition produced. To re-enable:
-    re-add the geo imports (GeoEntityLocator, LANG_EN, geoentities_config,
-    DictionaryEntry, prepare_alias_banlist_dict) and build the locator over
-    `geo_config_path` (the LexPredict geoentities CSV), then remove this raise.
+    THE ISO CODE COLUMNS ARE DROPPED FROM THE ALIAS SET, AND A LENGTH THRESHOLD IS NOT ENOUGH.
+    LexNLP's default aliases are Entity Name, Alias, ISO-3166-2 and ISO-3166-3, and both code
+    columns are ordinary English words in a contract. The two-letter codes give IN, OR, ME, DE,
+    LA and AL -- "IN" matches "IN WITNESS WHEREOF" on essentially every document. Raising
+    min_alias_len to 3 removes those and walks into the three-letter codes, which are worse
+    because they match case-insensitively: measured on twenty sample contracts, NOR (Norway)
+    was the single most frequent span at 188 hits, from "neither ... nor", and AND (Andorra)
+    took 37. The set also contains PER, CAN, ARE, ARM, FIN, TON and MAR, and "per annum" alone
+    would poison the label.
+
+    So the fix is to name the alias columns rather than to filter by length. Entity Name and
+    Alias are kept; both ISO columns go. min_alias_len stays as a backstop against a short entry
+    in the Alias column, not as the primary guard.
+
+    The cost is postal abbreviations -- "New York, NY 10167" contributes only "New York". That is
+    acceptable because the gazetteer engine already recovers a two-letter state code where a ZIP
+    follows it, which is a constraint this dictionary cannot express, and duplicating the
+    capability badly is worse than not duplicating it.
+
+    Conflict resolving is left at LexNLP's default of "none", so a position matched by two
+    entities yields both. That is the honest behaviour for a candidate store: the duplicate is
+    visible to the resolution step rather than silently decided here.
+
+    The locator is built once in the parent and inherited by the pool through fork; rebuilding it
+    per worker would repeat the dictionary normalisation for every process.
     """
-    raise SystemExit(
-        "GPE via LexNLP is not wired up (excluded by policy: geography = spaCy + "
-        "gazetteer, MasterDoc section 16). Implement build_geo_locator to enable it."
+    config = pd.read_csv(geo_config_path)
+    alias_columns = [
+        DictionaryEntryAlias("Entity Name", LANG_EN.code, False),
+        DictionaryEntryAlias("Alias", LANG_EN.code, False),
+    ]
+    if iso_codes:
+        alias_columns += [
+            DictionaryEntryAlias("ISO-3166-2", LANG_EN.code, True),
+            DictionaryEntryAlias("ISO-3166-3", LANG_EN.code, True),
+        ]
+    entries = DictionaryEntry.load_entities_from_single_df(
+        config, LANG_EN.code, alias_columns=alias_columns)
+    ban = prepare_alias_banlist_dict(geoentities_config.ALIAS_BLACK_LIST)
+    return GeoEntityLocator(
+        LANG_EN.code,
+        entries,
+        ban,
+        text_languages=[LANG_EN.code],   # English aliases only: "Island" is German for Iceland
+        min_alias_len=min_alias_len,
     )
 
 
@@ -204,6 +248,11 @@ def main():
                     help="per-extractor-per-document cap in seconds (0 = off)")
     ap.add_argument("--geo-config", default=GEO_CONFIG_DEFAULT,
                     help="geoentities CSV for GPE (LexPredict single-df format)")
+    ap.add_argument("--geo-min-alias-len", type=int, default=GEO_MIN_ALIAS_DEFAULT,
+                    help="shortest geo alias matched; a backstop, not the primary guard")
+    ap.add_argument("--geo-iso-codes", action="store_true",
+                    help="also match ISO-3166 codes as places; NOR, AND, PER and CAN are English "
+                         "words and this is off for that reason")
     ap.add_argument("--n-process", type=int, default=1, help="worker processes (<=0 = all cores)")
     ap.add_argument("--chunk-size", type=int, default=8, help="docs per task when parallelising")
     ap.add_argument("--no-progress", action="store_true", help="disable the progress bar")
@@ -219,7 +268,12 @@ def main():
 
     # GPE is dictionary-driven: build the locator once (before the pool forks).
     if any(lab == "GPE" for lab, _, _ in _SELECTED):
-        _GEO_LOCATOR = build_geo_locator(args.geo_config)
+        _GEO_LOCATOR = build_geo_locator(args.geo_config, args.geo_min_alias_len,
+                                         args.geo_iso_codes)
+        n_alias = sum(len(e.aliases) for e in _GEO_LOCATOR.geo_config_list)
+        print(f"geo locator: {len(_GEO_LOCATOR.geo_config_list)} entities, {n_alias} aliases, "
+              f"min_alias_len={args.geo_min_alias_len}, iso_codes={args.geo_iso_codes}",
+              file=sys.stderr)
 
     nproc = args.n_process if args.n_process > 0 else (os.cpu_count() or 1)
     desc = f"lexnlp {[s[0] for s in _SELECTED]} (n_process={nproc})"

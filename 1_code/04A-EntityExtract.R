@@ -503,10 +503,14 @@ ent_report_superseded <- function(.db_path, .run, .clear = TRUE) {
 
 #' The label set each declared combination will actually be asked for
 #'
-#' ner_run() holds the per-engine policy and applies it silently. Reading it back out is what lets
-#' the manifest fingerprint the labels rather than the fact that a policy exists, and it is also the
-#' table a reader consults to see why the store's grid is ragged: a gazetteer emits places and
-#' nothing else, so its empty columns are a property of the engine and not a failure.
+#' ner_run() holds the per-engine policy and applies it silently. Reading it back out gives a reader
+#' the table that explains why the store's grid is ragged: a gazetteer emits places and nothing
+#' else, so its empty columns are a property of the engine and not a failure.
+#'
+#' NO LONGER A GUARD. It used to fingerprint the labels so a policy change could be detected and the
+#' affected engines cleared. The ledger is keyed on the label now, so a change is visible as missing
+#' work rather than as a mismatch, and nothing has to be cleared to act on it. What remains is
+#' documentation.
 #'
 #' @param .run Character vector of combo tokens.
 #' @param .labels Character, named list or NULL, exactly as passed to ner_run().
@@ -529,70 +533,6 @@ ent_labels_resolved <- function(.run, .labels = NULL) {
       })
     )
 }
-
-#' Clear the engines whose label set has moved since the store was built
-#'
-#' The ledger cannot see labels, so an engine asked for a new label is skipped as already done. The
-#' manifest can see it, and this is what turns seeing into acting: the affected combinations are
-#' removed from the store, ner_run() then finds their documents missing, and they extract again.
-#'
-#' Idempotent by construction. The clear happens only when the stored and current label strings
-#' differ, so the first render after a policy edit pays for the re-extraction and every render after
-#' it costs nothing. That matters more than it sounds: the alternative is a one-off command someone
-#' has to remember, which is how the previous store came to be missing PERSON without any sign of it.
-#'
-#' @param .db_path Path to the store.
-#' @param .path_manifest Manifest parquet path.
-#' @param .resolved Tibble from ent_labels_resolved().
-#' @param .quiet Suppress the messages.
-#' @return Invisibly, a tibble of the combinations cleared, empty when nothing moved.
-ent_clear_relabelled <- function(.db_path, .path_manifest, .resolved, .quiet = FALSE) {
-  if (FALSE) {
-    .db_path       <- .lP$Store$NerDB
-    .path_manifest <- .lP$Store$Manifest
-    .resolved      <- ent_labels_resolved(lst_run_args$.run, NULL)
-    .quiet         <- FALSE
-  }
-
-  none_ <- tibble::tibble(Combo = character(0), Stored = character(0), Current = character(0))
-  if (!fs::file_exists(.path_manifest) || !fs::file_exists(.db_path)) return(invisible(none_))
-
-  # The stored string is "combo=labels | combo=labels"; split it back into a table so the comparison
-  # is per combination. A manifest written before this field existed parses to nothing and is
-  # treated as no information rather than as a mismatch, because clearing a whole store on the
-  # strength of a format change would be the worse error.
-  parse_ <- function(.x) {
-    if (is.na(.x) || !grepl("=", .x, fixed = TRUE)) return(none_[, c("Combo", "Stored")])
-    parts_ <- strsplit(trimws(strsplit(.x, "|", fixed = TRUE)[[1]]), "=", fixed = TRUE)
-    tibble::tibble(
-      Combo  = purrr::map_chr(parts_, 1L),
-      Stored = purrr::map_chr(parts_, \(.p) if (length(.p) > 1L) .p[2] else NA_character_)
-    )
-  }
-
-  old_ <- parse_(arrow::read_parquet(.path_manifest)$Labels[1])
-  if (nrow(old_) == 0L) return(invisible(none_))
-
-  moved_ <- .resolved |>
-    dplyr::rename(Current = Labels) |>
-    dplyr::inner_join(old_, by = dplyr::join_by(Combo)) |>
-    dplyr::filter(.data$Stored != .data$Current) |>
-    dplyr::select(Combo, Stored, Current)
-
-  if (nrow(moved_) == 0L) {
-    if (!.quiet) cli::cli_alert_success("Label policy unchanged for every declared engine.")
-    return(invisible(moved_))
-  }
-
-  if (!.quiet) {
-    cli::cli_alert_warning("Label set moved for {nrow(moved_)} engine{?s}; clearing so they re-extract.")
-    tbl_say(.tab = moved_, .title = "Relabelled")
-  }
-  ner_db_clear(.db_path = .db_path, .run = moved_$Combo, .doc_ids = NULL,
-               .status = NULL, .quiet = .quiet)
-  invisible(moved_)
-}
-
 
 #' Compare the current extraction settings against the ones the store was built under
 #'
@@ -812,6 +752,183 @@ ent_family_consensus <- function(.mentions) {
     dplyr::left_join(elig_, by = "Label") |>
     dplyr::mutate(ShareOfMentions = .data$NMentions / sum(.data$NMentions), .by = Label) |>
     dplyr::arrange(.data$Label, .data$NFamilies)
+}
+
+
+# 5. Tuning ------------------------------------------------------------------------------------------------------------
+# Measures the SETTINGS rather than the engines. Everything here runs against a scratch store that
+# is deleted afterwards, because timing against the real store would be circular: the ledger would
+# report the documents already done and the second setting would be timed on no work at all.
+
+#' Time one extractor over a subsample at a given batch size
+#'
+#' Startup is subtracted. Container start, library import and dictionary construction are paid once
+#' per invocation whatever the batch size, so leaving them in would compress the very differences
+#' being measured -- and compress them most at the settings that finish fastest.
+#'
+#' @param .combo Character. Combination token, e.g. "lexnlp".
+#' @param .path_text Canonical text parquet.
+#' @param .n Integer. Documents drawn.
+#' @param .batch Integer. Batch size under test.
+#' @param .n_process Integer. Held fixed; this measures the batch knob.
+#' @param .timeout Integer. Per-document cap in seconds.
+#' @param .start_seconds Numeric. Fixed cost to subtract, from ent_tune_startup().
+#' @param .seed Integer. Draw seed.
+#' @return Tibble: Combo, Batch, NetSeconds, DocsPerSec, Candidates.
+ent_tune_run <- function(.combo, .path_text, .n = 200L, .batch = 8L, .n_process = 20L,
+                         .timeout = 240L, .start_seconds = 0, .seed = 42L) {
+  if (FALSE) {
+    .combo         <- "lexnlp"
+    .path_text     <- .lP$Sample$Text
+    .n             <- 200L
+    .batch         <- 8L
+    .n_process     <- 20L
+    .timeout       <- 240L
+    .start_seconds <- 3
+    .seed          <- 42L
+  }
+
+  dir_ <- fs::dir_create(fs::path(tempdir(), paste0("tune_", gsub("[:/]", "_", .combo))))
+  on.exit(if (fs::dir_exists(dir_)) fs::dir_delete(dir_), add = TRUE)
+
+  arrow::read_parquet(.path_text) |>
+    (\(.d) withr::with_seed(.seed, dplyr::slice_sample(.d, n = min(.n, nrow(.d)))))() |>
+    dplyr::select(DocID, TextRaw) |>
+    arrow::write_parquet(fs::path(dir_, "in.parquet"))
+
+  db_ <- fs::path(dir_, "scratch.duckdb")
+  t0_ <- Sys.time()
+  ok_ <- tryCatch({
+    ner_run(
+      .inputs = fs::path(dir_, "in.parquet"), .db_path = db_,
+      .run = .combo, .labels = NULL, .max_chars = NULL,
+      .n_process = .n_process, .batch_size = .batch, .timeout = .timeout,
+      .device = "auto", .no_progress = TRUE, .quiet = TRUE
+    )
+    TRUE
+  }, error = function(.e) FALSE)
+  secs_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+  net_  <- pmax(secs_ - .start_seconds, 0.1)
+
+  n_cand_ <- if (ok_ && fs::file_exists(db_)) {
+    con_ <- ner_db_connect(.db_path = db_, .read_only = TRUE)
+    on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE, after = FALSE)
+    DBI::dbGetQuery(con_, "SELECT COUNT(*) AS N FROM candidates")$N
+  } else {
+    NA_integer_
+  }
+
+  tibble::tibble(
+    Combo      = .combo,
+    Batch      = as.integer(.batch),
+    NetSeconds = round(net_, 1),
+    DocsPerSec = round(.n / net_, 2),
+    Candidates = as.integer(n_cand_)
+  )
+}
+
+
+#' The fixed cost of one invocation, so it can be taken out of the comparison
+#' @param .combo Combination token.
+#' @param .path_text Canonical text parquet.
+#' @param .n_process Integer.
+#' @return Numeric seconds.
+ent_tune_startup <- function(.combo, .path_text, .n_process = 20L) {
+  if (FALSE) {
+    .combo     <- "lexnlp"
+    .path_text <- .lP$Sample$Text
+    .n_process <- 20L
+  }
+  ent_tune_run(.combo = .combo, .path_text = .path_text, .n = 1L, .batch = 8L,
+               .n_process = .n_process, .start_seconds = 0)$NetSeconds
+}
+
+
+#' Sweep the batch size for one engine and report it
+#'
+#' BATCH SIZE IS THE KNOB THAT MOVES. Measured on this corpus, LexNLP runs 4.6 times slower at a
+#' batch of 128 than at 8: the pool hands out one task per batch, so a 200-document subsample at 128
+#' is two tasks for twenty workers. Document length makes it worse -- one contract in this sample
+#' runs to 876,000 characters, and a large batch strands whichever worker draws it while the rest
+#' finish early and idle.
+#'
+#' Worker count is not swept. It rises 1.60x from eight to sixteen and 1.15x from sixteen to
+#' twenty-four, which is a 28-core M3 Ultra reaching the end of its twenty performance cores. That
+#' is a property of the machine rather than of the extraction, and measuring it once is enough.
+#'
+#' CACHED, AND THE ALTERNATIVE IS THREE MINUTES ON EVERY RENDER. A sweep costs roughly 165 seconds
+#' for LexNLP alone, most of it in the slowest cell -- which is to say most of the bill is spent
+#' re-measuring the setting already rejected. The result changes only when the grid, the sample
+#' size, the worker count or the extractor itself changes, none of which happens between renders of
+#' a document being read for its tables.
+#'
+#' The cache is keyed on the settings, so editing the grid re-measures automatically. It is NOT
+#' keyed on the extractor's own code: change a Python file and the stale timing survives, which is
+#' what .rerun is for. Same trade the corpus index makes, and the same caveat.
+#'
+#' @param .combo Combination token.
+#' @param .path_text Canonical text parquet.
+#' @param .path_cache Parquet holding previous sweeps. NULL disables caching entirely.
+#' @param .rerun Logical. TRUE re-measures and overwrites the cached row for this key.
+#' @param .batches Integer vector of batch sizes.
+#' @param .n Documents per cell.
+#' @param .n_process Held fixed.
+#' @param .timeout Per-document cap.
+#' @return Invisibly the sweep tibble.
+ent_report_tuning <- function(.combo, .path_text, .path_cache = NULL, .rerun = FALSE,
+                              .batches = c(8L, 32L, 128L),
+                              .n = 200L, .n_process = 20L, .timeout = 240L) {
+  if (FALSE) {
+    .combo      <- "lexnlp"
+    .path_text  <- .lP$Sample$Text
+    .path_cache <- .lP$Sample$Tuning
+    .rerun      <- FALSE
+    .batches    <- c(8L, 32L, 128L)
+    .n          <- 200L
+    .n_process  <- 20L
+    .timeout    <- 240L
+  }
+
+  cli::cli_h3("Batch size: {(.combo)}")
+
+  key_ <- paste(.combo, paste(sort(.batches), collapse = "-"), .n, .n_process, .timeout, sep = "|")
+  cached_ <- if (!is.null(.path_cache) && fs::file_exists(.path_cache) && !isTRUE(.rerun)) {
+    arrow::read_parquet(.path_cache) |> dplyr::filter(.data$Key == key_)
+  } else {
+    tibble::tibble()
+  }
+
+  out_ <- if (nrow(cached_) > 0L) {
+    cli::cli_alert_info("Cached; set {.arg .rerun} to re-measure.")
+    dplyr::select(cached_, -Key)
+  } else {
+    start_ <- ent_tune_startup(.combo = .combo, .path_text = .path_text, .n_process = .n_process)
+    res_ <- purrr::map(.batches, function(.b) {
+      r_ <- ent_tune_run(.combo = .combo, .path_text = .path_text, .n = .n, .batch = .b,
+                         .n_process = .n_process, .timeout = .timeout, .start_seconds = start_)
+      cat(sprintf("   batch %-5d %7.1fs net  %7.2f doc/s  %8d candidates\n",
+                  .b, r_$NetSeconds, r_$DocsPerSec, r_$Candidates))
+      utils::flush.console()
+      r_
+    }) |>
+      purrr::list_rbind() |>
+      dplyr::mutate(Relative = round(max(.data$NetSeconds) / .data$NetSeconds, 2))
+
+    if (!is.null(.path_cache)) {
+      prior_ <- if (fs::file_exists(.path_cache)) {
+        arrow::read_parquet(.path_cache) |> dplyr::filter(.data$Key != key_)
+      } else {
+        tibble::tibble()
+      }
+      fs::dir_create(fs::path_dir(.path_cache))
+      dplyr::bind_rows(prior_, dplyr::mutate(res_, Key = key_)) |>
+        arrow::write_parquet(.path_cache)
+    }
+    res_
+  }
+
+  tbl_say(.tab = out_, .title = paste0("Batch size at n_process = ", .n_process))
+  invisible(out_)
 }
 
 
@@ -1037,6 +1154,125 @@ ent_describe <- function(.db_path, .path_text, .bins = 30L) {
   list(yield = yield_, position = pos_)
 }
 
+#' Collapse a positional distribution to one comparable number
+#'
+#' Ten decile shares per engine and label are readable pooled and unreadable once a twelve-class
+#' breakdown multiplies them. The contrast is the mean share at the two ends of the document over
+#' the mean share through the middle, which is one number that answers the question the shares were
+#' being consulted for: does this engine concentrate the label where parties are named, or spread it
+#' evenly through the text.
+#'
+#' A uniform engine scores 1.0 by construction. LexNLP's organisations score about 4.5; every spaCy
+#' model scores about 1.0.
+#'
+#' D1 AND D8 ARE EXCLUDED FROM THE MIDDLE deliberately. They are shoulder: a preamble spills into the
+#' second decile of a short document and a signature block into the ninth, so counting them as
+#' middle would blunt the very contrast being measured.
+#'
+#' @param .tab Binned table with Mid and Share, already shared within .by.
+#' @param .by Character vector of grouping columns.
+#' @return Tibble: the grouping columns, plus EndShare, MidShare and Contrast.
+ent_contrast <- function(.tab, .by = c("Combo", "Label")) {
+  if (FALSE) {
+    .tab <- .desc$position
+    .by  <- c("Combo", "Label")
+  }
+
+  .tab |>
+    dplyr::mutate(Zone = dplyr::case_when(
+      .data$Mid < 0.1 | .data$Mid >= 0.9  ~ "End",
+      .data$Mid >= 0.2 & .data$Mid < 0.8  ~ "Mid",
+      TRUE                                ~ "Shoulder"
+    )) |>
+    dplyr::summarise(Share = sum(.data$Share), .by = dplyr::all_of(c(.by, "Zone"))) |>
+    tidyr::pivot_wider(names_from = Zone, values_from = Share, values_fill = 0) |>
+    dplyr::mutate(
+      # Two deciles at the ends against six through the middle, so both sides are per-decile means
+      # and the ratio is scale-free.
+      EndShare = .data$End / 2,
+      MidShare = .data$Mid / 6,
+      Contrast = dplyr::if_else(.data$MidShare > 0, .data$EndShare / .data$MidShare, NA_real_)
+    ) |>
+    dplyr::select(dplyr::all_of(.by), EndShare, MidShare, Contrast)
+}
+
+
+#' The same description, cut by contract type
+#'
+#' A pooled median hides an engine that behaves well on employment agreements and badly on credit
+#' agreements, and those are exactly the two the party rules will lean on hardest. Two quantities
+#' carry the engine verdict -- distinct spans per document, and positional contrast -- so those are
+#' the two cut here, rather than the whole yield table cut twelve ways.
+#'
+#' READ `Docs` BEFORE READING `Contrast`. A contrast computed over a handful of documents is a
+#' number about those documents. The column is reported rather than the cell suppressed, because a
+#' threshold chosen here would be a decision hidden in a helper.
+#'
+#' @param .db_path DuckDB candidate store.
+#' @param .path_text Canonical text parquet, supplying document lengths.
+#' @param .path_anchors Sample anchors parquet, supplying the contract type.
+#' @param .bins Integer. Position bins; a multiple of ten.
+#' @return Tibble: Class, Combo, Label, Docs, Spans, DistinctPerDoc, Contrast.
+ent_describe_class <- function(.db_path, .path_text, .path_anchors, .bins = 30L) {
+  if (FALSE) {
+    .db_path      <- .lP$Store$NerDB
+    .path_text    <- .lP$Sample$Text
+    .path_anchors <- .lP$Sample$Anchors
+    .bins         <- 30L
+  }
+  if (.bins %% 10L != 0L) cli::cli_abort("{.arg .bins} must be a multiple of ten.")
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  DBI::dbExecute(con_, paste0(
+    "CREATE OR REPLACE TEMP VIEW lens AS SELECT DocID, length(TextRaw) AS DocLen ",
+    "FROM read_parquet('", as.character(fs::path_abs(.path_text)), "') WHERE length(TextRaw) > 0"
+  ))
+  DBI::dbExecute(con_, paste0(
+    "CREATE OR REPLACE TEMP VIEW cls AS SELECT DocID, ClassDetailed AS Class ",
+    "FROM read_parquet('", as.character(fs::path_abs(.path_anchors)), "')"
+  ))
+
+  combo_ <- "CASE WHEN c.Engine = c.Model THEN c.Engine ELSE c.Engine || ':' || c.Model END"
+  n_     <- as.integer(.bins)
+
+  yield_ <- DBI::dbGetQuery(con_, paste0(
+    "WITH per AS ( ",
+    "  SELECT k.Class, ", combo_, " AS Combo, c.Label, c.DocID, ",
+    "    COUNT(*) AS N, COUNT(DISTINCT upper(c.Span)) AS NDistinct ",
+    "  FROM candidates c JOIN cls k USING (DocID) ",
+    "  WHERE c.Label IS NOT NULL GROUP BY k.Class, Combo, c.Label, c.DocID) ",
+    "SELECT Class, Combo, Label, COUNT(*) AS Docs, SUM(N) AS Spans, ",
+    "  median(NDistinct) AS DistinctPerDoc ",
+    "FROM per GROUP BY Class, Combo, Label"
+  )) |>
+    tibble::as_tibble()
+
+  pos_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT k.Class, ", combo_, " AS Combo, c.Label, ",
+    "  least(", n_ - 1L, ", CAST(floor((((c.Start + c.Stop) / 2.0) / l.DocLen) * ", n_,
+    ") AS INTEGER)) AS Bin, COUNT(*) AS Spans ",
+    "FROM candidates c JOIN lens l USING (DocID) JOIN cls k USING (DocID) ",
+    "WHERE c.Label IS NOT NULL AND c.Start IS NOT NULL ",
+    "GROUP BY k.Class, Combo, c.Label, Bin"
+  )) |>
+    tibble::as_tibble() |>
+    dplyr::mutate(Mid = (as.integer(.data$Bin) + 0.5) / n_) |>
+    dplyr::mutate(Share = .data$Spans / sum(.data$Spans), .by = c(Class, Combo, Label)) |>
+    ent_contrast(.by = c("Class", "Combo", "Label"))
+
+  yield_ |>
+    dplyr::left_join(pos_, by = dplyr::join_by(Class, Combo, Label)) |>
+    dplyr::mutate(
+      Docs           = as.integer(.data$Docs),
+      Spans          = as.integer(.data$Spans),
+      DistinctPerDoc = as.integer(.data$DistinctPerDoc)
+    ) |>
+    dplyr::select(Class, Combo, Label, Docs, Spans, DistinctPerDoc, Contrast)
+}
+
+
 #' What each engine found
 #' @param .desc List from ent_describe().
 #' @return Invisibly the yield tibble.
@@ -1086,19 +1322,240 @@ ent_report_position <- function(.desc) {
 }
 
 
+#' Positional contrast by contract type, one label at a time
+#'
+#' Twelve classes down, engines across. One number per cell, so the grid can be read for two things
+#' at once: which engine concentrates the label at the ends of the document, and whether it does so
+#' consistently enough for a pooled decision to hold.
+#'
+#' @param .tab Tibble from ent_describe_class().
+#' @param .label Character. Which label to show.
+#' @return Invisibly the widened tibble.
+ent_report_class <- function(.tab, .label) {
+  if (FALSE) {
+    .tab   <- tab_class
+    .label <- "ORG"
+  }
+
+  wide_ <- .tab |>
+    dplyr::filter(.data$Label == .label) |>
+    dplyr::select(Class, Combo, Contrast) |>
+    tidyr::pivot_wider(names_from = Combo, values_from = Contrast) |>
+    dplyr::arrange(plot_factor(.data$Class, .key = "ClassDetailed"))
+
+  cli::cli_h3("{(.label)}: positional contrast by contract type")
+  wide_ |>
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), \(.x) round(.x, 2))) |>
+    tbl_say(.title = paste0("Ends over middle -- ", .label))
+  invisible(wide_)
+}
+
+
+#' Does the pooled engine verdict hold in every contract type
+#'
+#' The stability check, in two columns. An engine whose contrast runs 4.1 to 4.9 across classes can
+#' be crowned pooled; one running 1.2 to 8.0 cannot, and needs either a caveat or a per-class rule.
+#' Reported for every engine rather than for a shortlist, because an engine that looks poor pooled
+#' and excellent on one class is exactly what a shortlist would have discarded unseen.
+#'
+#' @param .tab Tibble from ent_describe_class().
+#' @param .min_docs Integer. Classes with fewer documents than this are excluded from the range,
+#'   since a contrast over a handful of documents is a number about those documents.
+#' @return Invisibly the stability tibble.
+ent_report_stability <- function(.tab, .min_docs = 30L) {
+  if (FALSE) {
+    .tab      <- tab_class
+    .min_docs <- 30L
+  }
+
+  out_ <- .tab |>
+    dplyr::filter(.data$Docs >= .min_docs, !is.na(.data$Contrast)) |>
+    dplyr::summarise(
+      Classes     = dplyr::n(),
+      MinContrast = min(.data$Contrast),
+      MedContrast = stats::median(.data$Contrast),
+      MaxContrast = max(.data$Contrast),
+      MedDistinct = stats::median(.data$DistinctPerDoc),
+      .by = c(Label, Combo)
+    ) |>
+    dplyr::mutate(Spread = .data$MaxContrast / pmax(.data$MinContrast, 0.01)) |>
+    dplyr::arrange(plot_factor(.data$Label, .key = "Label"), dplyr::desc(.data$MedContrast))
+
+  cli::cli_h2("Is the pooled verdict stable across contract types?")
+  out_ |>
+    dplyr::mutate(dplyr::across(c(MinContrast, MedContrast, MaxContrast, Spread),
+                                \(.x) round(.x, 2))) |>
+    tbl_say(.title = paste0("Contrast range over classes with at least ", .min_docs, " documents"))
+  cli::cli_alert_info(
+    "Spread is Max over Min. Near one means the engine behaves the same everywhere and the pooled \\
+     number can be trusted. Large means the label is doing different jobs in different contract \\
+     types, which is a reason to defer the choice rather than to pick the higher median."
+  )
+  invisible(out_)
+}
+
+
+#' The same document read by every engine that emits a label
+#'
+#' The block no summary replaces. A distinct-count of five against thirty-eight is a number; the two
+#' LISTS side by side, from one contract, show which thirty-three the larger engine added, and
+#' whether they are parties, referenced companies, or defined terms it mistook for names.
+#'
+#' Documents are drawn from the middle of the distribution rather than at random. The extremes are
+#' unreadable and unrepresentative -- one contract in this sample yields 68,482 organisation spans --
+#' and a block nobody reads is worse than no block.
+#'
+#' Spans are DISTINCT and in document order, so the head of each list is what the engine found at the
+#' top of the contract, which is where parties are named. That makes the lists comparable line by
+#' line rather than only by length.
+#'
+#' @param .db_path DuckDB candidate store.
+#' @param .path_text Canonical text parquet.
+#' @param .path_anchors Sample anchors parquet, supplying the contract type.
+#' @param .label Character. Which label to show.
+#' @param .n Integer. Documents drawn.
+#' @param .max_spans Integer. Distinct spans listed per engine before truncation.
+#' @param .opening Integer. Characters of the document opening shown for orientation.
+#' @param .seed Integer. Draw seed, so the same documents appear on every render.
+#' @return Tibble: DocID, Class, DocLen, Opening, Combo, NDistinct, Spans.
+ent_engine_examples <- function(.db_path, .path_text, .path_anchors, .label,
+                                .n = 5L, .max_spans = 8L, .opening = 190L, .seed = 42L) {
+  if (FALSE) {
+    .db_path      <- .lP$Store$NerDB
+    .path_text    <- .lP$Sample$Text
+    .path_anchors <- .lP$Sample$Anchors
+    .label        <- "ORG"
+    .n            <- 5L
+    .max_spans    <- 8L
+    .opening      <- 190L
+    .seed         <- 42L
+  }
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  combo_ <- "CASE WHEN c.Engine = c.Model THEN c.Engine ELSE c.Engine || ':' || c.Model END"
+
+  # One row per engine per document, carrying the distinct spans in document order. The window
+  # function ranks within engine and document so the list can be truncated at the head rather than
+  # sampled, and everything stays database-side until the draw has narrowed it to a handful.
+  per_ <- DBI::dbGetQuery(con_, paste0(
+    "WITH d AS ( ",
+    "  SELECT ", combo_, " AS Combo, c.DocID, upper(c.Span) AS Key, ",
+    "    any_value(c.Span) AS Span, min(c.Start) AS Start ",
+    "  FROM candidates c WHERE c.Label = '", .label, "' AND c.Start IS NOT NULL ",
+    "  GROUP BY Combo, c.DocID, Key), ",
+    "r AS (SELECT *, row_number() OVER (PARTITION BY Combo, DocID ORDER BY Start) AS Rank FROM d) ",
+    "SELECT Combo, DocID, COUNT(*) AS NDistinct, ",
+    "  string_agg(CASE WHEN Rank <= ", as.integer(.max_spans), " THEN Span END, ' | ' ",
+    "             ORDER BY Start) AS Spans ",
+    "FROM r GROUP BY Combo, DocID"
+  )) |>
+    tibble::as_tibble()
+
+  if (nrow(per_) == 0L) {
+    cli::cli_alert_warning("No {(.label)} spans in the store.")
+    return(tibble::tibble())
+  }
+
+  # Documents every emitting engine saw, so the lists are comparable and a blank line means the
+  # engine found nothing rather than that it was never asked.
+  n_combo_ <- dplyr::n_distinct(per_$Combo)
+  tot_ <- per_ |>
+    dplyr::summarise(Combos = dplyr::n_distinct(.data$Combo), Tot = sum(.data$NDistinct),
+                     .by = DocID) |>
+    dplyr::filter(.data$Combos == n_combo_)
+
+  # The middle two quartiles by total distinct spans: enough entities to tell the engines apart,
+  # few enough to print.
+  q_ <- stats::quantile(tot_$Tot, c(0.25, 0.75), na.rm = TRUE)
+  pick_ <- tot_ |>
+    dplyr::filter(.data$Tot >= q_[1], .data$Tot <= q_[2]) |>
+    (\(.d) withr::with_seed(.seed, dplyr::slice_sample(.d, n = min(.n, nrow(.d)))))()
+
+  meta_ <- arrow::read_parquet(.path_anchors) |>
+    dplyr::filter(.data$DocID %in% pick_$DocID) |>
+    dplyr::select(DocID, Class = ClassDetailed)
+
+  text_ <- arrow::read_parquet(.path_text) |>
+    dplyr::filter(.data$DocID %in% pick_$DocID) |>
+    dplyr::transmute(
+      DocID,
+      DocLen  = stringi::stri_length(.data$TextRaw),
+      Opening = stringi::stri_replace_all_regex(
+        stringi::stri_sub(.data$TextRaw, from = 1L, to = .opening), "\\s+", " "
+      )
+    )
+
+  per_ |>
+    dplyr::filter(.data$DocID %in% pick_$DocID) |>
+    dplyr::left_join(meta_, by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(text_, by = dplyr::join_by(DocID)) |>
+    dplyr::arrange(.data$DocID, dplyr::desc(.data$NDistinct)) |>
+    dplyr::select(DocID, Class, DocLen, Opening, Combo, NDistinct, Spans)
+}
+
+
+#' Print the paired reads, one block per document
+#'
+#' Engines are ordered by how many distinct spans they returned, largest first, so the comparison
+#' reads as a subtraction: the shortest list is the selective engine and everything above it is what
+#' the others added.
+#'
+#' @param .tab Tibble from ent_engine_examples().
+#' @param .label Character. Shown in the block header.
+#' @param .width Integer. Characters of the span list printed before truncation.
+#' @return Invisibly .tab.
+ent_report_examples <- function(.tab, .label, .width = 96L) {
+  if (FALSE) {
+    .tab   <- tab_ex
+    .label <- "ORG"
+    .width <- 96L
+  }
+  if (nrow(.tab) == 0L) return(invisible(.tab))
+
+  cli::cli_h3("{(.label)}: the same contract read by every engine")
+  pad_ <- max(nchar(.tab$Combo))
+
+  purrr::walk(unique(.tab$DocID), function(.d) {
+    rows_ <- dplyr::filter(.tab, .data$DocID == .d)
+    cat("-- ", .d, " | ", rows_$Class[1], " | ", format(rows_$DocLen[1], big.mark = ","),
+        " chars\n", sep = "")
+    cat("   opening : ", rows_$Opening[1], "\n", sep = "")
+    purrr::pwalk(dplyr::select(rows_, Combo, NDistinct, Spans),
+                 function(Combo, NDistinct, Spans) {
+                   txt_ <- dplyr::coalesce(Spans, "")
+                   if (nchar(txt_) > .width) txt_ <- paste0(substr(txt_, 1L, .width), " ...")
+                   cat("   ", formatC(Combo, width = -pad_), " [", formatC(NDistinct, width = 4),
+                       "] ", txt_, "\n", sep = "")
+                 })
+    cat("\n")
+  })
+
+  cli::cli_alert_info(
+    "Read down each block as a subtraction. The shortest list is the selective engine; what the \\
+     longer lists add is either a party the selective engine missed or a mention it was right to \\
+     leave out, and only the words distinguish those."
+  )
+  invisible(.tab)
+}
+
+
 #' Every report block in this document, in order
 #'
 #' @param .tab_sample Tibble from ent_build_sample().
 #' @param .ov List from ent_overview().
 #' @param .desc List from ent_describe().
+#' @param .class Tibble from ent_describe_class().
 #' @param .al List from ent_alignment().
 #' @param .tab_offsets Tibble from ent_check_offsets().
 #' @return Invisibly NULL.
-ent_report_all <- function(.tab_sample, .ov, .desc, .al, .tab_offsets) {
+ent_report_all <- function(.tab_sample, .ov, .desc, .class, .al, .tab_offsets) {
   if (FALSE) {
     .tab_sample  <- tab_sample
     .ov          <- .ov
     .desc        <- .desc
+    .class       <- tab_class
     .al          <- .al
     .tab_offsets <- tab_offsets
   }
@@ -1107,6 +1564,7 @@ ent_report_all <- function(.tab_sample, .ov, .desc, .al, .tab_offsets) {
   ent_report_store(.ov = .ov)
   ent_report_yield(.desc = .desc)
   ent_report_position(.desc = .desc)
+  ent_report_stability(.tab = .class)
   ent_report_agreement(.al = .al, .n = 12L)
   ent_report_offsets(.tab = .tab_offsets)
   invisible(NULL)
@@ -1176,11 +1634,17 @@ ent_overview <- function(.db_path,
   runs_ <- dplyr::tbl(con_, "runs")
   cand_ <- dplyr::tbl(con_, "candidates")
 
-  # Ledger: docs run per combo, split by Status, with the hit rate.
+  # Ledger: documents run per combination, split by Status.
+  #
+  # DOCS IS DISTINCT AND THE STATUS COUNTS ARE NOT, because the ledger is keyed on document AND
+  # label: a document run for four labels contributes four rows. Counting rows as documents would
+  # report four times the sample size and would do so differently per engine, since the ragged grid
+  # gives LexNLP four labels and the date regex one.
   ledger_ <- runs_ |>
     dplyr::group_by(Engine, Model) |>
     dplyr::summarise(
-      Docs    = dplyr::n(),
+      Docs    = dplyr::n_distinct(DocID),
+      Labels  = dplyr::n_distinct(Label),
       Success = sum(Status == "success", na.rm = TRUE),
       NoHit   = sum(Status == "nohit",   na.rm = TRUE),
       Timeout = sum(Status == "timeout", na.rm = TRUE),

@@ -29,8 +29,11 @@ text[Start:Stop] == Span. Aligned schema/CLI with extract_spacy.py /
 extract_lexnlp.py.
 """
 import argparse
+import os
+import signal
 import re
 import sys
+from multiprocessing import Pool
 from pathlib import Path
 
 import pandas as pd
@@ -86,12 +89,47 @@ def truncate_texts(texts, max_chars):
     return texts, n_trunc
 
 
-def extract_one(docid, text):
+_TIMEOUT = 0          # per-document seconds, set in each worker by _init_worker
+
+
+class _ExtractorTimeout(Exception):
+    pass
+
+
+def _alarm_handler(signum, frame):
+    raise _ExtractorTimeout()
+
+
+def _init_worker(timeout):
+    """Pool initializer: set the per-document cap and install the SIGALRM handler.
+
+    Every pattern is compiled at import, so a worker started under spawn recompiles them rather
+    than inheriting them. Nothing is set in main() and read in a worker.
+    """
+    global _TIMEOUT
+    signal.signal(signal.SIGALRM, _alarm_handler)
+    _TIMEOUT = timeout
+
+
+def extract_one(args):
     """Rows for one document: per-pattern matches, overlaps resolved by longest
     span first (pattern order breaking ties), output sorted by Start. Always
-    returns >=1 row: a null-span sentinel if nothing matched."""
+    returns >=1 row: a null-span sentinel if nothing matched.
+
+    Takes a (docid, text) TUPLE rather than two arguments, because imap_unordered passes one
+    item per call. The signature matches extract_moneyregex.py and extract_redaction.py.
+
+    A document that exceeds the cap emits a timeout marker rather than raising, so one
+    pathological document cannot end the pass. The greedy overlap resolution is quadratic in
+    candidate count in the worst case, which is where the cap earns its place: a table of dates
+    can produce tens of thousands of candidates in a single document.
+    """
+    docid, text = args
     rows = []
     if isinstance(text, str) and text.strip():
+      try:
+        if _TIMEOUT > 0:
+            signal.alarm(_TIMEOUT)
         cands = []
         for prio, (name, rx) in enumerate(COMPILED):
             for m in rx.finditer(text):
@@ -105,6 +143,12 @@ def extract_one(docid, text):
         kept.sort()
         rows = [(docid, s, e, text[s:e], "DATE", name, ENGINE, MODEL)
                 for s, e, name in kept]
+      except _ExtractorTimeout:
+        print(f"[timeout] {docid}: > {_TIMEOUT}s, skipped", file=sys.stderr)
+        return [(docid, None, None, None, None, "timeout:dateregex", ENGINE, MODEL)]
+      finally:
+        if _TIMEOUT > 0:
+            signal.alarm(0)
     if not rows:
         rows.append((docid, None, None, None, None, None, ENGINE, MODEL))
     return rows
@@ -120,6 +164,10 @@ def main():
                     help="unified labels to extract; this engine supports: DATE")
     ap.add_argument("--max-chars", type=int, default=0,
                     help="truncate each document to its first N characters (0 = off)")
+    ap.add_argument("--timeout", type=int, default=0,
+                    help="per-document cap in seconds (0 = off)")
+    ap.add_argument("--n-process", type=int, default=1, help="worker processes (<=0 = all cores)")
+    ap.add_argument("--chunk-size", type=int, default=64, help="docs per task when parallelising")
     ap.add_argument("--no-progress", action="store_true", help="disable the progress bar")
     args = ap.parse_args()
 
@@ -134,10 +182,21 @@ def main():
     rows = []
     if "DATE" in args.label:
         items = list(zip(df[args.id_col].tolist(), texts))
-        for docid, text in tqdm(items, total=len(items), unit="doc",
-                                desc=f"{ENGINE}:{MODEL}", file=sys.stderr,
-                                disable=args.no_progress):
-            rows.extend(extract_one(docid, text))
+        nproc = args.n_process if args.n_process > 0 else (os.cpu_count() or 1)
+        desc = f"{ENGINE}:{MODEL} (n_process={nproc})"
+        timeout = max(0, args.timeout)
+
+        if nproc == 1:
+            _init_worker(timeout)
+            for it in tqdm(items, total=len(items), unit="doc", desc=desc,
+                           file=sys.stderr, disable=args.no_progress):
+                rows.extend(extract_one(it))
+        else:
+            with Pool(processes=nproc, initializer=_init_worker, initargs=(timeout,)) as pool:
+                for r in tqdm(pool.imap_unordered(extract_one, items, chunksize=args.chunk_size),
+                              total=len(items), unit="doc", desc=desc,
+                              file=sys.stderr, disable=args.no_progress):
+                    rows.extend(r)
     else:
         print(f"no date extractor for {args.label}; writing sentinels only", file=sys.stderr)
         rows = [(docid, None, None, None, None, None, ENGINE, MODEL)
