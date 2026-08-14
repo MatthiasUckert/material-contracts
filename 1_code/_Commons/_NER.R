@@ -1380,7 +1380,7 @@ ner_db_append <- function(.db_path, .parquet, .labels,
     if (!.quiet) {
       cli::cli_alert_info("All {n_all_} document-label pair(s) already in store -- nothing to append.")
     }
-    return(invisible(list(docs = 0L, candidates = 0L, retried = 0L)))
+    return(invisible(list(docs = 0L, pairs = 0L, candidates = 0L, retried = 0L)))
   }
 
   # Register the ingest scope (DocIDs) and the per-doc status to write into runs
@@ -1446,7 +1446,18 @@ ner_db_append <- function(.db_path, .parquet, .labels,
     if (n_retry_ > 0L) msg_ <- paste0(msg_, " (incl. {n_retry_} timeout retr{?y/ies})")
     cli::cli_alert_success(msg_)
   }
-  return(invisible(list(docs = nrow(to_ingest_), candidates = n_cand_, retried = n_retry_)))
+  # DOCS IS DISTINCT DOCUMENTS, NOT INGESTED ROWS. Since the ledger gained its Label column a row is
+  # a document-label pair, so nrow() reports four times the truth for LexNLP and once for a
+  # single-label engine. ner_run() sums this into its Docs column, 04C takes the maximum across
+  # engines as the chunk's new-document count, and the progress line, the remaining count and the
+  # projected finish are all built on it -- a four-fold overstatement that would have run the
+  # counter past the corpus at a quarter of the way through.
+  return(invisible(list(
+    docs       = dplyr::n_distinct(to_ingest_$DocID),
+    pairs      = nrow(to_ingest_),
+    candidates = n_cand_,
+    retried    = n_retry_
+  )))
 }
 #' Which documents a combination has not yet been run on
 #'

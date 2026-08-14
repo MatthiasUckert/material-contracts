@@ -1,0 +1,589 @@
+---
+title: "Entity Rules -- Organisations and the Contracting Party (04B)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml, and overriding it per document is how two documents came to render at more
+# than twice the width of the rest.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120) # plain ASCII; ANSI codes paste as garbage
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+```{r}
+#| label: load-libraries
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_NER.R", encoding = "UTF-8")
+
+# The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING: the
+# level registry is rebuilt empty every time _Plots.R is sourced, so a library that registers a
+# vocabulary has to be sourced after it -- and 03A registers its taxonomy at SOURCE time rather than
+# inside a function, so a failure part-way through that file leaves every function below it
+# silently undefined.
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 03A owns the contract-type vocabulary and the fixed-width console formatter every document in the
+# monorepo reports through; 04A owns the sample, the canonical text and the candidate store.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
+  .f = function(.s) {
+    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+           encoding = "UTF-8")
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/04B-EntityRules.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+04A ran nine extractors over 4,398 hand-classified contracts and stored several million candidate
+spans. It ranked none of them, because ranking needs labels and there are no entity labels. This
+document writes the rules that turn those spans into parties, and it takes one entity at a time.
+
+**Organisations first**, because every other quantity a party carries is measured from where an
+organisation was found. The counterparty is whoever else is named beside the filer; the party's
+jurisdiction is the place name adjacent to it; the signing date is the date in the same sentence.
+None of those can be resolved before an organisation has been located.
+
+Three questions, in order:
+
+1. **Where does an engine write organisations?** A description of the extractor, using no external
+   fact, so nothing in it can be circular.
+2. **Does the region containing most of them contain the filer?** The one external fact EDGAR
+   supplies, turned into a recall floor.
+3. **How many distinct organisations does that region actually hold?** The candidate set every rule
+   after this one has to survive.
+
+## What the anchor can and cannot establish
+
+EDGAR records the registrant's own name, independently of the contract text. That is one side of one
+party. It can establish that an engine found *a* party; it can never establish that a span *is* a
+party, because nothing external records the counterparty. Every coverage figure below is therefore a
+**recall floor with its failure modes reported**, and precision on party role is measured only by
+reading the text.
+
+## Why a window, and why `max()`
+
+LexNLP's organisations are bimodal: 22.6% of spans in the first tenth of a document, 25.2% in the
+last, and 4.1% in the trough. The middle is body prose naming every company a contract mentions; the
+ends are the preamble and the signature block. A window is the cheapest instrument that separates
+them, and it costs nothing to revise, because every candidate already carries its offsets and a
+window is a `WHERE` clause over offsets that are already written.
+
+The window is `max(floor, share x DocLen)` rather than either arm alone, and the reason is that the
+two arms fail at opposite ends. An absolute head admits 93.3% of parties overall but only 85.4% of
+the longest length decile. A relative head admits 89.7% overall but only 58.2% of the *shortest*
+decile, because a tenth of a 2,473-character amendment is 247 characters and the party's offset runs
+past that. `max()` lets the floor bind on short documents and the share bind on long ones; `min()`
+caps the long documents and scores worse than either arm by itself.
+
+## Noise is expected here
+
+Nothing below applies a stoplist, suppresses defined terms, or repairs a span boundary beyond
+removing one leading connective. The counts are deliberately unfiltered. What the noise looks like
+is the evidence the next rule is written against, and filtering it before reading it would remove
+exactly the material that decides what to filter.
+
+# Configuration
+
+```{r}
+#| label: configure-paths
+.lP <- list(
+  Input = list(
+    # 04A's canonical text. Every offset in this family indexes this file and nothing else
+    # reconstructs it.
+    Text    = "2_output/04A-EntityExtract/sample_text.parquet",
+    # 04A's sample table: labels, folds, and the EDGAR facts the anchor is built from.
+    Anchors = "2_output/04A-EntityExtract/sample_anchors.parquet",
+    # 04A's candidate store, attached read-only.
+    Store   = "2_output/04A-EntityExtract/Store/EntityCandidates.duckdb"
+  ),
+  Output = list(
+    Party = utils_file_path(.dir_main, "contracting_party.parquet"), # one row per document
+    Head  = utils_file_path(.dir_main, "org_head.parquet")           # one row per document per name
+  ),
+  Params = list(
+    # The candidate set reads the selective engine. LexNLP's positional contrast runs 3.16 to 6.81
+    # across twelve contract types where every spaCy model runs 0.68 to 1.33, and its read examples
+    # return companies where spaCy returns filenames and section references.
+    ComboCand  = "lexnlp",
+    # The anchor arm reads every engine that emits ORG. Locating the filer is a RECALL problem, so
+    # an engine reaching it two per cent more often is worth more here than one that is cleaner.
+    ComboAnch  = NULL,
+    HeadShare  = 0.10,               # head runs to max(HeadFloor, HeadShare x DocLen)
+    HeadFloor  = 3000L,              # the arm that binds on short documents
+    TailShare  = 0.20,               # tail runs back from the end
+    GridHead   = c(0.05, 0.10, 0.15, 0.20),  # swept, so the choice is visible rather than asserted
+    GridFloor  = c(0L, 3000L),               # zero is the pure-relative arm, for comparison
+    GridTail   = c(0.10, 0.20, 0.30),
+    MinReverse = 10L,                # shortest fragment admitted as a reverse anchor match
+    Bins       = 50L,                # bins across relative position in the density figure
+    TermsN     = 25L,                # names listed in the document-frequency block
+    ReadN      = 10L,                # spans read back in context
+    ReadDocs   = 8L,                 # documents whose whole head is listed
+    ReadCtx    = 200L,               # characters either side of a span
+    Seed       = 42L                 # fixed, so the same documents are read on every render
+  )
+)
+
+fs::file_exists(unlist(.lP$Input))
+```
+
+Failing here rather than three chunks later is deliberate: a missing upstream artifact should stop
+the document where the path is declared.
+
+# Sample
+
+The anchor keys come first, because their availability bounds everything below. A document whose
+recorded name reduces to fewer than five characters carries no key, and is reported as such rather
+than counted as a failure to find something that was never being looked for.
+
+Both sides of the comparison run through one reduction: uppercase, punctuation to space, whitespace
+collapsed, a leading connective dropped, trailing corporate suffixes stripped repeatedly. *The
+Boeing Company* and `BOEING CO` both reduce to `BOEING`; `between Precision BioSciences, Inc.`
+reduces to `PRECISION BIOSCIENCES`.
+
+```{r}
+#| label: build-keys
+tab_keys <- ent_anchor_keys(
+  .path_anchors = .lP$Input$Anchors   # 04A's sample table, not the raw EDGAR metadata
+)
+
+ent_report_keys(.tab = tab_keys)
+```
+
+```{r}
+#| label: open-session
+con <- ent_session(
+  .db_path   = .lP$Input$Store,   # attached read-only; nothing here can write to 04A's artifact
+  .keys      = tab_keys,          # registered so every query below joins on it
+  .path_text = .lP$Input$Text     # supplies document lengths, so an offset becomes a position
+)
+```
+
+Two candidate tables, and the split is the point. The **candidate** set is what a rule will read, so
+it takes the selective engine. The **anchor** set is what establishes whether the filer was found at
+all, which is a recall question, so it reads every engine emitting the label.
+
+```{r}
+#| label: load-candidates
+ent_load_label(
+  .con    = con,
+  .name   = "org",                    # the candidate set the rules read
+  .label  = "ORG",
+  .combos = .lP$Params$ComboCand,     # lexnlp alone
+  .quiet  = FALSE
+)
+
+ent_load_label(
+  .con    = con,
+  .name   = "org_all",                # the anchor set, for recall
+  .label  = "ORG",
+  .combos = .lP$Params$ComboAnch,     # NULL = every engine emitting ORG
+  .quiet  = FALSE
+)
+```
+
+# Windows
+
+Where the engine writes, using no external fact. This section would read identically if EDGAR
+recorded nothing at all, which is what keeps the cutoff choice from being fitted to the thing it is
+later validated against.
+
+```{r}
+#| label: sweep-windows
+tab_grid <- tidyr::expand_grid(
+  Side  = "head",
+  Share = .lP$Params$GridHead,
+  Floor = .lP$Params$GridFloor
+) |>
+  dplyr::bind_rows(
+    tidyr::expand_grid(Side = "tail", Share = .lP$Params$GridTail, Floor = 0L)
+  ) |>
+  dplyr::mutate(Floor = as.integer(.data$Floor))
+
+tab_grid_win <- ent_window_grid(
+  .con   = con,
+  .table = "org",     # the candidate engine; the anchor set is swept separately below
+  .grid  = tab_grid
+)
+
+ent_report_windows(.tab = tab_grid_win)
+```
+
+Two numbers per cell because they answer different questions. `PctSpans` is where the mass is;
+`PctDocs` is whether the region is populated in most contracts or crowded in a few. An engine
+reaching 3,053 spans in a single document can put a quarter of its output in the head while reaching
+only half the documents, and only the second column would show it.
+
+`MedKeys` is the cost. It is the number of distinct normalised names a rule reading that region has
+to survive, and it is what the recall gains below have to be weighed against.
+
+```{r}
+#| label: measure-density
+tab_density <- ent_density(
+  .con   = con,
+  .table = "org",           # the candidate engine
+  .bins  = .lP$Params$Bins  # bins across relative position
+)
+
+tab_density |>
+  dplyr::summarise(
+    D0     = tbl_pct(sum(.data$Share[.data$Pos < 0.10])),
+    Trough = tbl_pct(min(.data$Share)),
+    D9     = tbl_pct(sum(.data$Share[.data$Pos > 0.90])),
+    .by = Weight
+  ) |>
+  tbl_say(.title = "First tenth, trough and last tenth, under both weightings")
+```
+
+Computed here rather than in Overview because the session closes at Deployment. The figure drawn
+from it is the last thing in the document; the numbers behind it belong beside the sweep they
+explain. Where the two weightings agree, the bimodality is a property of contracts. Where they
+diverge, it is a property of a handful of table-heavy filings, and 04A measured one document
+carrying 3,053 organisation spans.
+
+# The anchor
+
+```{r}
+#| label: match-anchor
+ent_anchor_match(
+  .con         = con,
+  .table       = "org_all",              # every engine, because this is a recall question
+  .min_reverse = .lP$Params$MinReverse,  # fragments shorter than this are refused
+  .quiet       = FALSE
+)
+```
+
+A span matches when one normalised form contains the other, and the direction is recorded rather
+than collapsed. **Forward** containment -- the span holds the key -- is safe. **Reverse** containment
+means the span is a *fragment* of the recorded name and has no length floor of its own: the single
+character `G` is contained in `GEORGIA PACIFIC`, and that match fired seventy-three times in one
+document. Roughly half of every spaCy engine's raw anchor matches are reverse matches with a median
+length of six characters, so an unguarded reverse arm does not merely add noise -- it inflates
+apparent recall, and inflates it most for the engines emitting the most fragments.
+
+# Choosing the head
+
+```{r}
+#| label: sweep-anchor
+tab_grid_anchor <- ent_anchor_grid(
+  .con  = con,
+  .keys = tab_keys,   # supplies both denominators: keyed documents, and the whole sample
+  .grid = tab_grid    # head rows only; the tail carries no anchor
+)
+
+ent_report_anchor_grid(.tab = tab_grid_anchor)
+```
+
+This is the only table that decides anything. Everything above describes the extractor; this says
+whether a rule reading the head would find the party. Read it against `MedKeys` in the window sweep:
+the cutoff worth taking is the one past which recall stops rising faster than the candidate count,
+and the `Floor = 0` rows are the pure-relative arm kept in the grid so the cost of dropping the floor
+is a number rather than an argument.
+
+```{r}
+#| label: locate-party
+tab_party <- ent_locate_party(
+  .con   = con,
+  .keys  = tab_keys,               # runs from the key side, so unmatched documents survive
+  .head  = .lP$Params$HeadShare,   # the chosen share
+  .floor = .lP$Params$HeadFloor    # the chosen floor
+)
+
+ent_report_party(.tab = tab_party)
+```
+
+Four of the five statuses are ways of not having an answer and they are not the same problem. **No
+key** is a limit of the recorded metadata. **No match** means no engine proposed the filer's name
+anywhere in its own contract, which is an extraction gap. **Fragment only** means spans were
+proposed but all of them were pieces too short to trust, which a better normaliser would narrow and
+a better extractor would not. **Late** means the name was found where a preamble is not.
+
+```{r}
+#| label: inspect-match-kind
+ent_report_match(.tab = tab_party)
+```
+
+# Entities in the head
+
+The candidate set every later rule reads, and the deduplication that makes it countable. LexNLP
+returns `Icosavax, Inc.`, `Icosavax Inc` and `Icosavax, Inc` as three distinct spans in one
+contract. They are one company, and the key built for the anchor collapses them at no extra cost.
+
+```{r}
+#| label: assign-region
+tab_region <- ent_assign_region(
+  .con   = con,
+  .table = "org",
+  .head  = .lP$Params$HeadShare,
+  .floor = .lP$Params$HeadFloor,
+  .tail  = .lP$Params$TailShare
+)
+
+tab_head <- ent_head_entities(
+  .con         = con,
+  .table       = "org",                 # the selective engine; the anchor set is far too noisy here
+  .head        = .lP$Params$HeadShare,
+  .floor       = .lP$Params$HeadFloor,
+  .min_reverse = .lP$Params$MinReverse  # the same floor the anchor match uses
+)
+
+ent_report_dedup(.head = tab_head, .region = tab_region)
+```
+
+```{r}
+#| label: inspect-terms
+tab_terms <- ent_head_terms(
+  .tab    = tab_head,
+  .n_docs = nrow(tab_keys)   # the whole sample, so the share is comparable across sections
+)
+
+ent_report_terms(.tab = tab_terms, .n = .lP$Params$TermsN)
+```
+
+Reported rather than applied. A name occurring in one contract is a party; a name occurring in a
+tenth of them is a defined term the drafting convention supplies, and where the list stops being
+generic is where a threshold would go. Choosing that threshold before reading the list would be a
+guess, and this document does not yet need it: the rules below tolerate the noise.
+
+# Reading
+
+Every table above is equally consistent with the chosen span being a preamble party and with it
+being a letterhead, a page footer or a defined term. The text is what separates them, so a fixed
+sample is read on every render.
+
+```{r}
+#| label: read-located
+ent_read_spans(
+  .tab       = dplyr::filter(tab_party, .data$Status == "located"),
+  .path_text = .lP$Input$Text,        # the same canonical text the offsets index
+  .n         = .lP$Params$ReadN,      # documents drawn
+  .ctx       = .lP$Params$ReadCtx,    # characters either side of the span
+  .seed      = .lP$Params$Seed        # fixed, so a change here is a change in the extraction
+) |>
+  ent_report_read(
+    .cols  = c("CompanyName", "Party", "MatchKind", "Start", "NEngine"),
+    .title = "Located spans in context"
+  )
+```
+
+```{r}
+#| label: read-late
+ent_read_spans(
+  .tab       = dplyr::filter(tab_party, .data$Status == "late"),
+  .path_text = .lP$Input$Text,
+  .n         = 6L,                    # fewer, because this is a diagnostic rather than the case
+  .ctx       = .lP$Params$ReadCtx,
+  .seed      = .lP$Params$Seed
+) |>
+  ent_report_read(
+    .cols  = c("CompanyName", "Party", "MatchKind", "Start", "DocLen"),
+    .title = "Spans found past the head"
+  )
+```
+
+```{r}
+#| label: read-head-entities
+ent_read_head(
+  .tab  = tab_head,
+  .keys = tab_keys,
+  .n    = .lP$Params$ReadDocs,   # documents whose entire head is listed
+  .seed = .lP$Params$Seed
+) |>
+  ent_report_head()
+```
+
+The last block is the one that says whether the deduplicated count means anything. A list of six
+names is equally consistent with six parties and with two parties written four ways, and only the
+words separate those readings. What remains after the anchor-marked rows is the counterparty
+candidate set the next rule will be written against.
+
+# Validation
+
+```{r}
+#| label: validate-offsets
+tab_check <- ent_read_spans(
+  .tab       = dplyr::filter(tab_party, .data$Status == "located"),
+  .path_text = .lP$Input$Text,
+  .n         = 500L,                  # a sample large enough to catch a systematic offset error
+  .ctx       = 0L,                    # no context; the span itself is what is being checked
+  .seed      = .lP$Params$Seed
+)
+
+# The two implementations of the same reduction, compared on the same input. They are written in
+# different languages over different row counts, and a drift between them would move every match
+# kind without raising an error anywhere.
+sql_key_ <- DBI::dbGetQuery(con, paste0(
+  "SELECT DocID, ", ent_sql_key(.col = "CompanyName"), " AS SqlKey FROM keys"
+)) |>
+  tibble::as_tibble() |>
+  dplyr::left_join(dplyr::select(tab_keys, DocID, AnchorKey), by = dplyr::join_by(DocID)) |>
+  dplyr::filter(!is.na(.data$AnchorKey))
+
+tibble::tibble(
+  Check = c(
+    "Located spans that round-trip to their own text",
+    "Located spans starting at or after character zero",
+    "Anchor keys where the R and SQL reductions agree",
+    "Documents carrying exactly one status"
+  ),
+  N = c(
+    sum(stringi::stri_detect_fixed(tab_check$Snippet, tab_check$Party)),
+    sum(tab_party$Start >= 0L, na.rm = TRUE),
+    sum(sql_key_$SqlKey == sql_key_$AnchorKey),
+    nrow(tab_party)
+  ),
+  Of = c(
+    nrow(tab_check),
+    sum(!is.na(tab_party$Start)),
+    nrow(sql_key_),
+    nrow(tab_party)
+  )
+) |>
+  dplyr::mutate(Share = tbl_pct(.data$N / .data$Of)) |>
+  tbl_say(.title = "The located set")
+```
+
+The third row is the check the roxygen in the library promises and the previous version of this
+document did not perform. The R reduction strips corporate suffixes with a token loop and the SQL
+reduction with a repeated-group regex; anything below 100% there means the two have drifted, and a
+drift moves every match kind silently.
+
+# Robustness
+
+```{r}
+#| label: inspect-by-class
+ent_report_class(.tab = tab_party)
+```
+
+```{r}
+#| label: inspect-by-length
+ent_report_length(.tab = tab_party)
+```
+
+The length table is where the window earns its shape. `MedHeadEnd` flat across the first deciles and
+rising across the last is the floor binding on short documents and the share binding on long ones. A
+located share that sags at either end means the arm covering that end is set wrong, and the sweep
+above says by how much.
+
+# Deployment
+
+```{r}
+#| label: write-artifacts
+arrow::write_parquet(tab_party, .lP$Output$Party)
+arrow::write_parquet(tab_head, .lP$Output$Head)
+
+DBI::dbDisconnect(con, shutdown = TRUE)
+
+tibble::tibble(
+  Artifact = c("Contracting party, per document", "Organisations in the head, per name"),
+  Path     = c(.lP$Output$Party, .lP$Output$Head)
+) |>
+  dplyr::mutate(
+    Exists = fs::file_exists(.data$Path),
+    MB     = round(as.numeric(fs::file_size(.data$Path)) / 1024^2, 1),
+    Path   = fs::path_file(.data$Path)
+  ) |>
+  tbl_say(.title = "Written by 04B")
+```
+
+The first artifact carries every document, not only the located ones. A consumer filtering on
+`Status` makes that decision visibly; a consumer handed a pre-filtered file makes it without knowing.
+
+# Overview
+
+```{r}
+#| label: fig-density
+#| fig-height: !expr plot_height(6L)
+#| fig-cap: "Share of LexNLP organisation spans by relative position in the document, weighted two
+#|   ways. The dashed rules mark the nominal head and tail cutoffs; on short documents the floor
+#|   pushes the effective head further right than the rule drawn. Where the two lines agree the
+#|   bimodality is a property of contracts rather than of a few large filings."
+ent_plot_density(
+  .tab  = tab_density,             # measured in Windows, before the session closed
+  .head = .lP$Params$HeadShare,    # nominal cutoff, drawn as a rule
+  .tail = .lP$Params$TailShare
+)
+```
+
+```{r}
+#| label: fig-party-status
+#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")))
+#| fig-cap: "Status of the contracting-party match by contract type, as shares within each type. The
+#|   leftmost segment is the working set; the three to its right are three different problems, and
+#|   the rightmost is a limit of the recorded metadata rather than of the extraction."
+ent_plot_party_status(
+  .tab       = tab_party,
+  .key_class = "ClassDetailed"   # the vocabulary 03A registered, so rows match the 03 family
+)
+```
+
+```{r}
+#| label: report-everything
+ent_report_all_org(
+  .keys        = tab_keys,
+  .grid_win    = tab_grid_win,
+  .grid_anchor = tab_grid_anchor,
+  .party       = tab_party,
+  .head        = tab_head,
+  .region      = tab_region,
+  .terms       = tab_terms
+)
+```
+
+# Next
+
+The head is a region and the anchor is a coordinate inside it. Three rules follow, in dependency
+order, and each is added to this document as its own entity section.
+
+**The document family.** A contract opening `by and between X and Y` carries a counterparty; a stock
+incentive plan opening `X 2017 STOCK INCENTIVE PLAN` is the company's own instrument and carries
+none. Roughly half the sample is the second kind, so a counterparty rule applied blindly would report
+a correct result as a failure across the largest classes in the taxonomy.
+
+**Counterparties.** Whatever the head holds that the anchor did not match. The candidate set is
+written above; what it still lacks is a way to separate a counterparty from a signatory, and a way
+to admit the natural persons that employment and indemnity agreements name on the other side.
+
+**The remaining labels.** Geography, dates and money are resolved in 04D against this same head, and
+each needs a role assignment before an engine can be chosen for it.

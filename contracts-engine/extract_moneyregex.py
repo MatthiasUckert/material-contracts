@@ -2,7 +2,8 @@
 """Regex money extractor with offsets -- a rule arm for the one label that had none.
 
 Input : one or more parquet paths (files and/or folders), one row = one document.
-Output: one parquet (DocID, Start, Stop, Span, Label, LabelRaw, Engine, Model).
+Output: one parquet (DocID, Start, Stop, Span, Label, LabelRaw, Engine, Model,
+        Amount, Currency).
 
 Stamps Engine = "paper", Model = MODEL. Label is always "MONEY"; LabelRaw carries the
 form matched, which is what makes the arm auditable: an amount found by its currency
@@ -64,6 +65,7 @@ import os
 import re
 import signal
 import sys
+from decimal import Decimal, InvalidOperation
 from multiprocessing import Pool
 from pathlib import Path
 
@@ -72,9 +74,11 @@ import pyarrow.dataset as pads
 from tqdm import tqdm
 
 ENGINE = "paper"
-MODEL = "moneyregex-v4"   # identifies THIS pattern set; bump on any rule change
+MODEL = "moneyregex-v6"   # identifies THIS pattern set; bump on any rule change
 LABEL = "MONEY"
-COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
+CORE = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
+EXTRA = ["Amount", "Currency"]
+COLUMNS = CORE + EXTRA
 
 # Symbols that survive HTML-to-text conversion, and the national prefixes that precede them.
 # R$ and US$ both end in the dollar sign, so the prefix is optional rather than enumerated twice.
@@ -103,10 +107,23 @@ CUR_NAME = r"(?:euros?|renminbi|yen)"
 # run past its own decimal point into the next number: "$9,752,233.001.857" was captured whole,
 # 71 times, and parses to nothing. Commas group with a dot decimal, dots group with a comma
 # decimal, and the two are never mixed.
+# v5: THE EUROPEAN ALTERNATIVE WAS EATING SUB-CENT FIGURES. As written in v4 it was
+# \d{1,3}(?:\.\d{3})+(?:,\d+)?, which matches "0.000" inside "0.0001" -- one dot group, three
+# digits, done -- so the trailing digit was dropped from the SPAN and a par value of $0.0001 was
+# stored as $0.000 and parsed to zero. "par value $0.0001 per share" is boilerplate in these
+# filings, and nothing downstream could have caught it: the span is well-formed, the offsets
+# round-trip, and zero is a number.
+#
+# European grouping is now admitted only where it is UNAMBIGUOUS -- either a comma decimal follows
+# it ("1.500,00") or there are two groups or more ("1.234.567"). A single dot group with nothing
+# after it falls through to the plain decimal, so "1.500" reads as one and a half. That is the US
+# reading and it is the right default for SEC filings; the same string in a European corpus would
+# need the other rule, which is why it is stated here rather than left to the regex.
 NUM = (
-    r"\d{1,3}(?:,\d{3})+(?:\.\d+)?"     # 1,234,567.89   US convention
-    r"|\d{1,3}(?:\.\d{3})+(?:,\d+)?"     # 1.234.567,89   European convention
-    r"|\d+\.\d+|\d+"
+    r"\d{1,3}(?:,\d{3})+(?:\.\d+)?"      # 1,234,567.89   US grouping
+    r"|\d{1,3}(?:\.\d{3})+,\d+"           # 1.500,00       European, comma decimal
+    r"|\d{1,3}(?:\.\d{3}){2,}"            # 1.234.567      European, two groups or more
+    r"|\d+\.\d+|\d+"                      # plain
 )
 
 # Numerals as words. "and" is NOT in this list: a pattern admitting it would match "and Dollars"
@@ -118,6 +135,19 @@ NUMWORD = (
 )
 CUR_WORD = r"(?:dollars?|euros?|pounds?)"
 
+# v6: THE SCALE WORD WAS ONLY EVER ATTACHED TO THE DOLLAR SIGN. symbol_scaled handled "$30 million"
+# and nothing else did, so "NOK 23 million" matched iso_amount, kept "NOK 23" and parsed to
+# twenty-three -- six orders of magnitude, at the BOTTOM of the distribution where a magnitude
+# check looks for errors at the top. Found by reading the five non-USD spans in a sample of
+# twenty-five; four of them were wrong.
+#
+# ORDER IS LOAD-BEARING AGAIN. Python's alternation is leftmost-first, so "million" must precede
+# "mill" or the longer word is cut short and the "ion" left behind. "mill" is in the list because
+# Scandinavian and continental filings abbreviate that way -- "NOK 23.0 mill" -- and "mm" because
+# finance writes "$5mm". Both are safe only because a currency marker is required first: a bare
+# "5 mm" is a millimetre and matches nothing here.
+SCALE_WORD = r"(?:million|billion|trillion|thousand|mill|mm)"
+
 # Order matters only for reporting; overlaps are resolved by length in find_amounts().
 PATTERNS = [
     # $5,000,000  US$10,000  R$1.500.000  EUR185,000,000  $0.001
@@ -125,10 +155,13 @@ PATTERNS = [
     # $30 million, $25.0 million. The figure alone parses to thirty, so the scale word has to be
     # inside the span or the amount is out by six orders of magnitude. Listed before the plain
     # symbol form because overlaps resolve longest-first and this one must win.
-    ("symbol_scaled",
-     rf"{PREFIX}{CUR_SYM}\s{{0,3}}\d+(?:\.\d+)?\s?(?:million|billion|thousand|trillion)\b"),
+    ("symbol_scaled", rf"{PREFIX}{CUR_SYM}\s{{0,3}}(?:{NUM})\s{{0,3}}{SCALE_WORD}\b"),
+    # NOK 23 million, EUR 5.5 mill -- the same trap as symbol_scaled, for a code rather than a sign
+    ("iso_scaled", rf"(?<![A-Za-z]){ISO}\s{{0,3}}(?:{NUM})\s{{0,3}}{SCALE_WORD}\b"),
     # EUR 11,848,000  USD9,750,000  RMB10,000,000
     ("iso_amount", rf"(?<![A-Za-z]){ISO}\s{{0,3}}(?:{NUM})"),
+    # Euro 6 million -- the name spelt out, with a scale word after the figure
+    ("name_scaled", rf"(?<![A-Za-z]){CUR_NAME}\s{{0,3}}(?:{NUM})\s{{0,3}}{SCALE_WORD}\b"),
     # Euro 6.667.856,00 -- the name spelt out, and European separators with it
     ("name_amount", rf"(?<![A-Za-z]){CUR_NAME}\s{{0,3}}(?:{NUM})"),
     # $[***]  $**  $TBD  $____  -- the amount was withheld and the symbol survived. Bare asterisks
@@ -149,6 +182,9 @@ PATTERNS = [
     # without them "E12" matches an exhibit number, a clause label and half the alphabet soup in a
     # filing header.
     ("euro_letter", r"(?<![A-Za-z])E\s?\d{1,3}(?:,\d{3})+(?:\.\d+)?"),
+    # 5 million Dollars -- the scale word sits BETWEEN the figure and the currency, so amount_word
+    # cannot reach it: that pattern requires the two to be adjacent.
+    ("word_scaled", rf"(?:{NUM})\s{{0,3}}{SCALE_WORD}\s+{CUR_WORD}\b"),
     # 5,000,000 Dollars
     ("amount_word", rf"(?:{NUM})\s+{CUR_WORD}\b"),
     # SIXTY-ONE THOUSAND NINETY AND 90/100 Dollars
@@ -157,6 +193,184 @@ PATTERNS = [
      rf"(?:\d{{1,2}}/100\s+)?{CUR_WORD}\b"),
 ]
 RX = [(name, re.compile(pat, re.IGNORECASE)) for name, pat in PATTERNS]
+
+
+# ---------------------------------------------------------------------------------------------
+# Parsing. THE FORMAT LIVES BESIDE THE PATTERN IT BELONGS TO, for the same reason the date
+# extractor's does: each of the ten forms determines exactly one reading of its own text, and a
+# parser written somewhere else has to guess which one fired. _RE_NUM below is compiled from NUM
+# itself rather than restated, so the figure the parser reads is by construction the figure the
+# extractor matched.
+#
+# WHY Amount CAN BE None WHILE Currency IS SET. Three forms match a REDACTED figure -- "$[***]",
+# "$**", "a minimum market price of $ per share". They carry a denomination and no number, and they
+# are among the reasons this arm exists at all: the amounts a filer withholds are systematically
+# the commercially material ones. Returning zero, or dropping the row, would erase exactly the
+# observation that matters.
+#
+# THE SCALE WORD MUST BE APPLIED. "$30 million" parses to thirty without it -- six orders of
+# magnitude, and thirty is a perfectly plausible contract value, so nothing downstream would flag it.
+#
+# BARE "$" IS READ AS USD. That is an assumption, not a fact. Prefixed forms are honoured -- US$,
+# R$, C$, A$, HK$, S$, NZ$ each resolve to their own code -- so it reaches only the unmarked sign,
+# which in an SEC filing is the domestic dollar.
+
+
+# Prefix before a dollar sign -> ISO. Bare "$" falls through to USD.
+PREFIX_ISO = {
+    "US": "USD", "U.S.": "USD", "U.S": "USD", "US.": "USD",
+    "R": "BRL", "C": "CAD", "A": "AUD", "HK": "HKD", "S": "SGD", "NZ": "NZD",
+}
+SYMBOL_ISO = {
+    "$": "USD",
+    "\u00a3": "GBP",
+    "\u20ac": "EUR",
+    "\u00a5": "JPY",
+    "\u0080": "EUR",     # the euro sign mangled by a cp1252 round trip
+}
+NAME_ISO = {
+    "euro": "EUR", "euros": "EUR", "renminbi": "CNY", "yen": "JPY",
+    "dollar": "USD", "dollars": "USD", "pound": "GBP", "pounds": "GBP",
+}
+# Keyed on the same words SCALE_WORD is built from, so a word can never be matched and then not
+# applied. "mill" and "mm" both mean million wherever a currency marker precedes them.
+SCALE = {"thousand": 1000, "million": 10 ** 6, "billion": 10 ** 9, "trillion": 10 ** 12,
+         "mill": 10 ** 6, "mm": 10 ** 6}
+
+WORD_VAL = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+    "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60, "seventy": 70,
+    "eighty": 80, "ninety": 90,
+}
+
+_RE_ISO = re.compile(r"(?<![A-Za-z])(USD|EUR|GBP|CHF|JPY|CAD|AUD|CNY|RMB|HKD|SGD|NZD|SEK|NOK|DKK)",
+                     re.IGNORECASE)
+_RE_SYM = re.compile(r"([$\u00a3\u20ac\u00a5\u0080])")
+_RE_PREFIX = re.compile(r"(U\.?S\.?|R|C|A|HK|S|NZ)?[$\u00a3\u20ac\u00a5\u0080]", re.IGNORECASE)
+_RE_NAME = re.compile(r"(?<![A-Za-z])(euros?|renminbi|yen|dollars?|pounds?)(?![A-Za-z])",
+                      re.IGNORECASE)
+_RE_NUM = re.compile(NUM)   # THE SAME pattern the extractor matched with, never a second copy
+_RE_SCALE = re.compile(r"(?<![A-Za-z])" + SCALE_WORD + r"(?![A-Za-z])", re.IGNORECASE)
+_RE_FRACTION = re.compile(r"(\d{1,2})/100")
+
+REDACT_FORMS = {"symbol_redact", "symbol_redact_open", "symbol_bare"}
+
+
+def _num_from_text(txt):
+    """A figure as a Decimal, with the separator convention decided per span.
+
+    THE REGEX CANNOT DECIDE THIS AND MUST NOT TRY. Its European alternative,
+    \\d{1,3}(?:\\.\\d{3})+, matches "0.001" -- and read as grouping that becomes 1, so a per-share
+    price of a tenth of a cent is recorded as one dollar, a factor of a thousand with no symptom.
+    Per-share prices in that form are common in these filings.
+
+    The rule, in order:
+      both separators present  the LAST one is the decimal point
+      two or more commas       grouping
+      exactly one comma        grouping if the tail is exactly three digits, else a decimal comma
+      two or more dots         European grouping
+      one dot or none          already a plain decimal
+
+    The remaining ambiguity is a single dot with three digits after it and nothing else: "1.500" is
+    one and a half in a US filing and fifteen hundred in a European one. It is read as a decimal,
+    because this corpus is SEC filings; the same string in another corpus would need the other rule.
+    """
+    m = _RE_NUM.search(txt)
+    if m is None:
+        return None
+    raw = m.group(0)
+    n_dot, n_com = raw.count("."), raw.count(",")
+
+    if n_com and n_dot:
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "").replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif n_com >= 2:
+        raw = raw.replace(",", "")
+    elif n_com == 1:
+        raw = raw.replace(",", "") if re.fullmatch(r"\d{1,3},\d{3}", raw) else raw.replace(",", ".")
+    elif n_dot >= 2:
+        raw = raw.replace(".", "")
+
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return None
+
+
+def _num_from_words(txt):
+    """A spelled-out amount as a Decimal. 'SIXTY-ONE THOUSAND NINETY AND 90/100' -> 61090.90."""
+    total, current = 0, 0
+    seen = False
+    for tok in re.split(r"[-\s]+", txt.lower()):
+        tok = tok.strip(",.")
+        if tok in WORD_VAL:
+            current += WORD_VAL[tok]
+            seen = True
+        elif tok == "hundred":
+            current = (current or 1) * 100
+            seen = True
+        elif tok in SCALE:
+            total += (current or 1) * SCALE[tok]
+            current = 0
+            seen = True
+    if not seen:
+        return None
+    value = Decimal(total + current)
+    frac = _RE_FRACTION.search(txt)
+    if frac is not None:
+        value += Decimal(frac.group(1)) / Decimal(100)
+    return value
+
+
+def currency_of(span, form):
+    """The ISO code a span denominates, or None."""
+    iso = _RE_ISO.search(span)
+    if iso is not None:
+        code = iso.group(1).upper()
+        return "CNY" if code == "RMB" else code
+
+    if form == "euro_letter":
+        return "EUR"
+
+    sym = _RE_SYM.search(span)
+    if sym is not None:
+        if sym.group(1) == "$":
+            pre = _RE_PREFIX.match(span[:sym.end()])
+            key = (pre.group(1) or "").upper().replace(".", "") if pre else ""
+            if key:
+                return PREFIX_ISO.get(key) or PREFIX_ISO.get(key + ".") or "USD"
+            return "USD"           # the unmarked dollar, in an SEC filing, is the domestic one
+        return SYMBOL_ISO.get(sym.group(1))
+
+    name = _RE_NAME.search(span)
+    if name is not None:
+        return NAME_ISO.get(name.group(1).lower())
+    return None
+
+
+def parse_money(span, form):
+    """One matched span and its pattern name -> (amount as a string or None, ISO code or None)."""
+    cur = currency_of(span, form)
+
+    if form in REDACT_FORMS:
+        return None, cur                  # withheld: a currency, deliberately no number
+
+    if form == "words_only":
+        val = _num_from_words(span)
+    else:
+        val = _num_from_text(span)
+        if val is not None:
+            scale = _RE_SCALE.search(span)
+            if scale is not None:
+                val = val * SCALE[scale.group(0).lower()]
+
+    if val is None:
+        return None, cur
+    return format(val.normalize(), "f"), cur
 
 _TIMEOUT = 0
 
@@ -244,12 +458,16 @@ def extract_one(args):
                     signal.alarm(0)
         except _ExtractorTimeout:
             print(f"[timeout] {docid}: moneyregex > {_TIMEOUT}s, skipped", file=sys.stderr)
-            return [(docid, None, None, None, None, "timeout:moneyregex", ENGINE, MODEL)]
+            return [(docid, None, None, None, None, "timeout:moneyregex", ENGINE, MODEL,
+                 None, None)]
         except Exception:                  # one bad document must not kill the run
             hits = []
-        rows = [(docid, s, e, sp, LABEL, form, ENGINE, MODEL) for s, e, sp, form in hits]
+        rows = []
+        for s_, e_, sp_, form_ in hits:
+            amount_, cur_ = parse_money(sp_, form_)
+            rows.append((docid, s_, e_, sp_, LABEL, form_, ENGINE, MODEL, amount_, cur_))
     if not rows:
-        rows.append((docid, None, None, None, None, None, ENGINE, MODEL))
+        rows.append((docid, None, None, None, None, None, ENGINE, MODEL, None, None))
     return rows
 
 
@@ -276,10 +494,11 @@ def main():
 
     if LABEL not in args.label:
         print(f"no money extractor for {args.label}; writing sentinels only", file=sys.stderr)
-        rows = [(docid, None, None, None, None, None, ENGINE, MODEL)
+        rows = [(docid, None, None, None, None, None, ENGINE, MODEL, None, None)
                 for docid in df[args.id_col].tolist()]
         out = pd.DataFrame(rows, columns=COLUMNS)
         out[["Start", "Stop"]] = out[["Start", "Stop"]].astype("Int64")
+        out[["Amount", "Currency"]] = out[["Amount", "Currency"]].astype("string")
         out.to_parquet(args.output, index=False)
         print(f"{len(df)} doc(s) -> 0 candidate(s)  [{ENGINE}:{MODEL}]")
         return
@@ -309,10 +528,14 @@ def main():
 
     out = pd.DataFrame(rows, columns=COLUMNS)
     out[["Start", "Stop"]] = out[["Start", "Stop"]].astype("Int64")
+    # Text across the seam, deliberately. A Decimal becomes a float in pandas, and a contract value
+    # of 9,752,233.001 is exactly the kind of number that does not survive that intact.
+    out[["Amount", "Currency"]] = out[["Amount", "Currency"]].astype("string")
     n_cand = int(out["Start"].notna().sum())
+    n_amt = int(out["Amount"].notna().sum())
     mix = out["LabelRaw"].value_counts().to_dict()
     out.to_parquet(args.output, index=False)
-    print(f"{len(df)} doc(s) -> {n_cand} candidate(s)  [{ENGINE}:{MODEL}]")
+    print(f"{len(df)} doc(s) -> {n_cand} candidate(s), {n_amt} with an amount  [{ENGINE}:{MODEL}]")
     if mix:
         print("  " + "  ".join(f"{k}={v}" for k, v in sorted(mix.items())), file=sys.stderr)
 

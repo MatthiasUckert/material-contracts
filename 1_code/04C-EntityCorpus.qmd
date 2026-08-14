@@ -149,7 +149,7 @@ The corollary is that **adding an engine makes every document incomplete again**
     Dir = utils_file_path(.dir_main, "Work")   # per-chunk text parquet, deleted as it is consumed
   ),
   Param = list(
-    ChunkSize  = 10000L,  # documents held in memory at once; not a unit of resumption
+    ChunkSize  = 25000L,  # documents held in memory at once; not a unit of resumption
     IndexRerun = FALSE,  # TRUE re-walks the tree; FALSE reuses the cached index
     Device     = "auto",
     # The switch that decides whether this render is a rehearsal or the release. An integer draws
