@@ -42,6 +42,20 @@
 # in _NER.R's label policy and reproduced in the manifest, so a reader can check it rather than
 # infer it.
 #
+# THE STORE IS ONE TABLE PER LABEL, AND `candidates` IS A VIEW OVER THEM
+# Section 9 is the reason. Every engine used to be forced to eight columns, so LexNLP's parsed date,
+# its resolved ISO code, its company legal form and moneyregex's amount had nowhere to go and were
+# discarded at the seam. The extension axis is the LABEL rather than the engine -- an amount belongs
+# to MONEY whoever found it -- so each label has its own table with its own typed extras, and the
+# view unions their core columns. Every reader above section 9 queries the view and did not change.
+#
+# THE READS ARE FILES, NOT A CHUNK
+# Every table here is consistent with two different stories until the text is read. ent_reads()
+# writes one standalone HTML per contract -- a tab per label, a tab per engine under it, spans marked
+# in place, extras in the tooltip -- which replaced a console block that could show five documents
+# and no attributes. The viewer itself is _Commons/_Reads.R, because 04B will want it for party
+# spans.
+#
 # WHAT IS NOT HERE
 # Engine and rule scoring against the EDGAR anchors is 04B. Field resolution -- parties, contract
 # dates, party locations, contract value -- is 04C. The corpus pass is 04D. The reusable engine seam
@@ -101,10 +115,10 @@ if (FALSE) {
   "spacy:en_core_web_lg",
   "spacy:en_core_web_trf",
   "lexnlp",
-  "paper:dateregex-v1",
+  "paper:dateregex-v2",
   "paper:gazetteer-v1",
   "paper:redaction-v1",
-  "paper:moneyregex-v4"
+  "paper:moneyregex-v6"
 )
 
 .ent_combos_short <- c(
@@ -1394,153 +1408,6 @@ ent_report_stability <- function(.tab, .min_docs = 30L) {
   invisible(out_)
 }
 
-
-#' The same document read by every engine that emits a label
-#'
-#' The block no summary replaces. A distinct-count of five against thirty-eight is a number; the two
-#' LISTS side by side, from one contract, show which thirty-three the larger engine added, and
-#' whether they are parties, referenced companies, or defined terms it mistook for names.
-#'
-#' Documents are drawn from the middle of the distribution rather than at random. The extremes are
-#' unreadable and unrepresentative -- one contract in this sample yields 68,482 organisation spans --
-#' and a block nobody reads is worse than no block.
-#'
-#' Spans are DISTINCT and in document order, so the head of each list is what the engine found at the
-#' top of the contract, which is where parties are named. That makes the lists comparable line by
-#' line rather than only by length.
-#'
-#' @param .db_path DuckDB candidate store.
-#' @param .path_text Canonical text parquet.
-#' @param .path_anchors Sample anchors parquet, supplying the contract type.
-#' @param .label Character. Which label to show.
-#' @param .n Integer. Documents drawn.
-#' @param .max_spans Integer. Distinct spans listed per engine before truncation.
-#' @param .opening Integer. Characters of the document opening shown for orientation.
-#' @param .seed Integer. Draw seed, so the same documents appear on every render.
-#' @return Tibble: DocID, Class, DocLen, Opening, Combo, NDistinct, Spans.
-ent_engine_examples <- function(.db_path, .path_text, .path_anchors, .label,
-                                .n = 5L, .max_spans = 8L, .opening = 190L, .seed = 42L) {
-  if (FALSE) {
-    .db_path      <- .lP$Store$NerDB
-    .path_text    <- .lP$Sample$Text
-    .path_anchors <- .lP$Sample$Anchors
-    .label        <- "ORG"
-    .n            <- 5L
-    .max_spans    <- 8L
-    .opening      <- 190L
-    .seed         <- 42L
-  }
-
-  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
-  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
-
-  combo_ <- "CASE WHEN c.Engine = c.Model THEN c.Engine ELSE c.Engine || ':' || c.Model END"
-
-  # One row per engine per document, carrying the distinct spans in document order. The window
-  # function ranks within engine and document so the list can be truncated at the head rather than
-  # sampled, and everything stays database-side until the draw has narrowed it to a handful.
-  per_ <- DBI::dbGetQuery(con_, paste0(
-    "WITH d AS ( ",
-    "  SELECT ", combo_, " AS Combo, c.DocID, upper(c.Span) AS Key, ",
-    "    any_value(c.Span) AS Span, min(c.Start) AS Start ",
-    "  FROM candidates c WHERE c.Label = '", .label, "' AND c.Start IS NOT NULL ",
-    "  GROUP BY Combo, c.DocID, Key), ",
-    "r AS (SELECT *, row_number() OVER (PARTITION BY Combo, DocID ORDER BY Start) AS Rank FROM d) ",
-    "SELECT Combo, DocID, COUNT(*) AS NDistinct, ",
-    "  string_agg(CASE WHEN Rank <= ", as.integer(.max_spans), " THEN Span END, ' | ' ",
-    "             ORDER BY Start) AS Spans ",
-    "FROM r GROUP BY Combo, DocID"
-  )) |>
-    tibble::as_tibble()
-
-  if (nrow(per_) == 0L) {
-    cli::cli_alert_warning("No {(.label)} spans in the store.")
-    return(tibble::tibble())
-  }
-
-  # Documents every emitting engine saw, so the lists are comparable and a blank line means the
-  # engine found nothing rather than that it was never asked.
-  n_combo_ <- dplyr::n_distinct(per_$Combo)
-  tot_ <- per_ |>
-    dplyr::summarise(Combos = dplyr::n_distinct(.data$Combo), Tot = sum(.data$NDistinct),
-                     .by = DocID) |>
-    dplyr::filter(.data$Combos == n_combo_)
-
-  # The middle two quartiles by total distinct spans: enough entities to tell the engines apart,
-  # few enough to print.
-  q_ <- stats::quantile(tot_$Tot, c(0.25, 0.75), na.rm = TRUE)
-  pick_ <- tot_ |>
-    dplyr::filter(.data$Tot >= q_[1], .data$Tot <= q_[2]) |>
-    (\(.d) withr::with_seed(.seed, dplyr::slice_sample(.d, n = min(.n, nrow(.d)))))()
-
-  meta_ <- arrow::read_parquet(.path_anchors) |>
-    dplyr::filter(.data$DocID %in% pick_$DocID) |>
-    dplyr::select(DocID, Class = ClassDetailed)
-
-  text_ <- arrow::read_parquet(.path_text) |>
-    dplyr::filter(.data$DocID %in% pick_$DocID) |>
-    dplyr::transmute(
-      DocID,
-      DocLen  = stringi::stri_length(.data$TextRaw),
-      Opening = stringi::stri_replace_all_regex(
-        stringi::stri_sub(.data$TextRaw, from = 1L, to = .opening), "\\s+", " "
-      )
-    )
-
-  per_ |>
-    dplyr::filter(.data$DocID %in% pick_$DocID) |>
-    dplyr::left_join(meta_, by = dplyr::join_by(DocID)) |>
-    dplyr::left_join(text_, by = dplyr::join_by(DocID)) |>
-    dplyr::arrange(.data$DocID, dplyr::desc(.data$NDistinct)) |>
-    dplyr::select(DocID, Class, DocLen, Opening, Combo, NDistinct, Spans)
-}
-
-
-#' Print the paired reads, one block per document
-#'
-#' Engines are ordered by how many distinct spans they returned, largest first, so the comparison
-#' reads as a subtraction: the shortest list is the selective engine and everything above it is what
-#' the others added.
-#'
-#' @param .tab Tibble from ent_engine_examples().
-#' @param .label Character. Shown in the block header.
-#' @param .width Integer. Characters of the span list printed before truncation.
-#' @return Invisibly .tab.
-ent_report_examples <- function(.tab, .label, .width = 96L) {
-  if (FALSE) {
-    .tab   <- tab_ex
-    .label <- "ORG"
-    .width <- 96L
-  }
-  if (nrow(.tab) == 0L) return(invisible(.tab))
-
-  cli::cli_h3("{(.label)}: the same contract read by every engine")
-  pad_ <- max(nchar(.tab$Combo))
-
-  purrr::walk(unique(.tab$DocID), function(.d) {
-    rows_ <- dplyr::filter(.tab, .data$DocID == .d)
-    cat("-- ", .d, " | ", rows_$Class[1], " | ", format(rows_$DocLen[1], big.mark = ","),
-        " chars\n", sep = "")
-    cat("   opening : ", rows_$Opening[1], "\n", sep = "")
-    purrr::pwalk(dplyr::select(rows_, Combo, NDistinct, Spans),
-                 function(Combo, NDistinct, Spans) {
-                   txt_ <- dplyr::coalesce(Spans, "")
-                   if (nchar(txt_) > .width) txt_ <- paste0(substr(txt_, 1L, .width), " ...")
-                   cat("   ", formatC(Combo, width = -pad_), " [", formatC(NDistinct, width = 4),
-                       "] ", txt_, "\n", sep = "")
-                 })
-    cat("\n")
-  })
-
-  cli::cli_alert_info(
-    "Read down each block as a subtraction. The shortest list is the selective engine; what the \\
-     longer lists add is either a party the selective engine missed or a mention it was right to \\
-     leave out, and only the words distinguish those."
-  )
-  invisible(.tab)
-}
-
-
 #' Every report block in this document, in order
 #'
 #' @param .tab_sample Tibble from ent_build_sample().
@@ -1550,7 +1417,8 @@ ent_report_examples <- function(.tab, .label, .width = 96L) {
 #' @param .al List from ent_alignment().
 #' @param .tab_offsets Tibble from ent_check_offsets().
 #' @return Invisibly NULL.
-ent_report_all <- function(.tab_sample, .ov, .desc, .class, .al, .tab_offsets) {
+ent_report_all <- function(.tab_sample, .ov, .desc, .class, .al, .tab_offsets,
+                           .extras = NULL, .contract = NULL) {
   if (FALSE) {
     .tab_sample  <- tab_sample
     .ov          <- .ov
@@ -1558,15 +1426,19 @@ ent_report_all <- function(.tab_sample, .ov, .desc, .class, .al, .tab_offsets) {
     .class       <- tab_class
     .al          <- .al
     .tab_offsets <- tab_offsets
+    .extras      <- tab_extras
+    .contract    <- tab_contract
   }
 
   ent_report_sample(.tab = .tab_sample)
   ent_report_store(.ov = .ov)
   ent_report_yield(.desc = .desc)
+  if (!is.null(.extras)) ent_report_extras(.tab = .extras)
   ent_report_position(.desc = .desc)
   ent_report_stability(.tab = .class)
   ent_report_agreement(.al = .al, .n = 12L)
   ent_report_offsets(.tab = .tab_offsets)
+  if (!is.null(.contract)) ent_report_contract(.tab = .contract)
   invisible(NULL)
 }
 
@@ -2046,4 +1918,589 @@ ent_plot_agreement <- function(.pairwise, .accuracy = 0.01) {
       .drop     = "both"          # per panel, with the free scales below
     ) +
     ggplot2::facet_wrap(~Label, scales = "free")
+}
+
+# 9. The per-label tables ----------------------------------------------------------------------------------------------
+# Everything above this point reads `candidates`, which is a VIEW over the six per-label tables and
+# carries the eight core columns only. That is deliberate: the descriptive layer asks questions about
+# spans and positions, and a span is a span whatever label it wears.
+#
+# This section asks the questions the view cannot answer. The extras live in the label tables --
+# LegalForm on org, Iso3 on gpe, DateValue on date, Amount on money -- and they are the reason the
+# store was split. A LABEL WITH NO EXTRAS IS NOT A FAILURE: spaCy emits none anywhere, and person and
+# redact declare none at all.
+
+#' How much of each label's extras an engine actually filled
+#'
+#' THE COLUMN THAT MATTERS IS PctFilled, NOT WHETHER THE COLUMN EXISTS. An extractor that changed
+#' after a store was built leaves its extras null for every document extracted before the change, and
+#' nothing errors -- the column is there, typed, and empty. That is the one failure mode this section
+#' exists to make visible, and it reads as a coverage well below a hundred rather than as an absence.
+#'
+#' @param .db_path Path to the DuckDB candidate store.
+#' @return Tibble: Label, Combo, Column, Rows, Filled, PctFilled. Empty where no label declares an
+#'   extra, which is a valid store and not an error.
+ent_extras <- function(.db_path) {
+  if (FALSE) .db_path <- .lP$Store$NerDB
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  have_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
+  ))$table_name
+
+  labs_ <- names(.store_schema)[
+    store_table(names(.store_schema)) %in% have_ &
+      purrr::map_int(names(.store_schema), \(.l) length(store_extras(.l))) > 0L
+  ]
+  if (length(labs_) == 0L) {
+    return(tibble::tibble(Label = character(0), Combo = character(0), Column = character(0),
+                          Rows = integer(0), Filled = integer(0), PctFilled = numeric(0)))
+  }
+
+  combo_ <- "CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END"
+
+  purrr::map(labs_, function(.l) {
+    tbl_  <- store_table(.l)
+    cols_ <- names(store_extras(.l))
+    cnt_  <- paste0("COUNT(", cols_, ") AS ", cols_, collapse = ", ")
+    DBI::dbGetQuery(con_, paste0(
+      "SELECT ", combo_, " AS Combo, COUNT(*) AS Rows, ", cnt_, " FROM ", tbl_, " GROUP BY Combo"
+    )) |>
+      tibble::as_tibble() |>
+      tidyr::pivot_longer(cols = dplyr::all_of(cols_), names_to = "Column", values_to = "Filled") |>
+      dplyr::mutate(Label = .l, .before = 1L)
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::mutate(
+      Rows      = as.integer(.data$Rows),
+      Filled    = as.integer(.data$Filled),
+      PctFilled = round(100 * .data$Filled / pmax(1L, .data$Rows), 1)
+    ) |>
+    dplyr::select(Label, Combo, Column, Rows, Filled, PctFilled)
+}
+
+
+#' What the engines resolved, beyond finding it
+#' @param .tab Tibble from ent_extras().
+#' @return Invisibly the tibble.
+ent_report_extras <- function(.tab) {
+  if (FALSE) .tab <- tab_extras
+
+  cli::cli_h2("What each engine resolved")
+  if (nrow(.tab) == 0L) {
+    cli::cli_alert_info("No label declares an extra; the store carries the core columns only.")
+    return(invisible(.tab))
+  }
+
+  .tab |>
+    dplyr::filter(.data$Filled > 0L) |>
+    dplyr::arrange(plot_factor(.data$Label, .key = "Label"),
+                   plot_factor(.data$Combo, .key = "Combo"), .data$Column) |>
+    tbl_say(.title = "Extra columns populated, per engine and label")
+
+  cli::cli_alert_info(
+    "This is what separates finding a thing from knowing what it is. A date span is a string until \\
+     something parses it; an amount is a string until something applies the scale word. Engines \\
+     absent from this table found spans and resolved nothing, which is a real difference and not a \\
+     defect -- spaCy is a recogniser and carries no vocabulary to resolve against."
+  )
+
+  short_ <- dplyr::filter(.tab, .data$Rows > 0L, .data$PctFilled < 99, .data$Filled > 0L)
+  if (nrow(short_) > 0L) {
+    cli::cli_alert_warning(
+      "PARTIALLY FILLED EXTRAS BELOW. An extractor that gained a field after some documents were \\
+       already extracted leaves them null, and nothing errors. Clear that engine and re-run it."
+    )
+    short_ |>
+      dplyr::arrange(.data$PctFilled) |>
+      tbl_say(.title = "Extras filled for only part of an engine's rows")
+  }
+  invisible(.tab)
+}
+
+
+#' The engine-by-label grid, one column per contract type
+#'
+#' TWENTY-EIGHT ROWS BY TWELVE COLUMNS, and that orientation is the readable one. The transpose --
+#' classes down, engine-label pairs across -- is the same numbers in a table nobody scrolls to the
+#' end of, and it splits the five ORG rows apart instead of grouping them. Here every engine that
+#' emits a label sits directly under its neighbours, which is the comparison the table is for.
+#'
+#' Counts rather than a rate, deliberately: this is the first look, and a rate hides that a class
+#' with sixty documents and one with six hundred are not equally well observed. The Docs column
+#' carries that.
+#'
+#' @param .tab Tibble from ent_describe_class().
+#' @param .value Character. Which quantity fills the cells.
+#' @return Invisibly the wide tibble.
+ent_class_grid <- function(.tab, .value = c("Spans", "Docs", "DistinctPerDoc")) {
+  if (FALSE) {
+    .tab   <- tab_class
+    .value <- "Spans"
+  }
+  .value <- match.arg(.value)
+
+  wide_ <- .tab |>
+    dplyr::mutate(Pair = paste0(.data$Combo, " | ", .data$Label)) |>
+    dplyr::arrange(plot_factor(.data$Label, .key = "Label"),
+                   plot_factor(.data$Combo, .key = "Combo")) |>
+    dplyr::mutate(Pair = forcats::fct_inorder(.data$Pair)) |>
+    dplyr::select(Pair, Class, dplyr::all_of(.value)) |>
+    tidyr::pivot_wider(id_cols = Pair, names_from = Class, values_from = dplyr::all_of(.value),
+                       values_fill = 0L) |>
+    dplyr::mutate(Pair = as.character(.data$Pair))
+
+  # Columns in the registered class order, so the grid reads the same way as every figure.
+  ord_ <- intersect(as.character(plot_levels(.key = "ClassDetailed")), names(wide_))
+  wide_ <- dplyr::select(wide_, Pair, dplyr::all_of(ord_), dplyr::everything())
+
+  cli::cli_h2("{(.value)} by engine-label pair and contract type")
+  wide_ |>
+    tbl_say(.title = paste0(.value, " -- ", nrow(wide_), " pair(s) x ", length(ord_), " class(es)"))
+  cli::cli_alert_info(
+    "A zero is either an engine that does not emit that label or a contract type that carries none \\
+     of it. The two are told apart by the row: a pair absent from the row set entirely is the \\
+     first, a zero within a populated row is the second."
+  )
+  invisible(wide_)
+}
+
+
+#' The nine contract tests, over the whole store rather than a sample of it
+#'
+#' The Check-NER-* scripts run these on twenty-five documents to decide whether an engine may be
+#' inserted at all. Here they run over everything that WAS inserted, which is a different question:
+#' the first asks whether an extractor is well formed, the second whether the store built from it
+#' still is. A store assembled over many sessions from several extractor versions can fail these
+#' while every individual extraction passed.
+#'
+#' T3 and T4 are sampled rather than exhaustive. Rehydrating eight and a half million spans against
+#' their documents is minutes of work to re-establish something 04A already checks continuously; the
+#' sample is large enough to catch a systematic offset error, which is the only kind that occurs.
+#'
+#' @param .db_path Path to the DuckDB candidate store.
+#' @param .path_text Canonical text parquet.
+#' @param .n_offsets Integer. Spans drawn for the offset round-trip.
+#' @return Tibble: Test, N, Of, Pass.
+ent_contract_tests <- function(.db_path, .path_text, .n_offsets = 5000L) {
+  if (FALSE) {
+    .db_path   <- .lP$Store$NerDB
+    .path_text <- .lP$Sample$Text
+    .n_offsets <- 5000L
+  }
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  DBI::dbExecute(con_, paste0(
+    "CREATE OR REPLACE TEMP VIEW txt AS SELECT DocID, TextRaw FROM read_parquet('",
+    as.character(fs::path_abs(.path_text)), "')"
+  ))
+
+  one_ <- function(.sql) as.integer(DBI::dbGetQuery(con_, .sql)[[1]])
+
+  n_cand_ <- one_("SELECT COUNT(*) FROM candidates")
+  n_docs_ <- one_("SELECT COUNT(*) FROM txt")
+
+  rt_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT c.Span = substr(t.TextRaw, c.Start + 1, c.Stop - c.Start) AS OK, ",
+    "  (c.Start >= 0 AND c.Stop <= length(t.TextRaw) AND c.Start < c.Stop) AS InDoc ",
+    "FROM candidates c JOIN txt t USING (DocID) USING SAMPLE ", as.integer(.n_offsets), " ROWS"
+  )) |>
+    tibble::as_tibble()
+
+  tibble::tibble(
+    Test = c("T1 core columns present on every label table",
+             "T2 every ledger document accounted for",
+             "T3 offsets round-trip to Span (sampled)",
+             "T4 offsets inside the document (sampled)",
+             "T5 every candidate carries an Engine and a Model",
+             "T6 every candidate carries a Label",
+             "T7 no duplicate DocID/Start/Stop/LabelRaw/Engine/Model",
+             "T8 no null-span rows in the store",
+             "T9 every stored combination is declared in the ledger"),
+    N = c(
+      # The view exists and selects the core, which is the assertion: a label table missing a core
+      # column cannot be unioned and the view would have failed to build.
+      length(intersect(.store_core, names(DBI::dbGetQuery(con_,
+                                                          "SELECT * FROM candidates LIMIT 0")))),
+      one_("SELECT COUNT(DISTINCT DocID) FROM runs WHERE DocID IN (SELECT DocID FROM txt)"),
+      sum(rt_$OK, na.rm = TRUE),
+      sum(rt_$InDoc, na.rm = TRUE),
+      one_("SELECT COUNT(*) FROM candidates WHERE Engine IS NOT NULL AND Model IS NOT NULL"),
+      one_("SELECT COUNT(*) FROM candidates WHERE Label IS NOT NULL"),
+      # LabelRaw IS PART OF THE KEY, and leaving it out is what made this fail. The gazetteer can
+      # match one span as two GeoClasses and LexNLP's geoentity resolver emits both readings of an
+      # ambiguous place at identical offsets: distinct rows, distinct sub-classes, and a key without
+      # LabelRaw counts them as duplicates of each other. This is the key the Check-NER-* scripts
+      # assert, so the two now ask the same question.
+      one_(paste0("SELECT COUNT(*) FROM (SELECT DISTINCT DocID, Start, Stop, LabelRaw, ",
+                  "Engine, Model FROM candidates)")),
+      n_cand_ - one_("SELECT COUNT(*) FROM candidates WHERE Start IS NULL OR Span IS NULL"),
+      one_(paste0("SELECT COUNT(*) FROM (SELECT DISTINCT Engine, Model, Label FROM candidates c ",
+                  "WHERE EXISTS (SELECT 1 FROM runs r WHERE r.Engine = c.Engine ",
+                  "AND r.Model = c.Model AND r.Label = c.Label))"))
+    ),
+    Of = c(
+      length(.store_core),
+      one_("SELECT COUNT(DISTINCT DocID) FROM runs"),
+      nrow(rt_), nrow(rt_),
+      n_cand_, n_cand_, n_cand_, n_cand_,
+      one_("SELECT COUNT(*) FROM (SELECT DISTINCT Engine, Model, Label FROM candidates)")
+    )
+  ) |>
+    dplyr::mutate(Pass = .data$N == .data$Of)
+}
+
+
+#' The nine tests, said out loud
+#'
+#' A FAILURE PRINTS ITS ROWS. A count that does not reconcile says a store is wrong and nothing about
+#' where, and the difference between a real defect and a test asking the wrong question is visible in
+#' the offending rows and in no other way.
+#'
+#' @param .tab Tibble from ent_contract_tests().
+#' @param .db_path Path to the store, for showing what failed. NULL suppresses that.
+#' @return Invisibly the tibble.
+ent_report_contract <- function(.tab, .db_path = NULL) {
+  if (FALSE) {
+    .tab     <- tab_contract
+    .db_path <- .lP$Store$NerDB
+  }
+
+  cli::cli_h2("The candidate contract, over the whole store")
+  tbl_say(.tab, .title = "Nine tests")
+
+  if (all(.tab$Pass)) {
+    cli::cli_alert_success("All nine hold.")
+  } else {
+    cli::cli_alert_danger(
+      "Failures above. Each one means a query written against this store returns something other \\
+       than what its author expects, and none of them raises an error on its own."
+    )
+
+    if (!is.null(.db_path) && any(!.tab$Pass & grepl("^T7", .tab$Test))) {
+      con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+      on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+      DBI::dbGetQuery(con_, paste0(
+        "SELECT Engine, Model, Label, LabelRaw, COUNT(*) AS N FROM (",
+        "  SELECT DocID, Start, Stop, LabelRaw, Engine, Model, Label, COUNT(*) AS Copies ",
+        "  FROM candidates GROUP BY ALL HAVING COUNT(*) > 1",
+        ") GROUP BY ALL ORDER BY N DESC"
+      )) |>
+        tibble::as_tibble() |>
+        tbl_say(.title = "Where the duplicate rows are")
+    }
+  }
+  invisible(.tab)
+}
+
+
+#' Write one standalone HTML span viewer per document
+#'
+#' The reads. Every table in this document is consistent with two different stories until the text is
+#' read, and the viewer is where that happens: one file per contract, a tab per label, a tab per
+#' engine under it, every span marked in place and every extra in the tooltip.
+#'
+#' CANDIDATES COME FROM THE LABEL TABLES, NOT FROM `candidates`. The view carries the core columns
+#' only, and the extras are the reason to look.
+#'
+#' CACHED. A document whose file exists is skipped, because this runs inside a render and the full
+#' sample is several gigabytes. The cache cannot know that _Reads.R itself changed, which is the one
+#' thing it will get wrong -- pass .overwrite after editing the renderer.
+#'
+#' @param .db_path Path to the DuckDB candidate store.
+#' @param .path_text Canonical text parquet.
+#' @param .path_anchors Sample anchors parquet, supplying the header metadata.
+#' @param .dir_out Directory for the files.
+#' @param .doc_ids Character vector of documents, or NULL for every document in the text file.
+#' @param .max_chars Integer or NULL. Truncate the DISPLAYED text; announced on the page.
+#' @param .overwrite Logical. TRUE re-renders files that already exist.
+#' @param .workers Integer or NULL. Passed to read_export(); NULL takes half the cores.
+#' @return Invisibly the tibble from read_export().
+ent_reads <- function(.db_path, .path_text, .path_anchors, .dir_out, .doc_ids = NULL,
+                      .max_chars = NULL, .overwrite = FALSE, .workers = NULL) {
+  if (FALSE) {
+    .db_path      <- .lP$Store$NerDB
+    .path_text    <- .lP$Sample$Text
+    .path_anchors <- .lP$Sample$Anchors
+    .dir_out      <- .lP$Output$Reads
+    .doc_ids      <- NULL
+    .max_chars    <- NULL
+    .overwrite    <- FALSE
+    .workers      <- NULL
+  }
+
+  tab_text_ <- arrow::read_parquet(.path_text) |>
+    dplyr::select(DocID, TextRaw)
+  ids_ <- if (is.null(.doc_ids)) tab_text_$DocID else intersect(.doc_ids, tab_text_$DocID)
+  tab_text_ <- dplyr::filter(tab_text_, .data$DocID %in% ids_)
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  duckdb::duckdb_register(con_, "ent_read_docs", data.frame(DocID = ids_))
+  on.exit(duckdb::duckdb_unregister(con_, "ent_read_docs"), add = TRUE, after = FALSE)
+
+  have_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
+  ))$table_name
+  labs_ <- names(.store_schema)[store_table(names(.store_schema)) %in% have_]
+
+  tab_cand_ <- purrr::map(labs_, function(.l) {
+    tbl_  <- store_table(.l)
+    sel_  <- paste(c("DocID", "Start", "Stop", "Span", "LabelRaw", "Engine", "Model",
+                     names(store_extras(.l))), collapse = ", ")
+    DBI::dbGetQuery(con_, paste0(
+      "SELECT ", sel_, " FROM ", tbl_,
+      " WHERE DocID IN (SELECT DocID FROM ent_read_docs)"
+    )) |>
+      tibble::as_tibble() |>
+      dplyr::mutate(Label = .l, .after = "Span")
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::mutate(
+      Combo = dplyr::if_else(.data$Engine == .data$Model, .data$Engine,
+                             paste0(.data$Engine, ":", .data$Model))
+    )
+
+  tab_meta_ <- arrow::read_parquet(.path_anchors) |>
+    dplyr::filter(.data$DocID %in% ids_) |>
+    dplyr::transmute(
+      DocID,
+      Class     = .data$ClassDetailed,
+      Company   = .data$CompanyName,
+      CIK       = as.character(.data$CIK),
+      Filed     = as.character(.data$DateFiled),
+      Amendment = as.character(.data$AmendType)
+    )
+
+  read_export(
+    .text      = tab_text_,
+    .cands     = tab_cand_,
+    .dir_out   = .dir_out,
+    .meta      = tab_meta_,
+    .doc_ids   = ids_,
+    .combos    = as.character(plot_levels(.key = "Combo")),
+    .max_chars = .max_chars,
+    .overwrite = .overwrite,
+    .workers   = .workers
+  )
+}
+
+# 10. The tables themselves --------------------------------------------------------------------------------------------
+# What the store actually looks like, table by table. Everything above reads the data; this reads the
+# CONTAINER -- how many rows each label holds, which columns it declares, and how much of each column
+# is filled.
+#
+# IT IS A SEPARATE SECTION BECAUSE IT ANSWERS A DIFFERENT QUESTION. The yield and agreement blocks ask
+# what the engines found; these ask whether the thing they were written into is shaped the way the
+# schema says. A store assembled over several sessions from more than one extractor version can be
+# entirely correct about what it found and still carry a column nobody ever filled -- and a null
+# column is indistinguishable from a column that does not exist until someone looks.
+
+#' Row and column counts for every table in the store
+#'
+#' @param .db_path Path to the DuckDB candidate store.
+#' @return Tibble: Table, Label, Rows, Docs, Engines, NCol, NExtra.
+ent_store_tables <- function(.db_path) {
+  if (FALSE) .db_path <- .lP$Store$NerDB
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  tabs_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' ",
+    "ORDER BY table_name"
+  ))$table_name
+  tabs_ <- setdiff(tabs_, "runs")
+
+  lab_of_ <- purrr::set_names(names(.store_schema), store_table(names(.store_schema)))
+
+  purrr::map(tabs_, function(.t) {
+    lab_  <- if (.t %in% names(lab_of_)) unname(lab_of_[[.t]]) else toupper(.t)
+    cols_ <- names(DBI::dbGetQuery(con_, paste0("SELECT * FROM ", .t, " LIMIT 0")))
+    n_ <- DBI::dbGetQuery(con_, paste0(
+      "SELECT COUNT(*) AS Rows, COUNT(DISTINCT DocID) AS Docs, ",
+      "  COUNT(DISTINCT Engine || ':' || Model) AS Engines FROM ", .t
+    ))
+    tibble::tibble(
+      Table  = .t,
+      Label  = lab_,
+      Rows   = as.integer(n_$Rows),
+      Docs   = as.integer(n_$Docs),
+      Engines = as.integer(n_$Engines),
+      NCol   = length(cols_),
+      NExtra = length(setdiff(cols_, .store_core))
+    )
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::arrange(dplyr::desc(.data$Rows))
+}
+
+
+#' Every column of every table, with how much of it is filled
+#'
+#' ONE SCAN PER TABLE, NOT ONE PER COLUMN. COUNT(col) skips nulls, so every column's fill can be
+#' asked for in a single pass -- which matters because org holds five million rows and twelve
+#' separate scans of it is a minute of waiting for something one query answers.
+#'
+#' @param .db_path Path to the DuckDB candidate store.
+#' @return Tibble: Table, Label, Column, Type, IsExtra, Rows, NonNull, PctNonNull.
+ent_store_schema <- function(.db_path) {
+  if (FALSE) .db_path <- .lP$Store$NerDB
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  tabs_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' ",
+    "ORDER BY table_name"
+  ))$table_name
+  tabs_ <- setdiff(tabs_, "runs")
+
+  lab_of_ <- purrr::set_names(names(.store_schema), store_table(names(.store_schema)))
+
+  purrr::map(tabs_, function(.t) {
+    meta_ <- DBI::dbGetQuery(con_, paste0(
+      "SELECT column_name, data_type FROM information_schema.columns ",
+      "WHERE table_name = '", .t, "' ORDER BY ordinal_position"
+    )) |>
+      tibble::as_tibble()
+
+    cnt_ <- DBI::dbGetQuery(con_, paste0(
+      "SELECT COUNT(*) AS TotalRows, ",
+      paste0("COUNT(", meta_$column_name, ") AS ", meta_$column_name, collapse = ", "),
+      " FROM ", .t
+    ))
+
+    tibble::tibble(
+      Table   = .t,
+      Label   = if (.t %in% names(lab_of_)) unname(lab_of_[[.t]]) else toupper(.t),
+      Column  = meta_$column_name,
+      Type    = meta_$data_type,
+      IsExtra = !meta_$column_name %in% .store_core,
+      Rows    = as.integer(cnt_$TotalRows),
+      NonNull = as.integer(unlist(cnt_[meta_$column_name]))
+    )
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::mutate(PctNonNull = round(100 * .data$NonNull / pmax(1L, .data$Rows), 1))
+}
+
+
+#' A few real rows from each table, one engine at a time
+#'
+#' THE FIRST VERSION SHOWED ONE ENGINE PER TABLE, which is the least informative view there is. A
+#' plain LIMIT returns the first rows of whichever engine happens to sort first, so org showed
+#' LexNLP and never spaCy, and the whole point of a per-label table -- that several engines write
+#' into it and only some of them resolve anything -- was invisible. Rows are now drawn PER ENGINE.
+#'
+#' WITHIN AN ENGINE, THE MOST-RESOLVED ROWS COME FIRST. A row where every extra is filled says more
+#' about the table than three rows where one is, and ordering on the count of non-null extras costs
+#' nothing because the window function is computed in the same pass.
+#'
+#' SPANS ARE DEDUPLICATED. Without it, LexNLP's GPE peek was "New York" three times: the same string
+#' at three offsets, resolving identically, filling the screen with one fact.
+#'
+#' @param .db_path Path to the DuckDB candidate store.
+#' @param .n Integer. Rows per engine per table.
+#' @return Invisibly, a named list of tibbles.
+ent_store_peek <- function(.db_path, .n = 2L) {
+  if (FALSE) {
+    .db_path <- .lP$Store$NerDB
+    .n       <- 2L
+  }
+
+  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  have_ <- DBI::dbGetQuery(con_, paste0(
+    "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
+  ))$table_name
+  labs_ <- names(.store_schema)[store_table(names(.store_schema)) %in% have_]
+
+  out_ <- purrr::map(labs_, function(.l) {
+    tbl_    <- store_table(.l)
+    extras_ <- names(store_extras(.l))
+    fill_   <- if (length(extras_) == 0L) "0" else {
+      paste0("(", paste0("CASE WHEN ", extras_, " IS NULL THEN 0 ELSE 1 END",
+                         collapse = " + "), ")")
+    }
+    sel_ <- paste(c("Engine", "Model", "Span", "LabelRaw", extras_), collapse = ", ")
+
+    DBI::dbGetQuery(con_, paste0(
+      "WITH d AS (",
+      "  SELECT ", sel_, ", ", fill_, " AS Filled FROM ", tbl_,
+      "  QUALIFY ROW_NUMBER() OVER (PARTITION BY Engine, Model, Span ORDER BY Filled DESC) = 1",
+      ") SELECT ", sel_, " FROM d ",
+      "QUALIFY ROW_NUMBER() OVER (PARTITION BY Engine, Model ORDER BY Filled DESC, Span) <= ",
+      as.integer(.n)
+    )) |>
+      tibble::as_tibble() |>
+      dplyr::arrange(.data$Engine, .data$Model)
+  }) |>
+    purrr::set_names(labs_)
+
+  purrr::iwalk(out_, function(.d, .l) {
+    n_ext_ <- length(store_extras(.l))
+    cli::cli_h3("{(.l)} -- table {store_table(.l)}, \
+                 {n_ext_} declared extra{?s}, {dplyr::n_distinct(.d$Engine, .d$Model)} engine{?s}")
+    if (nrow(.d) == 0L) {
+      cli::cli_alert_warning("{.field {store_table(.l)}} is empty.")
+    } else {
+      print(.d, n = Inf, width = Inf)
+    }
+  })
+  invisible(out_)
+}
+
+
+#' The store, table by table
+#' @param .tabs Tibble from ent_store_tables().
+#' @param .schema Tibble from ent_store_schema().
+#' @return Invisibly, the schema tibble.
+ent_report_store_tables <- function(.tabs, .schema) {
+  if (FALSE) {
+    .tabs   <- tab_tables
+    .schema <- tab_schema
+  }
+
+  cli::cli_h2("One table per label")
+  tbl_say(.tabs, .title = "Rows, documents and engines, per label table")
+
+  cli::cli_alert_info(
+    "Docs is the count for THAT label, not for the store: a document with no money in it appears in \\
+     org and not in money, which is a fact about the contract rather than a gap in the extraction."
+  )
+
+  cli::cli_h2("Columns")
+  .schema |>
+    dplyr::filter(!.data$IsExtra) |>
+    dplyr::summarise(
+      Tables  = dplyr::n(),
+      MinPct  = min(.data$PctNonNull),
+      .by = c(Column, Type)
+    ) |>
+    tbl_say(.title = "The core, which every table carries")
+
+  ext_ <- dplyr::filter(.schema, .data$IsExtra)
+  if (nrow(ext_) == 0L) {
+    cli::cli_alert_info("No table declares an extra.")
+  } else {
+    ext_ |>
+      dplyr::select(Label, Column, Type, Rows, NonNull, PctNonNull) |>
+      dplyr::arrange(plot_factor(.data$Label, .key = "Label"), .data$Column) |>
+      tbl_say(.title = "The extras, and how much of each is filled")
+
+    cli::cli_alert_info(
+      "PctNonNull IS ACROSS EVERY ENGINE IN THE TABLE, so a column filled by one engine out of six \\
+       reads low by construction and is not a fault -- spaCy resolves nothing anywhere. The number \\
+       that means something is in Validation, where the same quantity is cut BY ENGINE: a column \\
+       filled for part of ONE engine's rows is an extractor that changed mid-store."
+    )
+  }
+  invisible(.schema)
 }

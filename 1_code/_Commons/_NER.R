@@ -279,7 +279,7 @@ ner_lexnlp <- function(
 #' Run the ported date-pattern extractor over parquet input
 #'
 #' The paper's eight date patterns, ported so that the published measure can be reproduced rather
-#' than described. The script stamps Engine "paper" and Model "dateregex-v1"; the model tag names
+#' than described. The script stamps Engine "paper" and its own MODEL constant; the model tag names
 #' the pattern set, so revising a pattern means bumping MODEL in extract_dateregex.py and not
 #' silently changing what an existing store means.
 #'
@@ -376,7 +376,7 @@ ner_dateregex <- function(
   if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_dateregex.py failed (status {status_}).")
 
   elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("dateregex [dateregex-v1] done in {elapsed_}s -> {.path {(.output)}}")
+  if (!.quiet) cli::cli_alert_success("dateregex done in {elapsed_}s -> {.path {(.output)}}")
   return(invisible(.output))
 }
 
@@ -503,7 +503,7 @@ ner_gazetteer <- function(
   if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_gazetteer.py failed (status {status_}).")
 
   elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("gazetteer [gazetteer-v1] done in {elapsed_}s -> {.path {(.output)}}")
+  if (!.quiet) cli::cli_alert_success("gazetteer done in {elapsed_}s -> {.path {(.output)}}")
   return(invisible(.output))
 }
 
@@ -637,7 +637,7 @@ ner_redaction <- function(
   if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_redaction.py failed (status {status_}).")
 
   elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("redaction [redaction-v1] done in {elapsed_}s -> {.path {(.output)}}")
+  if (!.quiet) cli::cli_alert_success("redaction done in {elapsed_}s -> {.path {(.output)}}")
   return(invisible(.output))
 }
 
@@ -741,9 +741,42 @@ ner_moneyregex <- function(
   if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_moneyregex.py failed (status {status_}).")
 
   elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("moneyregex [moneyregex-v4] done in {elapsed_}s -> {.path {(.output)}}")
+  if (!.quiet) cli::cli_alert_success("moneyregex done in {elapsed_}s -> {.path {(.output)}}")
   return(invisible(.output))
 }
+
+# THE PAPER MODEL REGISTRY --------------------------------------------------------------------------
+# ONE PLACE THAT KNOWS WHICH PORTED EXTRACTORS EXIST. Before this, a model version was a control-flow
+# constant in four separate functions: the combination parser validated against a hard-coded vector,
+# the label policy keyed on the full token, ner_run() dispatched on an exact string match, and each
+# wrapper printed its own version into its success message. Bumping dateregex from v1 to v2 therefore
+# needed four edits in this file plus two in 04A, and missing one failed at a different point each
+# time -- the parser rejected the token, or the policy returned no labels, or the dispatcher fell
+# through to "no runner", or the extraction ran and the identity guard refused the ingest afterwards.
+#
+# The STEM is the identity; the version is data. A pattern set may be revised, and revising it must
+# not mean editing a dispatcher: extract_dateregex.py stamps its own MODEL, the guard in
+# ner_db_append() compares that against the dispatched token, and a mismatch is caught before a row
+# is written. Nothing here needs to know which version is current.
+.ner_paper_models <- list(
+  dateregex  = list(label = "DATE",   runner = "ner_dateregex"),
+  gazetteer  = list(label = "GPE",    runner = "ner_gazetteer"),
+  redaction  = list(label = "REDACT", runner = "ner_redaction"),
+  moneyregex = list(label = "MONEY",  runner = "ner_moneyregex")
+)
+
+
+#' The stem of a paper model, with the version stripped
+#'
+#' "dateregex-v2" -> "dateregex". Everything before the first "-v" followed by digits, so a model
+#' carrying no version returns itself and one carrying a hyphen in its name is unaffected.
+#'
+#' @param .model Character vector of paper model tags.
+#' @return Character vector of stems.
+ner_paper_stem <- function(.model) {
+  stringi::stri_replace_first_regex(.model, "-v\\d+$", "")
+}
+
 
 #' The labels a combination is asked for
 #'
@@ -783,15 +816,24 @@ ner_label_policy <- function(.engine, .model, .labels = NULL) {
     # measure it against the gazetteer and spaCy; whether it earns a corpus pass is a separate
     # decision, and the ledger makes adding it later an incremental run rather than a re-run.
     # PERSON is absent because LexNLP exposes no offsets for it.
-    "lexnlp"              = c("ORG", "GPE", "DATE", "MONEY"),
-    "paper:dateregex-v1"  = "DATE",
-    "paper:gazetteer-v1"  = "GPE",
-    "paper:redaction-v1"  = "REDACT",
-    "paper:moneyregex-v4" = "MONEY"
+    "lexnlp"              = c("ORG", "GPE", "DATE", "MONEY")
   )
 
-  key_em_  <- paste0(.engine, ":", .model)
-  default_ <- if (!is.null(policy_[[key_em_]])) policy_[[key_em_]] else policy_[[.engine]]
+  # The four ported extractors are single-label specialists and their label is a property of the
+  # STEM, not of the version: dateregex-v2 emits DATE for the same reason dateregex-v1 did.
+  key_em_  <- if (.engine == "paper") {
+    ner_paper_stem(.model)
+  } else {
+    paste0(.engine, ":", .model)
+  }
+  spec_    <- if (.engine == "paper") .ner_paper_models[[key_em_]]$label else NULL
+  default_ <- if (!is.null(spec_)) {
+    spec_
+  } else if (!is.null(policy_[[key_em_]])) {
+    policy_[[key_em_]]
+  } else {
+    policy_[[.engine]]
+  }
   ner_arg(.labels, .engine, .model, .default = default_)
 }
 
@@ -847,7 +889,7 @@ ner_label_policy <- function(.engine, .model, .labels = NULL) {
 ner_run <- function(
     .inputs,
     .db_path,
-    .run = c("spacy:en_core_web_sm", "lexnlp", "paper:dateregex-v1", "paper:gazetteer-v1"),
+    .run = c("spacy:en_core_web_sm", "lexnlp", "paper:dateregex-v2", "paper:gazetteer-v1"),
     .labels = NULL, # NULL = per-combo policy; scalar/vector or named (engine / engine:model)
     .max_chars = NULL, # truncate docs to first N chars before extraction (NULL = off)
     .retry_timeout = FALSE, # re-run docs previously ingested as Status = 'timeout'
@@ -865,7 +907,7 @@ ner_run <- function(
   if (FALSE) {
     .inputs <- .lP$Input$SampleContracts
     .db_path <- file.path(.lP$Cache$NerTest, "test_store.duckdb")
-    .run <- c("spacy:en_core_web_sm", "lexnlp", "paper:dateregex-v1", "paper:gazetteer-v1")
+    .run <- c("spacy:en_core_web_sm", "lexnlp", "paper:dateregex-v2", "paper:gazetteer-v1")
     .labels <- NULL
     .max_chars <- NULL
     .retry_timeout <- FALSE
@@ -901,11 +943,21 @@ ner_run <- function(
       tibble::tibble(Engine = "lexnlp", Model = "lexnlp", ModelArg = "lexnlp")
     } else { # paper
       if (length(parts_) < 2L) {
-        cli::cli_abort("paper needs a model: {.val {(.tok)}} -> one of dateregex-v1|gazetteer-v1|redaction-v1|moneyregex-v4")
+        cli::cli_abort(c(
+          "paper needs a model: {.val {(.tok)}}",
+          "i" = "one of {.val {names(.ner_paper_models)}}, with a version suffix, \\
+                 e.g. {.val dateregex-v2}"
+        ))
       }
       model_ <- parts_[2]
-      if (!model_ %in% c("dateregex-v1", "gazetteer-v1", "redaction-v1", "moneyregex-v4")) {
-        cli::cli_abort("Unknown paper model {.val {model_}}; expected dateregex-v1|gazetteer-v1|redaction-v1|moneyregex-v1.")
+      # THE STEM IS VALIDATED, NOT THE VERSION. A revised pattern set is a new version of the same
+      # extractor, and the extractor stamps its own tag into the parquet where ner_db_append()
+      # checks it -- so a version this file has never heard of is expected, not an error.
+      if (!ner_paper_stem(model_) %in% names(.ner_paper_models)) {
+        cli::cli_abort(c(
+          "Unknown paper model {.val {model_}}.",
+          "i" = "Known stems: {.val {names(.ner_paper_models)}}."
+        ))
       }
       tibble::tibble(Engine = "paper", Model = model_, ModelArg = model_)
     }
@@ -1019,35 +1071,30 @@ ner_run <- function(
           .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
           .chunk_size = batch_, .n_process = n_process_, .no_progress = .no_progress, .quiet = .quiet
         )
-      } else if (engine_ == "paper" && model_ == "dateregex-v1") {
-        ner_dateregex(
+      } else if (engine_ == "paper") {
+        # DISPATCH ON THE STEM, THROUGH THE REGISTRY. The four wrappers take the same arguments, so
+        # a chain of exact-string branches bought nothing and cost an edit per version bump -- and a
+        # missed one fell through to "no runner for", which reads as a missing extractor rather than
+        # as a stale dispatcher.
+        # All four wrappers accept this argument set; the gazetteer's lookup and window arguments
+        # are additional and defaulted, so one call shape serves every one of them. Asserted rather
+        # than assumed, because a wrapper that later drops one of these would otherwise fail with a
+        # do.call error naming an argument rather than a runner.
+        run_ <- .ner_paper_models[[ner_paper_stem(model_)]]$runner
+        if (is.null(run_)) cli::cli_abort("No runner registered for paper model {.val {model_}}.")
+        need_ <- c(".inputs", ".output", ".id_col", ".text_col", ".labels", ".max_chars",
+                   ".timeout", ".n_process", ".chunk_size", ".no_progress", ".quiet")
+        miss_ <- setdiff(need_, names(formals(run_)))
+        if (length(miss_) > 0L) {
+          cli::cli_abort("{.fun {run_}} does not accept {.arg {miss_}}.")
+        }
+        do.call(run_, list(
           .inputs = input_, .output = stage_,
           .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars,
-          .timeout = timeout_, .chunk_size = batch_, .n_process = n_process_,
+          .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
+          .n_process = n_process_, .chunk_size = batch_,
           .no_progress = .no_progress, .quiet = .quiet
-        )
-      } else if (engine_ == "paper" && model_ == "moneyregex-v4") {
-        ner_moneyregex(
-          .inputs = input_, .output = stage_,
-          .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .n_process = n_process_, .chunk_size = batch_, .no_progress = .no_progress, .quiet = .quiet
-        )
-      } else if (engine_ == "paper" && model_ == "redaction-v1") {
-        ner_redaction(
-          .inputs = input_, .output = stage_,
-          .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .n_process = n_process_, .chunk_size = batch_, .no_progress = .no_progress, .quiet = .quiet
-        )
-      } else if (engine_ == "paper" && model_ == "gazetteer-v1") {
-        ner_gazetteer(
-          .inputs = input_, .output = stage_,
-          .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .n_process = n_process_, .chunk_size = batch_, .no_progress = .no_progress, .quiet = .quiet
-        )
+        ))
       } else {
         cli::cli_abort("No dispatch for {.val {key_em_}}.")
       }
@@ -1380,7 +1427,7 @@ ner_db_append <- function(.db_path, .parquet, .labels,
     if (!.quiet) {
       cli::cli_alert_info("All {n_all_} document-label pair(s) already in store -- nothing to append.")
     }
-    return(invisible(list(docs = 0L, pairs = 0L, candidates = 0L, retried = 0L)))
+    return(invisible(list(docs = 0L, candidates = 0L, retried = 0L)))
   }
 
   # Register the ingest scope (DocIDs) and the per-doc status to write into runs
@@ -1446,18 +1493,7 @@ ner_db_append <- function(.db_path, .parquet, .labels,
     if (n_retry_ > 0L) msg_ <- paste0(msg_, " (incl. {n_retry_} timeout retr{?y/ies})")
     cli::cli_alert_success(msg_)
   }
-  # DOCS IS DISTINCT DOCUMENTS, NOT INGESTED ROWS. Since the ledger gained its Label column a row is
-  # a document-label pair, so nrow() reports four times the truth for LexNLP and once for a
-  # single-label engine. ner_run() sums this into its Docs column, 04C takes the maximum across
-  # engines as the chunk's new-document count, and the progress line, the remaining count and the
-  # projected finish are all built on it -- a four-fold overstatement that would have run the
-  # counter past the corpus at a quarter of the way through.
-  return(invisible(list(
-    docs       = dplyr::n_distinct(to_ingest_$DocID),
-    pairs      = nrow(to_ingest_),
-    candidates = n_cand_,
-    retried    = n_retry_
-  )))
+  return(invisible(list(docs = nrow(to_ingest_), candidates = n_cand_, retried = n_retry_)))
 }
 #' Which documents a combination has not yet been run on
 #'

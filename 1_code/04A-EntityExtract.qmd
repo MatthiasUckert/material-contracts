@@ -41,6 +41,13 @@ source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 source("1_code/_Commons/_NER.R", encoding = "UTF-8")
 
+# ORDER IS LOAD-BEARING HERE TOO. _Store.R supersedes three functions in _NER.R -- ner_db_init(),
+# ner_db_append() and ner_db_clear() -- so it must be sourced AFTER it or the flat-table versions
+# win and the per-label tables are never created. _Reads.R has no such dependency and is sourced
+# beside it because it is the other half of what this document produces.
+source("1_code/_Commons/_Store.R", encoding = "UTF-8")
+source("1_code/_Commons/_Reads.R", encoding = "UTF-8")
+
 # The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING: the
 # level registry is rebuilt empty every time _Plots.R is sourced, so a library that registers a
 # vocabulary must be sourced after it -- and 03A registers its taxonomy at SOURCE time rather than
@@ -125,6 +132,15 @@ counterparty is an individual rather than a company, so a family that reads only
 reports the largest part of the sample as having one party. That is why the label is worth the
 re-extraction.
 
+## One table per label, and `candidates` is a view over them
+
+Every engine used to be forced to the same eight columns, which is why LexNLP's parsed date, its
+resolved ISO code, its company legal form and moneyregex's amount had nowhere to go and were
+discarded at the seam for the whole life of the project. The extension axis is the **label** rather
+than the engine -- an amount belongs to `MONEY` whoever found it -- so each label has its own table
+with its own typed extras and the view unions their core columns. Every reader in this document
+queries the view and none of them changed.
+
 ## What is not here
 
 Engine and rule scoring against the EDGAR anchors is 04B. Field resolution is 04C. The corpus pass
@@ -156,14 +172,19 @@ is 04D. The reusable engine seam and the store itself live in `_Commons/_NER.R` 
     Manifest = utils_file_path(.dir_main, "Store", "manifest.parquet")
   ),
   Params = list(
-    DocsPerRun   = 2500L,   # R-side slice size; bounds Python-side memory
+    DocsPerRun   = 5000L,   # R-side slice size; bounds Python-side memory
     OffsetSample = 2000L,   # candidates rehydrated per engine in Validation
     TuneDocs     = 200L,           # documents per cell in the batch-size sweep
     TuneBatches  = c(8L, 32L, 128L),
     TuneRerun    = FALSE,          # TRUE re-measures; the cache is blind to extractor edits
-    ExampleDocs  = 5L,      # contracts read by every engine, per label
-    ExampleSpans = 8L,      # distinct spans listed per engine before truncation
-    Seed         = 42L      # fixed, so the same contracts are read on every render
+    ReadDocs     = NULL,    # NULL = every document; an integer draws that many, for a quick render
+    ReadOverwrite = FALSE,  # TRUE re-renders cached HTML; set after editing _Commons/_Reads.R
+    ReadWorkers  = NULL,    # NULL = half the cores; the parent holds every document's text
+    ContractSample = 5000L, # spans rehydrated for the offset tests in Validation
+    Seed         = 42L      # fixed, so the same contracts are drawn on every render
+  ),
+  Output = list(
+    Reads = utils_file_path(.dir_main, "Reads")   # one standalone HTML span viewer per contract
   )
 )
 
@@ -226,16 +247,24 @@ is why it is a warning rather than an abort.
 ```{r}
 #| label: declare-engines
 ner_tuning <- list(
-  "paper:dateregex-v1"    = list(n_process =  1L, batch_size = NULL, timeout =   0L),
-  "spacy:en_core_web_sm"  = list(n_process = 20L, batch_size =  16L, timeout = 600L),
-  "spacy:en_core_web_md"  = list(n_process = 20L, batch_size =  16L, timeout = 600L),
-  "spacy:en_core_web_lg"  = list(n_process = 20L, batch_size =  16L, timeout = 600L),
-  "lexnlp"                = list(n_process = 20L, batch_size =   8L, timeout = 240L),
+  "paper:dateregex-v2"    = list(n_process = 24L, batch_size = NULL, timeout =   0L),
+  "spacy:en_core_web_sm"  = list(n_process = 24L, batch_size =  16L, timeout = 600L),
+  "spacy:en_core_web_md"  = list(n_process = 24L, batch_size =  16L, timeout = 600L),
+  "spacy:en_core_web_lg"  = list(n_process = 24L, batch_size =  16L, timeout = 600L),
+  "lexnlp"                = list(n_process = 24L, batch_size =   8L, timeout = 240L),
   "spacy:en_core_web_trf" = list(n_process =  1L, batch_size = 128L, timeout = 600L),
-  "paper:gazetteer-v1"    = list(n_process = 20L, batch_size =   8L, timeout = 120L),
-  "paper:redaction-v1"    = list(n_process = 20L, batch_size =  64L, timeout =   0L),
-  "paper:moneyregex-v4"   = list(n_process = 20L, batch_size =  64L, timeout =   0L)
+  "paper:gazetteer-v1"    = list(n_process = 24L, batch_size =   8L, timeout = 120L),
+  "paper:redaction-v1"    = list(n_process = 24L, batch_size =  64L, timeout =   0L),
+  "paper:moneyregex-v6"   = list(n_process = 24L, batch_size =  64L, timeout =   0L)
 )
+
+# THE TWO DECLARATIONS MUST AGREE, AND UNTIL NOW NOTHING CHECKED. The tuning list names the
+# combinations to RUN; .ent_combos in the R file names the combinations to PLOT. Bumping a model
+# version in one and not the other is what this assertion exists for: the extractor stamps its own
+# constants into the parquet, ner_db_append() compares them against the dispatched token, and the
+# mismatch surfaces AFTER the extraction has already run. Checking here costs nothing and fails
+# before the first document is read.
+stopifnot(setequal(names(ner_tuning), as.character(plot_levels(.key = "Combo"))))
 
 lst_run_args <- ner_run_args(.tuning = ner_tuning)
 ```
@@ -351,9 +380,9 @@ cli::cli_alert_info(
 )
 ```
 
-The knobs are passed as the three resolved lists rather than as the tuning table, because `ner_run()`
-takes them that way and resolves each per combination internally. `ner_run_args()` exists to make
-that translation once.
+The knobs are passed as the three resolved lists rather than as the tuning table, because
+`ner_run()` takes them that way and resolves each per combination internally. `ner_run_args()`
+exists to make that translation once.
 
 Zeros in `Missing` are the expected steady state: on a second render every document is already in
 the ledger and this section costs seconds. The failure to look for is a non-zero `Missing` with zero
@@ -432,14 +461,16 @@ yield table cut twelve ways.
 
 ```{r}
 #| label: inspect-class-grid
-purrr::walk(
-  .x = plot_levels("Label"),                        # every label, in the registered order
-  .f = function(.l) ent_report_class(.tab = tab_class, .label = .l)
-)
+tab_grid <- ent_class_grid(.tab = tab_class, .value = "Spans")
 ```
 
-Read `Docs` in the stability table below before trusting any single cell here: a contrast computed
-over a handful of documents is a number about those documents.
+Twenty-eight rows because the grid is engine-by-label rather than engine: five engines emit `ORG`,
+six emit `GPE`, one emits `REDACT`. Reading down a block of rows compares engines on one label;
+reading across compares contract types for one engine.
+
+Counts rather than a rate, deliberately. This is the first look, and a rate would hide that a class
+with sixty documents and one with six hundred are not equally well observed -- `Docs` in the
+stability table below carries that.
 
 ```{r}
 #| label: inspect-stability
@@ -454,34 +485,93 @@ This is the table that says whether a pooled decision is safe. An engine whose c
 a reason to defer the choice rather than to pick the higher median -- it usually means the label is
 doing two different jobs in two different kinds of contract.
 
-## The same contract, read by every engine
+## Positional contrast, one tab per label
+
+The same quantity as the grid above, cut the other way: within a label, does the pooled positional
+verdict hold in every contract type. Six tabs rather than six stacked tables, because these are read
+one at a time and never against each other.
+
+TABS ARE WRITTEN OUT RATHER THAN GENERATED. Quarto's tabset filter runs at parse time, so a `:::`
+div emitted from an R chunk arrives too late to be turned into tabs -- it renders as an empty box.
+The cost is that the six labels are hard-coded here and in `.ent_labels`; they are a closed set that
+has not changed since the family was designed, and a seventh would be a larger decision than a tab.
+
+::: {.panel-tabset}
+
+## ORG
 
 ```{r}
-#| label: inspect-examples
-purrr::walk(
-  .x = plot_levels("Label"),
-  .f = function(.l) {
-    ent_engine_examples(
-      .db_path      = .lP$Store$NerDB,
-      .path_text    = .lP$Sample$Text,
-      .path_anchors = .lP$Sample$Anchors,
-      .label        = .l,
-      .n            = .lP$Params$ExampleDocs,   # documents per label
-      .max_spans    = .lP$Params$ExampleSpans,  # distinct spans listed per engine
-      .seed         = .lP$Params$Seed
-    ) |>
-      ent_report_examples(.label = .l)
-  }
-)
+#| label: class-org
+ent_report_class(.tab = tab_class, .label = "ORG")
 ```
 
-A distinct count of five against thirty-eight is a number. The two lists side by side, from one
-contract, show *which* thirty-three the larger engine added -- and whether those are parties the
-selective engine missed or mentions it was right to leave out. No summary answers that.
+## PERSON
 
-Documents are drawn from the middle two quartiles by span count rather than at random. The extremes
-are unrepresentative and unreadable: one contract in this sample yields 68,482 organisation spans,
-and a block nobody reads is worse than no block.
+```{r}
+#| label: class-person
+ent_report_class(.tab = tab_class, .label = "PERSON")
+```
+
+## GPE
+
+```{r}
+#| label: class-gpe
+ent_report_class(.tab = tab_class, .label = "GPE")
+```
+
+## DATE
+
+```{r}
+#| label: class-date
+ent_report_class(.tab = tab_class, .label = "DATE")
+```
+
+## MONEY
+
+```{r}
+#| label: class-money
+ent_report_class(.tab = tab_class, .label = "MONEY")
+```
+
+## REDACT
+
+```{r}
+#| label: class-redact
+ent_report_class(.tab = tab_class, .label = "REDACT")
+```
+
+:::
+
+## Reading the contracts
+
+```{r}
+#| label: write-reads
+# tab_reads <- ent_reads(
+#   .db_path      = .lP$Store$NerDB,
+#   .path_text    = .lP$Sample$Text,
+#   .path_anchors = .lP$Sample$Anchors,
+#   .dir_out      = .lP$Output$Reads,
+#   .doc_ids      = if (is.null(.lP$Params$ReadDocs)) NULL else {
+#     withr::with_seed(.lP$Params$Seed,
+#                      sample(arrow::read_parquet(.lP$Sample$Text)$DocID, .lP$Params$ReadDocs))
+#   },
+#   .overwrite    = .lP$Params$ReadOverwrite,
+#   .workers      = .lP$Params$ReadWorkers
+# )
+```
+
+Every table in this document is consistent with two different stories until the text is read. One
+standalone HTML per contract: a tab per label, a tab per engine under it, every span marked in place
+and every extra in the tooltip. No Quarto, no server -- a file that opens in a browser and can be
+sent to a coauthor.
+
+A distinct count of five against thirty-eight is a number. The two marked texts side by side show
+*which* thirty-three the larger engine added, and whether those are parties the selective engine
+missed or mentions it was right to leave out. No summary answers that.
+
+CACHED, because this runs inside a render and the full sample is several gigabytes. A document whose
+file already exists is skipped. The cache cannot know that `_Commons/_Reads.R` itself changed, which
+is the one thing it will get wrong -- set `ReadOverwrite` after editing the renderer.
 
 # Agreement
 
@@ -501,6 +591,41 @@ Read the pairwise table by family rather than by pair. Four of the nine combinat
 mention found by four engines is usually one implementation agreeing with itself, and the family
 consensus table is the one that says how much genuinely independent corroboration exists.
 
+# The store, table by table
+
+```{r}
+#| label: inspect-store-tables
+tab_tables <- ent_store_tables(.db_path = .lP$Store$NerDB)
+tab_schema <- ent_store_schema(.db_path = .lP$Store$NerDB)
+
+ent_report_store_tables(.tabs = tab_tables, .schema = tab_schema)
+```
+
+Everything above reads the data; this reads the **container**. Six tables, one per label, each with
+the eight core columns and whatever extras that label admits -- and `candidates` is a view unioning
+their cores, which is why no reader above this point changed when the store was split.
+
+The split exists because the extension axis is the label rather than the engine. An amount belongs
+to `MONEY` whoever found it, a legal form to `ORG`, a parsed date to `DATE`. Forced into one flat
+table those columns had nowhere to live, and for the whole life of the project they were discarded
+at the seam: LexNLP parsed every date it found and the parse was thrown away.
+
+```{r}
+#| label: inspect-store-peek
+ent_store_peek(.db_path = .lP$Store$NerDB, .n = 2L)
+```
+
+Two rows per **engine**, not two per table. A plain head returns whichever engine sorts first, so
+`org` would show LexNLP and never spaCy -- and the point of a per-label table, that several engines
+write into it and only some of them resolve anything, would be invisible. Within an engine the
+most-resolved rows come first, and repeated spans are dropped so the same string does not fill the
+screen three times.
+
+This is the whole argument for the rewrite in three screens: a `DATE` row carrying `2012-06-04` and
+a confidence beside the string it was parsed from, a `MONEY` row carrying `23000000` and `NOK`
+beside `NOK 23 million`, an `ORG` row carrying `CORP` beside a company name. None of it was
+reachable before.
+
 # Validation
 
 ```{r}
@@ -518,6 +643,34 @@ This is the only quantity in the entire family that is *verified* rather than co
 has to be exactly 1.0. Below that, offsets index a string that is not the one on disk, and every
 number in 04B onwards is wrong without anything erroring: the party location, every context window,
 every rehydrated snippet.
+
+```{r}
+#| label: validate-contract
+tab_contract <- ent_contract_tests(
+  .db_path   = .lP$Store$NerDB,
+  .path_text = .lP$Sample$Text,
+  .n_offsets = .lP$Params$ContractSample
+)
+
+ent_report_contract(.tab = tab_contract, .db_path = .lP$Store$NerDB)
+```
+
+The same nine tests the `Check-NER-*` scripts run on twenty-five documents before an engine may be
+inserted at all, run here over everything that *was* inserted. They are different questions: the
+first asks whether an extractor is well formed, the second whether the store assembled from it still
+is. A store built over several sessions from more than one extractor version can fail these while
+every individual extraction passed.
+
+```{r}
+#| label: validate-extras
+tab_extras <- ent_extras(.db_path = .lP$Store$NerDB)
+
+ent_report_extras(.tab = tab_extras)
+```
+
+An extra filled for part of an engine's rows is the failure this block exists for. An extractor that
+gained a field after some documents were already extracted leaves the rest null, the column is there
+and typed, and nothing errors -- it reads as a coverage below a hundred and in no other way.
 
 # Robustness
 
@@ -628,7 +781,9 @@ ent_report_all(
   .desc        = .desc,
   .class       = tab_class,
   .al          = .al,
-  .tab_offsets = tab_offsets
+  .tab_offsets = tab_offsets,
+  .extras      = tab_extras,
+  .contract    = tab_contract
 )
 ```
 

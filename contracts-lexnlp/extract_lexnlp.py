@@ -63,7 +63,48 @@ from lexnlp.extract.en.percents import get_percent_annotations
 from lexnlp.extract.en.ratios import get_ratio_annotations
 from lexnlp.extract.en.durations import get_duration_annotations
 
-COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
+CORE = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
+
+# THE EXTRAS, AND WHY THEY ARE IN ONE WIDE TABLE RATHER THAN FOUR NARROW ONES
+# Every annotation this file collects carries fields beyond its offsets, and until now all of them
+# were discarded at the seam: the parsed calendar date, the resolved ISO code, the company's legal
+# form, the amount and its currency. Nothing downstream could reconstruct them -- parsing "the ninth
+# day of January" needs a grammar and resolving "Republic of Korea" to KOR needs a table.
+#
+# One pass produces every label, so one parquet carries every label's extras and each row fills only
+# its own. The columns are sparse and parquet stores a null column for nothing; the R side selects
+# the ones its target table declares and ignores the rest, which is why adding a field here needs no
+# change there.
+#
+# NAMES ARE LexNLP'S OWN. The store renames them on ingest -- TypeAbbr becomes LegalForm because "NA"
+# is LexNLP's abbreviation for National Association and R prints that identically to missing -- and
+# that mapping belongs on the R side, next to the schema it serves, not here.
+EXTRA = [
+    "Name", "NameAbbr", "TypeFull", "TypeAbbr", "TypeLabel", "Description",   # ORG
+    "NameEn", "Alias", "EntityCategory", "Iso2", "Iso3",     # GPE
+    "EntityId", "EntityPriority",
+    "DateValue", "Score",                                    # DATE
+    "Amount", "Currency",                                    # MONEY
+]
+COLUMNS = CORE + EXTRA
+
+# Annotation attribute -> output column, per label. Read off the annotation with getattr, so an
+# attribute a LexNLP version does not carry arrives as null instead of raising.
+ANN_FIELDS = {
+    # THE ATTRIBUTE NAMES ARE company_type_abbr AND company_type_label, not type_abbr/type_label.
+    # getattr() with a default cannot tell a field that is absent from a field that is empty, so the
+    # wrong names produced nulls in every row and nothing anywhere raised -- the columns existed,
+    # were typed, and were uniformly NA. That is the exact failure the per-engine coverage table in
+    # Validation exists to surface, and it is why "the column is there" is not evidence.
+    "ORG":   {"Name": "name", "NameAbbr": "name_abbr",
+              "TypeFull": "company_type_full", "TypeAbbr": "company_type_abbr",
+              "TypeLabel": "company_type_label", "Description": "description"},
+    "GPE":   {"Name": "name", "NameEn": "name_en", "Alias": "alias",
+              "EntityCategory": "entity_category", "Iso2": "iso_3166_2", "Iso3": "iso_3166_3",
+              "EntityId": "entity_id", "EntityPriority": "entity_priority"},
+    "DATE":  {"DateValue": "date", "Score": "score"},
+    "MONEY": {"Amount": "amount", "Currency": "currency"},
+}
 GEO_CONFIG_DEFAULT = "/app/geoentities.csv"   # LexPredict single-df format, baked into the image
 GEO_MIN_ALIAS_DEFAULT = 4                     # backstop only; the ISO columns are dropped outright
 
@@ -159,6 +200,52 @@ EXTRACTORS = {
 }
 
 
+def _extra_values(label, ann):
+    """The extras for one annotation, in COLUMNS order, as a tuple with None where absent.
+
+    EVERYTHING CROSSES THE SEAM AS TEXT except what is already a plain number. A date becomes a
+    timezone-bearing timestamp and a Decimal becomes a float once pandas touches them, and a contract
+    value of 9,752,233.001 does not survive that intact. Ten characters of ISO-8601 and a decimal
+    string are unambiguous in both languages.
+    """
+    fields = ANN_FIELDS.get(label)
+    if not fields:
+        return (None,) * len(EXTRA)
+
+    out = {}
+    for col, attr in fields.items():
+        val = getattr(ann, attr, None)
+        if val is None:
+            continue
+        # NaN IS NOT None AND str(NaN) IS "nan". LexNLP's geo table is read with pandas, so an
+        # absent ISO-3 arrives as a float NaN rather than as None -- it passes the check above, and
+        # str() turns it into the three-character string "nan", which is not null in parquet, not
+        # null in DuckDB, and looks exactly like a country code three characters long. The store
+        # then holds "nan" where it should hold nothing, and every count of resolved codes is wrong
+        # in the direction that looks healthy.
+        if isinstance(val, float) and val != val:
+            continue
+        if col == "DateValue":
+            try:
+                val = val.isoformat()[:10]
+            except AttributeError:
+                val = str(val)[:10]
+        elif col == "Amount":
+            try:
+                val = format(val, "f")
+            except (ValueError, TypeError):
+                val = str(val)
+        elif col in ("EntityId", "EntityPriority", "Score"):
+            pass                                  # numeric already; pandas types the column
+        else:
+            val = str(val)
+        out[col] = val
+    return tuple(out.get(c) for c in EXTRA)
+
+
+_NO_EXTRA = (None,) * len(EXTRA)
+
+
 def write_output(rows, path):
     """Build the aligned DataFrame and write parquet, with real nulls on the offsets.
 
@@ -168,6 +255,11 @@ def write_output(rows, path):
     """
     out = pd.DataFrame(rows, columns=COLUMNS)
     out[["Start", "Stop"]] = out[["Start", "Stop"]].astype("Int64")
+    # Text columns stay text; the two genuinely numeric extras are left for pandas to infer, which
+    # gives Int64/float64 with real nulls rather than object.
+    for col in EXTRA:
+        if col not in ("EntityId", "EntityPriority", "Score"):
+            out[col] = out[col].astype("string")
     out.to_parquet(path, index=False)
     return out
 
@@ -224,13 +316,15 @@ def extract_one(args):
             for ann in anns:
                 start, stop = ann.coords
                 if 0 <= start < stop <= n:
-                    rows.append((docid, start, stop, text[start:stop], label, raw, "lexnlp", "lexnlp"))
+                    rows.append((docid, start, stop, text[start:stop], label, raw,
+                                 "lexnlp", "lexnlp") + _extra_values(label, ann))
     # one marker row per timed-out extractor (null span; survives into the store
     # only long enough for ner_db_append to read Status, then dropped)
     for raw in timed_out:
-        rows.append((docid, None, None, None, None, f"timeout:{raw}", "lexnlp", "lexnlp"))
+        rows.append((docid, None, None, None, None, f"timeout:{raw}", "lexnlp", "lexnlp")
+                    + _NO_EXTRA)
     if not rows:                                    # genuine no-hit -> sentinel
-        rows.append((docid, None, None, None, None, None, "lexnlp", "lexnlp"))
+        rows.append((docid, None, None, None, None, None, "lexnlp", "lexnlp") + _NO_EXTRA)
     return rows
 
 

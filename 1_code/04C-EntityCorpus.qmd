@@ -38,6 +38,11 @@ library <- function(...) suppressPackageStartupMessages(base::library(...))
 source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
 source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
 source("1_code/_Commons/_NER.R", encoding = "UTF-8")
+
+# ORDER IS LOAD-BEARING. _Store.R supersedes ner_db_init(), ner_db_append() and ner_db_clear(), so
+# it must come AFTER _NER.R or the flat-table versions win and the corpus store is built without the
+# per-label tables -- which would be discovered only after the run.
+source("1_code/_Commons/_Store.R", encoding = "UTF-8")
 source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
 source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
 
@@ -94,13 +99,24 @@ an argument, and an argument belongs where a reader can see it.
 |:--|:--|:--|
 | `lexnlp` | ORG, GPE, DATE, MONEY | Settled for ORG: contrast 3.16-6.81 against 0.68-1.33 for spaCy |
 | `paper:gazetteer-v1` | GPE | The other place candidate, and the only one that reaches cities |
-| `paper:dateregex-v1` | DATE | The other date candidate; it reaches expiry cues in 415 documents against LexNLP's 113 |
-| `paper:moneyregex-v4` | MONEY | Keeps the currency symbol where the alternatives drop it |
+| `paper:dateregex-v2` | DATE | The other date candidate; it reaches expiry cues in 415 documents against LexNLP's 113 |
+| `paper:moneyregex-v6` | MONEY | Keeps the currency symbol where the alternatives drop it |
 | `paper:redaction-v1` | REDACT | The only engine |
 
 Two labels carry two engines each, deliberately. DATE and GPE are **undecided**, and undecided
 means both candidates run: the choice needs role-level analysis that does not exist yet, and
 re-running a corpus pass to recover a discarded engine costs far more than storing it.
+
+## What the corpus pass now carries that the last one did not
+
+Every engine in the plan resolves as well as finds. LexNLP writes the parsed date, the ISO code, the
+company legal form and the amount; `dateregex-v2` writes a parsed date for 99.6% of what it matches;
+`moneyregex-v6` writes an amount and an ISO currency. Those columns had nowhere to live in the flat
+store and were discarded at the seam for the whole life of the project.
+
+**This is the reason not to defer.** LexNLP's geoentity pass costs around five seconds a document
+and roughly three and a half days at twenty workers over the corpus. A pass that finds the spans and
+throws the resolution away is a pass that has to be repeated, and this is not a repeatable pass.
 
 ## What is absent, and what that costs
 
@@ -156,7 +172,7 @@ The corollary is that **adding an engine makes every document incomplete again**
     # that many documents at random and writes to a separate store; NULL processes the corpus.
     # SET AN INTEGER, READ THE THROUGHPUT, THEN SET NULL. Every rate this project has is from the
     # 4,398-document sample, whose length distribution is not the corpus's.
-    Limit      = NULL
+    Limit      = 10000L
   )
 )
 
@@ -172,8 +188,8 @@ tab_plan <- tibble::tribble(
   ~Combo,                  ~Labels,
   "lexnlp",                c("ORG", "GPE", "DATE", "MONEY"),
   "paper:gazetteer-v1",    "GPE",
-  "paper:dateregex-v1",    "DATE",
-  "paper:moneyregex-v4",   "MONEY",
+  "paper:dateregex-v2",    "DATE",
+  "paper:moneyregex-v6",   "MONEY",
   "paper:redaction-v1",    "REDACT"
 )
 
@@ -213,8 +229,8 @@ costs more than its other three extractors combined.
   # dateregex was single-process because the extractor had no Pool, not because regex resists
   # parallelism. It has one now. The cap is non-zero because the greedy overlap resolution is
   # quadratic in candidate count and a date table can yield tens of thousands in one document.
-  "paper:dateregex-v1"  = list(n_process = 20L, batch_size = 64L, timeout = 120L),
-  "paper:moneyregex-v4" = list(n_process = 20L, batch_size = 64L, timeout = 120L),
+  "paper:dateregex-v2"  = list(n_process = 20L, batch_size = 64L, timeout = 120L),
+  "paper:moneyregex-v6" = list(n_process = 20L, batch_size = 64L, timeout = 120L),
   "paper:redaction-v1"  = list(n_process = 20L, batch_size = 64L, timeout = 120L)
 )
 
