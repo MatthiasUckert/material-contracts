@@ -165,14 +165,14 @@ The corollary is that **adding an engine makes every document incomplete again**
     Dir = utils_file_path(.dir_main, "Work")   # per-chunk text parquet, deleted as it is consumed
   ),
   Param = list(
-    ChunkSize  = 25000L,  # documents held in memory at once; not a unit of resumption
+    ChunkSize  = 50000L,  # documents held in memory at once; not a unit of resumption
     IndexRerun = FALSE,  # TRUE re-walks the tree; FALSE reuses the cached index
     Device     = "auto",
     # The switch that decides whether this render is a rehearsal or the release. An integer draws
     # that many documents at random and writes to a separate store; NULL processes the corpus.
     # SET AN INTEGER, READ THE THROUGHPUT, THEN SET NULL. Every rate this project has is from the
     # 4,398-document sample, whose length distribution is not the corpus's.
-    Limit      = 10000L
+    Limit      = NULL
   )
 )
 

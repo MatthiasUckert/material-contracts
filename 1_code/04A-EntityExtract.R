@@ -2391,28 +2391,45 @@ ent_store_schema <- function(.db_path) {
 }
 
 
-#' A few real rows from each table, one engine at a time
+#' A few real rows from the store, filtered and ordered as asked
 #'
-#' THE FIRST VERSION SHOWED ONE ENGINE PER TABLE, which is the least informative view there is. A
-#' plain LIMIT returns the first rows of whichever engine happens to sort first, so org showed
-#' LexNLP and never spaCy, and the whole point of a per-label table -- that several engines write
-#' into it and only some of them resolve anything -- was invisible. Rows are now drawn PER ENGINE.
+#' TWO DIFFERENT QUESTIONS, ONE FUNCTION. "What does the store look like" wants a couple of rows from
+#' every engine of every label, ordered so the resolved ones come first -- that is the render default.
+#' "What does LexNLP's ORG output actually look like" wants a hundred rows of one pair, ordered at
+#' RANDOM.
 #'
-#' WITHIN AN ENGINE, THE MOST-RESOLVED ROWS COME FIRST. A row where every extra is filled says more
-#' about the table than three rows where one is, and ordering on the count of non-null extras costs
-#' nothing because the window function is computed in the same pass.
-#'
-#' SPANS ARE DEDUPLICATED. Without it, LexNLP's GPE peek was "New York" three times: the same string
-#' at three offsets, resolving identically, filling the screen with one fact.
+#' THE TWO ORDERINGS ARE NOT INTERCHANGEABLE AND THE DEFAULT IS THE DANGEROUS ONE. Ordering by how
+#' many extras are filled selects for the most elaborate matches, and for LexNLP those are the
+#' comma-separated lender lists where its span boundaries are worst. Two rows chosen that way sent a
+#' whole session chasing an offset bug that affects four percent of rows. Random is what to use when
+#' the question is "is this typical".
 #'
 #' @param .db_path Path to the DuckDB candidate store.
-#' @param .n Integer. Rows per engine per table.
-#' @return Invisibly, a named list of tibbles.
-ent_store_peek <- function(.db_path, .n = 2L) {
+#' @param .n Integer. Rows per engine per label.
+#' @param .labels Character vector of labels, or NULL for every table in the store.
+#' @param .engines Character vector of combination tokens, e.g. "lexnlp" or "spacy:en_core_web_trf",
+#'   or NULL for every engine.
+#' @param .order "filled" puts the most-resolved rows first; "random" samples; "first" takes them in
+#'   storage order.
+#' @param .distinct_span Logical. Drop repeated spans within an engine, so one string does not fill
+#'   the screen. Ignored when .order is "random", where repetition is information.
+#' @return Invisibly, the tibble where ONE label was asked for, and a named list of tibbles where
+#'   several were. THE RETURN TYPE VARIES ON PURPOSE, which is normally a smell and is right here:
+#'   this is an interactive inspector, a single label is the common call, and unwrapping a
+#'   one-element list by hand every time is friction with no payoff. The labels cannot simply be
+#'   bound into one tibble instead -- each declares its own extras, so the result would be wide and
+#'   mostly null, which is the exact shape the per-label tables exist to avoid.
+ent_store_peek <- function(.db_path, .n = 2L, .labels = NULL, .engines = NULL,
+                           .order = c("filled", "random", "first"), .distinct_span = TRUE) {
   if (FALSE) {
-    .db_path <- .lP$Store$NerDB
-    .n       <- 2L
+    .db_path       <- .lP$Store$NerDB
+    .n             <- 100L
+    .labels        <- "ORG"
+    .engines       <- "lexnlp"
+    .order         <- "random"
+    .distinct_span <- TRUE
   }
+  .order <- match.arg(.order)
 
   con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
@@ -2421,22 +2438,46 @@ ent_store_peek <- function(.db_path, .n = 2L) {
     "SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE'"
   ))$table_name
   labs_ <- names(.store_schema)[store_table(names(.store_schema)) %in% have_]
+  if (!is.null(.labels)) labs_ <- intersect(labs_, toupper(.labels))
+  if (length(labs_) == 0L) cli::cli_abort("No matching label table in the store.")
+
+  # The combination token is Engine or Engine:Model; matching on the assembled string means a caller
+  # writes what the tab bars and the tables already show them.
+  combo_sql_ <- "CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END"
+  eng_where_ <- if (is.null(.engines)) "" else {
+    paste0(" WHERE ", combo_sql_, " IN ('", paste(unique(.engines), collapse = "', '"), "')")
+  }
 
   out_ <- purrr::map(labs_, function(.l) {
     tbl_    <- store_table(.l)
     extras_ <- names(store_extras(.l))
     fill_   <- if (length(extras_) == 0L) "0" else {
-      paste0("(", paste0("CASE WHEN ", extras_, " IS NULL THEN 0 ELSE 1 END",
-                         collapse = " + "), ")")
+      paste0("(", paste0("CASE WHEN ", extras_, " IS NULL THEN 0 ELSE 1 END", collapse = " + "), ")")
     }
-    sel_ <- paste(c("Engine", "Model", "Span", "LabelRaw", extras_), collapse = ", ")
+    # DocID AND Stop BELONG HERE. Without DocID a row cannot be traced back to the contract it came
+    # from, and without Stop the span's extent is invisible -- which matters precisely when the
+    # question is whether the offsets point at the entity, since a span the same length as the name
+    # in the wrong place and a span longer than the name are different problems.
+    sel_ <- paste(c("DocID", "Engine", "Model", "Start", "Stop", "Span", "LabelRaw", extras_),
+                  collapse = ", ")
+
+    ord_ <- switch(.order,
+      filled = "Filled DESC, Span",
+      random = "random()",
+      first  = "Start"
+    )
+    dedup_ <- if (.distinct_span && .order != "random") {
+      "  QUALIFY ROW_NUMBER() OVER (PARTITION BY Engine, Model, Span ORDER BY Filled DESC) = 1"
+    } else {
+      ""
+    }
 
     DBI::dbGetQuery(con_, paste0(
       "WITH d AS (",
-      "  SELECT ", sel_, ", ", fill_, " AS Filled FROM ", tbl_,
-      "  QUALIFY ROW_NUMBER() OVER (PARTITION BY Engine, Model, Span ORDER BY Filled DESC) = 1",
+      "  SELECT ", sel_, ", ", fill_, " AS Filled FROM ", tbl_, eng_where_,
+      dedup_,
       ") SELECT ", sel_, " FROM d ",
-      "QUALIFY ROW_NUMBER() OVER (PARTITION BY Engine, Model ORDER BY Filled DESC, Span) <= ",
+      "QUALIFY ROW_NUMBER() OVER (PARTITION BY Engine, Model ORDER BY ", ord_, ") <= ",
       as.integer(.n)
     )) |>
       tibble::as_tibble() |>
@@ -2446,18 +2487,17 @@ ent_store_peek <- function(.db_path, .n = 2L) {
 
   purrr::iwalk(out_, function(.d, .l) {
     n_ext_ <- length(store_extras(.l))
-    cli::cli_h3("{(.l)} -- table {store_table(.l)}, \
-                 {n_ext_} declared extra{?s}, {dplyr::n_distinct(.d$Engine, .d$Model)} engine{?s}")
+    cli::cli_h3("{(.l)} -- table {store_table(.l)}, \\
+                 {n_ext_} declared extra{?s}, {dplyr::n_distinct(.d$Engine, .d$Model)} engine{?s}, \\
+                 ordered {(.order)}")
     if (nrow(.d) == 0L) {
-      cli::cli_alert_warning("{.field {store_table(.l)}} is empty.")
+      cli::cli_alert_warning("Nothing matched in {.field {store_table(.l)}}.")
     } else {
       print(.d, n = Inf, width = Inf)
     }
   })
-  invisible(out_)
+  if (length(out_) == 1L) invisible(out_[[1]]) else invisible(out_)
 }
-
-
 #' The store, table by table
 #' @param .tabs Tibble from ent_store_tables().
 #' @param .schema Tibble from ent_store_schema().

@@ -803,3 +803,6 @@ for individuals in exactly the classes where the counterparty is one. That belon
 sample for free and on the corpus only at the cost of adding a spaCy model to that pass. Whether the
 CNN models are adequate for `PERSON` is a separate question from their showing on organisations, and
 this store now holds what is needed to answer it.
+
+
+
