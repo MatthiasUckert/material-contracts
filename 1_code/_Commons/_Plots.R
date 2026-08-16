@@ -1047,3 +1047,210 @@ plot_report_design <- function() {
   cli::cli_alert_info("A key absent above is why plot_factor() aborts, not a data problem.")
   invisible(out_)
 }
+
+
+# 10. Maps -----------------------------------------------------------------------------------------------------------
+# The geography documents draw countries and US states. Only the DRAWING lives here -- which spans to
+# count and how to weight them is a rule and belongs to the entity that owns the question. Both
+# functions take a tibble of one row per area with a value, and nothing else.
+#
+# A LOG FILL, BY DEFAULT AND FOR A REASON. Counts of places in US contracts span three orders of
+# magnitude between the United States and everywhere else, so a linear fill paints one country and
+# leaves the rest indistinguishable from empty. The legend says which scale is in use.
+#
+# THERE IS NO FACET ARGUMENT. Twelve world maps in a three-column grid are three hundred pixels wide
+# each: the titles clip, the coastlines vanish and no country is distinguishable from its neighbour.
+# A small multiple has to be small AND legible, and a world map is not. Where a figure is wanted per
+# group, the caller loops and emits one full-width map per tab.
+#
+# The shapes are cached in an environment, the same way the level registry is, because a document
+# drawing one map per contract type would otherwise reload the same coastlines twelve times.
+#
+# Needs sf, rnaturalearth and maps; all three are already in renv for the descriptives.
+
+.plot_shapes <- new.env(parent = emptyenv())
+
+
+#' The world, once
+#'
+#' @return An sf of countries keyed by ISO alpha-3, Antarctica dropped.
+plot_shape_world <- function() {
+  if (is.null(.plot_shapes$World)) {
+    .plot_shapes$World <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") |>
+      dplyr::filter(!is.na(.data$iso_a3), .data$iso_a3 != "ATA") |>
+      dplyr::select(Area = iso_a3)
+  }
+  .plot_shapes$World
+}
+
+
+#' The US states, once
+#'
+#' @return An sf of states keyed by uppercase name.
+plot_shape_usa <- function() {
+  if (is.null(.plot_shapes$Usa)) {
+    .plot_shapes$Usa <- sf::st_as_sf(maps::map("state", fill = TRUE, plot = FALSE)) |>
+      dplyr::mutate(Area = stringi::stri_trans_toupper(.data$ID)) |>
+      dplyr::select(Area)
+  }
+  .plot_shapes$Usa
+}
+
+
+#' Fill and label one map, given its shapes
+#'
+#' The shared body of the two map functions: join, fill, optionally label the largest areas, and
+#' theme. Kept separate so the world and the states differ only in their shapes and their projection.
+#'
+#' An area absent from the table is drawn in the missing colour rather than dropped, so a blank is
+#' visibly a blank and not a hole in the coastline. Where every value is missing the log transform is
+#' skipped, because a log scale over nothing is an error rather than an empty panel.
+#'
+#' @param .shape An sf carrying an Area column.
+#' @param .tab Tibble with Area and a value column.
+#' @param .val Character. Column holding the value.
+#' @param .log Logical. Fill on a log scale.
+#' @param .name Character. Legend title.
+#' @param .label_n Integer. Label this many largest areas with their value. Zero draws none.
+#' @param .label_size Numeric. Label text size in millimetres.
+#' @return A ggplot object, without a coordinate system.
+plot_map_body <- function(.shape, .tab, .val = "N", .log = TRUE, .name = NULL, .label_n = 0L,
+                          .label_size = 2.4) {
+  if (FALSE) {
+    .shape      <- plot_shape_world()
+    .tab        <- tibble::tibble(Area = c("USA", "CAN"), N = c(4000, 120))
+    .val        <- "N"
+    .log        <- TRUE
+    .name       <- NULL
+    .label_n    <- 10L
+    .label_size <- 2.4
+  }
+
+  join_ <- .shape |>
+    dplyr::left_join(dplyr::rename(.tab, Val = dplyr::all_of(.val)), by = dplyr::join_by(Area))
+
+  any_ <- any(!is.na(join_$Val))
+  fmt_ <- scales::label_number(accuracy = 1, big.mark = ",")
+
+  out_ <- join_ |>
+    ggplot2::ggplot() +
+    ggplot2::geom_sf(ggplot2::aes(fill = .data$Val), colour = "#FFFFFF", linewidth = 0.1) +
+    ggplot2::scale_fill_gradient(
+      low   = "#DCE6F1",
+      high  = "#002147",
+      trans = if (.log && any_) "log10" else "identity",
+      na.value = "#F2F2F2",
+      name  = .name,
+      labels = fmt_
+    ) +
+    ggplot2::labs(x = NULL, y = NULL)
+
+  if (.label_n > 0L && any_) {
+    top_ <- join_ |>
+      dplyr::filter(!is.na(.data$Val)) |>
+      dplyr::slice_max(.data$Val, n = .label_n, with_ties = FALSE)
+
+    if (nrow(top_) > 0L) {
+      pts_ <- suppressWarnings(sf::st_point_on_surface(top_))
+      out_ <- out_ +
+        ggplot2::geom_sf_label(
+          data         = pts_,
+          mapping      = ggplot2::aes(label = fmt_(.data$Val)),
+          inherit.aes  = FALSE,
+          size         = .label_size,
+          label.size   = 0.1,
+          label.padding = ggplot2::unit(0.08, "lines"),
+          fill         = "#FFFFFFDD",
+          colour       = .plot_ink,
+          family       = .plot_font
+        )
+    }
+  }
+
+  out_ +
+    plot_theme(.grid = "none", .legend = "bottom") +
+    ggplot2::theme(
+      axis.text        = ggplot2::element_blank(),
+      axis.ticks       = ggplot2::element_blank(),
+      panel.background = ggplot2::element_rect(fill = "#FFFFFF", colour = NA)
+    )
+}
+
+
+#' Countries, filled by a value
+#'
+#' Joins on ISO 3166 alpha-3, which is the only country key both extraction engines can produce --
+#' the gazetteer's Iso2 is a US STATE code, not a country code, and reading it as one silently
+#' empties every country outside the United States.
+#'
+#' The latitude is clipped below the Antarctic and above the high Arctic, because neither carries
+#' contract geography and together they cost a third of the panel.
+#'
+#' @param .tab Tibble with an Area column of ISO alpha-3 codes and a value column.
+#' @param .val Character. Column holding the value to fill by.
+#' @param .log Logical. Fill on a log scale.
+#' @param .name Character. Legend title.
+#' @param .label_n Integer. Label this many largest countries with their value.
+#' @param .label_size Numeric. Label text size in millimetres.
+#' @return A ggplot object.
+plot_map_world <- function(.tab, .val = "N", .log = TRUE, .name = NULL, .label_n = 12L,
+                           .label_size = 2.4) {
+  if (FALSE) {
+    .tab        <- tibble::tibble(Area = c("USA", "CAN"), N = c(4000, 120))
+    .val        <- "N"
+    .log        <- TRUE
+    .name       <- NULL
+    .label_n    <- 12L
+    .label_size <- 2.4
+  }
+
+  plot_map_body(
+    .shape      = plot_shape_world(),
+    .tab        = .tab,
+    .val        = .val,
+    .log        = .log,
+    .name       = .name,
+    .label_n    = .label_n,
+    .label_size = .label_size
+  ) +
+    ggplot2::coord_sf(ylim = c(-58, 84), expand = FALSE)
+}
+
+
+#' US states, filled by a value
+#'
+#' The tier the geography rule actually releases, and the one where the sample has enough mass to
+#' show structure -- a world map of US contracts is one dark country and a scattering.
+#'
+#' Albers equal area, because a state map on unprojected latitude and longitude stretches the north
+#' and the reader compares areas whether or not the figure invites it.
+#'
+#' @param .tab Tibble with an Area column of state names in any case and a value column.
+#' @param .val Character. Column holding the value to fill by.
+#' @param .log Logical. Fill on a log scale.
+#' @param .name Character. Legend title.
+#' @param .label_n Integer. Label this many largest states with their value.
+#' @param .label_size Numeric. Label text size in millimetres.
+#' @return A ggplot object.
+plot_map_usa <- function(.tab, .val = "N", .log = TRUE, .name = NULL, .label_n = 15L,
+                         .label_size = 2.4) {
+  if (FALSE) {
+    .tab        <- tibble::tibble(Area = c("DELAWARE", "TEXAS"), N = c(900, 120))
+    .val        <- "N"
+    .log        <- TRUE
+    .name       <- NULL
+    .label_n    <- 15L
+    .label_size <- 2.4
+  }
+
+  plot_map_body(
+    .shape      = plot_shape_usa(),
+    .tab        = dplyr::mutate(.tab, Area = stringi::stri_trans_toupper(.data$Area)),
+    .val        = .val,
+    .log        = .log,
+    .name       = .name,
+    .label_n    = .label_n,
+    .label_size = .label_size
+  ) +
+    ggplot2::coord_sf(crs = 5070, datum = NA, expand = FALSE)
+}

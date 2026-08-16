@@ -2,44 +2,44 @@
 #
 # WHAT THIS FILE DOES
 # 04A extracted nine engines over 4,398 hand-classified contracts and ranked none of them, because
-# ranking needs labels and there are no entity labels. This file writes the rules. It takes one
-# entity at a time; ORG is first, because every other party quantity -- the jurisdiction, the
-# address, the signing date -- is measured from where an organisation was found.
+# ranking needs labels and there are no entity labels. This file writes the rules. ORG is first,
+# because every other party quantity -- the jurisdiction, the address, the signing date -- is
+# measured from where an organisation was found.
 #
 # ONE ENGINE, AND THAT IS THE BINDING CONSTRAINT
 # 04C runs five engines over the corpus and none of them is spaCy. For ORG that leaves lexnlp alone,
-# which emits 81,467 spans across the sample against spaCy's 5.3 million, so the whole rule runs in R
-# over a table that fits in memory and DuckDB is read once.
+# which emits 81,467 spans across the sample against spaCy's 5.3 million. The whole rule therefore
+# runs in R over a table that fits in memory and DuckDB is read once.
 #
 # THE PARTY IS THE ANCHOR, NOT A REGION
-# An earlier design read a fixed head of the document and asked whether the filer was inside it.
-# Sweeping that head showed the located share rising from 70.6% to 75.1% -- and the LATE share
-# falling from 6.5% to 2.0%, with the two summing to 77.1% in every one of twenty cells. That is an
-# identity rather than a finding: the match runs on names and cannot depend on a region, so a wider
-# head buys no filer and only relabels one that was already found, while the candidate count doubles.
+# An earlier design read a fixed head of each document and asked whether the filer was inside it.
+# Sweeping that head across twenty settings showed the located share rising from 70.6% to 75.1% and
+# the LATE share falling from 6.5% to 2.0%, the two summing to 77.1% in every cell. That is an
+# identity: the match runs on names and cannot depend on a region, so a wider head buys no filer and
+# only relabels one already found, while the candidate count doubles.
 #
-# So there is no head. The filer is matched ANYWHERE in the document, the window is centred on WHERE
-# IT WAS FOUND, and every document gets its own bounds, stored. The window is the only thing a
-# counterparty count depends on, which is also why the window sweep is now cheap: the match is
-# computed once and the windows are re-cut over it.
+# So there is no head. The filer is matched ANYWHERE, the window is centred on WHERE IT WAS FOUND,
+# and every document carries its own bounds. The window is the only thing a counterparty count
+# depends on, which is why the window sweep is cheap: the match is computed once and re-cut.
 #
 # AN ENTITY IS A GROUP OF SPANS, AND ITS OFFSETS COME FROM ONE ROW OF THAT GROUP
-# A contract names the same company several times. The mentions are collapsed to one row per
-# (document, company), and that row is the EARLIEST mention taken WHOLE -- not a start from one
-# mention beside a stop from another, which produces a pair belonging to no mention at all and
-# brackets the entire agreement. The occurrence counts and the latest position are group facts and
-# are aggregated separately.
+# A contract names the same company several times. The mentions collapse to one row per (document,
+# company), and that row is the EARLIEST mention taken WHOLE -- not a start from one mention beside a
+# stop from another, which produces a pair belonging to no mention and brackets the whole agreement.
 #
-# NameCore IS THE NAME, THE SPAN IS THE POSITION. lexnlp's spans are ragged -- " BANK, LTD.andWEL",
-# ", a signer of the foregoing i" -- while its resolved name on the same row is clean. Measured on
-# the sample: median overshoot 5 characters, P90 12, and 99.0% of spans contain their own resolved
-# name, against a median gap of 130 characters between adjacent names. Tight enough that the
-# geography rule can use Start directly.
+# WHAT IS SETTLED BY MEASUREMENT, AND WHAT IS STILL A ROW IN A SWEEP
+# Settled: the window does not scale with length (unadjusted counts rise 13x across length deciles
+# while a fixed window rises 2x -- the extra names are body prose); the gap window buys nothing over
+# a fixed one (gap 500 and +/- 1,000 agree to three decimals) and is kept as reported evidence rather
+# than as a choice; span boundaries are tight (median overshoot 5 characters, 99.0% of spans contain
+# their own resolved name).
+# Open, and therefore swept: the released width, the tail width, and whether a one-token family match
+# found deep in a document should be refused.
 #
 # NOISE IS EXPECTED AND IS REPORTED AGAINST A BASELINE. No stoplist, no defined-term filter, no
-# geography exclusion. What every table carries instead is the UNADJUSTED count -- every distinct
-# organisation the contract names anywhere -- beside the rule's count, so the reader sees what the
-# rule removed rather than being asked to trust that it removed the right things.
+# geography exclusion. Every table carries the UNADJUSTED count -- every distinct organisation the
+# contract names anywhere -- so the reader sees what the rule removed rather than being asked to
+# trust that it removed the right things.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
@@ -53,8 +53,6 @@ if (FALSE) {
 
 
 # 1. Vocabulary ------------------------------------------------------------------------------------------------------
-# Registered at SOURCE time rather than inside a function, so every figure in this document and any
-# later one orders these axes identically.
 
 plot_register_levels(
   .key    = "PartyStatus",
@@ -74,23 +72,25 @@ plot_register_levels(
   .short  = c("filer", "counter", "signer", "other")
 )
 
-plot_register_levels(
-  .key    = "Region",
-  .levels = c("head", "middle", "tail"),
-  .short  = c("head", "middle", "tail")
-)
-
 
 # 2. One reduction, both sides ---------------------------------------------------------------------------------------
 # EDGAR writes a name in registration form and a contract writes it in prose. Both are reduced to a
 # common key: strip EDGAR's conformed-name artifacts, uppercase, an ampersand between spaces to AND,
 # punctuation to space, whitespace collapsed, a leading connective dropped, trailing corporate
-# suffixes stripped. "The Boeing Company" -> "BOEING"; "UGI CORP /PA/" -> "UGI";
-# "PETROL OIL & GAS INC" -> "PETROL OIL AND GAS", which is what the contract writes out in full.
+# suffixes stripped.
+#
+# THE DOTTED FORMS ARE IN THE LIST AS SEPARATE TOKENS, and they have to be. "WILLIAMS PARTNERS L.P."
+# becomes "WILLIAMS PARTNERS L P" once punctuation is spaced, and a list holding only "LP" strips
+# nothing -- which demoted that pair from an exact match to a family one. Partnerships and funds are
+# everywhere in this corpus, so the dotted variants are not an edge case.
+#
+# The alternation is SORTED BY DESCENDING LENGTH so a longer form is tried before a prefix of itself:
+# without it "CORP" can consume the front of "CORPORATION" and leave a fragment behind.
 
 .ent_suffix <- c("INC", "INCORPORATED", "CORP", "CORPORATION", "LLC", "LLP", "LP", "LTD", "LIMITED",
                  "PLC", "NV", "BV", "SA", "AG", "GMBH", "CO", "COMPANY", "COMPANIES", "TRUST",
-                 "NATASSOC")
+                 "NATASSOC", "AND",
+                 "L P", "L L C", "L L P", "N V", "B V", "S A", "A G", "P L C", "S A R L")
 
 .ent_lead <- c("MADE BY AND BETWEEN", "BY AND BETWEEN", "BY AND AMONG", "AMONGST", "BETWEEN",
                "AMONG", "AND", "WITH", "THIS", "THE", "DATED", "AS OF")
@@ -98,10 +98,10 @@ plot_register_levels(
 
 #' Remove EDGAR's conformed-name artifacts before the name is reduced
 #'
-#' EDGAR appends a state-of-incorporation marker to the conformed company name -- "UGI CORP /PA/",
-#' "XEROX CORP /NY/", and the backslash variant. The marker is not part of the name, but the
-#' reduction turns it into a trailing token that matches nothing in the contract text. A former-name
-#' parenthetical is removed for the same reason.
+#' EDGAR appends a state-of-incorporation marker to the conformed name -- "UGI CORP /PA/" and the
+#' backslash variant. The marker is not part of the name, but the reduction turns it into a trailing
+#' token that matches nothing in the contract text. A former-name parenthetical goes for the same
+#' reason: it is metadata about the registrant, not a name the contract will write.
 #'
 #' @param .x Character vector of EDGAR conformed company names.
 #' @return Character vector with the artifacts removed.
@@ -119,11 +119,10 @@ ent_strip_conformed <- function(.x) {
 #'
 #' The corporate suffix is the problem this solves: EDGAR records "BOEING CO" where the contract
 #' writes "The Boeing Company". Suffixes are removed with a repeated group rather than a token loop,
-#' because "BANK CO LTD" carries three. The leading connective is removed because the extractors do
-#' not stop cleanly at a name.
+#' because "BANK CO LTD" carries three.
 #'
-#' The ampersand is mapped to AND only BETWEEN SPACES, so "PETROL OIL & GAS" and its written-out form
-#' agree while "AT&T" is left to the punctuation pass.
+#' The ampersand maps to AND only BETWEEN SPACES, so "PETROL OIL & GAS" agrees with its written-out
+#' form while "AT&T" is left to the punctuation pass.
 #'
 #' @param .x Character vector of names or spans as recorded.
 #' @param .min Integer. Keys shorter than this become NA. One by default: the floors that matter --
@@ -132,12 +131,13 @@ ent_strip_conformed <- function(.x) {
 #' @return Character vector of keys, NA below .min characters.
 ent_norm_key <- function(.x, .min = 1L) {
   if (FALSE) {
-    .x   <- c("ACME HOLDINGS, INC.", "The Boeing Company", "PETROL OIL & GAS INC")
+    .x   <- c("ACME HOLDINGS, INC.", "WILLIAMS PARTNERS L.P.", "PETROL OIL & GAS INC")
     .min <- 1L
   }
 
+  sfx_sorted_ <- .ent_suffix[order(nchar(.ent_suffix), decreasing = TRUE)]
   lead_ <- paste0("^(", paste(.ent_lead, collapse = "|"), ") ")
-  sfx_  <- paste0("( (", paste(.ent_suffix, collapse = "|"), "))+$")
+  sfx_  <- paste0("( (", paste(sfx_sorted_, collapse = "|"), "))+$")
 
   out_ <- .x |>
     stringi::stri_trans_toupper() |>
@@ -187,9 +187,8 @@ ent_shared_tokens <- function(.a, .b) {
 #' Per-document anchor keys, one row per contract
 #'
 #' Reads 04A's sample table rather than the EDGAR metadata, so this document depends on one narrow
-#' artifact and the sample it describes cannot drift from the sample 04A extracted. No length floor
-#' is applied; AnchorLen is carried and the rule decides what is long enough for equality and what
-#' for containment, which are different questions.
+#' artifact and cannot drift from the sample 04A extracted. No length floor is applied; AnchorLen is
+#' carried and the rule decides what is long enough for equality and what for containment.
 #'
 #' @param .path_anchors 04A's sample_anchors.parquet.
 #' @return Tibble: DocID, Fold, Class, AmendType, CIK, CompanyName, CompanyClean, DateFiled,
@@ -222,8 +221,8 @@ ent_anchor_keys <- function(.path_anchors) {
 #' Document lengths, in code points
 #'
 #' stringi::stri_length rather than nchar, for the same reason every offset operation in this family
-#' uses stri_sub: Python emits code-point offsets and a byte-based length would disagree with them on
-#' any document carrying a multibyte character.
+#' uses stri_sub: Python emits code-point offsets and a byte-based length would disagree on any
+#' document carrying a multibyte character.
 #'
 #' @param .path_text 04A's canonical text parquet.
 #' @return Tibble: DocID, DocLen. Empty documents are dropped.
@@ -238,9 +237,9 @@ ent_doc_lens <- function(.path_text) {
 
 #' Load one engine's ORG spans, with both candidate keys and the document length
 #'
-#' Both keys are built here rather than inside the rule, because the reduction does not depend on any
-#' rule parameter and rebuilding it per sweep cell would run the same strings through the same regex
-#' to produce the identical answer.
+#' Both keys are built here rather than inside the rule: the reduction does not depend on any rule
+#' parameter, and rebuilding it per sweep cell would run the same strings through the same regex to
+#' produce the identical answer.
 #'
 #' @param .db_path 04A's candidate store.
 #' @param .lens Tibble from ent_doc_lens().
@@ -286,9 +285,8 @@ ent_load_org <- function(.db_path, .lens, .combo = "lexnlp", .quiet = FALSE) {
 
 
 # 4. Entities and the match ------------------------------------------------------------------------------------------
-# Everything in this section is WINDOW-FREE. That is the point of the redesign: the match does not
-# depend on where in the document anything sits, so it is computed once and every window is cut over
-# the same result.
+# Everything here is WINDOW-FREE. That is the point of the design: the match does not depend on where
+# in the document anything sits, so it is computed once and every window is cut over the same result.
 
 #' Build one match specification
 #'
@@ -296,48 +294,53 @@ ent_load_org <- function(.db_path, .lens, .combo = "lexnlp", .quiet = FALSE) {
 #' @param .min_key Integer. Shortest key admitted for EQUALITY. Two, because "CA, INC." reduces to
 #'   "CA" and that is the company's name rather than a degenerate key.
 #' @param .min_contain Integer. Shortest key admitted for CONTAINMENT or family. Five, because "CA"
-#'   is contained in "CATERPILLAR" and a key matching everything locates nothing.
-#' @param .tight Logical. Also compare keys with spaces removed, so UNITED AIRLINES and UNITED AIR
-#'   LINES are one company. They are, and nothing else in the reduction reaches that.
+#'   sits inside "CATERPILLAR" and a key matching everything locates nothing.
+#' @param .tight Logical. Also compare with spaces removed, so UNITED AIRLINES and UNITED AIR LINES
+#'   are one company. They are, and nothing else in the reduction reaches that.
 #' @param .frag_min Integer. Shortest fragment admitted as a reverse match.
 #' @param .frag_share Numeric. Fragment must also cover this share of the anchor key.
 #' @param .fam_tokens Integer. Leading tokens two keys must share to count as one corporate family.
 #' @param .fam_share Numeric. Those tokens must also be this share of the shorter key.
 #' @param .fam_df Numeric. A SINGLE shared leading token is admitted when it opens the name of a
-#'   company in at most this share of documents. CHENIERE is distinctive and CHENIERE ENERGY against
-#'   CHENIERE CREOLE TRAIL PIPELINE is one corporate family; NATIONAL is not. Zero disables the arm.
-#' @param .deep Integer. A matched party found past this offset is flagged rather than rejected: it
+#'   company in at most this share of documents. CHENIERE is evidence and NATIONAL is not. Zero
+#'   disables the one-token arm.
+#' @param .deep Integer. A matched party found past this offset is FLAGGED rather than rejected: it
 #'   is still the right company, but the window around it is a neighbourhood and not a preamble.
+#' @param .guard_deep_family Logical. Refuse a ONE-TOKEN family match found past .deep. The arm is
+#'   the weakest and the deep anchors are where it fails twice over -- 9.3% of family matches are
+#'   deep against 4.0% of exact ones. FALSE by default: the guard is swept before it is adopted.
 #' @return A named list carrying the match specification.
 ent_rule <- function(.key = "core", .min_key = 2L, .min_contain = 5L, .tight = TRUE,
                      .frag_min = 10L, .frag_share = 0.6,
-                     .fam_tokens = 2L, .fam_share = 0.5, .fam_df = 0.005, .deep = 5000L) {
+                     .fam_tokens = 2L, .fam_share = 0.5, .fam_df = 0.005,
+                     .deep = 5000L, .guard_deep_family = FALSE) {
   if (FALSE) {
-    .key         <- "core"
-    .min_key     <- 2L
-    .min_contain <- 5L
-    .tight       <- TRUE
-    .frag_min    <- 10L
-    .frag_share  <- 0.6
-    .fam_tokens  <- 2L
-    .fam_share   <- 0.5
-    .fam_df      <- 0.005
-    .deep        <- 5000L
+    .key               <- "core"
+    .min_key           <- 2L
+    .min_contain       <- 5L
+    .tight             <- TRUE
+    .frag_min          <- 10L
+    .frag_share        <- 0.6
+    .fam_tokens        <- 2L
+    .fam_share         <- 0.5
+    .fam_df            <- 0.005
+    .deep              <- 5000L
+    .guard_deep_family <- FALSE
   }
 
   if (!.key %in% c("core", "span")) cli::cli_abort("{.arg .key} must be \"core\" or \"span\".")
 
   list(
-    Key       = .key,       MinKey     = as.integer(.min_key),
-    MinContain = as.integer(.min_contain), Tight = isTRUE(.tight),
-    FragMin   = as.integer(.frag_min),     FragShare = .frag_share,
-    FamTokens = as.integer(.fam_tokens),   FamShare  = .fam_share, FamDf = .fam_df,
-    Deep      = as.integer(.deep)
+    Key        = .key,                     MinKey    = as.integer(.min_key),
+    MinContain = as.integer(.min_contain), Tight     = isTRUE(.tight),
+    FragMin    = as.integer(.frag_min),    FragShare = .frag_share,
+    FamTokens  = as.integer(.fam_tokens),  FamShare  = .fam_share, FamDf = .fam_df,
+    Deep       = as.integer(.deep),        GuardDeepFamily = isTRUE(.guard_deep_family)
   )
 }
 
 
-#' Override fields of a rule, coercing the integer ones
+#' Override fields of a rule, coercing the integer and logical ones
 #'
 #' @param .rule List from ent_rule().
 #' @param .over Named list of field values to replace.
@@ -353,7 +356,8 @@ ent_rule_set <- function(.rule, .over) {
   for (nm_ in c("MinKey", "MinContain", "FragMin", "FamTokens", "Deep")) {
     out_[[nm_]] <- as.integer(out_[[nm_]])
   }
-  out_$Tight <- isTRUE(out_$Tight)
+  out_$Tight           <- isTRUE(out_$Tight)
+  out_$GuardDeepFamily <- isTRUE(out_$GuardDeepFamily)
   out_
 }
 
@@ -364,13 +368,13 @@ ent_rule_set <- function(.rule, .over) {
 #'
 #' THE OFFSETS COME FROM ONE ROW, SELECTED WHOLE. Start, Stop and Span are taken from the EARLIEST
 #' mention by slice_min(), not computed column by column: a summarise() taking Start from the
-#' earliest mention and Stop from the longest returns a pair belonging to no mention, running from
-#' the preamble to the signature block. NOcc and MaxStart describe the GROUP and are aggregated
-#' separately, which is correct -- they are not properties of any single mention.
+#' earliest and Stop from the longest returns a pair belonging to no mention, running from the
+#' preamble to the signature block. NOcc and MaxStart describe the GROUP and are aggregated
+#' separately -- they are not properties of any single mention.
 #'
-#' MaxStart is what makes the corroboration signal possible once the tail is clamped past the window:
-#' an entity introduced beside the party and mentioned AGAIN at the end of the document was
-#' introduced and signed, which no position-of-first-mention column can say.
+#' MaxStart is what makes corroboration possible once the tail is clamped past the window: an entity
+#' introduced beside the party and mentioned AGAIN at the end was introduced and signed, which no
+#' position-of-first-mention column can say.
 #'
 #' @param .spans Tibble from ent_load_org().
 #' @param .rule List from ent_rule(). Supplies only the choice of key.
@@ -420,10 +424,10 @@ ent_entities <- function(.spans, .rule) {
 
 #' How often each leading token opens a company name, across documents
 #'
-#' The gate on the one-token family arm. CHENIERE opens a name in a handful of contracts and
-#' CHENIERE ENERGY against CHENIERE CREOLE TRAIL PIPELINE is one corporate family; NATIONAL opens
-#' hundreds and shares nothing. Counting DOCUMENTS rather than entities, so a single filing listing
-#' twenty affiliates does not make its own prefix look common.
+#' The gate on the one-token family arm. CHENIERE opens a name in a handful of contracts, so CHENIERE
+#' ENERGY against CHENIERE CREOLE TRAIL PIPELINE is one corporate family; NATIONAL opens hundreds and
+#' shares nothing. Counting DOCUMENTS rather than entities, so one filing listing twenty affiliates
+#' does not make its own prefix look common.
 #'
 #' @param .ent Tibble from ent_entities().
 #' @return Tibble: FirstTok, TokDocs, TokShare.
@@ -461,17 +465,17 @@ ent_match_facts <- function(.ent, .keys, .freq) {
     dplyr::mutate(FirstTok = stringi::stri_extract_first_regex(.data$Key, "^[A-Z0-9]+")) |>
     dplyr::left_join(.freq, by = dplyr::join_by(FirstTok)) |>
     dplyr::mutate(
-      TokShare   = dplyr::coalesce(.data$TokShare, 0),
-      KeyLen     = nchar(.data$Key),
-      KeyTok     = stringi::stri_count_fixed(.data$Key, " ") + 1L,
-      IsExact    = !is.na(.data$AnchorKey) & .data$Key == .data$AnchorKey,
-      IsTight    = !is.na(.data$AnchorKey) & .data$KeyTight == .data$AnchorTight,
-      IsFwd      = !is.na(.data$AnchorKey) &
-                   stringi::stri_detect_fixed(.data$Key, .data$AnchorKey),
-      IsRev      = !is.na(.data$AnchorKey) &
-                   stringi::stri_detect_fixed(.data$AnchorKey, .data$Key),
-      SharedTok  = ent_shared_tokens(.a = .data$Key, .b = .data$AnchorKey),
-      MinTok     = pmin(.data$KeyTok, .data$AnchorTok)
+      TokShare  = dplyr::coalesce(.data$TokShare, 0),
+      KeyLen    = nchar(.data$Key),
+      KeyTok    = stringi::stri_count_fixed(.data$Key, " ") + 1L,
+      IsExact   = !is.na(.data$AnchorKey) & .data$Key == .data$AnchorKey,
+      IsTight   = !is.na(.data$AnchorKey) & .data$KeyTight == .data$AnchorTight,
+      IsFwd     = !is.na(.data$AnchorKey) &
+                  stringi::stri_detect_fixed(.data$Key, .data$AnchorKey),
+      IsRev     = !is.na(.data$AnchorKey) &
+                  stringi::stri_detect_fixed(.data$AnchorKey, .data$Key),
+      SharedTok = ent_shared_tokens(.a = .data$Key, .b = .data$AnchorKey),
+      MinTok    = pmin(.data$KeyTok, .data$AnchorTok)
     )
 }
 
@@ -479,15 +483,20 @@ ent_match_facts <- function(.ent, .keys, .freq) {
 #' Turn the match facts into one match kind, under this rule's thresholds
 #'
 #' TWO FLOORS, GATING DIFFERENT ARMS. Equality is admitted down to MinKey; containment and family
-#' only from MinContain, because "CA" is contained in "CATERPILLAR" and an unfloored containment arm
+#' only from MinContain, because "CA" sits inside "CATERPILLAR" and an unfloored containment arm
 #' locates the wrong company while reporting success.
 #'
 #' Precedence is exact, forward, family, reverse -- safest first. Family and reverse can both fire on
 #' the same pair and the order settles it rather than leaving it to row order.
 #'
+#' The DEEP GUARD, when on, refuses a one-token family match found past the deep threshold. Two
+#' tokens shared is evidence on its own; one token plus a position that is not a preamble is the
+#' combination that produced DUKE ENERGY PROGRESS matched to Duke Energy Carolinas at character
+#' 101,874.
+#'
 #' @param .fact Tibble from ent_match_facts().
 #' @param .rule List from ent_rule().
-#' @return .fact with CanMatch, CanContain, FragFloor, IsFam and MatchKind added.
+#' @return .fact with CanMatch, CanContain, FragFloor, IsFam1, IsFam and MatchKind added.
 ent_match_kind <- function(.fact, .rule) {
   if (FALSE) {
     .fact <- tab_facts
@@ -499,21 +508,22 @@ ent_match_kind <- function(.fact, .rule) {
       CanMatch   = .data$KeyLen >= .rule$MinKey & .data$AnchorLen >= .rule$MinKey,
       CanContain = .data$KeyLen >= .rule$MinContain & .data$AnchorLen >= .rule$MinContain,
       FragFloor  = pmax(.rule$FragMin, .rule$FragShare * .data$AnchorLen),
-      # Two or more shared leading tokens, or exactly one that is distinctive enough to be evidence.
-      IsFam      = (.data$SharedTok >= .rule$FamTokens &
-                    .data$SharedTok / pmax(.data$MinTok, 1L) >= .rule$FamShare) |
-                   (.data$SharedTok == 1L & .rule$FamDf > 0 & .data$TokShare <= .rule$FamDf),
+      IsFamN     = .data$SharedTok >= .rule$FamTokens &
+                   .data$SharedTok / pmax(.data$MinTok, 1L) >= .rule$FamShare,
+      IsFam1     = .data$SharedTok == 1L & .rule$FamDf > 0 & .data$TokShare <= .rule$FamDf &
+                   !(.rule$GuardDeepFamily & .data$Start > .rule$Deep),
+      IsFam      = .data$IsFamN | .data$IsFam1,
       IsRevOk    = .data$IsRev & .data$KeyLen >= .data$FragFloor,
       MatchKind  = dplyr::case_when(
-        is.na(.data$AnchorKey)              ~ NA_character_,
-        !.data$CanMatch                     ~ NA_character_,
-        .data$IsExact                       ~ "exact",
-        .rule$Tight & .data$IsTight         ~ "exact",
-        !.data$CanContain                   ~ NA_character_,
-        .data$IsFwd                         ~ "forward",
-        .data$IsFam                         ~ "family",
-        .data$IsRevOk                       ~ "reverse",
-        TRUE                                ~ NA_character_
+        is.na(.data$AnchorKey)      ~ NA_character_,
+        !.data$CanMatch             ~ NA_character_,
+        .data$IsExact               ~ "exact",
+        .rule$Tight & .data$IsTight ~ "exact",
+        !.data$CanContain           ~ NA_character_,
+        .data$IsFwd                 ~ "forward",
+        .data$IsFam                 ~ "family",
+        .data$IsRevOk               ~ "reverse",
+        TRUE                        ~ NA_character_
       )
     )
 }
@@ -526,8 +536,8 @@ ent_match_kind <- function(.fact, .rule) {
 #' it and the coverage figure would be computed over the documents that worked.
 #'
 #' THE PARTY IS MATCHED ANYWHERE. There is no region test, so there is no "late": the earliest match
-#' in the document wins, with match quality breaking ties at the same position. Where no entity
-#' matches, the earliest entity in the document is taken instead and Status records that it was.
+#' wins, with match quality breaking ties at the same position. Where nothing matches, the earliest
+#' entity is taken and Status records that it was.
 #'
 #' @param .fact Tibble from ent_match_kind().
 #' @param .keys Tibble from ent_anchor_keys().
@@ -550,7 +560,7 @@ ent_locate_party <- function(.fact, .keys, .lens, .rule) {
     dplyr::arrange(.data$DocID, .data$Start, .data$KindRank) |>
     dplyr::slice_head(n = 1L, by = DocID) |>
     dplyr::select(DocID, MatchKey = Key, MatchName = Name, MatchSpan = Span, MatchStart = Start,
-                  MatchStop = Stop, MatchKind)
+                  MatchStop = Stop, MatchKind, MatchTok = SharedTok)
 
   first_ <- .fact |>
     dplyr::arrange(.data$DocID, .data$Start) |>
@@ -582,7 +592,6 @@ ent_locate_party <- function(.fact, .keys, .lens, .rule) {
       Party      = stringi::stri_trim_both(
         stringi::stri_replace_all_regex(dplyr::coalesce(.data$PartyName, ""), "\\s+", " ")
       ),
-      # The fallback's own error rate, measurable only where the match succeeded.
       MatchIsFirst = dplyr::if_else(
         .data$Status == "matched", .data$MatchKey == .data$FirstKey, NA
       )
@@ -592,51 +601,54 @@ ent_locate_party <- function(.fact, .keys, .lens, .rule) {
 
 
 # 5. The window ------------------------------------------------------------------------------------------------------
-# The ONLY window-dependent step, and therefore the only one a window sweep has to re-run. Each
-# document gets its own bounds and they are stored, because a window that cannot be audited per
-# document is a parameter rather than a rule.
+# The ONLY window-dependent step, and therefore the only one a window sweep has to re-run.
 
 #' Build one window specification
 #'
 #' @param .kind Character, "fixed" or "gap". FIXED takes a constant number of characters either side
-#'   of the party. GAP grows outward from the party through every name whose distance to its
-#'   neighbour is at most .par, and stops at the first larger gap. The gap arm exists because a
-#'   syndicated preamble is long BECAUSE it lists twelve lenders, so a constant width truncates the
-#'   list -- and scaling on document length is the wrong fix, since the same preamble appears in a
-#'   forty-page and a four-hundred-page agreement. Measured on the sample, adjacent names sit a
-#'   median of 130 characters apart with a P90 of 2,540.
+#'   of the party. GAP grows outward through every name whose distance to its neighbour is at most
+#'   .par and stops at the first larger gap. The gap arm is REPORTED rather than chosen: on this
+#'   sample gap 500 and +/- 1,000 return the same mean counterparty count to three decimals, and the
+#'   gap columns track the fixed ones across every length decile without exceeding them.
 #' @param .par Numeric. Half-width in characters for "fixed"; maximum admitted gap for "gap".
-#'   Inf under "fixed" is the whole document, which is the unadjusted baseline.
 #' @param .tail_share Numeric. Tail as a share of document length. Relative rather than flat because
 #'   a signature block genuinely scales with the number of parties -- twelve lenders take one
 #'   sentence in a preamble and twelve signature blocks at the end.
+#' @param .tail_floor Numeric. Minimum tail width in characters, so a flat tail can be swept against
+#'   the relative one by setting .tail_share to zero.
+#' @param .label Character or NULL. Overrides the generated label, used where several specifications
+#'   differ only in the tail and would otherwise collide.
 #' @return A named list carrying the window specification.
-ent_window_spec <- function(.kind = "fixed", .par = 2000, .tail_share = 0.10) {
+ent_window_spec <- function(.kind = "fixed", .par = 2000, .tail_share = 0.10, .tail_floor = 0,
+                            .label = NULL) {
   if (FALSE) {
     .kind       <- "fixed"
     .par        <- 2000
     .tail_share <- 0.10
+    .tail_floor <- 0
+    .label      <- NULL
   }
 
   if (!.kind %in% c("fixed", "gap")) cli::cli_abort("{.arg .kind} must be \"fixed\" or \"gap\".")
 
-  lab_ <- if (identical(.kind, "fixed")) {
-    if (is.infinite(.par)) "whole document" else paste0("+/- ", format(.par, big.mark = ","))
+  lab_ <- if (!is.null(.label)) {
+    .label
+  } else if (identical(.kind, "fixed")) {
+    paste0("+/- ", format(.par, big.mark = ","))
   } else {
     paste0("gap ", format(.par, big.mark = ","))
   }
 
-  list(Kind = .kind, Par = .par, TailShare = .tail_share, Label = lab_)
+  list(Kind = .kind, Par = .par, TailShare = .tail_share, TailFloor = .tail_floor, Label = lab_)
 }
 
 
 #' Cut the window around the party, and the tail behind it
 #'
-#' The tail is CLAMPED past the window end, so the two regions cannot overlap. That changes what the
-#' tail measures: it can no longer hold a name that also sits beside the party, so a name found there
-#' is one the party's neighbourhood did not carry -- "something outside the preamble gets named"
-#' rather than "the signature block adds names". Where the window swallows the document, there is no
-#' tail and the document is reported as having none rather than dropped.
+#' The tail is CLAMPED past the window end, so the two cannot overlap. That changes what it measures:
+#' a name found there cannot also sit beside the party, so the tail answers "does anything outside
+#' the party's neighbourhood get named" rather than "does the signature block add names". Where the
+#' window swallows the document there is no tail, reported rather than dropped.
 #'
 #' @param .fact Tibble from ent_match_kind().
 #' @param .party Tibble from ent_locate_party().
@@ -678,10 +690,7 @@ ent_window <- function(.fact, .party, .spec) {
         Cluster = cumsum(dplyr::coalesce(.data$Gap, 0) > .spec$Par),
         .by = DocID
       ) |>
-      dplyr::mutate(
-        PartyCluster = .data$Cluster[which(.data$IsFiler)[1L]],
-        .by = DocID
-      ) |>
+      dplyr::mutate(PartyCluster = .data$Cluster[which(.data$IsFiler)[1L]], .by = DocID) |>
       dplyr::mutate(
         InWindow = !is.na(.data$PartyCluster) & .data$Cluster == .data$PartyCluster
       ) |>
@@ -698,7 +707,8 @@ ent_window <- function(.fact, .party, .spec) {
 
   win_ |>
     dplyr::mutate(
-      TailStart    = pmax(.data$DocLen * (1 - .spec$TailShare), dplyr::coalesce(.data$WinEnd, 0)),
+      TailWant     = pmax(.spec$TailFloor, .spec$TailShare * .data$DocLen),
+      TailStart    = pmax(.data$DocLen - .data$TailWant, dplyr::coalesce(.data$WinEnd, 0)),
       HasTail      = .data$TailStart < .data$DocLen,
       InTail       = .data$HasTail & .data$Start >= .data$TailStart & !.data$InWindow,
       RecursInTail = .data$HasTail & .data$MaxStart >= .data$TailStart,
@@ -716,7 +726,7 @@ ent_window <- function(.fact, .party, .spec) {
 #'
 #' NFull is the UNADJUSTED baseline: every distinct organisation the contract names anywhere. It is
 #' carried in every table beside the rule's count, because a reader asked to accept a counterparty
-#' count needs to see what the rule removed rather than be told that it removed the right things.
+#' count needs to see what the rule removed.
 #'
 #' @param .roles Tibble from ent_window().
 #' @param .party Tibble from ent_locate_party().
@@ -749,6 +759,7 @@ ent_counts <- function(.roles, .party) {
     dplyr::left_join(cnt_, by = dplyr::join_by(DocID)) |>
     dplyr::mutate(
       dplyr::across(dplyr::starts_with("N"), \(.x) as.integer(dplyr::coalesce(.x, 0L))),
+      HasTail   = dplyr::coalesce(.data$HasTail, FALSE),
       WinWidth  = .data$WinEnd - .data$WinStart,
       TailWidth = .data$DocLen - .data$TailStart
     )
@@ -781,21 +792,13 @@ ent_apply <- function(.spans, .keys, .lens, .rule, .spec) {
   roles_ <- ent_window(.fact = fact_, .party = party_, .spec = .spec)
 
   list(
-    Rule   = .rule,
-    Spec   = .spec,
-    Ent    = ent_,
-    Facts  = fact_,
-    Party  = party_,
-    Roles  = roles_,
+    Rule = .rule, Spec = .spec, Ent = ent_, Facts = fact_, Party = party_, Roles = roles_,
     Counts = ent_counts(.roles = roles_, .party = party_)
   )
 }
 
 
 # 6. Sweeps ----------------------------------------------------------------------------------------------------------
-# The window sweep is cheap now, because the match is window-free: it is computed once and every
-# window is re-cut over the same facts. The match sweep is the expensive one and moves ONE FACTOR AT
-# A TIME around a base rule.
 
 #' Cut every window specification over one match, at document grain
 #'
@@ -806,10 +809,10 @@ ent_apply <- function(.spans, .keys, .lens, .rule, .spec) {
 #' @return Tibble: the count table for every spec, stacked, with Spec and SpecOrder.
 ent_sweep_window <- function(.fact, .party, .specs, .quiet = FALSE) {
   if (FALSE) {
-    .fact   <- tab_facts
-    .party  <- tab_party
-    .specs  <- .lP$Params$Specs
-    .quiet  <- FALSE
+    .fact  <- tab_facts
+    .party <- tab_party
+    .specs <- .lP$Params$Specs
+    .quiet <- FALSE
   }
 
   purrr::imap(.specs, function(.s, .i) {
@@ -851,7 +854,9 @@ ent_sweep_match <- function(.spans, .keys, .lens, .base, .spec, .quiet = FALSE) 
     list(Factor = "family",      Setting = "off",               Over = list(FamTokens = 99L,
                                                                             FamDf = 0)),
     list(Factor = "family",      Setting = "two tokens only",   Over = list(FamDf = 0)),
-    list(Factor = "family",      Setting = "one token, df 2%",  Over = list(FamDf = 0.02))
+    list(Factor = "family",      Setting = "one token, df 2%",  Over = list(FamDf = 0.02)),
+    list(Factor = "family",      Setting = "deep guard on",
+         Over = list(GuardDeepFamily = TRUE))
   )
 
   purrr::map(var_, function(.v) {
@@ -862,17 +867,17 @@ ent_sweep_match <- function(.spans, .keys, .lens, .base, .spec, .quiet = FALSE) 
     k_    <- p_$MatchKind[!is.na(p_$MatchKind)]
 
     tibble::tibble(
-      Factor      = .v$Factor,
-      Setting     = .v$Setting,
-      PctMatched  = mean(p_$Status == "matched"),
-      PctFirst    = mean(p_$Status == "first"),
-      PctExact    = if (length(k_) == 0L) NA_real_ else mean(k_ == "exact"),
-      PctFamily   = if (length(k_) == 0L) NA_real_ else mean(k_ == "family"),
-      PctDeep     = mean(p_$IsDeep, na.rm = TRUE),
+      Factor        = .v$Factor,
+      Setting       = .v$Setting,
+      PctMatched    = mean(p_$Status == "matched"),
+      PctFirst      = mean(p_$Status == "first"),
+      PctExact      = if (length(k_) == 0L) NA_real_ else mean(k_ == "exact"),
+      PctFamily     = if (length(k_) == 0L) NA_real_ else mean(k_ == "family"),
+      PctDeep       = mean(p_$IsDeep, na.rm = TRUE),
+      PctDeepFamily = mean(p_$IsDeep[!is.na(p_$MatchKind) & p_$MatchKind == "family"], na.rm = TRUE),
       PctMatchFirst = mean(p_$MatchIsFirst, na.rm = TRUE),
-      MedStart    = stats::median(p_$PartyStart, na.rm = TRUE),
-      MeanFull    = mean(c_$NFull),
-      MeanCounter = mean(c_$NCounter)
+      MedStart      = stats::median(p_$PartyStart, na.rm = TRUE),
+      MeanCounter   = mean(c_$NCounter)
     )
   }, .progress = !.quiet) |>
     purrr::list_rbind()
@@ -884,8 +889,7 @@ ent_sweep_match <- function(.spans, .keys, .lens, .base, .spec, .quiet = FALSE) 
 #' Share of organisation spans by relative position, weighted two ways
 #'
 #' Describes the engine and enters no rule. Span-weighted mass can be produced by a handful of
-#' table-heavy filings -- 04A measured one document carrying 3,053 organisation spans -- and
-#' document-weighted mass cannot.
+#' table-heavy filings; document-weighted mass cannot.
 #'
 #' @param .spans Tibble from ent_load_org().
 #' @param .bins Integer. Bins across relative position.
@@ -918,9 +922,9 @@ ent_density <- function(.spans, .bins = 50L) {
 #' How far a span runs past the name it resolves to
 #'
 #' Reported for the NEXT entity rather than this one. Nothing in the party rule depends on a tight
-#' boundary. The geography rule assigns a place to the nearest organisation, so its scale is the gap
-#' between adjacent names, and the overshoot against that gap is what says whether a ragged span can
-#' move an assignment.
+#' boundary. Geography assigns a place to the nearest organisation, so its scale is the gap between
+#' adjacent names, and the overshoot against that gap is what says whether a ragged span can move an
+#' assignment.
 #'
 #' @param .ent Tibble from ent_entities().
 #' @return Tibble: one row of quantiles and the share of spans holding their own name.
@@ -940,39 +944,71 @@ ent_boundary <- function(.ent) {
 }
 
 
-#' The distances the window is cut from
+#' How many names sit within reach of the party, at each candidate width
+#'
+#' CONDITIONED ON THE BOUND, which is the only form that informs a window. Reporting the quantiles of
+#' the distance over EVERY name in the document instead gives a median in the tens of thousands of
+#' characters, because most organisations a long contract names are body prose -- true, and useless
+#' for choosing a width.
 #'
 #' @param .roles Tibble from ent_window().
-#' @return Tibble: quantiles of the distance to the party and of the gap between adjacent names.
-ent_dist_profile <- function(.roles) {
-  if (FALSE) .roles <- tab_roles
-
-  ord_ <- dplyr::arrange(.roles, .data$DocID, .data$Start)
-
-  dist_ <- ord_ |>
-    dplyr::filter(!.data$IsFiler, !is.na(.data$DistToParty)) |>
-    dplyr::pull(.data$DistToParty) |>
-    abs()
-
-  gap_ <- ord_ |>
-    dplyr::mutate(Gap = .data$Start - dplyr::lag(.data$Start), .by = DocID) |>
-    dplyr::filter(!is.na(.data$Gap)) |>
-    dplyr::pull(.data$Gap)
-
-  qs_ <- function(.x, .lab) {
-    tibble::tibble(
-      Measure = .lab,
-      N       = length(.x),
-      P10     = unname(stats::quantile(.x, 0.10)),
-      Median  = stats::median(.x),
-      P90     = unname(stats::quantile(.x, 0.90)),
-      Mean    = mean(.x)
-    )
+#' @param .bounds Numeric vector of half-widths to report.
+#' @return Tibble: one row per bound, with the share of names inside it and their quantiles.
+ent_dist_profile <- function(.roles, .bounds = c(500, 1000, 2000, 4000, 10000)) {
+  if (FALSE) {
+    .roles  <- tab_roles
+    .bounds <- c(500, 1000, 2000, 4000, 10000)
   }
 
-  dplyr::bind_rows(
-    qs_(.x = dist_, .lab = "Any other name to the party, absolute characters"),
-    qs_(.x = gap_,  .lab = "Adjacent names, characters apart")
+  d_ <- .roles |>
+    dplyr::filter(!.data$IsFiler, !is.na(.data$DistToParty)) |>
+    dplyr::mutate(Abs = abs(.data$DistToParty))
+
+  n_ <- nrow(d_)
+
+  purrr::map(.bounds, function(.b) {
+    in_ <- d_$Abs[d_$Abs <= .b]
+    tibble::tibble(
+      Bound      = .b,
+      NWithin    = length(in_),
+      PctOfNames = length(in_) / max(n_, 1L),
+      MeanPerDoc = length(in_) / dplyr::n_distinct(.roles$DocID),
+      MedWithin  = if (length(in_) == 0L) NA_real_ else stats::median(in_),
+      P90Within  = if (length(in_) == 0L) NA_real_ else unname(stats::quantile(in_, 0.9))
+    )
+  }) |>
+    purrr::list_rbind()
+}
+
+
+#' How far apart adjacent names sit, among those near the party
+#'
+#' The scale the geography rule inherits, and the scale a gap window would chain through. Restricted
+#' to names within .bound of the party for the same reason as above: across a whole contract the
+#' gaps are dominated by body prose.
+#'
+#' @param .roles Tibble from ent_window().
+#' @param .bound Numeric. Only names this close to the party are considered.
+#' @return Tibble: one row of quantiles.
+ent_gap_profile <- function(.roles, .bound = 4000) {
+  if (FALSE) {
+    .roles <- tab_roles
+    .bound <- 4000
+  }
+
+  g_ <- .roles |>
+    dplyr::filter(!is.na(.data$DistToParty), abs(.data$DistToParty) <= .bound) |>
+    dplyr::arrange(.data$DocID, .data$Start) |>
+    dplyr::mutate(Gap = .data$Start - dplyr::lag(.data$Start), .by = DocID) |>
+    dplyr::filter(!is.na(.data$Gap))
+
+  tibble::tibble(
+    Bound  = .bound,
+    N      = nrow(g_),
+    P10    = unname(stats::quantile(g_$Gap, 0.10)),
+    Median = stats::median(g_$Gap),
+    P90    = unname(stats::quantile(g_$Gap, 0.90)),
+    Mean   = mean(g_$Gap)
   )
 }
 
@@ -980,9 +1016,9 @@ ent_dist_profile <- function(.roles) {
 #' How often each name in the window occurs across documents
 #'
 #' REPORTED AND NOT APPLIED. A name in one contract is a party; a name in a tenth of them is a
-#' defined term the drafting convention supplies. But a large bank appears in hundreds of credit
-#' agreements as a genuine counterparty, so a frequency cut deletes real parties along with
-#' boilerplate. PctFiler is what separates the two cases and is reported beside the frequency.
+#' defined term. But a large bank appears in hundreds of credit agreements as a genuine counterparty,
+#' so a frequency cut deletes real parties along with boilerplate. PctFiler separates the two cases
+#' and is reported beside the frequency.
 #'
 #' @param .roles Tibble from ent_window().
 #' @param .n_docs Integer. Denominator, the documents in the sample.
@@ -1007,15 +1043,15 @@ ent_head_terms <- function(.roles, .n_docs) {
 }
 
 
-# 8. The two class tables --------------------------------------------------------------------------------------------
-# Both carry an ALL row, so a class figure can be read against the sample without arithmetic. Class
-# is handled as a character here rather than a registered factor, because "All documents" is not a
+# 8. The class tables ------------------------------------------------------------------------------------------------
+# All carry an ALL row, so a class figure can be read against the sample without arithmetic. Class is
+# handled as character here rather than a registered factor, because "All documents" is not a
 # contract type and must not enter the taxonomy.
 
 #' Append an "All documents" row to a per-class summary
 #'
-#' @param .tab Tibble carrying a Class column.
-#' @param .fun Function taking the ungrouped tibble and returning a one-row summary.
+#' @param .tab Tibble carrying a Class column, already summarised.
+#' @param .fun Function taking the ungrouped source and returning a one-row summary.
 #' @param .src Tibble the summary is computed from.
 #' @return .tab with the ALL row appended and Class as ordered character.
 ent_bind_all <- function(.tab, .fun, .src) {
@@ -1062,19 +1098,30 @@ ent_table_where <- function(.counts) {
 
 #' What each window yields, by contract type
 #'
-#' The unadjusted count sits in the same table, so the rule is read against the thing it replaces
-#' rather than on its own.
+#' Window columns only. The tail belongs to a separate table because it is cut by a separate
+#' parameter, and mixing the two is how an earlier version reported every tail column as zero: the
+#' tail block was computed from the widest window in the sweep, where the window swallows the
+#' document and the tail is empty by construction.
 #'
 #' @param .sweep Tibble from ent_sweep_window().
-#' @param .status Character. "all", "matched" or "first" -- which documents the row is computed over.
+#' @param .counts Tibble from ent_counts(). Supplies the unadjusted baseline.
+#' @param .status Character. "all", "matched" or "first" -- which documents the row covers.
 #' @return Tibble: one row per class plus an ALL row, one column per window specification.
-ent_table_window <- function(.sweep, .status = "all") {
+ent_table_window <- function(.sweep, .counts, .status = "all") {
   if (FALSE) {
     .sweep  <- tab_sweep_window
+    .counts <- tab_counts
     .status <- "all"
   }
 
-  src_ <- if (identical(.status, "all")) .sweep else dplyr::filter(.sweep, .data$Status == .status)
+  keep_ <- if (identical(.status, "all")) {
+    .counts$DocID
+  } else {
+    .counts$DocID[.counts$Status == .status]
+  }
+
+  src_ <- dplyr::filter(.sweep,  .data$DocID %in% keep_)
+  cnt_ <- dplyr::filter(.counts, .data$DocID %in% keep_)
 
   wide_ <- src_ |>
     dplyr::summarise(MeanCounter = mean(.data$NCounter), .by = c(Class, Spec, SpecOrder)) |>
@@ -1082,18 +1129,9 @@ ent_table_window <- function(.sweep, .status = "all") {
     dplyr::select(-SpecOrder) |>
     tidyr::pivot_wider(names_from = Spec, values_from = MeanCounter)
 
-  extra_ <- src_ |>
-    dplyr::filter(.data$SpecOrder == max(.data$SpecOrder)) |>
-    dplyr::summarise(
-      Unadjusted    = mean(.data$NFull),
-      MedTailWidth  = stats::median(.data$TailWidth),
-      MeanTailNew   = mean(.data$NTailNew),
-      PctAnyTailNew = mean(.data$NTailNew > 0L),
-      MeanBothEnds  = mean(.data$NBothEnds),
-      .by = Class
-    )
+  base_ <- dplyr::summarise(cnt_, Docs = dplyr::n(), Unadjusted = mean(.data$NFull), .by = Class)
 
-  per_ <- dplyr::left_join(wide_, extra_, by = dplyr::join_by(Class))
+  per_ <- dplyr::left_join(base_, wide_, by = dplyr::join_by(Class))
 
   f_ <- function(.d) {
     w_ <- .d |>
@@ -1101,36 +1139,67 @@ ent_table_window <- function(.sweep, .status = "all") {
       dplyr::arrange(.data$SpecOrder) |>
       dplyr::select(-SpecOrder) |>
       tidyr::pivot_wider(names_from = Spec, values_from = MeanCounter)
-    e_ <- .d |>
-      dplyr::filter(.data$SpecOrder == max(.data$SpecOrder)) |>
-      dplyr::summarise(
-        Unadjusted    = mean(.data$NFull),
-        MedTailWidth  = stats::median(.data$TailWidth),
-        MeanTailNew   = mean(.data$NTailNew),
-        PctAnyTailNew = mean(.data$NTailNew > 0L),
-        MeanBothEnds  = mean(.data$NBothEnds)
-      )
-    dplyr::bind_cols(w_, e_)
+    b_ <- tibble::tibble(Docs = nrow(cnt_), Unadjusted = mean(cnt_$NFull))
+    dplyr::bind_cols(b_, w_)
   }
 
   ent_bind_all(.tab = per_, .fun = f_, .src = src_)
 }
 
 
+#' What each tail specification yields, by contract type
+#'
+#' Computed from the tail sweep, where the window is held at the released width and only the tail
+#' moves. A name here is one the party's neighbourhood did not carry.
+#'
+#' @param .sweep Tibble from ent_sweep_window() over the tail specifications.
+#' @return Tibble: one row per class plus an ALL row.
+ent_table_tail <- function(.sweep) {
+  if (FALSE) .sweep <- tab_sweep_tail
+
+  f_ <- function(.d) {
+    .d |>
+      dplyr::summarise(
+        MedTailWidth  = stats::median(.data$TailWidth, na.rm = TRUE),
+        PctNoTail     = mean(!.data$HasTail),
+        MeanTailNew   = mean(.data$NTailNew),
+        PctAnyTailNew = mean(.data$NTailNew > 0L),
+        MeanBothEnds  = mean(.data$NBothEnds),
+        .by = c(Spec, SpecOrder)
+      ) |>
+      dplyr::arrange(.data$SpecOrder) |>
+      dplyr::select(-SpecOrder)
+  }
+
+  per_ <- .sweep |>
+    dplyr::summarise(
+      MedTailWidth  = stats::median(.data$TailWidth, na.rm = TRUE),
+      PctNoTail     = mean(!.data$HasTail),
+      MeanTailNew   = mean(.data$NTailNew),
+      PctAnyTailNew = mean(.data$NTailNew > 0L),
+      MeanBothEnds  = mean(.data$NBothEnds),
+      .by = c(Class, Spec, SpecOrder)
+    ) |>
+    dplyr::arrange(.data$SpecOrder) |>
+    dplyr::select(-SpecOrder)
+
+  ent_bind_all(.tab = per_, .fun = f_, .src = .sweep)
+}
+
+
 #' What each window yields, by decile of document length
 #'
-#' The table that settles whether the window has to scale. The earlier length gradient -- a mean
+#' The table that settles whether the window has to scale. An earlier length gradient -- a mean
 #' counterparty count of 8.3 in the longest decile against 1.5 in the shortest -- was measured under
 #' a window that ITSELF scaled with length, so it could not separate "long contracts name more
-#' parties" from "we gave long contracts a wider window". At a fixed width it can.
+#' parties" from "we gave long contracts a wider window".
 #'
 #' @param .sweep Tibble from ent_sweep_window().
 #' @return Tibble: one row per decile, one column per window specification.
 ent_table_length <- function(.sweep) {
   if (FALSE) .sweep <- tab_sweep_window
 
-  base_ <- .sweep |>
-    dplyr::mutate(Decile = dplyr::ntile(.data$DocLen, 10L), .by = Spec)
+  base_ <- dplyr::mutate(.sweep, Decile = dplyr::ntile(.data$DocLen, 10L), .by = Spec)
 
   wide_ <- base_ |>
     dplyr::summarise(MeanCounter = mean(.data$NCounter), .by = c(Decile, Spec, SpecOrder)) |>
@@ -1138,16 +1207,14 @@ ent_table_length <- function(.sweep) {
     dplyr::select(-SpecOrder) |>
     tidyr::pivot_wider(names_from = Spec, values_from = MeanCounter)
 
-  extra_ <- base_ |>
-    dplyr::filter(.data$SpecOrder == max(.data$SpecOrder)) |>
+  base_ |>
+    dplyr::filter(.data$SpecOrder == 1L) |>
     dplyr::summarise(
       Docs       = dplyr::n(),
       MedLen     = stats::median(.data$DocLen),
       Unadjusted = mean(.data$NFull),
       .by = Decile
-    )
-
-  extra_ |>
+    ) |>
     dplyr::left_join(wide_, by = dplyr::join_by(Decile)) |>
     dplyr::arrange(.data$Decile)
 }
@@ -1222,8 +1289,7 @@ ent_read_spans <- function(.tab, .path_text, .col_start = "PartyStart", .col_sto
 #'
 #' AN EQUALITY, NOT A CONTAINMENT. Asking whether the span appears somewhere inside the slice is
 #' answered YES more easily the wider the slice runs, so a pair of offsets bracketing four pages of
-#' contract would pass it every time. The slice must BE the span, which is the only form that can
-#' fail, and it is what catches an entity whose offsets came from two different mentions.
+#' contract would pass it every time. The slice must BE the span.
 #'
 #' @param .tab Tibble carrying DocID, the two offset columns and the span column.
 #' @param .path_text 04A's canonical text parquet.
@@ -1269,21 +1335,20 @@ ent_check_offsets <- function(.tab, .path_text, .col_start = "PartyStart", .col_
 }
 
 
-#' Every organisation one document names, in order, with its assigned role
-#'
-#' The block that says whether the counterparty count means anything. A list of six names is equally
-#' consistent with six parties and with two parties written four ways.
+#' Every organisation a few documents name, in order, with its assigned role
 #'
 #' @param .roles Tibble from ent_window().
 #' @param .keys Tibble from ent_anchor_keys().
-#' @param .n Integer. Documents drawn.
+#' @param .docs Character vector of DocIDs, or NULL to draw at random.
+#' @param .n Integer. Documents drawn when .docs is NULL.
 #' @param .max Integer. Rows shown per document, so one table-heavy filing cannot fill the page.
 #' @param .seed Integer. Sampling seed.
 #' @return Tibble: the drawn documents' rows, ordered by document and position.
-ent_read_entities <- function(.roles, .keys, .n = 6L, .max = 12L, .seed = 42L) {
+ent_read_entities <- function(.roles, .keys, .docs = NULL, .n = 6L, .max = 12L, .seed = 42L) {
   if (FALSE) {
     .roles <- tab_roles
     .keys  <- tab_keys
+    .docs  <- NULL
     .n     <- 6L
     .max   <- 12L
     .seed  <- 42L
@@ -1291,9 +1356,10 @@ ent_read_entities <- function(.roles, .keys, .n = 6L, .max = 12L, .seed = 42L) {
 
   if (nrow(.roles) == 0L) return(tibble::tibble())
 
-  docs_ <- withr::with_seed(
-    .seed, sample(unique(.roles$DocID), size = min(.n, dplyr::n_distinct(.roles$DocID)))
-  )
+  pool_ <- if (is.null(.docs)) unique(.roles$DocID) else intersect(.docs, .roles$DocID)
+  if (length(pool_) == 0L) return(tibble::tibble())
+
+  docs_ <- withr::with_seed(.seed, sample(pool_, size = min(.n, length(pool_))))
 
   .roles |>
     dplyr::filter(.data$DocID %in% docs_) |>
@@ -1352,29 +1418,37 @@ ent_report_boundary <- function(.tab) {
     tbl_say(.title = "How far a span runs past its own name")
 
   cli::cli_alert_info(
-    "This block exists for the NEXT entity rather than this one. The party rule reads positions and \\
-     is insensitive to a ragged boundary; geography assigns a place to the nearest organisation, so \\
-     the overshoot has to be read against the gap between adjacent names reported below."
+    "This block exists for the NEXT entity. The party rule reads positions and is insensitive to a \\
+     ragged boundary; geography assigns a place to the nearest organisation, so the overshoot has to \\
+     be read against the neighbour gap below."
   )
   invisible(.tab)
 }
 
 
-#' The distances the window is cut from
-#' @param .tab Tibble from ent_dist_profile().
-#' @return Invisibly .tab.
-ent_report_dist <- function(.tab) {
-  if (FALSE) .tab <- tab_dist
+#' How many names sit within reach of the party
+#' @param .dist Tibble from ent_dist_profile().
+#' @param .gap Tibble from ent_gap_profile().
+#' @return Invisibly .dist.
+ent_report_dist <- function(.dist, .gap) {
+  if (FALSE) {
+    .dist <- tab_dist
+    .gap  <- tab_gap
+  }
 
-  cli::cli_h2("Distances between names")
-  tbl_say(.tab = .tab, .title = "To the party, and between neighbours")
+  cli::cli_h2("Distances inside the party's neighbourhood")
+  .dist |>
+    dplyr::mutate(PctOfNames = tbl_pct(.data$PctOfNames)) |>
+    tbl_say(.title = "Names within each candidate half-width")
+
+  tbl_say(.tab = .gap, .title = "Gap between adjacent names, among those near the party")
 
   cli::cli_alert_info(
-    "The first row is what a fixed window cuts. The second is what the GAP window chains through: a \\
-     syndicated preamble lists its lenders a few dozen characters apart and then stops, so the P90 \\
-     of this row is roughly where a preamble ends and the recitals begin."
+    "CONDITIONED ON THE BOUND, which is the only form that informs a width. Over every name in the \\
+     document the median distance runs into the tens of thousands of characters, because most \\
+     organisations a long contract names are body prose -- true, and useless for choosing a window."
   )
-  invisible(.tab)
+  invisible(.dist)
 }
 
 
@@ -1404,26 +1478,31 @@ ent_report_match <- function(.tab) {
     dplyr::arrange(plot_factor(.data$MatchKind, .key = "MatchKind")) |>
     tbl_say(.title = "How the filer was recognised")
 
+  n_fam1_ <- sum(.tab$MatchKind == "family" & .tab$MatchTok == 1L, na.rm = TRUE)
   out_ <- tibble::tibble(
-    Item = c("Matched documents where the party is also the FIRST name in the document",
+    Item = c("Matched documents where the party is also the FIRST name",
              "Documents falling back to the first name",
              "Documents with no organisation at all",
-             "Matched parties found deep in the document"),
+             "Matched parties found deep in the document",
+             "Family matches resting on a SINGLE shared token",
+             "Single-token family matches that are ALSO deep"),
     N    = c(sum(.tab$MatchIsFirst, na.rm = TRUE),
              sum(.tab$Status == "first"),
              sum(.tab$Status == "no entity"),
-             sum(.tab$IsDeep & .tab$Status == "matched", na.rm = TRUE)),
+             sum(.tab$IsDeep & .tab$Status == "matched", na.rm = TRUE),
+             n_fam1_,
+             sum(.tab$MatchKind == "family" & .tab$MatchTok == 1L & .tab$IsDeep, na.rm = TRUE)),
     Of   = c(sum(!is.na(.tab$MatchIsFirst)), nrow(.tab), nrow(.tab),
-             sum(.tab$Status == "matched"))
+             sum(.tab$Status == "matched"), sum(.tab$Status == "matched"), max(n_fam1_, 1L))
   ) |>
     dplyr::mutate(Share = tbl_pct(.data$N / .data$Of))
 
-  tbl_say(.tab = out_, .title = "The fallback, and the anchors that are not preambles")
+  tbl_say(.tab = out_, .title = "The fallback, and the two failures that compound")
   cli::cli_alert_info(
     "The first row IS the fallback's accuracy: the share of documents in which taking the first name \\
-     would have given the right answer, measurable only where the match succeeded. The last row is \\
-     the window that is a neighbourhood rather than a preamble -- accepted and flagged, because the \\
-     company is still the right one."
+     would have given the right answer, measurable only where the match succeeded. The LAST row is \\
+     what the deep guard would refuse -- one shared token AND a position that is not a preamble, \\
+     which is how DUKE ENERGY PROGRESS was matched to Duke Energy Carolinas at character 101,874."
   )
   invisible(out_)
 }
@@ -1464,14 +1543,34 @@ ent_report_window_table <- function(.tab, .title = "All documents") {
   }
 
   cli::cli_h2(paste0("Counterparties by window -- ", .title))
-  .tab |>
-    dplyr::mutate(PctAnyTailNew = tbl_pct(.data$PctAnyTailNew)) |>
-    tbl_say(.title = "Mean counterparties per document, and the unadjusted count beside them")
+  tbl_say(.tab = .tab, .title = "Mean counterparties per document, against the unadjusted count")
 
   cli::cli_alert_info(
     "UNADJUSTED is every distinct organisation the contract names anywhere -- the count this rule \\
      replaces, and the only honest thing to read the window columns against. The published figure it \\
-     supersedes is a mean of 2.94 partners per contract, which counted MENTIONS across two engines."
+     supersedes is a mean of 2.94 partners per contract, which counted MENTIONS across two engines. \\
+     The GAP columns are reported rather than chosen: they track the fixed widths without beating \\
+     them."
+  )
+  invisible(.tab)
+}
+
+
+#' What each tail specification yields
+#' @param .tab Tibble from ent_table_tail().
+#' @return Invisibly .tab.
+ent_report_tail <- function(.tab) {
+  if (FALSE) .tab <- tab_tail
+
+  cli::cli_h2("The tail, by contract type")
+  .tab |>
+    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x))) |>
+    tbl_say(.title = "One block per tail width, the window held at the released value")
+
+  cli::cli_alert_info(
+    "The tail is CLAMPED past the window, so a name here is one the party's neighbourhood did not \\
+     carry. MeanTailNew rising faster than MedTailWidth means the tail is finding parties; rising in \\
+     step with it means the count is being produced by the width of the region."
   )
   invisible(.tab)
 }
@@ -1487,11 +1586,9 @@ ent_report_length <- function(.tab) {
   tbl_say(.tab = .tab, .title = "Whether the window has to scale")
 
   cli::cli_alert_info(
-    "The question this table settles: a fixed window rising steeply with length means long contracts \\
-     genuinely name more parties and a constant width truncates them; a fixed window flat across the \\
-     deciles while UNADJUSTED rises means the extra names are body prose the window is right to \\
-     exclude. The GAP column is the third possibility -- a per-document width taken from the \\
-     clustering rather than from a proxy for it."
+    "UNADJUSTED rising steeply while the fixed columns stay flat means the extra names in a long \\
+     contract are body prose the window is right to exclude, and the width does not need to scale. \\
+     A fixed column rising in step with UNADJUSTED would mean the opposite."
   )
   invisible(.tab)
 }
@@ -1509,10 +1606,10 @@ ent_report_sweep_match <- function(.tab) {
     tbl_say(.title = "Each row differs from the base row in exactly one parameter")
 
   cli::cli_alert_info(
-    "MeanCounter barely moves across these rows and should not: the match decides WHICH entity \\
-     anchors the window, not how many names fall inside it. What to read is PctMatched against \\
-     PctDeep -- an arm that raises the first while raising the second is buying documents by \\
-     anchoring on a mention that is not a preamble."
+    "MeanCounter barely moves and should not: the match decides WHICH entity anchors the window, not \\
+     how many names fall inside it. Read PctMatched against PctDeepFamily -- an arm that raises the \\
+     first while raising the second is buying documents by anchoring on a mention that is not a \\
+     preamble, and the deep-guard row is what that costs to refuse."
   )
   invisible(.tab)
 }
@@ -1539,8 +1636,8 @@ ent_report_terms <- function(.tab, .n = 25L) {
     "PctFiler is why no threshold is set here: a name in many documents AND matching the filer in \\
      most of them is a large registrant, one in many and matching in none is boilerplate, and a \\
      frequency cut cannot tell them apart. {tbl_pct(one_)} of these names reduce to a SINGLE TOKEN, \\
-     which is where the known noise sits -- WILMINGTON from a trust company, OHIO from \\
-     \"an Ohio corporation\" -- measured rather than removed."
+     which is where the known noise sits -- OHIO from \"an Ohio corporation\" -- measured rather \\
+     than removed."
   )
   invisible(.tab)
 }
@@ -1580,14 +1677,16 @@ ent_report_read <- function(.tab, .cols = c("CompanyName", "Party", "MatchKind",
 #' Every organisation of a few documents, with its role and the window bounds
 #' @param .tab Tibble from ent_read_entities().
 #' @param .counts Tibble from ent_counts().
+#' @param .title Character. Block title.
 #' @return Invisibly .tab.
-ent_report_entities <- function(.tab, .counts) {
+ent_report_entities <- function(.tab, .counts, .title = "Whole documents, read in order") {
   if (FALSE) {
     .tab    <- tab_read_ent
     .counts <- tab_counts
+    .title  <- "Whole documents, read in order"
   }
 
-  cli::cli_h2("Whole documents, read in order")
+  cli::cli_h2(.title)
   if (nrow(.tab) == 0L) {
     cli::cli_alert_warning("No entities to read.")
     return(invisible(.tab))
@@ -1622,28 +1721,33 @@ ent_report_entities <- function(.tab, .counts) {
 #' @param .rule List from ent_rule().
 #' @param .boundary Tibble from ent_boundary().
 #' @param .dist Tibble from ent_dist_profile().
+#' @param .gap Tibble from ent_gap_profile().
 #' @param .party Tibble from ent_locate_party().
 #' @param .where Tibble from ent_table_where().
 #' @param .win_all Tibble from ent_table_window() over all documents.
 #' @param .win_matched Tibble from ent_table_window() over matched documents.
 #' @param .win_first Tibble from ent_table_window() over fallback documents.
+#' @param .tail Tibble from ent_table_tail().
 #' @param .length Tibble from ent_table_length().
 #' @param .sweep Tibble from ent_sweep_match().
 #' @param .terms Tibble from ent_head_terms().
 #' @param .n_terms Integer. Rows of the frequency table shown.
 #' @return Invisibly NULL.
-ent_report_all_org <- function(.keys, .rule, .boundary, .dist, .party, .where, .win_all,
-                               .win_matched, .win_first, .length, .sweep, .terms, .n_terms = 25L) {
+ent_report_all_org <- function(.keys, .rule, .boundary, .dist, .gap, .party, .where, .win_all,
+                               .win_matched, .win_first, .tail, .length, .sweep, .terms,
+                               .n_terms = 25L) {
   if (FALSE) {
     .keys        <- tab_keys
     .rule        <- .lP$Params$Rule
     .boundary    <- tab_boundary
     .dist        <- tab_dist
+    .gap         <- tab_gap
     .party       <- tab_party
     .where       <- tab_where
     .win_all     <- tab_win_all
     .win_matched <- tab_win_matched
     .win_first   <- tab_win_first
+    .tail        <- tab_tail
     .length      <- tab_length
     .sweep       <- tab_sweep_match
     .terms       <- tab_terms
@@ -1652,12 +1756,13 @@ ent_report_all_org <- function(.keys, .rule, .boundary, .dist, .party, .where, .
 
   ent_report_keys(.tab = .keys, .rule = .rule)
   ent_report_boundary(.tab = .boundary)
-  ent_report_dist(.tab = .dist)
+  ent_report_dist(.dist = .dist, .gap = .gap)
   ent_report_match(.tab = .party)
   ent_report_where(.tab = .where)
   ent_report_window_table(.tab = .win_all,     .title = "All documents")
   ent_report_window_table(.tab = .win_matched, .title = "Matched parties only")
   ent_report_window_table(.tab = .win_first,   .title = "Fallback parties only")
+  ent_report_tail(.tab = .tail)
   ent_report_length(.tab = .length)
   ent_report_sweep_match(.tab = .sweep)
   ent_report_terms(.tab = .terms, .n = .n_terms)
@@ -1666,7 +1771,6 @@ ent_report_all_org <- function(.keys, .rule, .boundary, .dist, .party, .where, .
 
 
 # 11. Figures --------------------------------------------------------------------------------------------------------
-# No titles inside these functions: the caption carries them.
 
 #' Density of organisation spans across relative position
 #' @param .tab Tibble from ent_density().
@@ -1727,7 +1831,7 @@ ent_plot_window <- function(.tab) {
 }
 
 
-#' The rule against the unadjusted count, by contract type
+#' The rule against the count it replaces, by contract type
 #' @param .tab Tibble from ent_counts().
 #' @return A ggplot object.
 ent_plot_baseline <- function(.tab) {

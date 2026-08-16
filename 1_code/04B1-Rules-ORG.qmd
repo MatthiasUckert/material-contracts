@@ -1,0 +1,754 @@
+---
+title: "Entity Rules -- The Contracting Party and its Counterparties (04B1)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120) # plain ASCII; ANSI codes paste as garbage
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+```{r}
+#| label: load-libraries
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_NER.R", encoding = "UTF-8")
+
+# ORDER IS LOAD-BEARING. _Store.R supersedes ner_db_init(), ner_db_append() and ner_db_clear() in
+# _NER.R and must be sourced after it. This document only reads, but it reads the per-label `org`
+# table rather than the `candidates` view, and the schema those extra columns live in is declared
+# there.
+source("1_code/_Commons/_Store.R", encoding = "UTF-8")
+
+# The shared design layer, sourced before anything that draws or prints. ORDER IS LOAD-BEARING here
+# too: the level registry is rebuilt empty every time _Plots.R is sourced, so a library registering a
+# vocabulary has to be sourced after it.
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# What every 04B document shares: the name reduction, the store loader, the span reader, the offset
+# check and the table shapes. Sourced after _Tables.R because it prints through tbl_say().
+source("1_code/_Commons/_Entity.R", encoding = "UTF-8")
+
+# 03A owns the contract-type vocabulary and the fixed-width console formatter every document in the
+# monorepo reports through; 04A owns the sample, the canonical text and the candidate store.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
+  .f = function(.s) {
+    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+           encoding = "UTF-8")
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/04B1-Rules-ORG.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+04A ran nine extractors over 4,398 hand-classified contracts and stored several million candidate
+spans. It ranked none of them, because ranking needs labels and there are no entity labels. 04B
+writes the rules, **one document per entity**, and this is the first: organisations, because every
+other party quantity -- the jurisdiction, the address, the signing date -- is measured from where an
+organisation was found.
+
+Shared tooling lives in `_Commons/_Entity.R`. Everything in this document's function file is a rule,
+and rules belong to one entity.
+
+## One engine, and why that decides the rest
+
+04C extracts the corpus with five engines and none of them is spaCy. For organisations that leaves
+LexNLP alone, which emits 81,467 spans against spaCy's 5.3 million. The whole rule therefore runs in
+R over a table that fits in memory, and DuckDB is read once.
+
+## The rule, in one paragraph
+
+Reduce the registrant's recorded name and every candidate span to a common key. Match the two
+**anywhere in the document**; where nothing matches, take the first organisation the contract names
+and record that it was a guess. Cut a window of fixed width around wherever the party was found and
+call the other distinct names inside it counterparties. Take a tail from the end, clamped so it
+cannot reach back into the window, and call what it holds signatories. Report all of it against the
+**unadjusted** count -- every distinct organisation named anywhere -- which is the quantity this
+replaces.
+
+## Why there is no head
+
+An earlier design read a fixed head of the document and asked whether the filer was inside it.
+Sweeping that head across twenty settings showed the located share rising from 70.6% to 75.1% and the
+*late* share falling from 6.5% to 2.0%, the two summing to **77.1% in every single cell**. That is an
+identity, not a finding: the match runs on names and cannot depend on a region, so a wider head
+bought no filer and only relabelled one already found, while the candidate count doubled.
+
+## What measurement settled
+
+**The window does not scale with length.** Across length deciles the unadjusted count rises
+thirteenfold while a fixed window rises about twofold: the extra organisations a long contract names
+are body prose, not parties.
+
+**A gap window buys nothing over a fixed one.** Growing outward through clustered names until the
+first large gap returned the same mean counterparty count as a fixed width -- `gap 500` and
+`+/- 1,000` agreed to three decimals -- and never exceeded it in any length decile. The gap columns
+stay in the tables as the evidence, not as a candidate.
+
+**The tail is relative, not flat.** A flat 3,000-character tail is *wider on the median* than a 10%
+tail and finds a third fewer names, because a relative tail puts its width on the long agreements
+where the signature blocks with many parties actually are.
+
+**Span boundaries are tight enough to ignore.** Median overshoot past the resolved name is 5
+characters, P90 is 12, and 99.0% of spans contain their own name.
+
+**The deep-family guard stays off.** Of the ten matches it would refuse, six are the right corporate
+family -- Nielsen Holdings to The Nielsen Company, NewAlliance Bancshares to NewAlliance Bank --
+against four bad ones, and refusing sends all ten to a fallback that is right 71% of the time. It
+remains a swept row so the trade is visible rather than assumed.
+
+Open, and therefore swept: the released width, the tail share, and the fragment rule.
+
+## The point is to reduce noise, not to eliminate it
+
+No stoplist, no defined-term filter, no check that a tail name is in a signature block rather than an
+exhibit list. Two failure modes are accepted and flagged: a filer first named at character 50,000
+anchors a window there and is marked **deep**, and a document where nothing matches takes its first
+name as the party. The counterparty tables are reported separately for the two populations, because
+a count survives a wrong anchor better than a named party does.
+
+# Configuration
+
+```{r}
+#| label: configure-paths
+.lP <- list(
+  Input = list(
+    # 04A's canonical text. Every offset in this family indexes this file.
+    Text    = "2_output/04A-EntityExtract/sample_text.parquet",
+    # 04A's sample table: labels, folds, and the EDGAR facts the anchor is built from.
+    Anchors = "2_output/04A-EntityExtract/sample_anchors.parquet",
+    # 04A's candidate store, opened read-only.
+    Store   = "2_output/04A-EntityExtract/Store/EntityCandidates.duckdb"
+  ),
+  Output = list(
+    Roles = utils_file_path(.dir_main, "roles_org.parquet"), # one row per document per name
+    Party = utils_file_path(.dir_main, "party_org.parquet")  # one row per document
+  ),
+  Params = list(
+    Combo    = "lexnlp", # the only ORG engine 04C runs over the corpus
+    Extras   = c("NameCore", "LegalForm", "Description"), # the label's resolved columns
+    Bins     = 50L,      # bins across relative position in the density figure
+    TermsN   = 25L,      # names listed in the document-frequency block
+    ReadN    = 10L,      # spans read back in context
+    ReadDocs = 6L,       # documents read whole
+    ReadMax  = 12L,      # rows per document, so one table-heavy filing cannot fill the page
+    ReadCtx  = 200L,     # characters either side of a span
+    CheckN   = 500L,     # spans cut from the text and compared to what was stored
+    Bounds   = c(500, 1000, 2000, 4000, 10000), # half-widths the distance profile reports
+    Seed     = 42L       # fixed, so the same documents are read on every render
+  )
+)
+
+# THE MATCH IS ONE VALUE AND THE WINDOW IS ANOTHER, because the match is window-free: it decides
+# which entity anchors the window, never how many names fall inside it.
+.lP$Params$Rule <- ent_rule(
+  .key               = "core",  # the resolved name, which lexnlp fills on every span it emits
+  .min_key           = 2L,      # shortest key admitted for EQUALITY
+  .min_contain       = 5L,      # shortest key admitted for CONTAINMENT or family
+  .tight             = TRUE,    # also compare with spaces removed: UNITED AIRLINES = UNITED AIR LINES
+  .frag_min          = 10L,     # shortest fragment admitted as a reverse match
+  .frag_share        = 0.6,     # and it must cover this much of the recorded name
+  .fam_tokens        = 2L,      # leading tokens two keys must share to be one corporate family
+  .fam_share         = 0.5,     # and those tokens must be this much of the shorter key
+  .fam_df            = 0.005,   # or ONE token, if it opens a name in at most this share of documents
+  .deep              = 5000L,   # a match past this offset is flagged, not rejected
+  .exact_within      = 500,     # prefer an exact match this close behind a contaminated one
+  .guard_deep_family = FALSE    # off: reading found most of what it would refuse to be correct
+)
+
+# The window carried into the released artifacts. +/- 2,000 clears the P90 gap between adjacent names
+# reported below, which is the argument for it: a window narrower than that gap cuts a list of
+# parties in half, and the distance distribution itself has no elbow to pick a width from.
+.lP$Params$Spec <- ent_window_spec(
+  .kind           = "fixed", # constant characters either side of the party
+  .par            = 2000,    # half-width
+  .tail_share     = 0.10,    # tail as a share of the document, clamped past the window
+  .tail_floor     = 0,       # no absolute minimum; the flat alternative is swept separately
+  .drop_fragments = FALSE    # swept and NOT adopted; see the fragment block below
+)
+
+# The window sweep. Fixed widths bracket the gap arm, which is reported as evidence rather than
+# offered as a choice. The last row is the fragment rule at the released width.
+.lP$Params$Specs <- list(
+  ent_window_spec(.kind = "fixed", .par = 500,  .tail_share = 0.10),
+  ent_window_spec(.kind = "fixed", .par = 1000, .tail_share = 0.10),
+  ent_window_spec(.kind = "fixed", .par = 2000, .tail_share = 0.10),
+  ent_window_spec(.kind = "fixed", .par = 4000, .tail_share = 0.10),
+  ent_window_spec(.kind = "gap",   .par = 250,  .tail_share = 0.10),
+  ent_window_spec(.kind = "gap",   .par = 500,  .tail_share = 0.10),
+  ent_window_spec(.kind = "gap",   .par = 1000, .tail_share = 0.10),
+  ent_window_spec(.kind = "fixed", .par = 2000, .tail_share = 0.10, .drop_fragments = TRUE,
+                  .label = "+/- 2,000 no frag")
+)
+
+# The tail sweep. The window is held at the released width and only the tail moves, so the two
+# parameters are never read off the same table. The flat block is the control that settles relative
+# against absolute.
+.lP$Params$TailSpecs <- list(
+  ent_window_spec(.kind = "fixed", .par = 2000, .tail_share = 0.10, .tail_floor = 0,
+                  .label = "tail 10%"),
+  ent_window_spec(.kind = "fixed", .par = 2000, .tail_share = 0.20, .tail_floor = 0,
+                  .label = "tail 20%"),
+  ent_window_spec(.kind = "fixed", .par = 2000, .tail_share = 0,    .tail_floor = 3000,
+                  .label = "tail 3,000 flat")
+)
+
+fs::file_exists(unlist(.lP$Input))
+```
+
+Failing here rather than three chunks later is deliberate: a missing upstream artifact should stop
+the document where the path is declared.
+
+# Sample
+
+Both sides run through one reduction: strip EDGAR's conformed-name artifact, uppercase, an ampersand
+between spaces to `AND`, punctuation to space, whitespace collapsed, a leading connective dropped,
+trailing corporate suffixes stripped.
+
+The suffix list holds the **dotted forms as separate tokens** -- `L P`, `L L C`, `N V` -- because
+punctuation-to-space turns `WILLIAMS PARTNERS L.P.` into `WILLIAMS PARTNERS L P`, and a list holding
+only `LP` strips nothing. That demoted an exact pair to a family match, and partnerships and funds
+are common enough here that it is not an edge case.
+
+```{r}
+#| label: build-keys
+tab_keys <- ent_anchor_keys(
+  .path_anchors = .lP$Input$Anchors   # 04A's sample table, not the raw EDGAR metadata
+)
+
+ent_report_keys(
+  .tab  = tab_keys,
+  .rule = .lP$Params$Rule   # supplies the two floors, so the table reports what the rule will do
+)
+```
+
+```{r}
+#| label: load-lengths
+tab_lens <- ent_doc_lens(
+  .path_text = .lP$Input$Text   # the canonical text; length in code points, not bytes
+)
+```
+
+```{r}
+#| label: load-spans
+tab_spans <- ent_load_label(
+  .db_path = .lP$Input$Store,     # opened read-only; nothing here can write to 04A's artifact
+  .lens    = tab_lens,            # supplies document length, so an offset becomes a position
+  .label   = "org",
+  .combo   = .lP$Params$Combo,    # lexnlp, the only ORG engine the corpus pass carries
+  .extras  = .lP$Params$Extras,   # the resolved name and the legal form
+  .quiet   = FALSE
+) |>
+  dplyr::mutate(
+    # Both keys are built once, outside the rule: the reduction depends on no rule parameter, and
+    # rebuilding it per sweep cell would run the same strings through the same regex to produce the
+    # identical answer.
+    SpanKey = ent_norm_key(.x = .data$Span, .min = 1L),
+    CoreKey = ent_norm_key(.x = dplyr::coalesce(.data$NameCore, .data$Span), .min = 1L)
+  )
+```
+
+# Entities and the match
+
+Everything in this section is window-free, which is what makes the window sweep affordable: the match
+is computed once and every window below is cut over the same result.
+
+Mentions of the same company collapse to one row per document per name, and that row is the
+**earliest mention taken whole**, so start, stop and span come from a single mention rather than from
+two. Single-token keys that appear as a token of a longer name in the *same* document are marked as
+fragments -- the bare `Railway` in a contract that also names `Florida East Coast Railway` -- which
+needs no vocabulary and no threshold, and is applied only if the window says so.
+
+```{r}
+#| label: apply-base-rule
+res_base <- ent_apply(
+  .spans = tab_spans,           # every lexnlp ORG span, with both candidate keys
+  .keys  = tab_keys,            # runs from the key side, so unmatched documents survive
+  .lens  = tab_lens,            # so a document with no organisation at all still carries a length
+  .rule  = .lP$Params$Rule,     # the match
+  .spec  = .lP$Params$Spec      # the window carried into the artifacts
+)
+
+tab_ent    <- res_base$Ent      # one row per document per distinct name, window-free
+tab_facts  <- res_base$Facts    # the same, with the comparison to the recorded name
+tab_party  <- res_base$Party    # one row per document
+tab_roles  <- res_base$Roles    # entities with the window, the tail and the assigned role
+tab_counts <- res_base$Counts   # one row per document, the counts and the bounds
+
+ent_report_match(.tab = tab_party)
+```
+
+A span matches when the two normalised forms are identical -- with or without spaces -- when one
+contains the other, or when they share a corporate prefix. **Forward** containment, the span holding
+the recorded name, is safe. **Reverse** containment means the span is a *fragment* and needs a floor:
+`G` sits inside `GEORGIA PACIFIC`, and an unfloored reverse arm inflates apparent recall rather than
+merely adding noise. **Family** reaches what the others cannot, and a single shared token is admitted
+only when it is distinctive, because `CHENIERE` is evidence and `NATIONAL` is not.
+
+```{r}
+#| label: measure-boundary
+tab_boundary <- ent_boundary(.tab = tab_ent)
+
+ent_report_boundary(
+  .tab  = tab_boundary,
+  .note = paste("Nothing in the party rule depends on a tight boundary. The geography rule assigns",
+                "a place to the NEAREST organisation, so its scale is the neighbour gap reported",
+                "below, and the overshoot has to be read against that.")
+)
+```
+
+```{r}
+#| label: measure-distances
+tab_dist <- ent_dist_profile(
+  .roles  = tab_roles,
+  .bounds = .lP$Params$Bounds   # the candidate half-widths, so the profile answers the same question
+)
+
+tab_gap <- ent_gap_profile(
+  .roles = tab_roles,
+  .bound = 4000                 # only names near the party; across a contract the gaps are prose
+)
+
+ent_report_dist(.dist = tab_dist, .gap = tab_gap)
+```
+
+# Where the party sits
+
+```{r}
+#| label: table-where
+tab_where <- ent_table_where(.counts = tab_counts)
+
+ent_report_where(.tab = tab_where)
+```
+
+# What the window yields
+
+Three populations of the same table. All documents is the released figure; the split says how much of
+it rests on a guessed anchor.
+
+```{r}
+#| label: sweep-windows
+tab_sweep_window <- ent_sweep_window(
+  .fact  = tab_facts,           # the match, computed once
+  .party = tab_party,           # the anchor every window is centred on
+  .specs = .lP$Params$Specs,    # eight specifications, re-cut over the same facts
+  .quiet = FALSE
+)
+```
+
+```{r}
+#| label: table-window-all
+tab_win_all <- ent_table_window(
+  .sweep  = tab_sweep_window,
+  .counts = tab_counts,         # supplies the unadjusted baseline
+  .status = "all"               # every document, however its party was found
+)
+
+ent_report_window_table(.tab = tab_win_all, .title = "All documents")
+```
+
+```{r}
+#| label: table-window-matched
+tab_win_matched <- ent_table_window(
+  .sweep  = tab_sweep_window,
+  .counts = tab_counts,
+  .status = "matched"           # the party matched the registrant's recorded name
+)
+
+ent_report_window_table(.tab = tab_win_matched, .title = "Matched parties only")
+```
+
+```{r}
+#| label: table-window-first
+tab_win_first <- ent_table_window(
+  .sweep  = tab_sweep_window,
+  .counts = tab_counts,
+  .status = "first"             # the first name in the document was taken instead
+)
+
+ent_report_window_table(.tab = tab_win_first, .title = "Fallback parties only")
+```
+
+```{r}
+#| label: table-window-length
+tab_length <- ent_table_length(.sweep = tab_sweep_window)
+
+ent_report_length(.tab = tab_length)
+```
+
+# What the tail yields
+
+```{r}
+#| label: sweep-tail
+tab_sweep_tail <- ent_sweep_window(
+  .fact  = tab_facts,
+  .party = tab_party,
+  .specs = .lP$Params$TailSpecs,  # window held at the released width, only the tail moves
+  .quiet = FALSE
+)
+
+tab_tail <- ent_table_tail(.sweep = tab_sweep_tail)
+
+ent_report_tail(.tab = tab_tail)
+```
+
+# Selection
+
+```{r}
+#| label: sweep-match
+tab_sweep_match <- ent_sweep_match(
+  .spans = tab_spans,
+  .keys  = tab_keys,
+  .lens  = tab_lens,
+  .base  = .lP$Params$Rule,     # every row differs from this in exactly one parameter
+  .spec  = .lP$Params$Spec,     # held fixed, so only the match moves
+  .quiet = FALSE
+)
+
+ent_report_sweep_match(.tab = tab_sweep_match)
+```
+
+```{r}
+#| label: inspect-terms
+tab_terms <- ent_window_terms(
+  .roles  = tab_roles,        # the names inside the window, with the role assigned to them
+  .n_docs = nrow(tab_keys)    # the whole sample, so the share is comparable across sections
+)
+
+ent_report_terms(.tab = tab_terms, .n = .lP$Params$TermsN)
+```
+
+# Reading
+
+Every table above is equally consistent with a chosen span being a preamble party and with it being
+a letterhead, a page footer or a defined term. The text is what separates them, so a fixed sample is
+read on every render.
+
+```{r}
+#| label: read-matched
+ent_read_spans(
+  .tab       = dplyr::filter(tab_party, .data$Status == "matched"),
+  .path_text = .lP$Input$Text,        # the same canonical text the offsets index
+  .col_start = "PartyStart",
+  .col_stop  = "PartyStop",
+  .n         = .lP$Params$ReadN,      # documents drawn
+  .ctx       = .lP$Params$ReadCtx,    # characters either side of the span
+  .seed      = .lP$Params$Seed        # fixed, so a change here is a change in the extraction
+) |>
+  ent_report_read(
+    .cols  = c("CompanyName", "Party", "MatchKind", "PartyStart"),
+    .title = "Matched parties in context"
+  )
+```
+
+```{r}
+#| label: read-family-deep
+ent_read_spans(
+  .tab       = dplyr::filter(tab_party, .data$MatchKind == "family", .data$MatchTok == 1L,
+                             .data$IsDeep),
+  .path_text = .lP$Input$Text,
+  .col_start = "PartyStart",
+  .col_stop  = "PartyStop",
+  .n         = 10L,                   # exactly what the deep guard would refuse, and does not
+  .ctx       = .lP$Params$ReadCtx,
+  .seed      = .lP$Params$Seed
+) |>
+  ent_report_read(
+    .cols  = c("CompanyName", "Party", "PartyKey", "PartyStart"),
+    .title = "One shared token AND a deep anchor -- what the guard would refuse"
+  )
+```
+
+This block is why the guard is off. Most of these are the right corporate family found somewhere
+other than a preamble, and refusing them sends the document to a fallback that is wrong more often
+than they are.
+
+```{r}
+#| label: read-fallback
+ent_read_spans(
+  .tab       = dplyr::filter(tab_party, .data$Status == "first"),
+  .path_text = .lP$Input$Text,
+  .col_start = "PartyStart",
+  .col_stop  = "PartyStop",
+  .n         = 8L,                    # the guess, read as a guess
+  .ctx       = .lP$Params$ReadCtx,
+  .seed      = .lP$Params$Seed
+) |>
+  ent_report_read(
+    .cols  = c("CompanyName", "Party", "Status", "PartyStart"),
+    .title = "Documents where the first name was taken instead"
+  )
+```
+
+```{r}
+#| label: read-documents
+ent_read_entities(
+  .roles = tab_roles,
+  .keys  = tab_keys,
+  .docs  = NULL,                  # drawn from the whole sample
+  .n     = .lP$Params$ReadDocs,
+  .max   = .lP$Params$ReadMax,
+  .seed  = .lP$Params$Seed
+) |>
+  ent_report_entities(.counts = tab_counts)
+```
+
+```{r}
+#| label: read-jumps
+# The documents whose count actually moves between the two candidate widths, rather than a random
+# draw from the class where the mean moved. A random draw mostly returns documents that did not move,
+# which is what made the Employment: Compensation anomaly unreadable last time.
+ent_read_entities(
+  .roles = tab_roles,
+  .keys  = tab_keys,
+  .docs  = ent_jump_docs(
+    .sweep = tab_sweep_window,
+    .from  = "+/- 1,000",
+    .to    = "+/- 2,000",
+    .col   = "NCounter",
+    .min   = 3L                   # a jump of three or more names between the two widths
+  ),
+  .n     = 5L,
+  .max   = .lP$Params$ReadMax,
+  .seed  = .lP$Params$Seed
+) |>
+  ent_report_entities(
+    .counts = tab_counts,
+    .title  = "Documents where widening from 1,000 to 2,000 adds three or more names"
+  )
+```
+
+```{r}
+#| label: read-late-exact
+# The party the rule chose, in documents where an EXACT match sits further on. LexNLP prepends a
+# document title to the first mention -- "Grant Date, Hubbell", "SECOND AMENDMENT TO AGILYSYS" --
+# and position-first then releases that as the party name while the clean name follows.
+ent_read_spans(
+  .tab       = dplyr::filter(tab_party, .data$HasLateExact),
+  .path_text = .lP$Input$Text,
+  .col_start = "PartyStart",
+  .col_stop  = "PartyStop",
+  .n         = 8L,
+  .ctx       = .lP$Params$ReadCtx,
+  .seed      = .lP$Params$Seed
+) |>
+  ent_report_read(
+    .cols  = c("CompanyName", "Party", "MatchKind", "PartyStart", "ExactName", "ExactGap"),
+    .title = "Chosen party, where an exact match sits further on"
+  )
+```
+
+```{r}
+#| label: read-fragments
+# The fragment rule, read rather than trusted. It is NOT adopted: PctFrag in the terms table shows
+# it marking BOEING at 76% and CITIBANK at 67% -- parents sharing a token with their own
+# subsidiaries -- while OHIO and ILLINOIS, the noise it was aimed at, sit under 10%. Containment
+# cannot separate a fragment from a corporate parent, and the block below is why.
+ent_read_entities(
+  .roles = tab_roles,
+  .keys  = tab_keys,
+  .docs  = unique(tab_roles$DocID[tab_roles$IsFragment & tab_roles$Role == "counterparty"]),
+  .n     = 5L,
+  .max   = .lP$Params$ReadMax,
+  .seed  = .lP$Params$Seed
+) |>
+  ent_report_entities(
+    .counts = tab_counts,
+    .title  = "Documents carrying a single-token fragment of a longer name"
+  )
+```
+
+# Validation
+
+```{r}
+#| label: validate-offsets
+# AN EQUALITY, NOT A CONTAINMENT. Asking whether the span appears somewhere inside the slice is
+# answered YES more easily the wider the slice runs. The slice must BE the span.
+tab_check <- ent_verify_span(
+  .tab       = tab_party,
+  .path_text = .lP$Input$Text,
+  .col_start = "PartyStart",
+  .col_stop  = "PartyStop",
+  .col_span  = "PartySpan",           # the span as stored, not the whitespace-collapsed name
+  .n         = .lP$Params$CheckN,
+  .seed      = .lP$Params$Seed
+)
+
+tibble::tibble(
+  Check = c(
+    "Text cut at the stored offsets equals the stored span",
+    "Party offsets at or after character zero",
+    "Documents carrying exactly one row",
+    "Window contains the party it is centred on",
+    "Tail begins at or after the window ends",
+    "Roles partition the entities",
+    "Tail width reported wherever a tail exists",
+    "Fragments are single-token by construction"
+  ),
+  N = c(
+    sum(tab_check$Exact),
+    sum(tab_party$PartyStart >= 0L, na.rm = TRUE),
+    dplyr::n_distinct(tab_party$DocID),
+    sum(tab_counts$WinStart <= tab_counts$PartyStart &
+          tab_counts$WinEnd >= tab_counts$PartyStart, na.rm = TRUE),
+    sum(tab_counts$TailStart >= tab_counts$WinEnd, na.rm = TRUE),
+    sum(tab_counts$NFull >= tab_counts$NCounter + tab_counts$NFragment +
+          tab_counts$NTailNew + tab_counts$NOther),
+    sum(!is.na(tab_counts$TailWidth[tab_counts$HasTail])),
+    sum(tab_roles$NTok[tab_roles$IsFragment] == 1L)
+  ),
+  Of = c(
+    nrow(tab_check),
+    sum(!is.na(tab_party$PartyStart)),
+    nrow(tab_party),
+    sum(!is.na(tab_counts$WinStart)),
+    sum(!is.na(tab_counts$WinEnd)),
+    nrow(tab_counts),
+    sum(tab_counts$HasTail),
+    sum(tab_roles$IsFragment)
+  )
+) |>
+  dplyr::mutate(Share = tbl_pct(.data$N / .data$Of)) |>
+  tbl_say(.title = "Every row is expected at 100%")
+```
+
+The first row is the offset discipline: Python emits code-point offsets, and any R operation reaching
+for `substr` rather than `stri_sub` would index bytes with no error raised anywhere. It is also the
+check that an entity's offsets came from one mention rather than two.
+
+# Deployment
+
+```{r}
+#| label: write-artifacts
+arrow::write_parquet(tab_roles, .lP$Output$Roles)
+arrow::write_parquet(tab_counts, .lP$Output$Party)
+
+tibble::tibble(
+  Artifact = c("Organisations with roles and window flags, per document per name",
+               "Party, window bounds and counts, per document"),
+  Path     = c(.lP$Output$Roles, .lP$Output$Party)
+) |>
+  dplyr::mutate(
+    Exists = fs::file_exists(.data$Path),
+    MB     = round(as.numeric(fs::file_size(.data$Path)) / 1024^2, 1),
+    Path   = fs::path_file(.data$Path)
+  ) |>
+  tbl_say(.title = "Written by 04B1")
+```
+
+`roles_org.parquet` is what the geography document reads: every organisation with its position and
+its role, so a place can be attached to the nearest one and the role looked up rather than
+re-derived. Both artifacts carry every document, not only the matched ones, and both carry the
+unadjusted count beside the rule's.
+
+# Overview
+
+```{r}
+#| label: fig-density
+#| fig-height: !expr plot_height(6L)
+#| fig-cap: "Share of LexNLP organisation spans by relative position in the document, weighted by
+#|   spans and by documents. No cutoff is drawn, because this version has no region rule: the shape
+#|   describes the engine, and the window is centred on the party rather than on the page."
+ent_plot_density(.tab = ent_density(.spans = tab_spans, .bins = .lP$Params$Bins))
+```
+
+```{r}
+#| label: fig-party-status
+#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")))
+#| fig-cap: "How the contracting party was found, by contract type, as shares within each type. The
+#|   middle segment is the fallback -- the first name in the document, taken because none matched the
+#|   registrant -- and the counterparty tables report it separately for that reason."
+ent_plot_status(.tab = tab_counts)
+```
+
+```{r}
+#| label: fig-window
+#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")))
+#| fig-cap: "Mean counterparties per document by contract type and window specification. The gap
+#|   columns are reported as evidence rather than offered as a choice: they track the fixed widths
+#|   without beating them."
+ent_plot_window(.tab = tab_sweep_window)
+```
+
+```{r}
+#| label: fig-baseline
+#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")))
+#| fig-cap: "The rule against the count it replaces. Each bar is the mean number of distinct
+#|   organisations named anywhere in the contract, split into those the window keeps as
+#|   counterparties and those it removes."
+ent_plot_baseline(.tab = tab_counts)
+```
+
+```{r}
+#| label: report-everything
+ent_report_all_org(
+  .keys        = tab_keys,
+  .rule        = .lP$Params$Rule,
+  .boundary    = tab_boundary,
+  .dist        = tab_dist,
+  .gap         = tab_gap,
+  .party       = tab_party,
+  .where       = tab_where,
+  .win_all     = tab_win_all,
+  .win_matched = tab_win_matched,
+  .win_first   = tab_win_first,
+  .tail        = tab_tail,
+  .length      = tab_length,
+  .sweep       = tab_sweep_match,
+  .terms       = tab_terms,
+  .n_terms     = .lP$Params$TermsN
+)
+```
+
+# Next
+
+04B2 resolves geography against the parties located here. Both engines are put on one hierarchy
+first -- LexNLP resolves jurisdictions and reaches no cities, the gazetteer reaches cities and
+resolves nothing in the store -- and then each place is attached to the nearest organisation in
+`roles_org.parquet`, carrying that organisation's role so every later cut is a filter rather than a
+rule. The three roles that adjacency separates -- state of incorporation, party location, governing
+law -- are named from the resulting table rather than declared in advance, and the filer's row is
+validated against the registered address EDGAR records.
+
+Dates, money and redactions follow as 04B3, 04B4 and 04B5, none of them anchored on a party.

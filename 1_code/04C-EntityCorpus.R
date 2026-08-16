@@ -649,7 +649,12 @@ ent_progress_step <- function(.progress, .n_new, .seconds) {
   }
 
   .progress$Chunk   <- .progress$Chunk + 1L
-  .progress$Docs    <- .progress$Docs + as.integer(.n_new)
+  # Coerced and guarded. A zero-length increment turns the accumulator into integer(0) and every
+  # arithmetic downstream inherits it silently, so the failure surfaces at whichever comparison
+  # touches it first rather than where the value came from.
+  n_new_ <- as.integer(.n_new)
+  if (length(n_new_) != 1L || is.na(n_new_)) n_new_ <- 0L
+  .progress$Docs    <- .progress$Docs + n_new_
   .progress$Seconds <- .progress$Seconds + as.numeric(.seconds)
 
   rate_  <- .progress$Docs / max(.progress$Seconds, 1e-9)
@@ -661,7 +666,7 @@ ent_progress_step <- function(.progress, .n_new, .seconds) {
     "[%s] chunk %d/%d | %s doc in %ds | %.1f doc/s | %s left | %.1fh | ETA %s",
     format(Sys.time(), "%H:%M:%S"),
     .progress$Chunk, .progress$NChunks,
-    format(as.integer(.n_new), big.mark = ","), round(as.numeric(.seconds)),
+    format(n_new_, big.mark = ","), round(as.numeric(.seconds)),
     rate_, format(left_, big.mark = ","), eta_h_, eta_at_
   )
 
@@ -706,7 +711,22 @@ ent_extract_corpus_chunk <- function(.chunk, .db_path, .run, .labels, .dir_work,
   t0_    <- Sys.time()
   docs_  <- ent_read_chunk(.chunk = .chunk)
   if (nrow(docs_) == 0L) {
-    return(invisible(tibble::tibble(nDocs = 0L, Seconds = 0)))
+    # THE SAME COLUMNS AS THE NORMAL RETURN, and the omission of nNew here cost a crash at the very
+    # end of the corpus pass. Every document in the final chunk was unreadable, this branch fired,
+    # the caller read out_$nNew as NULL, as.integer(NULL) gave integer(0), and the progress
+    # accumulator became zero-length -- which surfaced three lines later as "argument is of length
+    # zero" from a comparison that had nothing to do with the cause.
+    #
+    # A function with two exits owes them the same shape.
+    cli::cli_alert_warning(
+      "Every document in this chunk was unreadable or empty; nothing to extract. These stay \\
+       pending on every render, because a document that cannot be read cannot be recorded as done."
+    )
+    return(invisible(tibble::tibble(
+      nDocs   = 0L,
+      nNew    = 0L,
+      Seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+    )))
   }
 
   fs::dir_create(.dir_work)
