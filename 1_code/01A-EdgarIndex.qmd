@@ -1,0 +1,330 @@
+---
+title: "EDGAR Acquisition -- Index and Landing Pages (01A)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+```
+
+```{r}
+#| label: setup-sources
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # resolves to 1_code/01A-EdgarIndex.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+EDGAR publishes a quarterly master index listing every filing since 1993, and for each filing a landing page listing the
+documents attached to it. This document mirrors both locally and parses the landing HTML into a single table,
+`LandingPageAll.parquet`, holding twenty-one metadata fields per filing.
+
+No document is downloaded here. The landing pages say *what* each filing contains; fetching the contents is 01B, which
+reads the link tables mirrored below. The two are separate scripts because they fail differently and at different
+scales. The index is a few thousand files and completes in an afternoon. The documents are 1.8 million and took days,
+during which any interruption has to be recoverable without repeating what already succeeded.
+
+## Which filings are in scope
+
+Only a minority of EDGAR form types can carry a material contract. Mirroring the landing page of every filing would
+multiply the acquisition cost by roughly a factor of ten for filings that cannot contain the object of study, so the
+frame is restricted to seventeen types: the periodic reports, the current report that must disclose a material
+definitive agreement, the registration statements that attach material agreements as exhibits, each with its amendment
+variant, and the confidential-treatment order itself.
+
+Amendment variants are enumerated rather than matched by prefix. A pattern such as `^8-K` would also capture 8-K12B and
+8-K15D5, which are not current reports.
+
+The frame closes at 2024. This is a closure rule, not a data limit: EDGAR keeps publishing, so an open-ended frame would
+grow between renders and no two runs of the pipeline would describe the same corpus.
+
+## How the acquisition switch works
+
+Two steps here reach the SEC over the network, and both sit behind `.lP$Param$Acquire`, which defaults to `FALSE`. The
+*checks* never sit behind it. On every render this document computes how much of the selected frame has been mirrored
+and reports the shortfall, whether or not it fetched anything.
+
+The distinction matters. An earlier version of this pipeline gated the work and the diagnostic together behind a single
+flag, which meant a document with a badly incomplete mirror rendered exactly like a complete one: no error, no warning,
+and a coverage figure that was never computed. Gating only the network call costs one parquet scan per render and makes
+the state of the mirror a reported result rather than an assumption.
+
+## Where the mirror lives
+
+The mirror is `0_edgar/`, not `2_output/`. It is a local copy of somebody else's data rather than something this script
+derived, and it is shared: 01B writes its third subtree. Keeping it outside the per-script output directories means
+neither script writes into the other's, and the single-writer rule holds at the level it should -- 01A owns
+`MasterIndex/` and `DocumentLinks/`, 01B owns `DocumentData/`.
+
+# Configuration
+
+```{r}
+#| label: config
+.lP <- list(
+  Input = list(
+    Edgar = here::here("0_edgar")                                        # the local EDGAR mirror
+  ),
+  Cache = list(
+    RawExtract = utils_file_path(.dir_main, "Cache", "RawExtract")       # one parsed table per year-quarter
+  ),
+  Output = list(
+    LandingPageAll = utils_file_path(.dir_main, "LandingPageAll.parquet"),   # the one downstream artifact
+    Figures        = utils_file_path(.dir_main, "Figures")                   # figure files for the manuscript
+  ),
+  Param = list(
+    User    = "Matthias.Uckert@Outlook.com",   # SEC requires a contact address on every request
+    Forms   = edg_sec_forms(),                 # the seventeen types in scope
+    MaxYear = 2024L,                           # frame closure; fixed so renders are comparable
+    Workers = 10L,                             # parallel workers for landing-page parsing
+    Acquire = FALSE                            # TRUE permits the two network steps to run
+  )
+)
+
+# rGetEDGAR derives its whole directory tree from one root, and creates what is missing. Calling it
+# here rather than typing the subpaths means the layout cannot drift from what the package expects.
+.lP$Edgar <- rGetEDGAR::get_directories(fs::dir_create(.lP$Input$Edgar))
+
+fs::dir_exists(.lP$Input$Edgar)
+```
+
+`rGetEDGAR` is installed from `0_data/Binaries/` and is not on CRAN. If the call above fails, the package is missing from
+the project library rather than the path being wrong.
+
+# Index
+
+The master index is the population. The frame is the subset of it that needs a landing page: the seventeen form types,
+up to the closing year, deduplicated on `HashIndex`.
+
+```{r}
+#| label: index-select
+vec_hash_index <- edg_select_index(
+  .dir_master = .lP$Edgar$MasterIndex$DirParquet,   # mirrored master index
+  .forms      = .lP$Param$Forms,                    # the seventeen types in scope
+  .max_year   = .lP$Param$MaxYear                   # frame closure year
+)
+
+length(vec_hash_index)
+```
+
+# Acquisition
+
+Both chunks below are gated. Each reports what it did or did not do, so the render is a record either way.
+
+The master index comes first because everything else is selected from it.
+
+```{r}
+#| label: acquire-master-index
+if (isTRUE(.lP$Param$Acquire)) {
+  rGetEDGAR::edgar_get_master_index(
+    .dir     = .lP$Input$Edgar,      # mirror root; the package derives MasterIndex/ from it
+    .user    = .lP$Param$User,       # contact address sent with every request
+    .from    = NULL,                 # NULL starts at the earliest quarter EDGAR publishes
+    .to      = NULL,                 # NULL runs to the latest available
+    .verbose = TRUE                  # stream progress
+  )
+} else {
+  cli::cli_alert_info("Acquisition is OFF: the master index was not refreshed.")
+}
+```
+
+Landing pages and document links arrive from the same request. Ten requests per second is the SEC's published fair-access
+ceiling and the package enforces it, so this step is bounded by the SEC rather than by local hardware.
+
+```{r}
+#| label: acquire-document-links
+if (isTRUE(.lP$Param$Acquire)) {
+  rGetEDGAR::edgar_get_document_links(
+    .dir      = .lP$Input$Edgar,     # mirror root; the package derives DocumentLinks/ from it
+    .user     = .lP$Param$User,      # contact address sent with every request
+    .hash_idx = vec_hash_index,      # the frame selected above
+    .verbose  = TRUE                 # stream progress
+  )
+  invisible(gc())
+} else {
+  cli::cli_alert_info("Acquisition is OFF: no landing pages were fetched.")
+}
+```
+
+Coverage of the frame, computed on every render regardless of the switch.
+
+```{r}
+#| label: report-mirror-coverage
+edg_report_links(
+  .dir_master = .lP$Edgar$MasterIndex$DirParquet,      # the population
+  .forms      = .lP$Param$Forms,                       # the seventeen types in scope
+  .max_year   = .lP$Param$MaxYear,                     # frame closure year
+  .path_htmls = .lP$Edgar$DocLinks$DirMain$HTMLs,      # mirrored landing pages
+  .path_links = .lP$Edgar$DocLinks$DirMain$Links,      # mirrored link tables
+  .acquire    = .lP$Param$Acquire                      # reported, so a gap and a switch are distinguishable
+)
+```
+
+A small residue of missing index files is expected and tolerated. These are filings whose landing page EDGAR no longer
+serves, and they are lost to any method, not to this one.
+
+# Landing pages
+
+Parsing is local work on already-mirrored bytes, so it is not gated. It runs on every render and does nothing when
+there is nothing new, because it inspects its own output first: each year-quarter has one file, the function reads the
+`HashIndex` values already in it, and parses only the rest.
+
+That idempotence is what buys the ungated call. A step that is cheap when complete does not need a switch, and a step
+without a switch cannot be left switched off.
+
+```{r}
+#| label: parse-landing-pages
+tab_parse_log <- edg_parse_landing(
+  .path_htmls = .lP$Edgar$DocLinks$DirMain$HTMLs,   # mirrored landing pages, one dataset per quarter
+  .dir_raw    = .lP$Cache$RawExtract,               # destination for the per-quarter parsed tables
+  .workers    = .lP$Param$Workers,                  # parallel workers; also the chunk count per quarter
+  .quiet      = FALSE                               # FALSE reports each quarter as it is processed
+)
+
+sum(tab_parse_log$nParsed)
+```
+
+Everything arrives from the HTML as character, because that is what the page contains. Cleaning converts types once,
+centrally, so no downstream script has to decide whether `FilingDate` is a date or a string, and turns the empty strings
+that unpopulated cells produce into genuine missing values. Left alone, an empty string counts as a present observation
+in every summary and joins as a real key.
+
+Rows whose parse failed are dropped here but retained in the per-quarter cache, so the failure rate stays computable
+from the two together.
+
+```{r}
+#| label: clean-landing-pages
+tab_landing <- edg_clean_landing(
+  .dir_raw  = .lP$Cache$RawExtract,        # per-quarter parsed tables
+  .path_out = .lP$Output$LandingPageAll    # the cleaned table downstream reads
+)
+
+nrow(tab_landing)
+```
+
+# Results
+
+```{r}
+#| label: report-landing
+edg_report_landing(.tab = tab_landing)
+```
+
+Report date is absent on a large share of filings by design: 8-K is a current report and covers no period. Filing date
+is different -- it should never be missing, and a nonzero share in that column is a parse failure rather than a
+property of the form.
+
+# Validation
+
+Two consistency checks between what was parsed and what survived cleaning. The prediction in each case is zero, and a
+nonzero result names a specific fault rather than a general concern.
+
+```{r}
+#| label: validate-landing
+# Every quarter that has mirrored HTML should have a parsed table, and the parsed rows should
+# account for every HashIndex the cleaning step kept. A shortfall in the first is an interrupted
+# parse; in the second, a duplicate HashIndex across quarters.
+tibble::tibble(
+  QuartersWithHtml   = nrow(tab_parse_log),
+  QuartersParsed     = sum(tab_parse_log$nTotal > 0L),
+  RowsParsed         = sum(tab_parse_log$nTotal),
+  RowsKept           = nrow(tab_landing),
+  DuplicateHashIndex = sum(duplicated(tab_landing$HashIndex))
+) |>
+  tbl_out(.title = "Parse against clean")
+```
+
+`RowsKept` is below `RowsParsed` by exactly the number of parse failures, which are excluded by the `Error == 0` filter.
+`DuplicateHashIndex` should be zero: the hash identifies a filing, and a repeat means one filing was mirrored under two
+quarters.
+
+# Deployment
+
+`LandingPageAll.parquet` is written by the cleaning step above and is the only artifact of this script that anything
+downstream reads. 01B selects documents from it; 01C filters it to the filings whose documents were actually retrieved
+and publishes that as `LandingPage.parquet`.
+
+The two are deliberately separate files rather than one file filtered in place. The unfiltered version is the
+denominator for every coverage statement made later, and a pipeline that overwrites its own denominator cannot report
+how much it lost.
+
+```{r}
+#| label: deploy-report
+fs::file_info(.lP$Output$LandingPageAll) |>
+  dplyr::select("path", "size") |>
+  tbl_out(.title = "Written")
+```
+
+# Overview
+
+```{r}
+#| label: fig-coverage-by-year
+#| fig-height: 3.4
+#| fig-cap: "Filings mirrored per calendar year. The frame closes in 2024, so the final year is
+#|   partial by construction rather than by attrition."
+gg_coverage <- edg_plot_coverage(.tab = edg_landing_coverage(.tab = tab_landing))
+
+plot_save(
+  .plot    = gg_coverage,               # the figure
+  .name    = "coverage-by-year",        # meaningful filename, not unnamed-chunk-N
+  .dir     = .lP$Output$Figures,        # figure destination
+  .height  = 3.4,                       # from the ladder: a time series is a low panel
+  .width   = 7.5,                       # the fixed project width
+  .formats = c("pdf", "png"),           # manuscript and web
+  .dpi     = 300                        # print resolution
+)
+
+gg_coverage
+```
+
+```{r}
+#| label: overview-all
+edg_report_all(
+  .lp  = .lP,            # configuration, so the reporters resolve their own paths
+  .tab = tab_landing     # the cleaned landing table
+)
+```
+
+# Next
+
+**01B-EdgarDocuments** reads the link tables mirrored here together with `LandingPageAll.parquet`, selects the Exhibit-10
+exhibits, CT orders and Item 1.01 8-Ks, downloads and parses them into `0_edgar/DocumentData/Parsed/`, and writes the
+`DocID` to `Path` index every later script uses to locate a document's text.
