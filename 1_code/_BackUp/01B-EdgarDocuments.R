@@ -11,17 +11,12 @@
 # mode: this script is network-bound and must survive interruption; 01C is local, cheap, and re-runs
 # from scratch in minutes.
 #
-# THIS SCRIPT WRITES ONLY INSIDE ITS OWN OUTPUT DIRECTORY
-# rGetEDGAR resolves link tables and downloaded documents from a single root: it reads
-# <root>/DocLinks/ and writes <root>/DocumentData/. Handing it 01A's root would put a million
-# documents inside 01A's directory, which is not this script's to write in.
-#
-# So 01B keeps its own root and stages the link tables into it first. The staged copy is a cache
-# derived from 01A's output, refreshed when 01A's differs, and it exists because the package's API
-# requires links and documents to share a parent -- not because two scripts need the same data.
-# The alternative, writing into a directory another script owns, trades a regenerable duplicate for
-# an ownership rule, which is the wrong way round: the duplicate can be rebuilt from one command
-# and the rule cannot be reinstated once the pipeline is built around breaking it.
+# WHERE THE DOCUMENTS LAND
+# rGetEDGAR resolves link tables and downloaded documents from a single root, so the documents are
+# written into the mirror 01A established rather than into this script's own output directory.
+# Duplicating three hundred megabytes of link tables to obtain a second root would buy nothing.
+# Ownership stays unambiguous: 01A writes MasterIndex/ and DocLinks/, 01B writes DocumentData/, and
+# no artifact has two writers. This script's own directory holds the index.
 #
 # THE PARSED TREE IS THE ONLY COPY
 # Documents are fetched with .keep_orig = FALSE, which discards the original bytes once parsing
@@ -147,72 +142,6 @@ edg_hash_with_item <- function(.path_landing, .item, .fixed = TRUE) {
     dplyr::distinct(.data$HashIndex) |>
     dplyr::collect() |>
     dplyr::pull(.data$HashIndex)
-}
-
-
-# 1b. Staging ----------------------------------------------------------------------------------------------------------
-
-#' Stage 01A's link tables into this script's own mirror root
-#'
-#' rGetEDGAR reads link tables and writes documents under one root, so downloading into this
-#' script's directory requires the links to be there too. This clones them, and nothing else: the
-#' master index is not staged because nothing here reads it.
-#'
-#' A CACHE, NOT A SECOND SOURCE. 01A remains the sole writer of the link tables. What sits here is a
-#' copy refreshed whenever the original differs, and deleting it costs one re-run of this chunk.
-#' Naming it a cache rather than an input is the honest description: no decision in this pipeline is
-#' ever made from this copy that would not be made identically from 01A's.
-#'
-#' REFRESHED BY NAME AND SIZE, NOT BY TIMESTAMP. A clone shares data blocks with its source, so its
-#' modification time says nothing useful about whether the contents still agree. Comparing the file
-#' names and byte sizes answers the question directly and costs one directory listing of each side.
-#'
-#' On a copy-on-write filesystem the clone is instantaneous and consumes no additional space.
-#' Elsewhere it is a real copy of a few gigabytes, made once.
-#'
-#' @param .dir_src Directory of 01A's mirrored link tables.
-#' @param .dir_dst Directory of this script's staged copy.
-#' @param .quiet Logical. Suppress per-file progress.
-#' @return A one-row tibble: nSource, nStaged, nCopied, Bytes.
-edg_stage_links <- function(.dir_src, .dir_dst, .quiet = FALSE) {
-  if (FALSE) {
-    .dir_src <- .lP$Input$Links
-    .dir_dst <- .lP$Edgar$DocLinks$DirMain$Links
-    .quiet   <- FALSE
-  }
-
-  fs::dir_create(.dir_dst)
-
-  src_ <- fs::dir_info(.dir_src, type = "file") |>
-    dplyr::transmute(Name = fs::path_file(.data$path), Path = .data$path, Size = as.numeric(.data$size))
-  dst_ <- fs::dir_info(.dir_dst, type = "file") |>
-    dplyr::transmute(Name = fs::path_file(.data$path), SizeDst = as.numeric(.data$size))
-
-  todo_ <- src_ |>
-    dplyr::left_join(dst_, by = dplyr::join_by("Name")) |>
-    dplyr::filter(is.na(.data$SizeDst) | .data$SizeDst != .data$Size)
-
-  if (nrow(todo_) > 0L) {
-    if (!.quiet) cli::cli_alert_info("Staging {nrow(todo_)} link table{?s} into this script's mirror.")
-    purrr::walk(
-      .x = seq_len(nrow(todo_)),
-      .f = function(.i) {
-        dst_f_ <- fs::path(.dir_dst, todo_$Name[.i])
-        if (fs::file_exists(dst_f_)) fs::file_delete(dst_f_)
-        st_ <- system2("cp", c("-c", shQuote(todo_$Path[.i]), shQuote(dst_f_)))
-        if (!identical(st_, 0L)) cli::cli_abort("Staging failed for {todo_$Name[.i]}.")
-      }
-    )
-  } else if (!.quiet) {
-    cli::cli_alert_info("Link tables already staged.")
-  }
-
-  tibble::tibble(
-    nSource = nrow(src_),
-    nStaged = length(fs::dir_ls(.dir_dst, type = "file")),
-    nCopied = nrow(todo_),
-    Bytes   = sum(src_$Size)
-  )
 }
 
 

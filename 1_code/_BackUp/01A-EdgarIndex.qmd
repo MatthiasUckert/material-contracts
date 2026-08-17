@@ -363,27 +363,6 @@ fs::file_info(.lP$Output$LandingPageAll) |>
   tbl_out(.title = "Written")
 ```
 
-Every script in this pipeline writes inside its own output directory and nowhere else, and this checks that this one
-did. `rGetEDGAR` builds its whole tree from a single root, so resolving the mirror creates a `DocumentData/` branch
-alongside the two this script fills. That branch belongs to 01B, which keeps its own root.
-
-An empty directory there is harmless and is removed, so that a folder inspected after a render contains only what the
-script produced. Files there are not removed: a cleanup that deleted whatever it found would destroy the evidence in
-precisely the case worth investigating.
-
-```{r}
-#| label: deploy-own-output
-edg_check_own_output(
-  .dir_mirror = fs::path(.dir_main, "GetEDGAR"),        # this script's mirror root
-  .own        = c("MasterIndex", "DocumentLinks"),      # the branches this script fills
-  .cap        = 1000L                                   # stop counting past this; any nonzero is the finding
-) |>
-  tbl_out(
-    .title = "Own output",
-    .notes = c(Action = "A branch that is not empty and not owned means another script wrote into this one.")
-  )
-```
-
 # Overview
 
 ```{r}

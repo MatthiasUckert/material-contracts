@@ -1,0 +1,413 @@
+---
+title: "EDGAR Acquisition -- Document Metadata (01C)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+```
+
+```{r}
+#| label: setup-sources
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 01A owns the mirror layout; 01B owns the document index. Sourcing both rather than restating any
+# of it is what keeps the three in agreement.
+purrr::walk(
+  .x = c("01A-EdgarIndex", "01B-EdgarDocuments"),
+  .f = function(.s) {
+    source(
+      file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+      encoding = "UTF-8"
+    )
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # resolves to 1_code/01C-EdgarMetaData.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+01B put the documents on disk and indexed them. This is the first script that opens them.
+
+It measures every document, decides which are too damaged to analyse, restricts the upstream metadata to the filings
+that survived, and joins everything into `FullMetaData.parquet` -- the single table that 02, 03 and 04 read. Everything
+the rest of the pipeline knows about a document that is not its text comes from here.
+
+Nothing here touches the network, so nothing here is gated. Every step inspects its own output and does only what is
+missing. This is the document in the family where "everything runs" holds without qualification, and it is also where
+most of the numbers a referee will ask about are produced.
+
+## Flagged, not deleted
+
+Documents failing the quality rules are marked `Removed = 1` and kept in the table. A pipeline that drops them cannot
+report its own attrition, and how much was excluded and why is a result rather than an implementation detail. Every
+downstream script filters on the flag; none of them has to know the rule.
+
+## What the rules are for
+
+The three rules catch failures of *conversion*, not properties of the contract. A PDF that rendered as coordinates, an
+attachment that is a hyperlink to a document rather than the document, a page of a financial statement filed under an
+exhibit number: these arrive looking like data and are not.
+
+Each threshold sits far from anything a real agreement produces, which is deliberate. A blunt rule that removes wreckage
+is defensible; a finely tuned one that removes short agreements is a research decision disguised as data cleaning.
+
+| Rule | Fires when | What it catches |
+|:--|:--|:--|
+| Too short | 10 words or fewer after the header | stubs, links, empty conversions |
+| Not prose | under 20% stopwords **and** under 100 words | tables and conversion debris |
+| Mostly digits | 75% or more tokens numeric | financial statements |
+
+The second rule needs its length condition. Ordinary English runs far above twenty per cent stopwords, but a *long*
+document that runs low is an exhibit schedule -- legitimate content, densely tabular. Only a short one is debris.
+
+## The adjusted word count
+
+Every parsed document begins with the SEC's own header block: `<TYPE>`, `<SEQUENCE>`, `<FILENAME>`, `<DESCRIPTION>`.
+Those words are counted along with the contract's, so an attachment containing nothing but a header does not measure as
+empty. `nWordsAdj` subtracts them, and the emptiness rule is applied to that rather than to the raw count.
+
+## Cost
+
+Three passes over 1.8 million documents, each opening every file once: parse status, text statistics, stopword counts.
+Each writes a cache and skips if it is present, so the first run is hours and every later one is seconds.
+
+# Configuration
+
+```{r}
+#| label: config
+.dir_index <- here::here("2_output", "01A-EdgarIndex")
+.dir_docs  <- here::here("2_output", "01B-EdgarDocuments")
+
+.lP <- list(
+  Input = list(
+    Mirror         = fs::path(.dir_index, "GetEDGAR"),                  # the mirror 01A established
+    LandingPageAll = fs::path(.dir_index, "LandingPageAll.parquet"),    # unfiltered, written by 01A
+    FilePaths      = fs::path(.dir_docs, "FilePaths.parquet"),          # DocID to Path, written by 01B
+    StopShort      = here::here("0_data", "Dictionaries", "LoughranMcDonald", "StopWords_Generic.txt"),
+    StopLong       = here::here("0_data", "Dictionaries", "LoughranMcDonald", "StopWords_Generic.txt")
+  ),
+  Cache = list(
+    StopWords = utils_file_path(.dir_main, "Cache", "StopWords.parquet"),   # standardised dictionary
+    DocErrors = utils_file_path(.dir_main, "Cache", "DocErrors.parquet"),   # pass 1: parse status
+    DocStats  = utils_file_path(.dir_main, "Cache", "DocStats.parquet"),    # pass 2: text statistics
+    DocStop   = utils_file_path(.dir_main, "Cache", "DocStop.parquet")      # pass 3: stopword counts
+  ),
+  Output = list(
+    DocStats     = utils_file_path(.dir_main, "DocStats.parquet"),       # per-document measurements
+    RemovedDocs  = utils_file_path(.dir_main, "RemovedDocs.parquet"),    # what the rules flagged, and why
+    LinkData     = utils_file_path(.dir_main, "LinkData.parquet"),       # links, restricted to retrieved
+    MasterIndex  = utils_file_path(.dir_main, "MasterIndex.parquet"),    # index, restricted to retrieved
+    LandingPage  = utils_file_path(.dir_main, "LandingPage.parquet"),    # landing, restricted to retrieved
+    FullMetaData = utils_file_path(.dir_main, "FullMetaData.parquet"),   # the one table downstream reads
+    Figures      = utils_file_path(.dir_main, "Figures")                 # figure files for the manuscript
+  ),
+  Param = list(
+    Workers = 10L    # parallel workers; also the number of chunks each pass is split into
+  )
+)
+
+.lP$Edgar <- rGetEDGAR::get_directories(.lP$Input$Mirror)
+
+fs::file_exists(c(.lP$Input$FilePaths, .lP$Input$LandingPageAll, .lP$Input$StopShort))
+```
+
+Failing here, rather than three passes later, is deliberate: a missing input should stop the document at the point the
+path is declared, not after two hours of measurement.
+
+# Input
+
+```{r}
+#| label: load-index
+tab_index <- arrow::read_parquet(.lP$Input$FilePaths)
+
+nrow(tab_index)
+```
+
+# Measurement
+
+The stopword dictionary is standardised with the same function that standardised the document text, so a word is spelled
+identically on both sides of the comparison. Standardising only one side is how a stopword count comes out
+systematically low without anything appearing to be wrong.
+
+```{r}
+#| label: build-dictionary
+tab_stopdict <- edg_stopword_dict(
+  .path_short = .lP$Input$StopShort,    # short Loughran-McDonald list
+  .path_long  = .lP$Input$StopLong,     # long Loughran-McDonald list
+  .path_out   = .lP$Cache$StopWords     # standardised, cached for the workers to read
+)
+
+nrow(tab_stopdict)
+```
+
+Three passes, one function. They differ only in what they compute per file, and sharing the traversal means they cannot
+drift apart in how they chunk, how they handle a failure, or which documents they cover. Each writes a cache and skips
+if it is present.
+
+```{r}
+#| label: measure-errors
+tab_errors <- edg_measure_corpus(
+  .tab_idx  = tab_index,               # every document on disk
+  .path_out = .lP$Cache$DocErrors,     # cache; present means finished
+  .fun      = edg_doc_error,           # reads the parse status recorded at download time
+  .workers  = .lP$Param$Workers,       # parallel workers
+  .label    = "parse errors"           # shown in progress output
+)
+```
+
+```{r}
+#| label: measure-stats
+tab_stats_raw <- edg_measure_corpus(
+  .tab_idx  = tab_index,               # every document on disk
+  .path_out = .lP$Cache$DocStats,      # cache; present means finished
+  .fun      = edg_doc_stats,           # word, character and numeric counts plus the header fields
+  .workers  = .lP$Param$Workers,       # parallel workers
+  .label    = "text statistics"        # shown in progress output
+)
+```
+
+```{r}
+#| label: measure-stopwords
+tab_stop_raw <- edg_measure_corpus(
+  .tab_idx  = tab_index,                                            # every document on disk
+  .path_out = .lP$Cache$DocStop,                                    # cache; present means finished
+  .fun      = \(.p) edg_doc_stopwords(.p, .lP$Cache$StopWords),     # dictionary path closed over
+  .workers  = .lP$Param$Workers,                                    # parallel workers
+  .label    = "stopword counts"                                     # shown in progress output
+)
+```
+
+```{r}
+#| label: report-errors
+edg_report_errors(.tab_err = tab_errors)
+```
+
+The three passes are joined into one table per document. The adjusted word count is computed here, and the numeric share
+is capped at one: the numerator counts numeric tokens with one pattern and the denominator counts words with another, so
+on documents that are almost entirely digits the two disagree enough to exceed unity. The cap is honest because the
+quantity is only ever used against a threshold well below it.
+
+```{r}
+#| label: build-docstats
+tab_docstats <- edg_doc_statistics(
+  .tab_stats = tab_stats_raw,   # text statistics pass
+  .tab_stop  = tab_stop_raw     # stopword pass
+)
+
+arrow::write_parquet(tab_docstats, .lP$Output$DocStats)
+nrow(tab_docstats)
+```
+
+# Selection
+
+The three rules below decide what is analysable, so they are written out here rather than hidden behind a function call.
+Thresholds and their order are the argument a referee would want to see.
+
+```{r}
+#| label: flag-removals
+tab_removed <- edg_flag_removals(
+  .tab_stats = tab_docstats,   # the per-document measurements
+  .tab_idx   = tab_index       # supplies the document type for reporting
+)
+
+arrow::write_parquet(tab_removed, .lP$Output$RemovedDocs)
+nrow(tab_removed)
+```
+
+```{r}
+#| label: report-removals
+edg_report_removals(.tab_rem = tab_removed, .tab_idx = tab_index)
+```
+
+# Restriction
+
+Three upstream tables are restricted to the filings whose documents were actually retrieved. The unrestricted versions
+stay where 01A and 01B wrote them, because they are the denominators for every coverage statement made later, and a
+pipeline that overwrites its own denominator cannot report how much it lost.
+
+```{r}
+#| label: restrict-upstream
+use_ids_ <- tab_index$DocID
+
+tab_links <- arrow::open_dataset(sources = .lP$Edgar$DocLinks$DirMain$Links) |>
+  dplyr::filter(.data$DocID %in% use_ids_) |>
+  dplyr::rename(
+    YQ = "YearQuarter", DocSeq = "Seq", DocDesc = "Description",
+    DocName = "Document", DocType = "Type", DocSize = "Size"
+  ) |>
+  dplyr::collect()
+
+use_idx_ <- unique(tab_links$HashIndex)
+
+tab_master <- arrow::open_dataset(sources = .lP$Edgar$MasterIndex$DirParquet) |>
+  dplyr::filter(.data$HashIndex %in% use_idx_) |>
+  dplyr::rename(YQ = "YearQuarter") |>
+  dplyr::select(-dplyr::any_of(c("Year", "Quarter"))) |>
+  dplyr::collect()
+
+tab_landing <- arrow::open_dataset(sources = .lP$Input$LandingPageAll) |>
+  dplyr::filter(.data$HashIndex %in% use_idx_) |>
+  dplyr::collect()
+
+purrr::walk2(
+  .x = list(tab_links, tab_master, tab_landing),
+  .y = c(.lP$Output$LinkData, .lP$Output$MasterIndex, .lP$Output$LandingPage),
+  .f = arrow::write_parquet
+)
+
+c(Links = nrow(tab_links), Master = nrow(tab_master), Landing = nrow(tab_landing))
+```
+
+# Deployment
+
+`FullMetaData.parquet` joins the three restricted tables to the document statistics. Two derived columns are added.
+
+`MultFiler` marks documents filed by more than one registrant. The same agreement is filed by every party to it, so one
+document legitimately appears under several CIKs; the flag makes those rows identifiable rather than looking like
+duplicates.
+
+`Removed` carries the quality decision. The row stays.
+
+```{r}
+#| label: build-metadata
+rem_ids_ <- tab_removed$DocID
+
+tab_metadata <- tab_links |>
+  dplyr::inner_join(tab_master, by = dplyr::join_by("HashIndex", "CIK", "YQ")) |>
+  dplyr::inner_join(tab_docstats, by = dplyr::join_by("DocID")) |>
+  dplyr::mutate(
+    nCIK      = dplyr::n(),
+    MultFiler = as.integer(.data$nCIK > 1L),
+    .by       = "HashDocument"
+  ) |>
+  dplyr::mutate(Removed = as.integer(.data$DocID %in% rem_ids_)) |>
+  dplyr::inner_join(
+    y  = dplyr::select(tab_index, "DocID", DocTypeMod = "DocType", DocPath = "Path"),
+    by = dplyr::join_by("DocID")
+  ) |>
+  dplyr::rename(DocTypeRaw = "DocType") |>
+  dplyr::relocate("DocTypeMod", .after = "DocTypeRaw")
+
+arrow::write_parquet(tab_metadata, .lP$Output$FullMetaData)
+nrow(tab_metadata)
+```
+
+# Validation
+
+Four checks. Each states its expectation first, so a result that differs is a finding rather than a number to interpret
+afterwards.
+
+```{r}
+#| label: validate-metadata
+# 1. The two inner joins can only lose rows. Anything lost is a document whose link row has no
+#    matching index entry, which is a join failure rather than a filtering decision.
+# 2. Every flagged document should appear in the final table, marked rather than absent.
+# 3. DocID identifies a document, so it should be unique.
+# 4. Jointly filed copies of the same agreement should be byte-identical. Where they are not, the
+#    joint filing is not in fact the same document.
+tibble::tibble(
+  RowsLinks       = nrow(tab_links),
+  RowsMetaData    = nrow(tab_metadata),
+  LostInJoin      = nrow(tab_links) - nrow(tab_metadata),
+  FlaggedTotal    = nrow(tab_removed),
+  FlaggedInTable  = sum(tab_metadata$Removed),
+  DuplicateDocID  = sum(duplicated(tab_metadata$DocID))
+) |>
+  tbl_out(
+    .title = "Consolidation checks",
+    .notes = c(
+      LostInJoin     = "Nonzero means link rows with no matching master-index entry.",
+      FlaggedInTable = "Should equal FlaggedTotal: flagged documents are marked, not dropped."
+    )
+  )
+```
+
+```{r}
+#| label: validate-multifiler
+edg_multifiler_check(.tab_meta = tab_metadata) |>
+  tbl_out(
+    .title  = "Jointly filed documents",
+    .pct    = "ShareAgreeing",
+    .digits = 1L,
+    .notes  = c(ShareAgreeing = "Copies agreeing on both file size and character count.")
+  )
+```
+
+# Overview
+
+```{r}
+#| label: fig-removals-by-rule
+#| fig-height: 2.4
+#| fig-cap: "Documents flagged by each quality rule. Rules are applied in order, so a document
+#|   caught by two is attributed to the first."
+gg_removals <- edg_plot_removals(.tab = edg_removal_summary(.tab_rem = tab_removed, .tab_idx = tab_index))
+
+plot_save(
+  .plot    = gg_removals,               # the figure
+  .name    = "removals-by-rule",        # meaningful filename, not unnamed-chunk-N
+  .dir     = .lP$Output$Figures,        # figure destination
+  .height  = 2.4,                       # from the ladder: three rows is a low panel
+  .width   = 7.5,                       # the fixed project width
+  .formats = c("pdf", "png"),           # manuscript and web
+  .dpi     = 300                        # print resolution
+)
+
+gg_removals
+```
+
+```{r}
+#| label: overview-all
+edg_report_all_meta(
+  .tab_err  = tab_errors,      # parse status per document
+  .tab_rem  = tab_removed,     # what the rules flagged
+  .tab_idx  = tab_index,       # the corpus, as denominator
+  .tab_meta = tab_metadata     # the consolidated table
+)
+```
+
+# Next
+
+**02-SelectSample** merges `FullMetaData.parquet` to Compustat and defines the descriptive and estimation samples. It is
+a sibling of the classification and entity families rather than an ancestor: **03** reads this table directly for
+contract classification, and **04** for named-entity extraction. All three filter on `Removed == 0`.

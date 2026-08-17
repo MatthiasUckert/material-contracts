@@ -1,0 +1,17 @@
+[project]
+name = "contracts-spacy"
+version = "0.1.0"
+description = "spaCy NER over contract text, emitting the shared candidate schema."
+requires-python = ">=3.10"
+
+# spaCy pulls torch through the transformer extra, so this environment is a gigabyte and
+# cannot be merged with anything light. That is the whole reason it is its own folder.
+dependencies = [
+    "spacy[transformers]>=3.7",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+    "tqdm>=4.60",
+]
+
+[tool.uv]
+package = false

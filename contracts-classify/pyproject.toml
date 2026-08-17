@@ -1,0 +1,25 @@
+[project]
+name = "contracts-classify"
+version = "0.1.0"
+description = "Contract classification: the transformer arm and the keyword arm (the 03 family)."
+requires-python = ">=3.10"
+
+# BOTH ARMS, ONE ENVIRONMENT. The keyword arm needs no torch and could stand alone, but 03F applies
+# BOTH to the corpus in one pass, so splitting them would give that document two interpreter paths
+# where it has one. The publishable half is extracted when it is actually published, not before.
+#
+# scikit-learn is DECLARED here and was declared nowhere before: classify_train.py, keyword_train.py
+# and keyword_text.py all import it, and it appeared in neither contracts-engine's pyproject nor its
+# lock. A lock that does not name a dependency cannot reproduce a run, and this is a
+# results-producing dependency rather than a convenience.
+dependencies = [
+    "torch>=2.2",
+    "transformers>=4.40",
+    "scikit-learn>=1.4",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+]
+
+[tool.uv]
+package = false

@@ -1,45 +1,50 @@
-# 01A-CopyFromOld: seed 01A's output directory from the previous project ------------------------------------------------
+# 01B-CopyFromOld: seed the document corpus from the previous project ---------------------------------------------------
 #
 # WHAT THIS IS
-# Scaffolding, not pipeline. 01A-EdgarIndex.qmd is written as what it is -- a script that acquires
-# from EDGAR and parses what it acquired. This script exists solely so that acquisition does not
-# have to happen a second time: it places the previous project's already-mirrored files exactly
-# where 01A would have written them, so the document renders against real data with its acquisition
-# switch off. It is the only file in the 01 family that names the previous project, and it is
-# deleted once the migration closes.
+# Scaffolding, not pipeline. 01B-EdgarDocuments.qmd is written as what it is -- a script that fetches
+# documents from EDGAR and indexes them. This script exists solely so that fetching does not have to
+# happen a second time: it places the previous project's already-downloaded corpus exactly where 01B
+# would have written it, so the document renders against real data with its acquisition switch off.
+# It is deleted once the migration closes.
 #
 # WHAT IT COPIES
-#   old/GetEDGAR/MasterIndex/        -> 2_output/01A-EdgarIndex/GetEDGAR/MasterIndex/
-#   old/GetEDGAR/DocumentLinks/      -> 2_output/01A-EdgarIndex/GetEDGAR/DocumentLinks/
-#   old/LandingPage/RawExtract/      -> 2_output/01A-EdgarIndex/Cache/RawExtract/
-#   old/LandingPage/LandingPage.pq   -> 2_output/01A-EdgarIndex/LandingPageAll.parquet
+#   old/GetEDGAR/DocumentData/       -> 2_output/01A-EdgarIndex/GetEDGAR/DocumentData/
+#   old/Output/FilePaths.parquet     -> 2_output/01B-EdgarDocuments/FilePaths.parquet
 #
-# It does NOT copy GetEDGAR/DocumentData/ -- 1.77 million files written by 01B, seeded separately.
+# DocumentData/ is taken whole rather than just its Parsed/ subtree, because it also holds the parse
+# ledger written during acquisition, which records which documents failed and why. 01C reports on
+# that, and separating the ledger from the documents it describes leaves both harder to interpret.
+#
+# The destination is 01A's mirror, not 01B's own directory. rGetEDGAR resolves link tables and
+# documents from a single root, so the corpus belongs beside the links it was selected from.
+#
+# THIS IS THE IRREPLACEABLE ONE
+# The corpus was fetched with .keep_orig = FALSE, so the original bytes are gone and there is no
+# local source to re-parse from. Re-deriving it means one request per document at ten per second:
+# days of wall time, assuming every link still resolves, and a measurable share no longer does.
+# Everything below is built around not damaging it.
 #
 # FOUR SAFETY PROPERTIES
 #
 # 1. DRY RUN BY DEFAULT. .APPLY is FALSE. The first run reports the plan and changes nothing.
 #
-# 2. IT REFUSES RATHER THAN OVERWRITES. Any destination holding files aborts the script before
-#    anything is written, and aborts entirely rather than skipping the offending row: a partly
-#    seeded directory is the state hardest to diagnose later, because it looks populated.
-#    An EMPTY destination directory counts as clear, since rendering 01A creates the mirror tree
-#    whether or not it has anything to put in it.
+# 2. IT REFUSES RATHER THAN OVERWRITES, and aborts entirely rather than skipping the offending row:
+#    a partly seeded tree is the state hardest to diagnose later, because it looks populated. An
+#    EMPTY destination directory counts as clear, since rendering 01A creates the mirror tree
+#    including an empty DocumentData/ whether or not anything has been put in it.
 #
-# 3. IT COPIES, IT DOES NOT MOVE. The previous project is left exactly as it was and remains the
-#    fallback until the new one renders end to end.
+# 3. IT COPIES, IT DOES NOT MOVE. The previous project is left exactly as it was.
 #
-# 4. IT VERIFIES INDEPENDENTLY. Counts are recomputed after cp returns rather than inferred from its
-#    exit status. A copy that exits zero having written a truncated tree is the failure this cannot
-#    absorb, and counting is cheap beside re-downloading.
+# 4. IT VERIFIES INDEPENDENTLY, and counts the Parsed/ subtree separately from the whole. A copy
+#    that truncated one branch but happened to total correctly would pass a single aggregate check.
 #
 # WHY cp -c
-# Both projects sit on the same APFS volume, so clonefile() makes the copy instantaneous and free:
-# the trees share data blocks until one is written to. Hardlinks are equally fast and equally cheap
-# but share one inode, so editing either tree would edit both. Clones diverge on write, which for an
-# archive that cannot be regenerated is the entire argument.
+# Same APFS volume, so clonefile() makes this instantaneous and free: the trees share data blocks
+# until one is written to. Hardlinks are equally fast and cheap but share one inode, so editing
+# either tree would edit both. Clones diverge on write, which for a corpus that cannot be
+# regenerated is the entire argument.
 #
-# Run from the project root:  source("1_code/_Migration/01A-CopyFromOld.R")
+# Run from the project root:  source("1_code/_Migration/01B-CopyFromOld.R")
 
 .APPLY   <- FALSE    # FALSE reports the plan and changes nothing; TRUE performs the copy
 .DIR_OLD <- NULL     # set to a path to override the sibling-project autodetect
@@ -54,7 +59,7 @@ say_ <- function(...) {
 
 # Files below a directory, counted without collecting their paths. fs::dir_info() and
 # list.files(recursive = TRUE) both allocate in proportion to the number of files and take the R
-# session down on trees of this size; a breadth-first walk holds one directory at a time.
+# session down on a tree of this size; a breadth-first walk holds one directory at a time.
 walk_count_ <- function(.path) {
   if (!dir.exists(.path)) return(if (file.exists(.path)) 1L else 0L)
   n_     <- 0L
@@ -77,33 +82,34 @@ fmt_ <- function(.x) format(.x, big.mark = ",", scientific = FALSE)
 dir_new_ <- here::here()
 dir_old_ <- if (!is.null(.DIR_OLD)) .DIR_OLD else file.path(dirname(dir_new_), "pMatDisc")
 dir_src_ <- file.path(dir_old_, "2_output", "01-GetEDGAR")
-dir_dst_ <- file.path("2_output", "01A-EdgarIndex")
+dir_mir_ <- file.path("2_output", "01A-EdgarIndex", "GetEDGAR")
+dir_01b_ <- file.path("2_output", "01B-EdgarDocuments")
 
-say_("== Seed 01A ==")
+say_("== Seed 01B ==")
 say_("FROM : ", dir_src_, if (dir.exists(dir_src_)) "   [ok]" else "   [MISSING]")
-say_("TO   : ", file.path(dir_new_, dir_dst_))
+say_("TO   : ", file.path(dir_new_, dir_mir_), " and ", dir_01b_)
 say_("MODE : ", if (isTRUE(.APPLY)) "APPLY -- files will be written" else "DRY RUN -- nothing will be written")
 
 if (!dir.exists(dir_src_)) {
   stop("Previous 01-GetEDGAR output not found. Set .DIR_OLD at the top of this script.")
 }
+if (!dir.exists(file.path(dir_new_, dir_mir_))) {
+  stop("01A's mirror does not exist yet. Seed and render 01A before seeding 01B.")
+}
 
 
 # 3. The plan ----------------------------------------------------------------------------------------------------------
 #
-# Kind distinguishes a directory clone from a single file: a directory is created by the copy, a
-# file needs its parent to exist first.
+# Counting the source walks roughly 1.8 million files and takes a minute or two. It is done anyway,
+# because the count is the baseline the copy is verified against, and a verification with no
+# baseline verifies nothing.
+
+say_("\nCounting the source tree -- this takes a minute on 1.8 million files ...")
 
 plan_ <- tibble::tribble(
-  ~Label,        ~From,                                            ~To,                                       ~Kind,
-  "MasterIndex", file.path("GetEDGAR", "MasterIndex"),
-  file.path(dir_dst_, "GetEDGAR", "MasterIndex"),   "dir",
-  "DocLinks",    file.path("GetEDGAR", "DocumentLinks"),
-  file.path(dir_dst_, "GetEDGAR", "DocumentLinks"), "dir",
-  "RawExtract",  file.path("LandingPage", "RawExtract"),
-  file.path(dir_dst_, "Cache", "RawExtract"),       "dir",
-  "LandingPage", file.path("LandingPage", "LandingPage.parquet"),
-  file.path(dir_dst_, "LandingPageAll.parquet"),    "file"
+  ~Label,         ~From,                                     ~To,                                      ~Kind,
+  "DocumentData", file.path("GetEDGAR", "DocumentData"),     file.path(dir_mir_, "DocumentData"),      "dir",
+  "FilePaths",    file.path("Output", "FilePaths.parquet"),  file.path(dir_01b_, "FilePaths.parquet"), "file"
 ) |>
   dplyr::mutate(
     PathFrom  = file.path(dir_src_, .data$From),
@@ -115,6 +121,10 @@ plan_ <- tibble::tribble(
     Blocked   = .data$nAtDst > 0L
   )
 
+# The parsed subtree, counted separately. It is the part that matters and the part whose loss would
+# be least visible in a whole-tree total.
+n_parsed_src_ <- walk_count_(file.path(dir_src_, "GetEDGAR", "DocumentData", "Parsed"))
+
 say_("\n-- Plan --")
 plan_ |>
   dplyr::mutate(
@@ -125,6 +135,8 @@ plan_ |>
   dplyr::select("Label", "From", "To", "Files", "Source", "Destination") |>
   as.data.frame() |>
   print(row.names = FALSE)
+
+say_("\n  of which Parsed/: ", fmt_(n_parsed_src_), " documents")
 
 
 # 4. Refuse on any collision or missing source -------------------------------------------------------------------------
@@ -140,19 +152,21 @@ if (any(plan_$Blocked)) {
 }
 
 
-# 5. Volume check ------------------------------------------------------------------------------------------------------
+# 5. Volume and space --------------------------------------------------------------------------------------------------
 
 dev_ <- function(.path) {
   out_ <- system2("df", c("-P", "-k", shQuote(.path)), stdout = TRUE)
-  strsplit(trimws(out_[2L]), "\\s+")[[1L]][1L]
+  strsplit(trimws(out_[2L]), "\\s+")[[1L]]
 }
+same_vol_ <- identical(dev_(dir_old_)[1L], dev_(dir_new_)[1L])
 
 say_("\n-- Volume --")
-say_(if (identical(dev_(dir_old_), dev_(dir_new_))) {
-  "Same volume: cp -c clones instantly and uses no extra space."
+if (same_vol_) {
+  say_("Same volume: cp -c clones instantly and uses no extra space.")
 } else {
-  "Different volumes: cp -c falls back to a full byte copy. This will take time and space."
-})
+  say_("Different volumes: this will be a full byte copy of ", fmt_(sum(plan_$nFiles)), " files.")
+  say_("Free on destination: ", round(as.numeric(dev_(dir_new_)[4L]) / 1048576), " GB")
+}
 
 
 # 6. Execute -----------------------------------------------------------------------------------------------------------
@@ -199,6 +213,14 @@ if (!isTRUE(.APPLY)) {
     ) |>
     dplyr::select("Label", "nBefore", "nAfter", "Match")
 
+  n_parsed_dst_ <- walk_count_(file.path(dir_new_, dir_mir_, "DocumentData", "Parsed"))
+  ver_ <- dplyr::bind_rows(ver_, tibble::tibble(
+    Label   = "  of which Parsed",
+    nBefore = n_parsed_src_,
+    nAfter  = n_parsed_dst_,
+    Match   = ifelse(n_parsed_src_ == n_parsed_dst_, "ok", "MISMATCH")
+  ))
+
   print(as.data.frame(ver_), row.names = FALSE)
 
   if (any(ver_$Match != "ok")) {
@@ -206,13 +228,5 @@ if (!isTRUE(.APPLY)) {
   }
 
   say_("\nAll counts match. The previous project is untouched and remains the fallback.")
-  say_("")
-  say_("Before rendering, move the seeded landing table aside so the render rebuilds it from the")
-  say_("per-quarter cache rather than reusing it. Comparing the two afterwards is what validates")
-  say_("the port:")
-  say_("")
-  say_("  fs::file_move(")
-  say_("    here::here('2_output', '01A-EdgarIndex', 'LandingPageAll.parquet'),")
-  say_("    here::here('2_output', '01A-EdgarIndex', 'LandingPageAll_seeded.parquet')")
-  say_("  )")
+  say_("Next: source 01B-VerifyMigration.R with .STAGE <- 'before', then render 01B.")
 }

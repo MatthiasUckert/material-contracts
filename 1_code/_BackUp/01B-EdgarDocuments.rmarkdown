@@ -98,18 +98,10 @@ mapping is then versioned with the package rather than with this project.
 
 ## Where the documents land
 
-Every script in this pipeline writes inside its own output directory and nowhere else. That is not tidiness: it is what
-makes the dependency graph readable from the filesystem, and what guarantees that deleting one script's output cannot
-damage another's.
-
-`rGetEDGAR` makes that awkward here. It resolves link tables and downloaded documents from a single root, reading
-`<root>/DocLinks/` and writing `<root>/DocumentData/`, so handing it 01A's root would place a million documents inside
-01A's directory. This script therefore keeps its own root and stages the link tables into it first.
-
-The staged copy is a cache, not a second source. 01A remains the only writer of the link tables; what sits here is a
-clone refreshed whenever the original differs, and deleting it costs one re-run of the chunk below. The trade is a
-regenerable duplicate against an ownership rule, and the duplicate is the cheaper thing to give up -- it rebuilds from
-one command, whereas a rule broken once has to be honoured by every script written afterwards.
+`rGetEDGAR` resolves link tables and downloaded documents from a single root, so documents are written into the mirror
+01A established rather than into this script's own output directory. Duplicating three hundred megabytes of link tables
+to obtain a second root would buy nothing. Ownership stays unambiguous: 01A writes `MasterIndex/` and `DocLinks/`, 01B
+writes `DocumentData/`, and no artifact has two writers. This script's own directory holds the index.
 
 ## The parsed tree is the only copy
 
@@ -125,11 +117,8 @@ acquisition is gated, and why nothing in this document deletes anything.
 
 .lP <- list(
   Input = list(
-    IndexMirror    = fs::path(.dir_index, "GetEDGAR"),                 # 01A's mirror, read only
-    LandingPageAll = fs::path(.dir_index, "LandingPageAll.parquet")    # written by 01A, read only
-  ),
-  Cache = list(
-    Mirror = utils_file_path(.dir_main, "GetEDGAR")   # this script's own root; staged links live here
+    Mirror         = fs::path(.dir_index, "GetEDGAR"),                 # the mirror 01A established
+    LandingPageAll = fs::path(.dir_index, "LandingPageAll.parquet")    # written by 01A
   ),
   Output = list(
     FilePaths = utils_file_path(.dir_main, "FilePaths.parquet"),   # the DocID to Path index
@@ -143,32 +132,11 @@ acquisition is gated, and why nothing in this document deletes anything.
   )
 )
 
-# 01A's tree is asserted to exist before it is resolved. get_directories() creates whatever is
-# missing, so calling it on an absent root would silently manufacture an empty mirror inside 01A's
-# directory instead of reporting that 01A has not run.
-stopifnot("01A's mirror is missing; render 01A first" = fs::dir_exists(.lP$Input$IndexMirror))
-
-edgar_index_    <- rGetEDGAR::get_directories(.lP$Input$IndexMirror)   # 01A's, read only
-.lP$Input$Links <- edgar_index_$DocLinks$DirMain$Links
-
-.lP$Edgar <- rGetEDGAR::get_directories(.lP$Cache$Mirror)              # this script's own
+# Resolved from the same root 01A used, so the two scripts cannot disagree about where the mirror is.
+.lP$Edgar <- rGetEDGAR::get_directories(.lP$Input$Mirror)
+.lP$Input$Links <- .lP$Edgar$DocLinks$DirMain$Links
 
 fs::file_exists(.lP$Input$LandingPageAll)
-```
-
-# Staging
-
-The link tables are cloned into this script's root so that the download reads and writes in one place, and that place is
-this script's own. Refreshed by comparing file names and byte sizes rather than timestamps: a clone shares data blocks
-with its source, so its modification time says nothing about whether the contents still agree.
-
-```{r}
-#| label: stage-links
-edg_stage_links(
-  .dir_src = .lP$Input$Links,                    # 01A's link tables
-  .dir_dst = .lP$Edgar$DocLinks$DirMain$Links,   # this script's staged copy
-  .quiet   = FALSE                               # FALSE reports how many were copied
-)
 ```
 
 # Selection
@@ -181,14 +149,14 @@ extensions lives in the library.
 #| label: select-documents
 # 1. Exhibit 10 -- the material contracts themselves.
 tab_ex10 <- edg_links_with_ext(
-  .path_links = .lP$Edgar$DocLinks$DirMain$Links,   # staged link tables
+  .path_links = .lP$Input$Links,                    # mirrored link tables
   .types      = edg_doc_types(.mod = "Exhibit 10"), # every observed spelling of an Exhibit 10 type
   .hash_index = NULL                                # NULL keeps all filings
 )
 
 # 2. CT orders -- the record of what redaction was permitted to remove.
 tab_ctos <- edg_links_with_ext(
-  .path_links = .lP$Edgar$DocLinks$DirMain$Links,   # staged link tables
+  .path_links = .lP$Input$Links,             # mirrored link tables
   .types      = edg_doc_types(.mod = "CTO"), # confidential-treatment orders
   .hash_index = NULL                         # NULL keeps all filings
 )
@@ -203,7 +171,7 @@ vec_item_hash <- edg_hash_with_item(
 )
 
 tab_08ks <- edg_links_with_ext(
-  .path_links = .lP$Edgar$DocLinks$DirMain$Links,          # staged link tables
+  .path_links = .lP$Input$Links,                           # mirrored link tables
   .types      = edg_doc_types(.mod = c("8-K", "8-K/A")),   # current reports and their amendments
   .hash_index = vec_item_hash                              # only those reporting the item
 )
@@ -247,14 +215,9 @@ edg_report_selection(
 use_docids <- setdiff(tab_selected$DocID, vec_on_disk)
 ```
 
-Two things can leave a document outstanding, and they need different responses. A count that is stable across renders is
-links the SEC no longer serves, which are lost to any method rather than to this one; a count that jumps is an
-interrupted acquisition, which the switch above will finish.
-
-On the present corpus it is neither: every selected document is on disk, and every document on disk is selected. The
-retrieved corpus is exactly the inclusion rule applied to the mirror, with no attrition in either direction. That is
-worth stating rather than assuming, because it is the one place where a selection rule and the corpus it produced could
-have drifted apart without anything downstream noticing.
+The outstanding count does not converge to zero. A residue of selected documents has links the SEC no longer serves,
+and those stay outstanding permanently. A count stable across renders is dead links; a count that jumps is an
+interrupted run.
 
 # Acquisition
 
@@ -265,7 +228,7 @@ document and quantified in 01C rather than suppressed here.
 #| label: acquire-documents
 if (isTRUE(.lP$Param$Acquire) && length(use_docids) > 0L) {
   rGetEDGAR::edgar_download_document(
-    .dir       = .lP$Cache$Mirror,   # this script's own root: links staged in, documents written out
+    .dir       = .lP$Input$Mirror,   # the mirror root, shared with 01A
     .user      = .lP$Param$User,     # contact address sent with every request
     .doc_ids   = use_docids,         # only what is outstanding
     .keep_orig = FALSE,              # discard originals after parsing; see below
@@ -343,21 +306,16 @@ tibble::tibble(
   )
 ```
 
-Two things about where this script wrote. A nested `GetEDGAR/` inside its own root would mean the download resolved its
-tree differently from the rest of the document, leaving documents where nothing looks for them. And no document should
-ever appear under 01A's root, which this script reads from and must never write to.
+The download writes into the mirror through the same root the rest of the pipeline reads from. A nested `GetEDGAR/`
+appearing inside it would mean the two resolved differently, leaving documents where nothing looks for them.
 
 ```{r}
 #| label: validate-mirror-root
 tibble::tibble(
-  ParsedRoot    = as.character(.lP$Edgar$DocumentData$Parsed),
-  StrayNested   = fs::dir_exists(fs::path(.lP$Cache$Mirror, "GetEDGAR")),
-  WroteInto01A  = fs::dir_exists(fs::path(.lP$Input$IndexMirror, "DocumentData"))
+  ParsedRoot  = as.character(.lP$Edgar$DocumentData$Parsed),
+  StrayNested = fs::dir_exists(fs::path(.lP$Input$Mirror, "GetEDGAR"))
 ) |>
-  tbl_out(
-    .title = "Where this script wrote",
-    .notes = c(WroteInto01A = "Must be FALSE. Documents under 01A's root mean this script wrote outside its own.")
-  )
+  tbl_out(.title = "Mirror root")
 ```
 
 # Deployment
@@ -409,3 +367,4 @@ edg_report_all_docs(
 **01C-EdgarMetaData** reads this index and measures the documents: word counts, stopword ratios and parse errors. It
 applies the quality rules that drop a document from the study, restricts the landing table and the master index to the
 filings that survived, and consolidates everything into `FullMetaData.parquet`, which is what 02, 03 and 04 read.
+
