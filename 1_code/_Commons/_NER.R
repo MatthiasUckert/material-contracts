@@ -1,1880 +1,1347 @@
-# _NER.R: the extraction seam every entity engine is called through (ner_*) ---------------------------------------------
+# ======================================================================================================================
+# _NER.R -- extraction suites, the candidate store, and the benchmark ledger
+# ======================================================================================================================
 #
-# Six extractors, one orchestrator, one store. Everything in this file is shared: 04A runs the whole
-# engine set over the labelled sample to build the evidence, and 04D runs the surviving subset over
-# the corpus. Both call the same wrappers, so the corpus is extracted by the code the sample was
-# measured with rather than by a second implementation that agrees at the third decimal.
+# Sourced by 04A before its own library. Three suites produce entity candidates; one store holds
+# them; one ledger records what has been done.
 #
-# WHAT DOES NOT LIVE HERE. Anything that reads the finished store to describe or judge it belongs to
-# the script asking the question. The overview, agreement and per-class profiling functions moved to
-# 04A-EntityExtract.R, which is their only caller: a shared file holding one script's analysis makes
-# that script's concerns look like everyone's. The engine seam is genuinely shared; its reporting
-# was not.
+# THE ARCHITECTURE, IN ONE PARAGRAPH. Each suite is a separate Python environment invoked as a
+# subprocess, because their dependencies are mutually incompatible -- LexNLP is pinned to Python 3.8
+# and ships in a container, spaCy pulls a gigabyte of models, and matcon-extract needs pandas and
+# nothing else. Parquet is the seam: R writes the staged text, Python writes candidate spans, R
+# ingests. Python never touches DuckDB and R never parses a document.
 #
-# The interactive HTML span viewer moved to _BackUp/_2026-08-11_NER-HtmlExport.R. It is parked, not
-# discarded -- it is the tool for reading what an extractor actually did to a document, and it is
-# wanted back once there is a session to spend on it.
+# THREE FUNCTIONS RATHER THAN ONE DISPATCHER. An earlier design routed every suite through one
+# entry point driven by a registry table. It was abandoned because the suites are not uniform:
+# spaCy takes a model and a batch size because it streams through nlp.pipe, LexNLP takes neither and
+# needs volume mounts, matcon takes neither and resolves modules from the labels. A single signature
+# covering all three is mostly arguments that do not apply, and a registry restating what each suite
+# can do is a second declaration that can disagree with the first -- which is exactly the defect
+# that made this rewrite necessary.
 #
-# CROSS-LANGUAGE BOUNDARY. Every extractor is a command line and a parquet file. Neither side holds
-# a handle on the other's session, so a failure surfaces as a non-zero exit status rather than a
-# corrupted workspace, and either environment can be rebuilt without disturbing the other. Python
-# never touches DuckDB; the store is written from R alone.
+# EXTRACTION AND INGEST ARE SEPARATE, and that is not tidiness. The benchmark runs extraction and
+# discards the output; if extraction wrote to the store there would be no way to time it without
+# polluting what it measures.
 #
-# OFFSETS. Every candidate carries Start and Stop as code-point indices into the canonical text
-# written by 04A. That is the one contract the whole family rests on, and it is why no extractor is
-# ever pointed at a normalised or reconstructed copy of a document.
+# THE OFFSET CONTRACT. Every span is 0-based, half-open, over CODE POINTS, and
+# text[Start:Stop] == Span exactly. Python emits code-point offsets; R must slice with
+# stringi::stri_sub and never base substr, which indexes bytes and misaligns about ninety-nine per
+# cent of spans on this corpus. Every check script tests this and it has caught real bugs.
 
 
-# 1. Extractors --------------------------------------------------------------------------------------------------------
-# One wrapper per extractor. Each builds a command line, runs it, and returns the parquet it wrote.
-# Optional flags are appended only when they differ from the script's own default, so the command
-# records the decisions actually taken rather than the ones that happened to be in force.
+# 1. Suites ------------------------------------------------------------------------------------------------------------
 
-#' Run the spaCy extractor over parquet input
+#' Default worker count for every suite
 #'
-#' The wrapper exists so that every spaCy flag is set from R and none is left to the script's own
-#' defaults: a run whose label set or truncation was decided inside Python is a run whose store
-#' cannot be reproduced from the calling document alone. Optional flags are appended only when they
-#' differ from the extractor's default, so the command line records the decisions actually taken.
+#' Twenty rather than twenty-four, and the reason is the machine. Measured throughput rises 1.60x
+#' from eight workers to sixteen and only 1.15x from sixteen to twenty-four, which is the shape of a
+#' 28-core M3 Ultra: twenty performance cores and eight efficiency cores. Workers past the twentieth
+#' land on efficiency cores running at roughly a third the speed, so they add scheduling pressure
+#' and very little work.
 #'
-#' The timeout is a per-window stall guard rather than a per-document one. When no window completes
-#' inside it the extractor drops to sequential processing and skips the offending window, naming the
-#' document and window on stderr, so a multi-day pass cannot hang silently on one pathological file.
+#' The transformer ignores this. extract_spacy.py forces n_process to 1 whenever a GPU is active,
+#' because one Metal device cannot be shared across worker processes, so the outlier resolves itself
+#' rather than needing a special case here.
+.ner_n_process <- 20L
+
+#' Default documents per unit of work
 #'
-#' @param .inputs Character. Parquet file(s) or folder(s); folders are globbed recursively.
-#' @param .output Character. Destination parquet for the candidate spans.
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .text_col Character. Text column the offsets will index.
-#' @param .labels Character or NULL. Entity labels to keep; NULL keeps everything the model emits.
-#' @param .max_chars Integer or NULL. Truncate each document to its first N characters before
-#'   extraction. NULL is no truncation. Documents still over spaCy's max_length are windowed inside
-#'   the extractor either way.
-#' @param .timeout Integer. Per-window stall guard in seconds; 0 disables it.
-#' @param .model Character. spaCy model name.
-#' @param .device Character. auto, cpu, cuda or mps. auto sends CNN models to CPU and the
-#'   transformer to the available accelerator.
-#' @param .batch_size Integer. Documents per spaCy batch.
-#' @param .n_process Integer. Worker processes. The transformer occupies one device and must stay
-#'   at one.
-#' @param .overwrite Logical. TRUE re-runs even when .output exists.
-#' @param .no_progress Logical. Suppress the extractor's own progress bar AND the subprocess
-#'   streams it rides on. Those inherit the calling terminal, so they never reach a rendered
-#'   document; this is the switch for watching a long pass live.
-#' @param .engine_dir Character. Root of the contracts-engine package.
-#' @param .quiet Logical. Suppress the cli completion message, which DOES go through the message
-#'   stream and so is captured into a rendered document -- one line per engine per chunk.
-#' @return Invisibly, the output path.
-ner_spacy <- function(
-    .inputs,
-    .output,
-    .id_col = "DocID",
-    .text_col = "TextRaw",
-    .labels = c("ORG", "PERSON", "GPE", "DATE", "MONEY"), # NULL -> omit --label -> keep all
-    .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
-    .timeout = 600L, # per-window stall guard in seconds (0 = off)
-    .model = "en_core_web_sm",
-    .device = "auto", # auto|cpu|cuda|mps
-    .batch_size = 64L,
-    .n_process = 1L,
-    .overwrite = FALSE,
-    .no_progress = FALSE,
-    .engine_dir = here::here("contracts-engine"),
-    .quiet = FALSE
-) {
+#' One value across all three suites. The per-suite variation this replaces was calibrated against
+#' extractors that no longer exist: the gazetteer ran at roughly five seconds per document under
+#' gazetteer-v1 and needed a chunk of eight, and gazetteer-v2 runs at two thousand documents a
+#' second, where a chunk of eight is twenty times more task dispatches than the work justifies.
+#'
+#' 04A's benchmark section measures this. A deviation earns its place by producing a number, not by
+#' being inherited.
+.ner_batch_size <- 32L
+
+#' Default per-document cap, in seconds
+#'
+#' A HANG DETECTOR, NOT A BUDGET. At matcon's throughput a document taking ten minutes is running
+#' five orders of magnitude beyond the median and is pathological by definition. LexNLP's geoentity
+#' pass averages about five seconds per document and scales with length, so ten minutes is roughly
+#' two orders of magnitude of headroom -- generous, deliberately, because a timeout there is not a
+#' lost document but a document lost SYSTEMATICALLY IN THE LONGEST AGREEMENTS, which is the worst
+#' possible place for a missing-at-random assumption to fail.
+.ner_timeout <- 600L
+
+#' Where each suite lives
+#'
+#' Resolved from the repository root, so a checkout anywhere works and no home directory is written
+#' down. Each suite is its own uv project and is invoked through its own interpreter: never `uv run`
+#' from the repository root, which resolves the root environment instead of the suite's.
+#'
+#' @param .suite One of "spacy", "lexnlp", "matcon".
+#' @return Path to the suite's folder.
+.ner_suite_dir <- function(.suite) {
   if (FALSE) {
-    .inputs <- fil_sample_dirs$Path[20]
-    .output <- file.path(.lP$Cache$NerTest, "test_spacy_sm.parquet")
-    .id_col <- "DocID"
-    .text_col <- "TextRaw"
-    .labels <- c("ORG", "PERSON", "GPE", "DATE", "MONEY")
-    .max_chars <- NULL
-    .timeout <- 600L
-    .model <- "en_core_web_sm"
-    .device <- "cpu"
-    .batch_size <- 64L
-    .n_process <- 10L
-    .overwrite <- FALSE
-    .no_progress <- FALSE
-    .engine_dir <- here::here("contracts-engine")
-    .quiet <- FALSE
+    .suite <- "matcon"
   }
-
-  if (fs::file_exists(.output)) {
-    if (isTRUE(.overwrite)) {
-      fs::file_delete(.output)
-    } else {
-      if (!.quiet) cli::cli_alert_info("Output exists, skipping: {.path {(.output)}}")
-      return(invisible(.output))
-    }
-  }
-
-  t0_ <- Sys.time()
-
-  python_ <- fs::path(.engine_dir, ".venv", "bin", "python")
-  script_ <- fs::path(.engine_dir, "extract_spacy.py")
-  if (!fs::file_exists(python_)) cli::cli_abort("No engine venv at {.path {python_}}.")
-  if (!fs::file_exists(script_)) cli::cli_abort("Missing {.path {script_}}.")
-  fs::dir_create(fs::path_dir(.output))
-
-  args_ <- c(
-    script_, fs::path_abs(.inputs),
-    "--output", .output,
-    "--id-col", .id_col,
-    "--text-col", .text_col,
-    "--model", .model,
-    "--device", .device,
-    "--batch-size", .batch_size,
-    "--n-process", .n_process,
-    "--timeout", as.integer(.timeout)
-  )
-  if (!is.null(.labels)) args_ <- c(args_, "--label", .labels)
-  if (!is.null(.max_chars)) args_ <- c(args_, "--max-chars", as.integer(.max_chars))
-  if (isTRUE(.no_progress)) args_ <- c(args_, "--no-progress")
-
-  status_ <- system2(python_, args_,
-                     # Governed by .no_progress, NOT by .quiet. Both streams inherit the calling
-                     # terminal rather than passing through R's connection layer, so knitr never
-                     # captures them and they cost the rendered document nothing. What .quiet
-                     # suppresses is the cli chatter below, which DOES go through the message
-                     # stream: on a corpus pass that is one line per engine per chunk, thousands
-                     # of them. Tying the live progress bar to the same switch threw away the only
-                     # way to watch a two-day pass in order to avoid a problem it never caused.
-                     stdout = if (.no_progress) FALSE else "",
-                     stderr = if (.no_progress) FALSE else ""
-  )
-  if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_spacy.py failed (status {status_}).")
-
-  elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("spaCy [{(.model)}] done in {elapsed_}s -> {.path {(.output)}}")
-  return(invisible(.output))
+  here::here(switch(
+    .suite,
+    spacy  = "contracts-spacy",
+    lexnlp = "contracts-lexnlp",
+    matcon = "contracts-extract",
+    cli::cli_abort("Unknown suite {(.suite)}.")
+  ))
 }
 
-#' Run the LexNLP extractor inside its container over parquet input
+#' Which device a spaCy model should run on
 #'
-#' LexNLP is pinned to Python 3.8 and cannot share the engine environment, so it runs in a
-#' container: the inputs' common base is mounted read-only at /work and the output directory at
-#' /out, and host paths are translated into the mount before the command is built.
+#' THE ONLY SURVIVING PER-MODEL TUNING VALUE, and it is not really tuning -- it is a fact about what
+#' each pipeline is made of.
 #'
-#' Geography is excluded by policy rather than by capability. LexNLP's geoentity pass is the
-#' throughput killer in this engine set, and places are covered by the gazetteer, so paying for it
-#' here would buy a second opinion at several times the cost of the first.
+#' Activating a GPU forces n_process to 1, because one Metal device cannot be shared across worker
+#' processes. For the transformer that is the right trade: the model is a single large matrix
+#' operation per batch and the device wins by more than the twenty workers it costs.
 #'
-#' The timeout caps every extractor on every document because LexNLP's maxent NER and date grammar
-#' spin pathologically on a small number of files. On timeout that extractor is skipped for that
-#' document, the document still lands in the output carrying its marker row, and the run continues.
+#' For the CNN pipelines it is exactly the wrong trade. Their per-document work is small enough that
+#' host-device transfer dominates the arithmetic, so activating the GPU buys almost nothing and pays
+#' for it by dropping from twenty CPU workers to one. Measured on this sample: en_core_web_lg on
+#' MPS with one worker ran at roughly one window per second, which is over an hour for a pass the
+#' CPU does in minutes.
 #'
-#' @param .inputs Character. Parquet file(s) or folder(s); folders are globbed recursively.
-#' @param .output Character. Destination parquet for the candidate spans.
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .text_col Character. Text column the offsets will index.
-#' @param .labels Character. Entity labels to keep, within the supported set.
-#' @param .max_chars Integer or NULL. Truncate each document to its first N characters. NULL is no
-#'   truncation.
-#' @param .timeout Integer. Per-extractor-per-document cap in seconds; 0 disables it.
-#' @param .geo_config Character. In-container path to the geoentity table. Unused while GPE is
-#'   excluded, and kept so that re-enabling it is a one-argument change.
-#' @param .chunk_size Integer. Documents per worker chunk.
-#' @param .n_process Integer. Worker processes.
-#' @param .overwrite Logical. TRUE re-runs even when .output exists.
-#' @param .no_progress Logical. Suppress the extractor's own progress bar AND the subprocess
-#'   streams it rides on. Those inherit the calling terminal, so they never reach a rendered
-#'   document; this is the switch for watching a long pass live.
-#' @param .image Character. Container image tag.
-#' @param .quiet Logical. Suppress the cli completion message, which DOES go through the message
-#'   stream and so is captured into a rendered document -- one line per engine per chunk.
-#' @return Invisibly, the output path.
-ner_lexnlp <- function(
-    .inputs,
-    .output,
-    .id_col = "DocID",
-    .text_col = "TextRaw",
-    .labels = c("ORG", "DATE", "MONEY"), # full supported set
-    .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
-    .timeout = 60L, # per-extractor-per-doc cap in seconds (0 = off)
-    .geo_config = "/app/geoentities.csv", # in-container path (GPE only)
-    .chunk_size = 8L,
-    .n_process = 1L,
-    .overwrite = FALSE,
-    .no_progress = FALSE,
-    .image = "contracts-lexnlp",
-    .quiet = FALSE
-) {
+#' @param .model spaCy model name.
+#' @return "auto" for a transformer pipeline, "cpu" otherwise.
+.ner_spacy_device <- function(.model) {
   if (FALSE) {
-    .inputs <- fil_sample_dirs$Path[20]
-    .output <- file.path(.lP$Cache$NerTest, "test_lexnlp.parquet")
-    .id_col <- "DocID"
-    .text_col <- "TextRaw"
-    .labels <- c("ORG", "DATE", "MONEY")
-    .max_chars <- NULL
-    .timeout <- 60L
-    .geo_config <- "/app/geoentities.csv"
-    .chunk_size <- 8L
-    .n_process <- 10L
-    .overwrite <- FALSE
-    .no_progress <- FALSE
-    .image <- "contracts-lexnlp"
-    .quiet <- FALSE
+    .model <- "en_core_web_trf"
+  }
+  if (stringi::stri_detect_fixed(.model, "trf")) "auto" else "cpu"
+}
+
+#' A suite's Python interpreter
+#'
+#' @param .suite One of "spacy", "matcon". LexNLP has no interpreter on the host; it runs in a
+#'   container.
+#' @return Path to the suite venv's python.
+.ner_python <- function(.suite) {
+  if (FALSE) {
+    .suite <- "matcon"
+  }
+  out_ <- fs::path(.ner_suite_dir(.suite), ".venv", "bin", "python")
+  if (!fs::file_exists(out_)) {
+    cli::cli_abort(c(
+      "No interpreter for suite {(.suite)} at {(out_)}.",
+      "i" = "cd {(.ner_suite_dir(.suite))} && uv venv --python 3.12 && uv pip install ..."
+    ))
+  }
+  out_
+}
+
+#' Run a subprocess, stream its output, and abort on failure
+#'
+#' Every suite call goes through this. Output streams to the console rather than being captured,
+#' because these run for minutes to hours and a progress bar nobody can see is worse than no
+#' progress bar. A non-zero exit aborts rather than returning quietly: a suite that failed halfway
+#' leaves a partial parquet, and ingesting it would record partial extraction as complete.
+#'
+#' @param .cmd Executable.
+#' @param .args Character vector of arguments.
+#' @param .label What to name in the abort message.
+#' @return Elapsed seconds, invisibly.
+.ner_system <- function(.cmd, .args, .label) {
+  if (FALSE) {
+    .cmd   <- "echo"
+    .args  <- "hello"
+    .label <- "demo"
+  }
+  t0_     <- Sys.time()
+  status_ <- system2(.cmd, .args, stdout = "", stderr = "")
+  secs_   <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+  if (!identical(status_, 0L)) {
+    cli::cli_abort("{(.label)} exited with status {(status_)} after {round(secs_, 1)}s.")
+  }
+  invisible(secs_)
+}
+
+#' Extract with spaCy
+#'
+#' One model per call. Vectorising over models was considered and rejected: extract_spacy.py takes
+#' --model singular, so four models are four subprocess launches whether the loop sits in R or in
+#' Python, and the benchmark needs a wall clock per model rather than one for the set. Looping at
+#' the call site keeps a single tested path.
+#'
+#' @param .path_in Staged parquet carrying .id_col and .text_col.
+#' @param .out_dir Directory for the output parquet. Created if absent.
+#' @param .model spaCy model name, e.g. "en_core_web_lg".
+#' @param .labels Cross-engine labels to keep. NULL keeps everything the model produces.
+#' @param .id_col,.text_col Column names in the staged parquet.
+#' @param .max_chars Truncate each document to its first N characters. 0 disables.
+#' @param .n_process Worker processes. Ignored on GPU, where the script forces 1.
+#' @param .batch_size Documents per nlp.pipe batch.
+#' @param .timeout Per-document cap in seconds.
+#' @param .device One of auto, cpu, cuda, mps. NULL resolves per model -- see .ner_spacy_device().
+#' @param .quiet Suppress the progress bar.
+#' @return Path to the parquet written, invisibly, with an "elapsed" attribute in seconds.
+ner_spacy <- function(.path_in,
+                      .out_dir,
+                      .model      = "en_core_web_lg",
+                      .labels     = NULL,
+                      .id_col     = "DocID",
+                      .text_col   = "TextRaw",
+                      .max_chars  = 0L,
+                      .n_process  = .ner_n_process,
+                      .batch_size = .ner_batch_size,
+                      .timeout    = .ner_timeout,
+                      .device     = NULL,
+                      .quiet      = FALSE) {
+  if (FALSE) {
+    .path_in    <- here::here("2_output", "04A-EntityExtract", "sample_text.parquet")
+    .out_dir    <- here::here("2_output", "04A-EntityExtract", "Stage")
+    .model      <- "en_core_web_lg"
+    .labels     <- c("ORG", "PERSON", "GPE")
+    .id_col     <- "DocID"
+    .text_col   <- "TextRaw"
+    .max_chars  <- 0L
+    .n_process  <- 20L
+    .batch_size <- 32L
+    .timeout    <- 600L
+    .device     <- NULL
+    .quiet      <- FALSE
   }
 
-  if (fs::file_exists(.output)) {
-    if (isTRUE(.overwrite)) {
-      fs::file_delete(.output)
-    } else {
-      if (!.quiet) cli::cli_alert_info("Output exists, skipping: {.path {(.output)}}")
-      return(invisible(.output))
-    }
-  }
+  # NULL means "decide from the model", which is what keeps the rule in one place instead of at
+  # every call site. An explicit value still wins, for the benchmark and for debugging.
+  device_ <- .device %||% .ner_spacy_device(.model = .model)
 
-  t0_ <- Sys.time()
+  fs::dir_create(.out_dir)
+  out_ <- fs::path(.out_dir, paste0("spacy__", .model, ".parquet"))
+
+  args_ <- c(
+    fs::path(.ner_suite_dir("spacy"), "extract_spacy.py"),
+    .path_in,
+    "--output",     out_,
+    "--model",      .model,
+    "--id-col",     .id_col,
+    "--text-col",   .text_col,
+    "--max-chars",  .max_chars,
+    "--n-process",  .n_process,
+    "--batch-size", .batch_size,
+    "--timeout",    .timeout,
+    "--device",     device_,
+    if (!is.null(.labels)) c("--label", .labels),
+    if (.quiet) "--no-progress"
+  )
+
+  secs_ <- .ner_system(.ner_python("spacy"), as.character(args_), paste0("spacy:", .model))
+  structure(out_, elapsed = secs_) |> invisible()
+}
+
+#' Extract with LexNLP
+#'
+#' Runs in a container because LexNLP 2.3.0 is pinned to Python 3.8. The inputs' common parent is
+#' mounted read-only at /work and the output directory at /out, so nothing the container writes can
+#' reach anything but its own output.
+#'
+#' NO --platform FLAG. Pinning linux/amd64 breaks image resolution under the containerd image store,
+#' and the native arm64 build is 1.93x faster. The architecture warning at runtime is cosmetic.
+#'
+#' @param .path_in Staged parquet carrying .id_col and .text_col.
+#' @param .out_dir Directory for the output parquet. Created if absent.
+#' @param .model Ignored; present so all three suites share one signature. LexNLP has one version
+#'   and it is the container's.
+#' @param .labels Labels to extract. Defaults to everything this suite produces.
+#' @param .id_col,.text_col Column names in the staged parquet.
+#' @param .max_chars Truncate each document to its first N characters. 0 disables.
+#' @param .n_process Worker processes inside the container.
+#' @param .batch_size Documents per task.
+#' @param .timeout Per-document cap in seconds.
+#' @param .image Container image name.
+#' @param .quiet Suppress the progress bar.
+#' @return Path to the parquet written, invisibly, with an "elapsed" attribute in seconds.
+ner_lexnlp <- function(.path_in,
+                       .out_dir,
+                       .model      = NULL,
+                       .labels     = c("ORG", "GPE", "DATE", "MONEY"),
+                       .id_col     = "DocID",
+                       .text_col   = "TextRaw",
+                       .max_chars  = 0L,
+                       .n_process  = .ner_n_process,
+                       .batch_size = .ner_batch_size,
+                       .timeout    = .ner_timeout,
+                       .image      = "contracts-lexnlp",
+                       .quiet      = FALSE) {
+  if (FALSE) {
+    .path_in    <- here::here("2_output", "04A-EntityExtract", "sample_text.parquet")
+    .out_dir    <- here::here("2_output", "04A-EntityExtract", "Stage")
+    .model      <- NULL
+    .labels     <- c("ORG", "GPE", "DATE", "MONEY")
+    .id_col     <- "DocID"
+    .text_col   <- "TextRaw"
+    .max_chars  <- 0L
+    .n_process  <- 20L
+    .batch_size <- 32L
+    .timeout    <- 600L
+    .image      <- "contracts-lexnlp"
+    .quiet      <- FALSE
+  }
 
   if (Sys.which("docker") == "") cli::cli_abort("docker not found on PATH.")
-  inputs_ <- fs::path_abs(.inputs)
-  out_dir_ <- fs::path_dir(.output)
-  fs::dir_create(out_dir_)
+  fs::dir_create(.out_dir)
 
-  base_ <- fs::path_common(inputs_)
-  if (!fs::is_dir(base_)) base_ <- fs::path_dir(base_) # single-file case
-  rel_ <- fs::path_rel(inputs_, base_)
-  cont_in_ <- as.character(fs::path("/work", rel_))
-  cont_in_[rel_ == "."] <- "/work"
+  # THE IMAGE MUST MATCH ITS SOURCES. Editing extract_lexnlp.py without rebuilding leaves a running
+  # container that no longer matches the repository, and the extraction it produces is attributed in
+  # the store to code that has changed since. The container runs, the parquet is well formed, and
+  # the rows are wrong about their own provenance. A warning rather than an abort, because a stale
+  # image is still usable if the caller knows.
+  ner_lexnlp_check_image(.image = .image, .abort = FALSE)
+
+  in_    <- fs::path_real(.path_in)
+  base_  <- fs::path_dir(in_)
+  out_   <- fs::path(.out_dir, "lexnlp__lexnlp.parquet")
 
   args_ <- c(
     "run", "--rm",
-    "-v", paste0(as.character(fs::path_real(base_)), ":/work:ro"),
-    "-v", paste0(as.character(fs::path_real(out_dir_)), ":/out"),
+    "-v", paste0(as.character(base_), ":/work:ro"),
+    "-v", paste0(as.character(fs::path_real(.out_dir)), ":/out"),
     .image,
-    cont_in_,
-    "--output", fs::path("/out", fs::path_file(.output)),
-    "--id-col", .id_col,
-    "--text-col", .text_col,
-    "--label", .labels,
-    "--geo-config", .geo_config,
-    "--n-process", .n_process,
-    "--chunk-size", .chunk_size,
-    "--timeout", as.integer(.timeout)
+    fs::path("/work", fs::path_file(in_)),
+    "--output",     fs::path("/out", fs::path_file(out_)),
+    "--id-col",     .id_col,
+    "--text-col",   .text_col,
+    "--label",      .labels,
+    "--max-chars",  .max_chars,
+    "--n-process",  .n_process,
+    "--chunk-size", .batch_size,
+    "--timeout",    .timeout,
+    if (.quiet) "--no-progress"
   )
-  if (!is.null(.max_chars)) args_ <- c(args_, "--max-chars", as.integer(.max_chars))
-  if (isTRUE(.no_progress)) args_ <- c(args_, "--no-progress")
 
-  status_ <- system2("docker", args_,
-                     # Governed by .no_progress, NOT by .quiet. Both streams inherit the calling
-                     # terminal rather than passing through R's connection layer, so knitr never
-                     # captures them and they cost the rendered document nothing. What .quiet
-                     # suppresses is the cli chatter below, which DOES go through the message
-                     # stream: on a corpus pass that is one line per engine per chunk, thousands
-                     # of them. Tying the live progress bar to the same switch threw away the only
-                     # way to watch a two-day pass in order to avoid a problem it never caused.
-                     stdout = if (.no_progress) FALSE else "",
-                     stderr = if (.no_progress) FALSE else ""
-  )
-  if (!identical(as.integer(status_), 0L)) cli::cli_abort("LexNLP container failed (status {status_}).")
-
-  elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("LexNLP done in {elapsed_}s -> {.path {(.output)}}")
-  return(invisible(.output))
+  secs_ <- .ner_system("docker", as.character(args_), "lexnlp")
+  structure(out_, elapsed = secs_) |> invisible()
 }
 
-
-
-#' Run the ported date-pattern extractor over parquet input
+#' Extract with matcon-extract
 #'
-#' The paper's eight date patterns, ported so that the published measure can be reproduced rather
-#' than described. The script stamps Engine "paper" and its own MODEL constant; the model tag names
-#' the pattern set, so revising a pattern means bumping MODEL in extract_dateregex.py and not
-#' silently changing what an existing store means.
+#' RETURNS SEVERAL PATHS, unlike the other two. Labels map to modules inside the package -- DATE and
+#' TERM both come from dateregex, MONEY from moneyregex -- so one call can run several extractors,
+#' and each writes its own parquet. One parquet per model is not a convenience: ner_db_append()
+#' asserts that a staging file carries exactly one (Engine, Model) pair, because a file carrying two
+#' would attribute spans to a method that never saw the document.
 #'
-#' Single process and pure regex, so it finishes in minutes. That is why it runs first in the engine
-#' order: the positional evidence is available for inspection long before the transformer starts.
+#' THE CALLER NEVER NAMES A MODEL. Which version of dateregex runs is whatever is installed, and the
+#' extractor stamps it. That is the rule the whole restructuring restored, and ner_matcon_describe()
+#' is how R learns the tag without typing it.
 #'
-#' @param .inputs Character. Parquet file(s) or folder(s); folders are globbed recursively.
-#' @param .output Character. Destination parquet for the candidate spans.
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .text_col Character. Text column the offsets will index.
-#' @param .labels Character. Entity labels to keep; DATE is the whole supported set.
-#' @param .max_chars Integer or NULL. Truncate each document to its first N characters. NULL is no
-#'   truncation.
-#' @param .overwrite Logical. TRUE re-runs even when .output exists.
-#' @param .no_progress Logical. Suppress the extractor's own progress bar AND the subprocess
-#'   streams it rides on. Those inherit the calling terminal, so they never reach a rendered
-#'   document; this is the switch for watching a long pass live.
-#' @param .engine_dir Character. Root of the contracts-engine package.
-#' @param .quiet Logical. Suppress the cli completion message, which DOES go through the message
-#'   stream and so is captured into a rendered document -- one line per engine per chunk.
-#' @return Invisibly, the output path.
-ner_dateregex <- function(
-    .inputs,
-    .output,
-    .id_col = "DocID",
-    .text_col = "TextRaw",
-    .labels = "DATE", # full supported set
-    .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
-    .timeout = 0L, # per-document cap in seconds (0 = off)
-    .chunk_size = 64L,
-    .n_process = 1L, # <=0 = all cores
-    .overwrite = FALSE,
-    .no_progress = FALSE,
-    .engine_dir = here::here("contracts-engine"),
-    .quiet = FALSE
-) {
+#' @param .path_in Staged parquet carrying .id_col and .text_col.
+#' @param .out_dir Directory for the output parquets. Created if absent.
+#' @param .model Ignored; present so all three suites share one signature. The package versions
+#'   itself and reports through --describe.
+#' @param .labels Labels to extract. Defaults to everything this suite produces.
+#' @param .id_col,.text_col Column names in the staged parquet.
+#' @param .max_chars Truncate each document to its first N characters. 0 disables.
+#' @param .n_process Worker processes.
+#' @param .batch_size Documents per task.
+#' @param .timeout Per-document cap in seconds.
+#' @param .quiet Suppress the progress bar.
+#' @return Character vector of parquet paths, invisibly, with an "elapsed" attribute in seconds.
+ner_matcon <- function(.path_in,
+                       .out_dir,
+                       .model      = NULL,
+                       .labels     = c("DATE", "TERM", "MONEY", "REDACT", "GPE"),
+                       .id_col     = "DocID",
+                       .text_col   = "TextRaw",
+                       .max_chars  = 0L,
+                       .n_process  = .ner_n_process,
+                       .batch_size = .ner_batch_size,
+                       .timeout    = .ner_timeout,
+                       .quiet      = FALSE) {
   if (FALSE) {
-    .inputs <- fil_sample_dirs$Path[20]
-    .output <- file.path(.lP$Cache$NerTest, "test_dateregex.parquet")
-    .id_col <- "DocID"
-    .text_col <- "TextRaw"
-    .labels <- "DATE"
-    .max_chars <- NULL
-    .timeout <- 0L
-    .chunk_size <- 64L
-    .n_process <- 1L
-    .overwrite <- FALSE
-    .no_progress <- FALSE
-    .engine_dir <- here::here("contracts-engine")
-    .quiet <- FALSE
+    .path_in    <- here::here("2_output", "04A-EntityExtract", "sample_text.parquet")
+    .out_dir    <- here::here("2_output", "04A-EntityExtract", "Stage")
+    .model      <- NULL
+    .labels     <- c("DATE", "TERM", "MONEY", "REDACT", "GPE")
+    .id_col     <- "DocID"
+    .text_col   <- "TextRaw"
+    .max_chars  <- 0L
+    .n_process  <- 20L
+    .batch_size <- 32L
+    .timeout    <- 600L
+    .quiet      <- FALSE
   }
 
-  if (fs::file_exists(.output)) {
-    if (isTRUE(.overwrite)) {
-      fs::file_delete(.output)
-    } else {
-      if (!.quiet) cli::cli_alert_info("Output exists, skipping: {.path {(.output)}}")
-      return(invisible(.output))
-    }
-  }
-
-  t0_ <- Sys.time()
-
-  python_ <- fs::path(.engine_dir, ".venv", "bin", "python")
-  script_ <- fs::path(.engine_dir, "extract_dateregex.py")
-  if (!fs::file_exists(python_)) cli::cli_abort("No engine venv at {.path {python_}}.")
-  if (!fs::file_exists(script_)) cli::cli_abort("Missing {.path {script_}}.")
-  fs::dir_create(fs::path_dir(.output))
+  fs::dir_create(.out_dir)
 
   args_ <- c(
-    script_, fs::path_abs(.inputs),
-    "--output", .output,
-    "--id-col", .id_col,
-    "--text-col", .text_col,
-    "--label", .labels,
-    "--n-process", as.integer(.n_process),
-    "--chunk-size", as.integer(.chunk_size),
-    "--timeout", as.integer(.timeout)
+    "-m", "matcon_extract",
+    .path_in,
+    "--out-dir",    .out_dir,
+    "--label",      .labels,
+    "--id-col",     .id_col,
+    "--text-col",   .text_col,
+    "--max-chars",  .max_chars,
+    "--n-process",  .n_process,
+    "--chunk-size", .batch_size,
+    "--timeout",    .timeout,
+    if (.quiet) "--no-progress"
   )
-  if (!is.null(.max_chars)) args_ <- c(args_, "--max-chars", as.integer(.max_chars))
-  if (isTRUE(.no_progress)) args_ <- c(args_, "--no-progress")
 
-  status_ <- system2(python_, args_,
-                     # Governed by .no_progress, NOT by .quiet. Both streams inherit the calling
-                     # terminal rather than passing through R's connection layer, so knitr never
-                     # captures them and they cost the rendered document nothing. What .quiet
-                     # suppresses is the cli chatter below, which DOES go through the message
-                     # stream: on a corpus pass that is one line per engine per chunk, thousands
-                     # of them. Tying the live progress bar to the same switch threw away the only
-                     # way to watch a two-day pass in order to avoid a problem it never caused.
-                     stdout = if (.no_progress) FALSE else "",
-                     stderr = if (.no_progress) FALSE else ""
-  )
-  if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_dateregex.py failed (status {status_}).")
+  secs_ <- .ner_system(.ner_python("matcon"), as.character(args_), "matcon")
 
-  elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("dateregex done in {elapsed_}s -> {.path {(.output)}}")
-  return(invisible(.output))
+  # The package writes <engine>__<model>.parquet per model, so the paths are discovered rather than
+  # predicted -- R does not know which models the requested labels resolved to until it asks.
+  want_  <- ner_matcon_describe() |>
+    dplyr::filter(purrr::map_lgl(.data$Labels, \(.l) any(.l %in% .labels)))
+  out_   <- fs::path(.out_dir, paste0(want_$Engine, "__", want_$Model, ".parquet"))
+  miss_  <- out_[!fs::file_exists(out_)]
+  if (length(miss_) > 0L) {
+    cli::cli_abort("matcon reported success but {length(miss_)} expected file(s) are absent: {(miss_)}")
+  }
+
+  structure(as.character(out_), elapsed = secs_) |> invisible()
 }
-
-#' Run the ported place-name gazetteer over parquet input
-#'
-#' The paper's USGS-plus-countries lookup, rewritten with a hierarchy and a proximity gate. The
-#' rewrite matters: the original excluded any place name that is also an English dictionary word,
-#' which removes forty of the fifty US states and leaves a state-level geography consisting of the
-#' ten whose names run to two words. This version keeps those names and gates them on context
-#' instead, so Delaware and California are recoverable while Reading and Mobile are not admitted
-#' without a jurisdiction beside them.
-#'
-#' Matching runs case-insensitively against the canonical text rather than a normalised copy,
-#' because the offsets have to index the string every other engine indexed. The matcher lowercases
-#' internally, so case-insensitivity costs nothing in fidelity.
-#'
-#' @param .inputs Character. Parquet file(s) or folder(s); folders are globbed recursively.
-#' @param .output Character. Destination parquet for the candidate spans.
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .text_col Character. Text column the offsets will index.
-#' @param .labels Character. Entity labels to keep; GPE is the whole supported set.
-#' @param .lookup Character. Path to the gazetteer parquet.
-#' @param .state_window Integer. Characters within which a jurisdiction must appear for a
-#'   distinctive place name to be admitted.
-#' @param .word_window Integer. The same for a place name that is also an ordinary English word,
-#'   which needs a jurisdiction immediately adjacent. This is what separates the city from the
-#'   street it stands on.
-#' @param .max_chars Integer or NULL. Truncate each document to its first N characters. NULL is no
-#'   truncation.
-#' @param .timeout Integer. Per-document matching cap in seconds; a marker row is written on
-#'   timeout. 0 disables it.
-#' @param .n_process Integer. Worker processes.
-#' @param .chunk_size Integer. Documents per worker chunk.
-#' @param .overwrite Logical. TRUE re-runs even when .output exists.
-#' @param .no_progress Logical. Suppress the extractor's own progress bar AND the subprocess
-#'   streams it rides on. Those inherit the calling terminal, so they never reach a rendered
-#'   document; this is the switch for watching a long pass live.
-#' @param .engine_dir Character. Root of the contracts-engine package.
-#' @param .quiet Logical. Suppress the cli completion message, which DOES go through the message
-#'   stream and so is captured into a rendered document -- one line per engine per chunk.
-#' @return Invisibly, the output path.
-ner_gazetteer <- function(
-    .inputs,
-    .output,
-    .id_col = "DocID",
-    .text_col = "TextRaw",
-    .labels = "GPE", # full supported set
-    .lookup = here::here("contracts-engine", "data", "gazetteer", "geo_lookup.parquet"),
-    .state_window = 200L, # loose window (chars) for distinctive gated names
-    .word_window = 40L, # strict window (chars) for common-word gated names
-    .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
-    .timeout = 120L, # per-doc cap in seconds (0 = off)
-    .n_process = 1L,
-    .chunk_size = 8L,
-    .overwrite = FALSE,
-    .no_progress = FALSE,
-    .engine_dir = here::here("contracts-engine"),
-    .quiet = FALSE
-) {
-  if (FALSE) {
-    .inputs <- fil_sample_dirs$Path[20]
-    .output <- file.path(.lP$Cache$NerTest, "test_gazetteer.parquet")
-    .id_col <- "DocID"
-    .text_col <- "TextRaw"
-    .labels <- "GPE"
-    .lookup <- here::here("contracts-engine", "data", "gazetteer", "geo_lookup.parquet")
-    .state_window <- 200L
-    .word_window <- 40L
-    .max_chars <- NULL
-    .timeout <- 120L
-    .n_process <- 10L
-    .chunk_size <- 8L
-    .overwrite <- FALSE
-    .no_progress <- FALSE
-    .engine_dir <- here::here("contracts-engine")
-    .quiet <- FALSE
-  }
-
-  if (fs::file_exists(.output)) {
-    if (isTRUE(.overwrite)) {
-      fs::file_delete(.output)
-    } else {
-      if (!.quiet) cli::cli_alert_info("Output exists, skipping: {.path {(.output)}}")
-      return(invisible(.output))
-    }
-  }
-
-  t0_ <- Sys.time()
-
-  python_ <- fs::path(.engine_dir, ".venv", "bin", "python")
-  script_ <- fs::path(.engine_dir, "extract_gazetteer.py")
-  if (!fs::file_exists(python_)) cli::cli_abort("No engine venv at {.path {python_}}.")
-  if (!fs::file_exists(script_)) cli::cli_abort("Missing {.path {script_}}.")
-  if (!fs::file_exists(.lookup)) cli::cli_abort("Gazetteer lookup not found: {.path {(.lookup)}}.")
-  fs::dir_create(fs::path_dir(.output))
-
-  args_ <- c(
-    script_, fs::path_abs(.inputs),
-    "--output", .output,
-    "--id-col", .id_col,
-    "--text-col", .text_col,
-    "--label", .labels,
-    "--lookup", fs::path_abs(.lookup),
-    "--state-window", as.integer(.state_window),
-    "--word-window", as.integer(.word_window),
-    "--n-process", .n_process,
-    "--chunk-size", .chunk_size,
-    "--timeout", as.integer(.timeout)
-  )
-  if (!is.null(.max_chars)) args_ <- c(args_, "--max-chars", as.integer(.max_chars))
-  if (isTRUE(.no_progress)) args_ <- c(args_, "--no-progress")
-
-  status_ <- system2(python_, args_,
-                     # Governed by .no_progress, NOT by .quiet. Both streams inherit the calling
-                     # terminal rather than passing through R's connection layer, so knitr never
-                     # captures them and they cost the rendered document nothing. What .quiet
-                     # suppresses is the cli chatter below, which DOES go through the message
-                     # stream: on a corpus pass that is one line per engine per chunk, thousands
-                     # of them. Tying the live progress bar to the same switch threw away the only
-                     # way to watch a two-day pass in order to avoid a problem it never caused.
-                     stdout = if (.no_progress) FALSE else "",
-                     stderr = if (.no_progress) FALSE else ""
-  )
-  if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_gazetteer.py failed (status {status_}).")
-
-  elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("gazetteer done in {elapsed_}s -> {.path {(.output)}}")
-  return(invisible(.output))
-}
-
-#' Resolve inputs to a flat list of parquet files
-#'
-#' Mirrors what the Python extractors do with the same argument, so a folder passed to R and the
-#' same folder passed to the engine resolve to the same file set. An empty result is an error rather
-#' than an empty run: a mistyped path that silently processes nothing looks identical to a
-#' completed pass in the ledger.
-#'
-#' @param .inputs Character. Parquet file(s) or folder(s); folders are globbed recursively.
-#' @return Character vector of absolute, unique parquet paths.
-ner_input_files <- function(.inputs) {
-  if (FALSE) {
-    .inputs <- fil_sample_dirs$Path[20]
-  }
-
-  paths_ <- fs::path_abs(.inputs)
-  files_ <- purrr::map(paths_, \(.p) {
-    if (fs::is_dir(.p)) fs::dir_ls(.p, recurse = TRUE, glob = "*.parquet") else .p
-  }) |>
-    unlist() |>
-    unique() |>
-    as.character()
-  if (length(files_) == 0L) cli::cli_abort("No parquet files found in {.arg .inputs}.")
-  return(files_)
-}
-
-#' Run the redaction-indicator extractor over parquet input
-#'
-#' Not an entity extractor in the usual sense. It emits the bracketed indicators the published
-#' analysis counted as spans under the label REDACT, with LabelRaw carrying the class
-#' (RedactSymbol, RedactExplicit, OmitExplicit, OmitSymbol, RedactBare).
-#'
-#' Emitting them with offsets rather than as a count is the whole point. A count says how much was
-#' withheld but not what; putting the indicators in the same coordinate system as the candidates
-#' turns "how far is this amount from the nearest redaction" into a window function instead of a
-#' second pass over the text. That is the only external evidence money admits, since a marker sits
-#' exactly where a commercially material figure used to be.
-#'
-#' @param .inputs Character. Parquet file(s) or folder(s); folders are globbed recursively.
-#' @param .output Character. Destination parquet for the candidate spans.
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .text_col Character. Text column the offsets will index.
-#' @param .labels Character. Entity labels to keep; REDACT is the whole supported set.
-#' @param .max_chars Integer or NULL. Truncate each document to its first N characters. NULL is no
-#'   truncation, which is what this extractor wants: a cap drops most of the markers.
-#' @param .timeout Integer. Per-document cap in seconds; 0 disables it.
-#' @param .n_process Integer. Worker processes.
-#' @param .chunk_size Integer. Documents per worker chunk.
-#' @param .overwrite Logical. TRUE re-runs even when .output exists.
-#' @param .no_progress Logical. Suppress the extractor's own progress bar AND the subprocess
-#'   streams it rides on. Those inherit the calling terminal, so they never reach a rendered
-#'   document; this is the switch for watching a long pass live.
-#' @param .engine_dir Character. Root of the contracts-engine package.
-#' @param .quiet Logical. Suppress the cli completion message, which DOES go through the message
-#'   stream and so is captured into a rendered document -- one line per engine per chunk.
-#' @return Invisibly, the output path.
-ner_redaction <- function(
-    .inputs,
-    .output,
-    .id_col = "DocID",
-    .text_col = "TextRaw",
-    .labels = "REDACT", # full supported set
-    .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
-    .timeout = 0L, # per-document cap in seconds; 0 = off
-    .n_process = 16L,
-    .chunk_size = 64L,
-    .overwrite = FALSE,
-    .no_progress = FALSE,
-    .engine_dir = here::here("contracts-engine"),
-    .quiet = FALSE
-) {
-  if (FALSE) {
-    .inputs <- fil_sample_dirs$Path[20]
-    .output <- file.path(.lP$Cache$NerTest, "test_redaction.parquet")
-    .id_col <- "DocID"
-    .text_col <- "TextRaw"
-    .labels <- "REDACT"
-    .max_chars <- NULL
-    .timeout <- 0L
-    .n_process <- 16L
-    .chunk_size <- 64L
-    .overwrite <- FALSE
-    .no_progress <- FALSE
-    .engine_dir <- here::here("contracts-engine")
-    .quiet <- FALSE
-  }
-
-  if (fs::file_exists(.output)) {
-    if (isTRUE(.overwrite)) {
-      fs::file_delete(.output)
-    } else {
-      if (!.quiet) cli::cli_alert_info("Output exists, skipping: {.path {(.output)}}")
-      return(invisible(.output))
-    }
-  }
-
-  t0_ <- Sys.time()
-
-  python_ <- fs::path(.engine_dir, ".venv", "bin", "python")
-  script_ <- fs::path(.engine_dir, "extract_redaction.py")
-  if (!fs::file_exists(python_)) cli::cli_abort("No engine venv at {.path {python_}}.")
-  if (!fs::file_exists(script_)) cli::cli_abort("Missing {.path {script_}}.")
-  fs::dir_create(fs::path_dir(.output))
-
-  args_ <- c(
-    script_, fs::path_abs(.inputs),
-    "--output", .output,
-    "--id-col", .id_col,
-    "--text-col", .text_col,
-    "--label", .labels,
-    "--n-process", as.integer(.n_process),
-    "--chunk-size", as.integer(.chunk_size),
-    "--timeout", as.integer(.timeout)
-  )
-  if (!is.null(.max_chars)) args_ <- c(args_, "--max-chars", as.integer(.max_chars))
-  if (isTRUE(.no_progress)) args_ <- c(args_, "--no-progress")
-
-  status_ <- system2(python_, args_,
-                     # Governed by .no_progress, NOT by .quiet. Both streams inherit the calling
-                     # terminal rather than passing through R's connection layer, so knitr never
-                     # captures them and they cost the rendered document nothing. What .quiet
-                     # suppresses is the cli chatter below, which DOES go through the message
-                     # stream: on a corpus pass that is one line per engine per chunk, thousands
-                     # of them. Tying the live progress bar to the same switch threw away the only
-                     # way to watch a two-day pass in order to avoid a problem it never caused.
-                     stdout = if (.no_progress) FALSE else "",
-                     stderr = if (.no_progress) FALSE else ""
-  )
-  if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_redaction.py failed (status {status_}).")
-
-  elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("redaction done in {elapsed_}s -> {.path {(.output)}}")
-  return(invisible(.output))
-}
-
-#' Run the monetary-pattern extractor over parquet input
-#'
-#' A rule arm for the one label with no external anchor. Money cannot be ranked on recall, because
-#' EDGAR records no contract value, so the choice between engines has to rest on something other
-#' than a recall table: agreement with the other family, and whether an engine can propose a span at
-#' a site where the figure was withheld.
-#'
-#' @param .inputs Character. Parquet file(s) or folder(s); folders are globbed recursively.
-#' @param .output Character. Destination parquet for the candidate spans.
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .text_col Character. Text column the offsets will index.
-#' @param .labels Character. Entity labels to keep; MONEY is the whole supported set.
-#' @param .max_chars Integer or NULL. Truncate each document to its first N characters. NULL is no
-#'   truncation.
-#' @param .timeout Integer. Per-document cap in seconds; 0 disables it.
-#' @param .n_process Integer. Worker processes.
-#' @param .chunk_size Integer. Documents per worker chunk.
-#' @param .overwrite Logical. TRUE re-runs even when .output exists.
-#' @param .no_progress Logical. Suppress the extractor's own progress bar AND the subprocess
-#'   streams it rides on. Those inherit the calling terminal, so they never reach a rendered
-#'   document; this is the switch for watching a long pass live.
-#' @param .engine_dir Character. Root of the contracts-engine package.
-#' @param .quiet Logical. Suppress the cli completion message, which DOES go through the message
-#'   stream and so is captured into a rendered document -- one line per engine per chunk.
-#' @return Invisibly, the output path.
-ner_moneyregex <- function(
-    .inputs,
-    .output,
-    .id_col = "DocID",
-    .text_col = "TextRaw",
-    .labels = "MONEY", # full supported set
-    .max_chars = NULL, # NULL -> omit --max-chars -> no truncation
-    .timeout = 0L, # per-document cap in seconds; 0 = off
-    .n_process = 16L,
-    .chunk_size = 64L,
-    .overwrite = FALSE,
-    .no_progress = FALSE,
-    .engine_dir = here::here("contracts-engine"),
-    .quiet = FALSE
-) {
-  if (FALSE) {
-    .inputs <- fil_sample_dirs$Path[20]
-    .output <- file.path(.lP$Cache$NerTest, "test_moneyregex.parquet")
-    .id_col <- "DocID"
-    .text_col <- "TextRaw"
-    .labels <- "MONEY"
-    .max_chars <- NULL
-    .timeout <- 0L
-    .n_process <- 16L
-    .chunk_size <- 64L
-    .overwrite <- FALSE
-    .no_progress <- FALSE
-    .engine_dir <- here::here("contracts-engine")
-    .quiet <- FALSE
-  }
-
-  if (fs::file_exists(.output)) {
-    if (isTRUE(.overwrite)) {
-      fs::file_delete(.output)
-    } else {
-      if (!.quiet) cli::cli_alert_info("Output exists, skipping: {.path {(.output)}}")
-      return(invisible(.output))
-    }
-  }
-
-  t0_ <- Sys.time()
-
-  python_ <- fs::path(.engine_dir, ".venv", "bin", "python")
-  script_ <- fs::path(.engine_dir, "extract_moneyregex.py")
-  if (!fs::file_exists(python_)) cli::cli_abort("No engine venv at {.path {python_}}.")
-  if (!fs::file_exists(script_)) cli::cli_abort("Missing {.path {script_}}.")
-  fs::dir_create(fs::path_dir(.output))
-
-  args_ <- c(
-    script_, fs::path_abs(.inputs),
-    "--output", .output,
-    "--id-col", .id_col,
-    "--text-col", .text_col,
-    "--label", .labels,
-    "--n-process", as.integer(.n_process),
-    "--chunk-size", as.integer(.chunk_size),
-    "--timeout", as.integer(.timeout)
-  )
-  if (!is.null(.max_chars)) args_ <- c(args_, "--max-chars", as.integer(.max_chars))
-  if (isTRUE(.no_progress)) args_ <- c(args_, "--no-progress")
-
-  status_ <- system2(python_, args_,
-                     # Governed by .no_progress, NOT by .quiet. Both streams inherit the calling
-                     # terminal rather than passing through R's connection layer, so knitr never
-                     # captures them and they cost the rendered document nothing. What .quiet
-                     # suppresses is the cli chatter below, which DOES go through the message
-                     # stream: on a corpus pass that is one line per engine per chunk, thousands
-                     # of them. Tying the live progress bar to the same switch threw away the only
-                     # way to watch a two-day pass in order to avoid a problem it never caused.
-                     stdout = if (.no_progress) FALSE else "",
-                     stderr = if (.no_progress) FALSE else ""
-  )
-  if (!identical(as.integer(status_), 0L)) cli::cli_abort("extract_moneyregex.py failed (status {status_}).")
-
-  elapsed_ <- round(as.numeric(difftime(Sys.time(), t0_, units = "secs")), 1)
-  if (!.quiet) cli::cli_alert_success("moneyregex done in {elapsed_}s -> {.path {(.output)}}")
-  return(invisible(.output))
-}
-
-# THE PAPER MODEL REGISTRY --------------------------------------------------------------------------
-# ONE PLACE THAT KNOWS WHICH PORTED EXTRACTORS EXIST. Before this, a model version was a control-flow
-# constant in four separate functions: the combination parser validated against a hard-coded vector,
-# the label policy keyed on the full token, ner_run() dispatched on an exact string match, and each
-# wrapper printed its own version into its success message. Bumping dateregex from v1 to v2 therefore
-# needed four edits in this file plus two in 04A, and missing one failed at a different point each
-# time -- the parser rejected the token, or the policy returned no labels, or the dispatcher fell
-# through to "no runner", or the extraction ran and the identity guard refused the ingest afterwards.
+# 2. Description -------------------------------------------------------------------------------------------------------
 #
-# The STEM is the identity; the version is data. A pattern set may be revised, and revising it must
-# not mean editing a dispatcher: extract_dateregex.py stamps its own MODEL, the guard in
-# ner_db_append() compares that against the dispatched token, and a mismatch is caught before a row
-# is written. Nothing here needs to know which version is current.
-.ner_paper_models <- list(
-  dateregex  = list(label = "DATE",   runner = "ner_dateregex"),
-  gazetteer  = list(label = "GPE",    runner = "ner_gazetteer"),
-  redaction  = list(label = "REDACT", runner = "ner_redaction"),
-  moneyregex = list(label = "MONEY",  runner = "ner_moneyregex")
+# WHAT THIS SECTION SOLVES. The ledger is keyed on (DocID, Engine, Model, Label), so R must know the
+# model tag BEFORE a pass in order to ask what still needs doing. But the model is stamped by the
+# extractor and never typed in R -- that is the rule that keeps a version string out of the
+# runbooks. Something has to bridge the two.
+#
+# The previous answer was a table in R naming each extractor's labels, keyed on the extractor STEM.
+# It was silently wrong the moment dateregex-v3 emitted a second label: the stem said DATE, the
+# request asked for DATE, TERM was filtered out inside Python, and the ledger recorded success.
+# Nothing errored, and no check could have caught it, because the table and the code agreed about
+# the stem and disagreed about nothing R could see.
+#
+# So the extractor answers for itself. matcon-extract --describe reports its models, labels and spec
+# hashes as JSON; R reads that rather than restating it. There is no second declaration, so there is
+# nothing to drift.
+#
+# THE ASYMMETRY IS DELIBERATE. spaCy and LexNLP do not self-describe, so their label sets are
+# declared here. That is honest rather than inconsistent: ours describes itself because we wrote it,
+# and a third-party wrapper is described because we did not. Their label vocabularies have not
+# changed in the project's life, and a check asserts the declaration matches what actually arrived.
+
+
+#' What matcon-extract will stamp, asked of the package itself
+#'
+#' Calls `python -m matcon_extract --describe` and parses the JSON. One subprocess, roughly a second,
+#' and it replaces every R-side statement of what matcon can do.
+#'
+#' `SpecHash` is the fingerprint of the constants that determine an extractor's output -- pattern
+#' tables, vocabularies, and for the gazetteer a content hash of its lookup file. A hash that has
+#' moved under an unchanged model tag means somebody edited a rule without bumping the version,
+#' which would silently change what an existing store's rows mean. Checking it here costs a second
+#' and fails before the first document is read; the alternative is discovering it after a slice has
+#' already been ingested.
+#'
+#' `Ready` is FALSE where an extractor's data dependency is absent. The gazetteer without its lookup
+#' can produce no output at all, so it reports no hash rather than one that merely looks valid.
+#'
+#' @return Tibble: Module, Engine, Model, Labels (list), Extras (list), SpecHash, Ready.
+#' @examples
+#' if (FALSE) ner_matcon_describe()
+ner_matcon_describe <- function() {
+  if (FALSE) {
+    # no arguments
+  }
+
+  raw_ <- system2(
+    .ner_python("matcon"),
+    c("-m", "matcon_extract", "--describe"),
+    stdout = TRUE, stderr = FALSE
+  )
+  if (length(raw_) == 0L) cli::cli_abort("matcon-extract --describe returned nothing.")
+
+  lst_ <- jsonlite::fromJSON(paste(raw_, collapse = "\n"), simplifyVector = FALSE)
+
+  out_ <- lst_ |>
+    purrr::keep(\(.d) isTRUE(.d$available)) |>
+    purrr::map(\(.d) tibble::tibble(
+      Module   = .d$module,
+      Engine   = .d$engine,
+      Model    = .d$model,
+      Labels   = list(unlist(.d$labels)),
+      Extras   = list(unlist(.d$extras)),
+      SpecHash = .d$spec_hash %||% NA_character_,
+      Ready    = isTRUE(.d$ready)
+    )) |>
+    purrr::list_rbind()
+
+  if (nrow(out_) == 0L) cli::cli_abort("matcon-extract reports no installed extractors.")
+  out_
+}
+
+#' Which spaCy models are actually installed
+#'
+#' A MODEL NAME IS NOT A MODEL. Declaring four and having three is not an error anyone notices until
+#' the fourth is loaded, which on this pipeline is after the other three have finished -- and the
+#' third of them is the slow one. Asking the suite costs one subprocess and about a second.
+#'
+#' This narrows the asymmetry between our suite and the third-party ones. matcon-extract describes
+#' itself completely; spaCy cannot report which labels it will emit, but it can certainly report
+#' which models exist, and a declaration that can be checked should be.
+#'
+#' @return Character vector of installed model names, possibly empty.
+ner_spacy_installed <- function() {
+  if (FALSE) {
+    # no arguments
+  }
+
+  raw_ <- suppressWarnings(system2(
+    .ner_python("spacy"),
+    c("-c", shQuote("import spacy, json; print(json.dumps(sorted(spacy.util.get_installed_models())))")),
+    stdout = TRUE, stderr = FALSE
+  ))
+  if (length(raw_) == 0L || !is.null(attr(raw_, "status"))) {
+    cli::cli_warn("Could not ask the spaCy suite which models it has; assuming none.")
+    return(character(0))
+  }
+  as.character(jsonlite::fromJSON(paste(raw_, collapse = "")))
+}
+
+#' What spaCy and LexNLP produce, declared because they cannot say
+#'
+#' `Model` for spaCy is the model NAME, which is genuinely its version: en_core_web_lg and
+#' en_core_web_trf are different models, not different runs of one. LexNLP has a single version and
+#' it is the container's, so its model tag repeats its engine name.
+#'
+#' These label sets are checked against what arrives -- see ner_describe_verify(). A declaration
+#' nobody checks is how the previous design failed.
+#'
+#' @param .spacy_models spaCy model names to describe.
+#' @return Tibble: Suite, Engine, Model, Labels (list).
+ner_declare_third_party <- function(.spacy_models = c("en_core_web_sm", "en_core_web_md",
+                                                      "en_core_web_lg", "en_core_web_trf")) {
+  if (FALSE) {
+    .spacy_models <- c("en_core_web_lg", "en_core_web_trf")
+  }
+
+  # spaCy's native tags are mapped to the cross-engine vocabulary inside extract_spacy.py. ORG,
+  # PERSON and GPE are the three that survive that mapping and that any consumer here reads.
+  #
+  # READY IS CHECKED, NOT ASSERTED. A declared model that is not installed fails at load time, which
+  # on this pipeline is after every faster combination has already run.
+  have_  <- ner_spacy_installed()
+  spacy_ <- tibble::tibble(
+    Suite  = "spacy",
+    Engine = "spacy",
+    Model  = .spacy_models,
+    Labels = list(c("ORG", "PERSON", "GPE")),
+    Ready  = .spacy_models %in% have_
+  )
+
+  # GPE is present but disabled by policy in some configurations; it is listed because the engine
+  # CAN produce it, and what is actually requested is the caller's choice.
+  # The container either exists or docker fails loudly at the first call, so there is nothing here
+  # that a check could establish earlier than the run itself.
+  lexnlp_ <- tibble::tibble(
+    Suite  = "lexnlp",
+    Engine = "lexnlp",
+    Model  = "lexnlp",
+    Labels = list(c("ORG", "GPE", "DATE", "MONEY")),
+    Ready  = TRUE
+  )
+
+  dplyr::bind_rows(spacy_, lexnlp_)
+}
+
+#' Everything all three suites can produce, in one table
+#'
+#' The ragged grid, written out: not every engine produces every label, and the shape of that
+#' raggedness is what 04A's comparison sections filter on. A label with one producer has no
+#' cross-engine agreement to report, and saying so once beats emitting empty panels.
+#'
+#' @param .spacy_models spaCy model names to include.
+#' @return Tibble: Suite, Engine, Model, Labels (list), SpecHash, Ready.
+ner_describe <- function(.spacy_models = c("en_core_web_sm", "en_core_web_md",
+                                           "en_core_web_lg", "en_core_web_trf")) {
+  if (FALSE) {
+    .spacy_models <- c("en_core_web_lg", "en_core_web_trf")
+  }
+
+  matcon_ <- ner_matcon_describe() |>
+    dplyr::transmute(
+      Suite  = "matcon",
+      .data$Engine,
+      .data$Model,
+      .data$Labels,
+      .data$SpecHash,
+      .data$Ready
+    )
+
+  third_ <- ner_declare_third_party(.spacy_models = .spacy_models) |>
+    dplyr::mutate(SpecHash = NA_character_)
+
+  dplyr::bind_rows(matcon_, third_) |>
+    dplyr::arrange(.data$Suite, .data$Model)
+}
+
+#' What can actually be run, with a loud account of what cannot
+#'
+#' Ready is FALSE for two reasons and both are recoverable: a spaCy model that is declared but not
+#' downloaded, or a matcon extractor whose data dependency is absent. Neither is a reason to stop --
+#' the remaining combinations are still worth running and the report still says what was compared --
+#' but neither should pass silently either, because a comparison across three models where four were
+#' intended is a different result and nothing else would record the difference.
+#'
+#' @param .describe Output of ner_describe().
+#' @return The Ready rows, invisibly, after reporting the others.
+ner_runnable <- function(.describe) {
+  if (FALSE) {
+    .describe <- ner_describe()
+  }
+
+  out_ <- dplyr::filter(.describe, .data$Ready)
+  bad_ <- dplyr::filter(.describe, !.data$Ready)
+
+  if (nrow(bad_) > 0L) {
+    tbl_say(
+      .tab   = dplyr::select(bad_, "Suite", "Model"),
+      .title = "NOT AVAILABLE -- excluded from every section below"
+    )
+    spacy_ <- dplyr::filter(bad_, .data$Suite == "spacy")$Model
+    if (length(spacy_) > 0L) {
+      cli::cli_alert_warning(
+        "Install with: contracts-spacy/.venv/bin/python -m spacy download
+         {paste(spacy_, collapse = ' && contracts-spacy/.venv/bin/python -m spacy download ')}"
+      )
+    }
+    mat_ <- dplyr::filter(bad_, .data$Suite == "matcon")$Model
+    if (length(mat_) > 0L) {
+      cli::cli_alert_warning(
+        "Data dependency absent for {paste(mat_, collapse = ', ')}; see matcon-extract --version."
+      )
+    }
+  }
+
+  if (nrow(out_) == 0L) cli::cli_abort("No combination is runnable.")
+  invisible(out_)
+}
+
+#' One row per (Engine, Model, Label): the grid a run actually covers
+#'
+#' Unnests ner_describe() and keeps only the labels a caller asked for. This is what the ledger is
+#' queried against and what the manifest fingerprints, so a document processed for ORG and not for
+#' GPE is two rows with two independent outcomes rather than one ambiguous one.
+#'
+#' @param .describe Output of ner_describe().
+#' @param .labels Labels to keep. NULL keeps everything each engine offers.
+#' @return Tibble: Suite, Engine, Model, Label.
+ner_grid <- function(.describe, .labels = NULL) {
+  if (FALSE) {
+    .describe <- ner_describe()
+    .labels   <- c("ORG", "GPE", "DATE", "TERM", "MONEY", "REDACT")
+  }
+
+  out_ <- .describe |>
+    dplyr::select("Suite", "Engine", "Model", "Labels") |>
+    tidyr::unnest_longer(col = "Labels", values_to = "Label")
+
+  if (!is.null(.labels)) out_ <- dplyr::filter(out_, .data$Label %in% .labels)
+
+  out_ |>
+    dplyr::arrange(.data$Suite, .data$Model, .data$Label) |>
+    dplyr::distinct()
+}
+
+#' How many engines produce each label
+#'
+#' 04A is built on cross-engine comparison, and after the matcon rewrite two labels have exactly one
+#' producer: REDACT and TERM. The agreement, alignment and contrast arms have nothing to say about
+#' either, so they are excluded by construction rather than by an empty result.
+#'
+#' @param .grid Output of ner_grid().
+#' @return Tibble: Label, NEngine, NModel, Engines, Comparable.
+ner_producers <- function(.grid) {
+  if (FALSE) {
+    .grid <- ner_grid(.describe = ner_describe())
+  }
+
+  .grid |>
+    dplyr::summarise(
+      NEngine = dplyr::n_distinct(.data$Engine),
+      NModel  = dplyr::n_distinct(.data$Model),
+      Engines = paste(sort(unique(.data$Engine)), collapse = ", "),
+      .by     = "Label"
+    ) |>
+    dplyr::mutate(Comparable = .data$NEngine > 1L) |>
+    dplyr::arrange(dplyr::desc(.data$NEngine), .data$Label)
+}
+
+#' Assert that what arrived matches what was declared or described
+#'
+#' THE CHECK THE PREVIOUS DESIGN LACKED. A declaration nobody verifies is a comment that happens to
+#' be executable. Two things are compared:
+#'
+#' The LABEL SET. Every label present in a staged parquet must appear in the grid for that
+#' (Engine, Model). A label outside it has no ledger entry, so it is invisible to every completeness
+#' check downstream -- it would be ingested, stored, and then never counted as done.
+#'
+#' The SPEC HASH, for matcon only. The stamped hash must equal the one recorded when the pass was
+#' planned. A difference means the rules changed between planning and running, which on a corpus
+#' pass is hours of extraction attributed to code that no longer exists.
+#'
+#' @param .paths Staged parquet paths to verify.
+#' @param .grid Output of ner_grid().
+#' @param .describe Output of ner_describe(), for the spec-hash comparison.
+#' @return The offending rows, invisibly; empty means a pass.
+ner_describe_verify <- function(.paths, .grid, .describe = NULL) {
+  if (FALSE) {
+    .paths    <- fs::dir_ls(here::here("2_output", "04A-EntityExtract", "Stage"), glob = "*.parquet")
+    .grid     <- ner_grid(.describe = ner_describe())
+    .describe <- ner_describe()
+  }
+
+  seen_ <- .paths |>
+    purrr::map(\(.p) {
+      arrow::read_parquet(.p, col_select = c("Engine", "Model", "Label")) |>
+        dplyr::filter(!is.na(.data$Label)) |>
+        dplyr::distinct()
+    }) |>
+    purrr::list_rbind()
+
+  bad_ <- dplyr::anti_join(seen_, .grid, by = dplyr::join_by(Engine, Model, Label))
+
+  if (nrow(bad_) > 0L) {
+    cli::cli_abort(c(
+      "{nrow(bad_)} (Engine, Model, Label) combination{?s} arrived that the grid does not contain.",
+      "i" = "Rows for a label outside the grid have no ledger entry and are invisible to every
+             completeness check downstream.",
+      "x" = "{paste(bad_$Engine, bad_$Model, bad_$Label, collapse = ' | ')}"
+    ))
+  }
+
+  invisible(bad_)
+}
+
+#' Report the grid and its raggedness
+#'
+#' @param .describe Output of ner_describe().
+#' @param .labels Labels to keep. NULL keeps everything.
+#' @return The grid, invisibly.
+ner_report_describe <- function(.describe, .labels = NULL) {
+  if (FALSE) {
+    .describe <- ner_describe()
+    .labels   <- NULL
+  }
+
+  grid_ <- ner_grid(.describe = .describe, .labels = .labels)
+  prod_ <- ner_producers(.grid = grid_)
+
+  tbl_say(
+    .tab   = dplyr::mutate(.describe, Labels = purrr::map_chr(.data$Labels, paste, collapse = ", ")),
+    .title = "Suites, models and what each stamps"
+  )
+  tbl_say(.tab = prod_, .title = "Producers per label")
+
+  single_ <- dplyr::filter(prod_, !.data$Comparable)$Label
+  if (length(single_) > 0L) {
+    cli::cli_alert_info(
+      "Single-producer label{?s}: {paste(single_, collapse = ', ')}. Yield and offset checks apply;
+       cross-engine agreement does not and is skipped rather than reported empty."
+    )
+  }
+
+  invisible(grid_)
+}
+# 3. The store ---------------------------------------------------------------------------------------------------------
+#
+# ONE DuckDB, ONE TABLE PER LABEL. The alternative arrangements were considered and rejected for the
+# same reason: the labels do not partition by suite. DATE comes from LexNLP and from matcon, GPE from
+# both plus spaCy, ORG from LexNLP and spaCy. A store split by suite puts the SAME LABEL in different
+# databases, which is the one arrangement that makes engine comparison expensive -- and comparison is
+# what 04A exists to do.
+#
+# WHY PER-LABEL TABLES RATHER THAN ONE FLAT ONE. Extras differ by label and not by engine: a
+# LegalForm belongs to ORG whoever found it, an Amount to MONEY. A flat table carries every extra on
+# every row and is mostly null; per-label tables carry each extra exactly where it means something.
+# Extras are SELECTED rather than required, so an engine that omits one ingests cleanly and reads
+# NULL -- which is how spaCy's core-only output and LexNLP's seventeen columns go through one path.
+#
+# WHERE TWO ENGINES SHARE AN EXTRA THEY SHARE THE COLUMN. matcon's gazetteer and LexNLP both emit
+# Iso2 in the US-MN form -- the geo lookup was built that way BECAUSE LexNLP emits it. One column
+# means "do these two engines resolve the same place" is a single query rather than a join across
+# schemas.
+
+
+#: Core columns, in this order, on every table. What every consumer reads and what routing depends on.
+.store_core <- c("DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model")
+
+#' The per-label schema
+#'
+#' Each entry names one label's table and the extra columns it carries beyond the core. A label
+#' absent from this list cannot be ingested, which is deliberate: a new label is a schema decision
+#' and should be made here rather than by whatever parquet arrives first.
+#'
+#' AMOUNT IS DECIMAL, NOT DOUBLE. moneyregex crosses the seam as text specifically so a contract
+#' value survives intact, and casting to a float one layer later would undo that. Measured on the
+#' sample, none of 36,647 amounts exceeds fifteen significant digits, so DOUBLE would be lossless
+#' today -- but 6,254 carry decimals and 952 are sub-cent, and making the two layers agree costs
+#' nothing.
+.store_schema <- list(
+  org = list(
+    Table  = "org",
+    Extras = c(LegalForm = "VARCHAR", LegalFormFull = "VARCHAR", Description = "VARCHAR")
+  ),
+  person = list(
+    Table  = "person",
+    Extras = character(0)
+  ),
+  gpe = list(
+    Table  = "gpe",
+    # Iso2 and Iso3 are SHARED between matcon and LexNLP. The rest split by engine and read NULL for
+    # the other, which is what per-label extras are for.
+    Extras = c(
+      Iso2 = "VARCHAR", Iso3 = "VARCHAR",                    # both engines
+      GeoKey = "VARCHAR", IsWord = "INTEGER",                # matcon only
+      NParent = "INTEGER", MatchKind = "VARCHAR",            # matcon only
+      GeoName = "VARCHAR", GeoAlias = "VARCHAR",             # lexnlp only
+      GeoCategory = "VARCHAR", GeoId = "VARCHAR"             # lexnlp only
+    )
+  ),
+  date = list(
+    Table  = "date",
+    Extras = c(DateValue = "VARCHAR", DateScore = "DOUBLE")
+  ),
+  term = list(
+    Table  = "term",
+    Extras = c(TermN = "DOUBLE", TermUnit = "VARCHAR", TermYears = "DOUBLE")
+  ),
+  money = list(
+    Table  = "money",
+    Extras = c(Amount = "DECIMAL(28,4)", Currency = "VARCHAR")
+  ),
+  redact = list(
+    Table  = "redact",
+    Extras = character(0)
+  )
 )
 
-
-#' The stem of a paper model, with the version stripped
+#' Which engine fills which extras, for the per-suite views
 #'
-#' "dateregex-v2" -> "dateregex". Everything before the first "-v" followed by digits, so a model
-#' carrying no version returns itself and one carrying a hyphen in its name is unaffected.
-#'
-#' @param .model Character vector of paper model tags.
-#' @return Character vector of stems.
-ner_paper_stem <- function(.model) {
-  stringi::stri_replace_first_regex(.model, "-v\\d+$", "")
-}
-
-
-#' The labels a combination is asked for
-#'
-#' THE POLICY LIVES HERE AND NOWHERE ELSE, because two readers need it and they must not drift.
-#' ner_run() uses it to build the --label argument; 04A's manifest uses it to fingerprint the store.
-#' While the policy was a local inside ner_run(), the manifest could only record that a policy
-#' existed -- it wrote the literal string "per-combo policy" -- so editing the policy left the
-#' fingerprint unchanged and the store reported itself complete under a label set it had never been
-#' built with. PERSON was absent from every spaCy extraction for a full pass that way, with nothing
-#' in any document able to show it.
-#'
-#' The grid this describes is deliberately ragged. spaCy is the only multi-label statistical engine
-#' and the only source of PERSON, for which LexNLP exposes no offsets; the four ported paper
-#' extractors are single-label specialists. An engine's absent labels are a property of the engine
-#' rather than a failure of the run.
-#'
-#' Keyed by "engine" and by "engine:model", with engine:model winning, because the paper's models
-#' differ from one another.
-#'
-#' @param .engine Character. Engine token.
-#' @param .model Character. Model tag.
-#' @param .labels Character, named list or NULL. An explicit override, exactly as ner_run() takes
-#'   it; NULL applies the policy.
-#' @return Character vector of unified labels.
-ner_label_policy <- function(.engine, .model, .labels = NULL) {
-  if (FALSE) {
-    .engine <- "spacy"
-    .model  <- "en_core_web_lg"
-    .labels <- NULL
-  }
-
-  policy_ <- list(
-    "spacy"               = c("ORG", "PERSON", "GPE", "DATE", "MONEY"),
-    # GPE IS THE EXPENSIVE ONE. LexNLP's geoentity pass costs roughly 5 s/doc against well under a
-    # tenth of that for the other three, which is affordable on the 4.4k sample and about three and
-    # a half days at n_process = 24 on the 1.46M corpus. It is requested here so the sample can
-    # measure it against the gazetteer and spaCy; whether it earns a corpus pass is a separate
-    # decision, and the ledger makes adding it later an incremental run rather than a re-run.
-    # PERSON is absent because LexNLP exposes no offsets for it.
-    "lexnlp"              = c("ORG", "GPE", "DATE", "MONEY")
+#' Presentation only: the underlying table stays unified. A reader of gpe_matcon sees six columns
+#' that mean something rather than ten of which four are always NULL, and `SELECT ... FROM gpe`
+#' still compares every engine in one query.
+.store_view_cols <- list(
+  gpe = list(
+    matcon = c("Iso2", "Iso3", "GeoKey", "IsWord", "NParent", "MatchKind"),
+    lexnlp = c("Iso2", "Iso3", "GeoName", "GeoAlias", "GeoCategory", "GeoId"),
+    spacy  = character(0)
   )
+)
 
-  # The four ported extractors are single-label specialists and their label is a property of the
-  # STEM, not of the version: dateregex-v2 emits DATE for the same reason dateregex-v1 did.
-  key_em_  <- if (.engine == "paper") {
-    ner_paper_stem(.model)
-  } else {
-    paste0(.engine, ":", .model)
-  }
-  spec_    <- if (.engine == "paper") .ner_paper_models[[key_em_]]$label else NULL
-  default_ <- if (!is.null(spec_)) {
-    spec_
-  } else if (!is.null(policy_[[key_em_]])) {
-    policy_[[key_em_]]
-  } else {
-    policy_[[.engine]]
-  }
-  ner_arg(.labels, .engine, .model, .default = default_)
-}
-
-#' Run a set of engine and model combinations into the candidate store
+#' Open the candidate store
 #'
-#' The orchestrator every extraction goes through, so that one ledger governs what has been done and
-#' no document is processed twice. Combinations are requested as tokens: "lexnlp", "spacy:<model>",
-#' "paper:<model>". The paper engine groups the ported extractors under one provenance axis, which
-#' is what keeps "whose method is this" answerable after the fact.
-#'
-#' Idempotent and resumable. Each combination asks the ledger which documents it has not yet seen,
-#' processes only those in slices, and appends. An interrupted run repeats only its unfinished
-#' slice, which is what makes a multi-hour extraction affordable inside a document that always
-#' executes. Staging names carry no chunk index, so a recomputed slice after a crash overwrites its
-#' own partial output rather than accumulating beside it.
-#'
-#' THE LEDGER IS BLIND TO THREE THINGS: which labels were requested, whether the text was truncated
-#' first, and how the model was labelled. A store built under one truncation and re-run under
-#' another therefore does nothing at all and reports success. 04A closes the label half of this by
-#' fingerprinting ner_label_policy() in its manifest and clearing the engines whose set has moved;
-#' .max_chars still has to be held fixed for the life of a store by hand.
-#'
-#' Stall protection differs by engine because the failure modes differ. A spaCy window stall drops
-#' to sequential processing and skips the offender; a LexNLP extractor or gazetteer document over
-#' its cap is skipped for that document alone. Either way the document lands in the store with a
-#' status, and the run continues.
-#'
-#' @param .inputs Character. Parquet file(s) or folder(s) holding the canonical text.
-#' @param .db_path Character. Path to the DuckDB candidate store; created if absent.
-#' @param .run Character. Combination tokens to run, cheapest first.
-#' @param .labels Character, named list or NULL. NULL applies each engine's own policy. A named
-#'   list keys on engine or engine:model.
-#' @param .max_chars Integer or NULL. Truncate every document to its first N characters before
-#'   extraction. Frozen for the life of the store.
-#' @param .retry_timeout Logical. TRUE re-runs documents previously ingested with Status "timeout".
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .text_col Character. Text column the offsets will index.
-#' @param .docs_per_run Integer. Documents per slice; bounds Python-side memory.
-#' @param .device Character. Passed to the spaCy extractor.
-#' @param .n_process Integer or named list. Worker processes, optionally per combination.
-#' @param .batch_size Integer or named list. Batch size, optionally per combination.
-#' @param .timeout Integer or named list. Stall guard, optionally per combination.
-#' @param .work_dir Character. Where staging parquet is written.
-#' @param .keep_staging Logical. TRUE leaves staging files in place after ingest.
-#' @param .no_progress Logical. Pass --no-progress to every extractor, suppressing the tqdm bar it
-#'   writes to stderr. Leave FALSE where this is the only thing running and the per-engine bar is
-#'   the progress display; set TRUE where a CALLER owns the display. The two cannot share a terminal
-#'   line: tqdm and cli both write carriage returns, and a corpus loop that shows its own bar over
-#'   chunks gets it overwritten by one bar per extractor per chunk.
-#' @param .overwrite Logical. Passed to the extractors.
-#' @param .quiet Logical. Suppress per-combination messages.
-#' @return Invisibly, a tibble of what each combination processed.
-ner_run <- function(
-    .inputs,
-    .db_path,
-    .run = c("spacy:en_core_web_sm", "lexnlp", "paper:dateregex-v2", "paper:gazetteer-v1"),
-    .labels = NULL, # NULL = per-combo policy; scalar/vector or named (engine / engine:model)
-    .max_chars = NULL, # truncate docs to first N chars before extraction (NULL = off)
-    .retry_timeout = FALSE, # re-run docs previously ingested as Status = 'timeout'
-    .id_col = "DocID",
-    .text_col = "TextRaw",
-    .docs_per_run = 5000L, # R-side corpus chunking (memory bound; NULL = all at once)
-    .device = "auto", # auto|cpu|cuda|mps (spaCy)
-    .n_process = 16L, # CPU workers -- scalar or named (engine / engine:model)
-    .batch_size = 64L, # spaCy batch / LexNLP+gazetteer chunksize -- scalar or named
-    .timeout = list(spacy = 600L, lexnlp = 60L, "paper:gazetteer-v1" = 120L), # stall guard secs, 0=off
-    .keep_staging = FALSE,
-    .no_progress = FALSE, # suppress the EXTRACTORS' own bars; see the note in the roxygen
-    .quiet = FALSE
-) {
+#' @param .db_path Path to the DuckDB file.
+#' @param .read_only Open read-only. A comparison must not be able to modify what it compares against.
+#' @return A DBI connection.
+ner_db_connect <- function(.db_path, .read_only = FALSE) {
   if (FALSE) {
-    .inputs <- .lP$Input$SampleContracts
-    .db_path <- file.path(.lP$Cache$NerTest, "test_store.duckdb")
-    .run <- c("spacy:en_core_web_sm", "lexnlp", "paper:dateregex-v2", "paper:gazetteer-v1")
-    .labels <- NULL
-    .max_chars <- NULL
-    .retry_timeout <- FALSE
-    .id_col <- "DocID"
-    .text_col <- "TextRaw"
-    .docs_per_run <- 5000L
-    .device <- "auto"
-    .n_process <- list(spacy = 16L, lexnlp = 24L, "paper:gazetteer-v1" = 16L)
-    .batch_size <- 64L
-    .timeout <- list(spacy = 600L, lexnlp = 60L, "paper:gazetteer-v1" = 120L)
-    .keep_staging <- FALSE
-    .no_progress <- FALSE
-    .quiet <- FALSE
-  }
-
-
-  # Parse .run tokens ("engine" or "engine:model") into the combo grid. Model =
-  # the tag stamped into the parquet; ModelArg = what the wrapper receives. Bare
-  # "spacy"/"paper" error (both need a model).
-  parse_run_ <- function(.tok) {
-    parts_ <- strsplit(.tok, ":", fixed = TRUE)[[1]]
-    engine_ <- parts_[1]
-    if (!engine_ %in% c("spacy", "lexnlp", "paper")) {
-      cli::cli_abort("Unknown engine in {.val {(.tok)}}; expected spacy|lexnlp|paper.")
-    }
-    if (engine_ == "spacy") {
-      if (length(parts_) < 2L) {
-        cli::cli_abort("spaCy needs a model: {.val {(.tok)}} -> e.g. {.val spacy:en_core_web_sm}")
-      }
-      model_ <- paste(parts_[-1], collapse = ":") # tolerate ':' in a model path
-      tibble::tibble(Engine = "spacy", Model = fs::path_file(model_), ModelArg = model_)
-    } else if (engine_ == "lexnlp") {
-      tibble::tibble(Engine = "lexnlp", Model = "lexnlp", ModelArg = "lexnlp")
-    } else { # paper
-      if (length(parts_) < 2L) {
-        cli::cli_abort(c(
-          "paper needs a model: {.val {(.tok)}}",
-          "i" = "one of {.val {names(.ner_paper_models)}}, with a version suffix, \\
-                 e.g. {.val dateregex-v2}"
-        ))
-      }
-      model_ <- parts_[2]
-      # THE STEM IS VALIDATED, NOT THE VERSION. A revised pattern set is a new version of the same
-      # extractor, and the extractor stamps its own tag into the parquet where ner_db_append()
-      # checks it -- so a version this file has never heard of is expected, not an error.
-      if (!ner_paper_stem(model_) %in% names(.ner_paper_models)) {
-        cli::cli_abort(c(
-          "Unknown paper model {.val {model_}}.",
-          "i" = "Known stems: {.val {names(.ner_paper_models)}}."
-        ))
-      }
-      tibble::tibble(Engine = "paper", Model = model_, ModelArg = model_)
-    }
-  }
-
-  combos_ <- purrr::map(.run, parse_run_) |> dplyr::bind_rows()
-  if (anyDuplicated(combos_[c("Engine", "Model")])) {
-    cli::cli_abort("Duplicate combo(s) in {.arg .run}.")
-  }
-
-  files_ <- ner_input_files(.inputs)
-  tmp_dir_ <- fs::path(fs::path_dir(.db_path), ".ner_tmp")
-  fs::dir_create(tmp_dir_)
-
-  summary_ <- vector("list", nrow(combos_))
-
-  for (i_ in seq_len(nrow(combos_))) {
-    engine_ <- combos_$Engine[i_]
-    model_ <- combos_$Model[i_]
-    key_em_ <- paste0(engine_, ":", model_)
-
-    # Resolve this combination's knobs once (broadcast scalar/vector or engine[:model])
-    labels_ <- ner_label_policy(.engine = engine_, .model = model_, .labels = .labels)
-    n_process_ <- ner_arg(.n_process, engine_, model_, .default = 16L)
-    batch_ <- ner_arg(.batch_size, engine_, model_, .default = 64L)
-    timeout_ <- ner_arg(.timeout, engine_, model_, .default = 0L)
-
-    miss_by_label_ <- ner_db_missing(
-      .db_path, .inputs, engine_, model_, .labels = labels_,
-      .id_col = .id_col, .retry_timeout = .retry_timeout, .quiet = .quiet
-    )
-
-    # GROUP BY MISSING-LABEL SIGNATURE, then issue one call per group. Documents rarely differ in
-    # what they still need: on a fresh store every document is missing every label, and after a
-    # policy addition every document is missing exactly the addition. Both collapse to a single
-    # group. Dispatching per label instead would be simpler and would pay one extractor start per
-    # label per slice -- for LexNLP on the corpus that is four container starts where one would do,
-    # roughly two and a half hours bought for nothing.
-    sig_ <- tibble::tibble(DocID = unique(unlist(miss_by_label_, use.names = FALSE))) |>
-      dplyr::mutate(
-        Sig = purrr::map_chr(.data$DocID, function(.d) {
-          paste(names(miss_by_label_)[purrr::map_lgl(miss_by_label_, \(.v) .d %in% .v)],
-                collapse = ",")
-        })
-      ) |>
-      dplyr::filter(nzchar(.data$Sig))
-
-    if (nrow(sig_) == 0L) {
-      summary_[[i_]] <- tibble::tibble(
-        Engine = engine_, Model = model_, Missing = 0L, Docs = 0L, Candidates = 0L
-      )
-      next
-    }
-
-    groups_ <- split(sig_$DocID, sig_$Sig)
-    if (!.quiet && length(groups_) > 1L) {
-      cli::cli_alert_info(
-        "{engine_}/{model_}: {length(groups_)} distinct missing-label group{?s}."
-      )
-    }
-
-    stage_ <- fs::path(tmp_dir_, paste0("staging_", engine_, "_", model_, ".parquet"))
-    input_ <- fs::path(tmp_dir_, paste0("input_", engine_, "_", model_, ".parquet"))
-    docs_ <- 0L
-    cands_ <- 0L
-    missing_ <- sig_$DocID
-
-    for (g_ in seq_along(groups_)) {
-
-    labels_ <- strsplit(names(groups_)[g_], ",", fixed = TRUE)[[1]]
-    grp_ids_ <- sort(groups_[[g_]])
-    per_ <- if (is.null(.docs_per_run)) length(grp_ids_) else as.integer(.docs_per_run)
-    slices_ <- split(grp_ids_, ceiling(seq_along(grp_ids_) / per_))
-
-    for (s_ in seq_along(slices_)) {
-      ids_ <- slices_[[s_]]
-      if (!.quiet && length(slices_) > 1L) {
-        cli::cli_alert_info(paste0("{engine_}/{model_} [{paste(labels_, collapse = ',')}]: ",
-                                   "slice {s_}/{length(slices_)} ({length(ids_)} doc{?s})"))
-      }
-
-      if (!fs::file_exists(stage_)) {
-        con_tmp_ <- ner_db_connect()
-        duckdb::duckdb_register(con_tmp_, "ner_slice_docs", data.frame(DocID = ids_))
-        files_sql_ <- paste0("'", files_, "'", collapse = ", ")
-        DBI::dbExecute(con_tmp_, paste0(
-          "COPY (SELECT \"", .id_col, "\", \"", .text_col, "\" ",
-          "FROM read_parquet([", files_sql_, "]) ",
-          "WHERE \"", .id_col, "\" IN (SELECT DocID FROM ner_slice_docs)) ",
-          "TO '", as.character(fs::path_abs(input_)), "' (FORMAT PARQUET)"
-        ))
-        DBI::dbDisconnect(con_tmp_, shutdown = TRUE)
-      } else if (!.quiet) {
-        cli::cli_alert_info("Reusing staging file from interrupted run: {.path {fs::path_file(stage_)}}")
-      }
-
-      if (engine_ == "spacy") {
-        is_trf_ <- grepl("trf", model_, fixed = TRUE)
-        device_ <- if (.device == "auto" && !is_trf_) "cpu" else .device
-        ner_spacy(
-          .inputs = input_, .output = stage_,
-          .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .model = combos_$ModelArg[i_], .device = device_,
-          .batch_size = batch_, .n_process = n_process_, .no_progress = .no_progress, .quiet = .quiet
-        )
-      } else if (engine_ == "lexnlp") {
-        ner_lexnlp(
-          .inputs = input_, .output = stage_,
-          .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .chunk_size = batch_, .n_process = n_process_, .no_progress = .no_progress, .quiet = .quiet
-        )
-      } else if (engine_ == "paper") {
-        # DISPATCH ON THE STEM, THROUGH THE REGISTRY. The four wrappers take the same arguments, so
-        # a chain of exact-string branches bought nothing and cost an edit per version bump -- and a
-        # missed one fell through to "no runner for", which reads as a missing extractor rather than
-        # as a stale dispatcher.
-        # All four wrappers accept this argument set; the gazetteer's lookup and window arguments
-        # are additional and defaulted, so one call shape serves every one of them. Asserted rather
-        # than assumed, because a wrapper that later drops one of these would otherwise fail with a
-        # do.call error naming an argument rather than a runner.
-        run_ <- .ner_paper_models[[ner_paper_stem(model_)]]$runner
-        if (is.null(run_)) cli::cli_abort("No runner registered for paper model {.val {model_}}.")
-        need_ <- c(".inputs", ".output", ".id_col", ".text_col", ".labels", ".max_chars",
-                   ".timeout", ".n_process", ".chunk_size", ".no_progress", ".quiet")
-        miss_ <- setdiff(need_, names(formals(run_)))
-        if (length(miss_) > 0L) {
-          cli::cli_abort("{.fun {run_}} does not accept {.arg {miss_}}.")
-        }
-        do.call(run_, list(
-          .inputs = input_, .output = stage_,
-          .id_col = .id_col, .text_col = .text_col,
-          .labels = labels_, .max_chars = .max_chars, .timeout = timeout_,
-          .n_process = n_process_, .chunk_size = batch_,
-          .no_progress = .no_progress, .quiet = .quiet
-        ))
-      } else {
-        cli::cli_abort("No dispatch for {.val {key_em_}}.")
-      }
-
-      # Identity guard: the parquet MUST stamp the combo we dispatched, else abort
-      # (catches an extractor's ENGINE/MODEL constants drifting from the token).
-      res_ <- ner_db_append(
-        .db_path, stage_, .labels = labels_,
-        .expect_engine = engine_, .expect_model = model_,
-        .retry_timeout = .retry_timeout, .quiet = .quiet
-      )
-      docs_ <- docs_ + res_$docs
-      cands_ <- cands_ + res_$candidates
-
-      if (isTRUE(.keep_staging)) {
-        tag_ <- sprintf("_%03d.parquet", s_)
-        fs::file_move(stage_, fs::path_ext_remove(stage_) |> paste0(tag_))
-        if (fs::file_exists(input_)) {
-          fs::file_move(input_, fs::path_ext_remove(input_) |> paste0(tag_))
-        }
-      } else {
-        del_ <- c(stage_, input_)
-        fs::file_delete(del_[fs::file_exists(del_)])
-      }
-    }
-
-    }  # end missing-label group
-
-    summary_[[i_]] <- tibble::tibble(
-      Engine = engine_, Model = model_,
-      Missing = length(missing_), Docs = docs_, Candidates = cands_
-    )
-  }
-
-  out_ <- dplyr::bind_rows(summary_)
-  if (!.quiet) {
-    cli::cli_alert_success(
-      paste0("ner_run complete: {sum(out_$Candidates)} candidate(s) over {sum(out_$Docs)} ",
-             "doc combo(s) ({nrow(out_)} engine/model combo(s)).")
-    )
-  }
-  return(invisible(out_))
-}
-
-
-#' Resolve a possibly per-combination argument for one engine and model
-#'
-#' Knobs may be given as a scalar applying to everything or as a list keyed on engine or
-#' engine:model. Resolving that in one place keeps every extractor wrapper free of the same four
-#' lines of lookup, and keeps the precedence rule -- the most specific key wins -- stated once.
-#'
-#' @param .x Scalar or named list. The argument as supplied by the caller.
-#' @param .engine Character. Engine name.
-#' @param .model Character. Model name.
-#' @param .default Value returned when nothing matches.
-#' @return The resolved value.
-ner_arg <- function(.x, .engine, .model, .default = NULL) {
-  if (is.null(.x)) return(.default)
-  if (is.null(names(.x))) return(.x) # unnamed -> broadcast (length 1 or N)
-  key_em_ <- paste0(.engine, ":", .model)
-  if (key_em_ %in% names(.x)) return(.x[[key_em_]])
-  if (.engine %in% names(.x)) return(.x[[.engine]])
-  return(.default)
-}
-
-
-# 2. The candidate store -----------------------------------------------------------------------------------------------
-# DuckDB holds two tables: `candidates`, one row per span, and `runs`, the ledger recording that a
-# document was seen by a combination and with what outcome. The ledger is what makes extraction
-# resumable, and its blindness to labels and truncation is why 04A carries a manifest beside it.
-
-#' Open a DuckDB connection with its own progress bar turned off
-#'
-#' EVERY CONNECTION IN THIS PROJECT GOES THROUGH HERE, and the reason is a display collision rather
-#' than anything about the data. DuckDB prints a progress bar for long-running queries by writing
-#' carriage returns to the terminal. So does cli, which is what the corpus pass in 04D uses to show
-#' how far through it is. Two writers on one line produce a smear that reports neither, and on a
-#' pass measured in days the progress display is not a nicety -- it is the only evidence the run is
-#' alive.
-#'
-#' DuckDB's own bar is the one to drop: it reports a single query, cli reports the pass. The setting
-#' is applied per connection rather than globally because there is no global to set from R, and it
-#' is wrapped in a tolerant call because the two setting names have moved between DuckDB versions
-#' and a connection that works is worth more than a bar that is definitely off.
-#'
-#' @param .db_path Path to the database file, or NULL for an in-memory connection.
-#' @param .read_only Logical. Open read-only. DuckDB is single-writer, so anything that only reads
-#'   should say so and leave the writer free.
-#' @return A live DBI connection. The caller disconnects with dbDisconnect(con, shutdown = TRUE).
-ner_db_connect <- function(.db_path = NULL, .read_only = FALSE) {
-  if (FALSE) {
-    .db_path   <- .lP$Store$NerDB
+    .db_path   <- here::here("2_output", "04A-EntityExtract", "Store", "EntityCandidates.duckdb")
     .read_only <- TRUE
   }
-
-  # The two raw dbConnect() calls in this project, and they belong here: everything else routes
-  # through this function so the settings below cannot be forgotten at a call site.
-  con_ <- if (is.null(.db_path)) {
-    DBI::dbConnect(duckdb::duckdb())
-  } else {
-    DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(.db_path), read_only = .read_only)
-  }
-  for (stmt_ in c("SET enable_progress_bar = false", "SET enable_progress_bar_print = false")) {
-    try(DBI::dbExecute(con_, stmt_), silent = TRUE)
-  }
-  con_
-}
-
-#' Open the candidate store, creating its schema if absent
-#'
-#' Safe to call repeatedly: the DDL is idempotent, so a caller never has to know whether the store
-#' already exists. The connection is live and the caller disconnects it with
-#' DBI::dbDisconnect(con, shutdown = TRUE); DuckDB is single-writer, so holding one open blocks
-#' every read-only session.
-#'
-#' @param .db_path Character. Path to the DuckDB file.
-#' @param .quiet Logical. Suppress the creation message.
-#' @return A live DBI connection.
-ner_db_init <- function(.db_path, .quiet = FALSE) {
-  if (FALSE) {
-    .db_path <- file.path(.lP$Cache$NerTest, "test_store.duckdb")
-    .quiet <- FALSE
-  }
-
-  exists_ <- fs::file_exists(.db_path)
   fs::dir_create(fs::path_dir(.db_path))
-  con_ <- ner_db_connect(.db_path = .db_path, .read_only = FALSE)
-
-  # candidates = real hits only -- the harmonised Python schema (Engine + Model
-  # are parquet columns). Null-span sentinels AND timeout markers are dropped
-  # before insert, so every column except LabelRaw is NOT NULL. Start/Stop BIGINT.
-  DBI::dbExecute(con_, "
-    CREATE TABLE IF NOT EXISTS candidates (
-      DocID     VARCHAR  NOT NULL,
-      Start     BIGINT   NOT NULL,
-      Stop      BIGINT   NOT NULL,
-      Span      VARCHAR  NOT NULL,
-      Label     VARCHAR  NOT NULL,
-      LabelRaw  VARCHAR,
-      Engine    VARCHAR  NOT NULL,
-      Model     VARCHAR  NOT NULL
-    );
-  ")
-
-  # runs = the completeness ledger and authoritative skip source. ONE ROW PER
-  # (DocID, Engine, Model, LABEL) ingested, with Status:
-  #   success -- ran, found candidates;        no re-run
-  #   nohit   -- ran clean, genuinely nothing;  no re-run
-  #   timeout -- >=1 extractor/window skipped;  re-run candidate (.retry_timeout)
-  #
-  # LABEL IS IN THE KEY, AND ITS ABSENCE WAS THE MOST EXPENSIVE DEFECT IN THIS PROJECT. A ledger
-  # keyed only on the combination cannot tell "spaCy has seen this document" from "spaCy has seen
-  # this document AND WAS ASKED FOR PERSON": add a label to the policy and every combination is
-  # already marked done, so the store reports itself complete under a set it was never built with.
-  # PERSON was absent from the sample store for an entire pass that way, and adding GPE to LexNLP
-  # later forced a re-extraction of ORG, DATE and MONEY -- 74% of that engine's cost -- to obtain
-  # one label that had not been asked for.
-  #
-  # With Label in the key the diff is exact: what is missing is missing per label, a policy
-  # addition extracts only the addition, and the manifest needs no label fingerprint because
-  # nothing has to be cleared.
-  DBI::dbExecute(con_, "
-    CREATE TABLE IF NOT EXISTS runs (
-      DocID     VARCHAR    NOT NULL,
-      Engine    VARCHAR    NOT NULL,
-      Model     VARCHAR    NOT NULL,
-      Label     VARCHAR    NOT NULL,
-      Status    VARCHAR    NOT NULL CHECK (Status IN ('success', 'nohit', 'timeout')),
-      CreatedAt TIMESTAMP  NOT NULL,
-      UNIQUE (DocID, Engine, Model, Label)
-    );
-  ")
-
-  # A store written before Label entered the key cannot be reconciled: its ledger records that a
-  # combination ran without recording what it was asked for, which is precisely the information
-  # needed to backfill. Refusing is the honest response -- silently treating those rows as covering
-  # every label would reintroduce the defect the column exists to prevent.
-  cols_ <- DBI::dbGetQuery(con_, "SELECT * FROM runs LIMIT 0") |> names()
-  if (!"Label" %in% cols_) {
-    DBI::dbDisconnect(con_, shutdown = TRUE)
-    cli::cli_abort(c(
-      "Store at {.path {(.db_path)}} predates the label-level ledger.",
-      "x" = "Its {.field runs} table has no {.field Label} column.",
-      "i" = "Delete the store and its manifest, then re-extract."
-    ))
-  }
-
-  if (!.quiet) {
-    if (exists_) {
-      cli::cli_alert_success("NER store OPENED at {.path {(.db_path)}}")
-    } else {
-      cli::cli_alert_success("NER store CREATED at {.path {(.db_path)}}")
-    }
-  }
-  return(con_)
+  DBI::dbConnect(duckdb::duckdb(dbdir = as.character(.db_path), read_only = .read_only))
 }
 
-#' Append one extractor's staging parquet to the store
+#' Create the store: seven label tables, the ledger, the benchmark log, and the views
 #'
-#' Ingest is insert-only by default: a combination already recorded in the ledger is skipped rather
-#' than duplicated, because an append that ran twice would double every candidate it wrote and
-#' nothing downstream could tell.
+#' Idempotent. Every statement is CREATE ... IF NOT EXISTS, so calling it on an existing store is a
+#' no-op and calling it on a fresh one builds everything.
 #'
-#' Marker and sentinel rows are dropped before the candidates insert, so the store holds real spans
-#' only and the ledger holds the status. Both tables are written in one transaction; splitting them
-#' would allow a store whose candidates and ledger disagree about what has been run.
+#' THE LEDGER IS SEPARATE FROM THE SPANS, and that is the point of it. A document that was processed
+#' and matched nothing has no row in any label table, so without a ledger it is indistinguishable
+#' from one that was never processed -- and the orchestrator would re-extract it forever while
+#' believing it complete.
 #'
-#' The identity guard is the check that earns its place. An extractor writing the wrong Engine or
-#' Model tag produces a store that looks complete and attributes spans to a method that never saw
-#' the document, so the expected values are asserted rather than trusted.
-#'
-#' @param .db_path Character. Path to the DuckDB file.
-#' @param .parquet Character. Staging parquet written by an extractor.
-#' @param .expect_engine Character or NULL. Assert the Engine tag in the staging file.
-#' @param .expect_model Character or NULL. Assert the Model tag.
-#' @param .retry_timeout Logical. TRUE deletes prior timeout rows for these documents first.
-#' @param .quiet Logical. Suppress the ingest message.
-#' @return Invisibly, a list of the row counts written.
-ner_db_append <- function(.db_path, .parquet, .labels,
-                          .expect_engine = NULL, .expect_model = NULL,
-                          .retry_timeout = FALSE, .quiet = FALSE) {
+#' @param .con Connection from ner_db_connect().
+#' @return .con, invisibly.
+ner_db_init <- function(.con) {
   if (FALSE) {
-    .db_path <- file.path(.lP$Cache$NerTest, "test_store.duckdb")
-    .parquet <- file.path(.lP$Cache$NerTest, "test_lexnlp.parquet")
-    .labels <- c("ORG", "DATE", "MONEY")
-    .expect_engine <- "lexnlp"
-    .expect_model <- "lexnlp"
-    .retry_timeout <- FALSE
-    .quiet <- FALSE
+    .con <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"))
   }
 
-  if (!fs::file_exists(.parquet)) cli::cli_abort("Staging parquet not found: {.path {(.parquet)}}.")
+  core_sql_ <- paste(
+    "DocID VARCHAR NOT NULL", "Start BIGINT", "Stop BIGINT", "Span VARCHAR",
+    "Label VARCHAR", "LabelRaw VARCHAR", "Engine VARCHAR NOT NULL", "Model VARCHAR NOT NULL",
+    sep = ", "
+  )
 
-  con_ <- ner_db_init(.db_path, .quiet = TRUE)
-  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
-
-  # Lazy view on the staging parquet -- DuckDB scans the file, R never holds it
-  parquet_ <- as.character(fs::path_abs(.parquet))
-  DBI::dbExecute(con_, paste0(
-    "CREATE OR REPLACE TEMP VIEW ner_src AS SELECT * FROM read_parquet('", parquet_, "')"
-  ))
-  src_ <- dplyr::tbl(con_, "ner_src")
-
-  # Identity guard: the parquet must carry exactly one (Engine, Model), and -- if
-  # an expectation was passed -- it must equal what ner_run dispatched. Abort
-  # loudly on drift rather than misfiling under the stamped identity and looping.
-  stamped_ <- src_ |>
-    dplyr::distinct(Engine, Model) |>
-    dplyr::collect()
-  if (nrow(stamped_) != 1L) {
-    cli::cli_abort(c(
-      "Staging parquet carries {nrow(stamped_)} distinct (Engine, Model) combo(s); expected exactly 1.",
-      "i" = "File: {.path {fs::path_file(.parquet)}}"
+  for (spec_ in .store_schema) {
+    extra_sql_ <- if (length(spec_$Extras) == 0L) {
+      ""
+    } else {
+      paste0(", ", paste(names(spec_$Extras), unname(spec_$Extras), collapse = ", "))
+    }
+    DBI::dbExecute(.con, glue::glue(
+      "CREATE TABLE IF NOT EXISTS {spec_$Table} ({core_sql_}{extra_sql_})"
     ))
   }
-  if (!is.null(.expect_engine) && !is.null(.expect_model)) {
-    if (!identical(stamped_$Engine[1], .expect_engine) ||
-        !identical(stamped_$Model[1], .expect_model)) {
-      cli::cli_abort(c(
-        "Stamped identity does not match what was dispatched -- the extractor's \\
-         ENGINE/MODEL constants have drifted from the {.arg .run} token.",
-        "x" = "parquet stamps {.val {stamped_$Engine[1]}} / {.val {stamped_$Model[1]}}",
-        "v" = "ner_run expected {.val {(.expect_engine)}} / {.val {(.expect_model)}}",
-        "i" = "Fix the extractor's ENGINE/MODEL constants (or the token), then rerun. \\
-               Ingesting as-is would misfile the rows and rerun this combo forever."
+
+  # FOUR STATES, NOT TWO. "error" is new and it closes a real gap: an extractor that crashed on a
+  # document used to fall through to a bare sentinel, indistinguishable from a clean miss. A pattern
+  # failing on a whole class of documents then looked exactly like that class having no matches.
+  DBI::dbExecute(.con, "
+    CREATE TABLE IF NOT EXISTS runs (
+      DocID   VARCHAR NOT NULL,
+      Engine  VARCHAR NOT NULL,
+      Model   VARCHAR NOT NULL,
+      Label   VARCHAR NOT NULL,
+      Status  VARCHAR NOT NULL,   -- hit | nohit | timeout | error
+      RunAt   TIMESTAMP NOT NULL,
+      PRIMARY KEY (DocID, Engine, Model, Label)
+    )")
+
+  DBI::dbExecute(.con, "
+    CREATE TABLE IF NOT EXISTS bench (
+      Suite    VARCHAR NOT NULL,
+      Model    VARCHAR NOT NULL,
+      Labels   VARCHAR NOT NULL,
+      Batch    INTEGER NOT NULL,
+      Workers  INTEGER NOT NULL,
+      NDoc     INTEGER NOT NULL,
+      Machine  VARCHAR NOT NULL,
+      Seconds  DOUBLE  NOT NULL,
+      DocPerS  DOUBLE  NOT NULL,
+      RunAt    TIMESTAMP NOT NULL,
+      PRIMARY KEY (Suite, Model, Labels, Batch, Workers, NDoc, Machine)
+    )")
+
+  ner_db_views(.con = .con)
+  invisible(.con)
+}
+
+#' Build the union view and the per-suite views
+#'
+#' `candidates` unions the seven label tables on the core columns, so "every span this store holds"
+#' is one query regardless of how many labels exist.
+#'
+#' NOTE FOR ANYTHING THAT ENUMERATES TABLES: DBI::dbListTables() returns views alongside tables, and
+#' rebuilding a view from a list that already contains it produces a self-referential definition that
+#' fails only when queried. Filter on duckdb_views() rather than trusting the table list.
+#'
+#' @param .con Connection.
+#' @return .con, invisibly.
+ner_db_views <- function(.con) {
+  if (FALSE) {
+    .con <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"))
+  }
+
+  sel_ <- purrr::map_chr(
+    .store_schema,
+    \(.s) glue::glue("SELECT {paste(.store_core, collapse = ', ')} FROM {.s$Table}")
+  )
+  DBI::dbExecute(.con, paste0(
+    "CREATE OR REPLACE VIEW candidates AS ", paste(sel_, collapse = " UNION ALL ")
+  ))
+
+  for (label_ in names(.store_view_cols)) {
+    tbl_ <- .store_schema[[label_]]$Table
+    for (engine_ in names(.store_view_cols[[label_]])) {
+      cols_ <- .store_view_cols[[label_]][[engine_]]
+      all_  <- c(.store_core, cols_)
+      DBI::dbExecute(.con, glue::glue(
+        "CREATE OR REPLACE VIEW {tbl_}_{engine_} AS
+         SELECT {paste(all_, collapse = ', ')} FROM {tbl_} WHERE Engine = '{engine_}'"
       ))
     }
   }
+  invisible(.con)
+}
 
-  # THE REQUESTED LABELS ARE AN ARGUMENT AND CANNOT BE INFERRED FROM THE PARQUET, which is the whole
-  # reason .labels exists. The staging file records what was FOUND; it is silent about what was
-  # ASKED FOR. A document requested for ORG and GPE that yielded only organisations needs two
-  # ledger rows -- ORG success, GPE nohit -- and without the requested set the second is
-  # underivable, so GPE would look missing on every subsequent render and re-extract forever.
-  labels_req_ <- sort(unique(as.character(.labels)))
-  if (length(labels_req_) == 0L) {
-    cli::cli_abort("{.arg .labels} must name the labels this extraction requested.")
+#' Ingest one staged parquet
+#'
+#' ONE (Engine, Model) PER FILE, ASSERTED. A staging file carrying two would attribute spans to a
+#' method that never saw the document, and nothing downstream could detect it -- the rows are well
+#' formed and the ledger is satisfied. This is why matcon writes one parquet per model rather than
+#' one per run.
+#'
+#' Delete-then-insert per (Engine, Model, Label): re-running one combination replaces exactly its own
+#' rows and cannot touch another engine's. That is the isolation a per-suite store was proposed to
+#' buy, and it is already here.
+#'
+#' @param .con Connection.
+#' @param .path Staged parquet.
+#' @param .labels Labels that were REQUESTED. Rows outside this set are refused rather than stored:
+#'   the ledger records what was asked for, so a row for an unrequested label has no ledger entry and
+#'   is invisible to every completeness check downstream.
+#' @return Tibble of rows written per label, invisibly.
+ner_db_append <- function(.con, .path, .labels) {
+  if (FALSE) {
+    .con    <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"))
+    .path   <- here::here("2_output", "04A-EntityExtract", "Stage", "matcon__dateregex-v3.parquet")
+    .labels <- c("DATE", "TERM")
   }
 
-  # Per document and label: timeout (marker) > success (a real span of THAT label) > nohit.
-  # A timeout is a property of the document under the engine, not of one label -- the extractor was
-  # cut off, so nothing it was asked for can be called clean.
-  hits_ <- src_ |>
-    dplyr::filter(!is.na(Start)) |>
-    dplyr::distinct(DocID, Engine, Model, Label) |>
-    dplyr::collect() |>
-    dplyr::mutate(HasHit = TRUE)
+  tab_ <- arrow::read_parquet(.path)
 
-  tmo_ <- src_ |>
-    dplyr::group_by(DocID, Engine, Model) |>
-    dplyr::summarise(
-      HasTimeout = max(dplyr::if_else(!is.na(LabelRaw) & LabelRaw %like% "timeout:%", 1L, 0L),
-                       na.rm = TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::collect()
+  stamp_ <- dplyr::distinct(tab_, .data$Engine, .data$Model)
+  if (nrow(stamp_) != 1L) {
+    cli::cli_abort(c(
+      "{fs::path_file(.path)} carries {nrow(stamp_)} (Engine, Model) pair(s); exactly one is required.",
+      "i" = "A file carrying two would attribute spans to a method that never saw the document."
+    ))
+  }
+  engine_ <- stamp_$Engine[[1L]]
+  model_  <- stamp_$Model[[1L]]
 
-  status_ <- tidyr::expand_grid(
-    dplyr::select(tmo_, DocID, Engine, Model, HasTimeout),
-    Label = labels_req_
-  ) |>
-    dplyr::left_join(hits_, by = dplyr::join_by(DocID, Engine, Model, Label)) |>
-    dplyr::mutate(Status = dplyr::case_when(
-      .data$HasTimeout == 1L ~ "timeout",
-      !is.na(.data$HasHit)   ~ "success",
-      TRUE                   ~ "nohit"
+  seen_ <- setdiff(unique(stats::na.omit(tab_$Label)), .labels)
+  if (length(seen_) > 0L) {
+    cli::cli_abort(c(
+      "{fs::path_file(.path)} carries label{?s} that were not requested: {paste(seen_, collapse = ', ')}.",
+      "i" = "The ledger records what was requested; unrequested rows would never be counted as done."
+    ))
+  }
+
+  out_ <- tibble::tibble(Label = character(0), NRow = integer(0))
+
+  for (label_ in intersect(.labels, names(.store_schema))) {
+    spec_ <- .store_schema[[label_]]
+    keep_ <- c(.store_core, intersect(names(spec_$Extras), names(tab_)))
+    part_ <- tab_ |>
+      dplyr::filter(.data$Label == label_) |>
+      dplyr::select(dplyr::all_of(keep_))
+
+    DBI::dbExecute(.con, glue::glue(
+      "DELETE FROM {spec_$Table} WHERE Engine = '{engine_}' AND Model = '{model_}'"
+    ))
+    if (nrow(part_) > 0L) DBI::dbAppendTable(.con, spec_$Table, as.data.frame(part_))
+
+    out_ <- dplyr::bind_rows(out_, tibble::tibble(Label = label_, NRow = nrow(part_)))
+  }
+
+  ner_db_ledger(.con = .con, .tab = tab_, .engine = engine_, .model = model_, .labels = .labels)
+  invisible(out_)
+}
+
+
+# 4. The ledger --------------------------------------------------------------------------------------------------------
+
+#' Record an outcome for every (document, label) a run covered
+#'
+#' FOUR STATES. A document appears once per requested label with exactly one of:
+#'
+#'   hit      at least one span for that label
+#'   nohit    processed, found nothing -- NOT the same as never processed
+#'   timeout  cut off by the per-document cap
+#'   error    the extractor raised
+#'
+#' The last two are read from the sentinel row's LabelRaw, which the Python side stamps as
+#' "timeout:<name>" or "error:<name>". Before the error state existed, a crash produced a bare
+#' sentinel and was recorded as nohit -- so a pattern failing on a class of documents was
+#' indistinguishable from that class having no matches.
+#'
+#' @param .con Connection.
+#' @param .tab The staged parquet, already read.
+#' @param .engine,.model The stamp, already verified as unique.
+#' @param .labels Labels requested.
+#' @return Rows written, invisibly.
+ner_db_ledger <- function(.con, .tab, .engine, .model, .labels) {
+  if (FALSE) {
+    .con    <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"))
+    .tab    <- arrow::read_parquet(here::here("2_output", "04A-EntityExtract", "Stage",
+                                              "matcon__dateregex-v3.parquet"))
+    .engine <- "matcon"
+    .model  <- "dateregex-v3"
+    .labels <- c("DATE", "TERM")
+  }
+
+  docs_ <- unique(.tab$DocID)
+
+  fail_ <- .tab |>
+    dplyr::filter(is.na(.data$Start), !is.na(.data$LabelRaw)) |>
+    dplyr::mutate(Fail = dplyr::if_else(
+      stringi::stri_startswith_fixed(.data$LabelRaw, "timeout:"), "timeout", "error"
     )) |>
-    dplyr::select(DocID, Engine, Model, Label, Status)
-
-  # Which staged (document, label) pairs are new vs already present, and their existing status
-  combos_ <- status_ |>
-    dplyr::left_join(
-      dplyr::tbl(con_, "runs") |>
-        dplyr::select(DocID, Engine, Model, Label, OldStatus = Status) |>
-        dplyr::collect(),
-      by = dplyr::join_by(DocID, Engine, Model, Label)
-    )
-
-  n_all_ <- nrow(combos_)
-  new_ <- combos_ |> dplyr::filter(is.na(OldStatus))
-  retry_ <- combos_ |> dplyr::filter(!is.na(OldStatus), OldStatus == "timeout")
-
-  to_ingest_ <- if (isTRUE(.retry_timeout)) {
-    dplyr::bind_rows(new_, retry_)
-  } else {
-    new_
-  }
-
-  if (nrow(to_ingest_) == 0L) {
-    if (!.quiet) {
-      cli::cli_alert_info("All {n_all_} document-label pair(s) already in store -- nothing to append.")
-    }
-    return(invisible(list(docs = 0L, candidates = 0L, retried = 0L)))
-  }
-
-  # Register the ingest scope (DocIDs) and the per-doc status to write into runs
-  duckdb::duckdb_register(con_, "ner_ingest_docs",
-                          data.frame(DocID = unique(to_ingest_$DocID)))
-  on.exit(duckdb::duckdb_unregister(con_, "ner_ingest_docs"), add = TRUE, after = FALSE)
-  duckdb::duckdb_register(con_, "ner_ingest_status",
-                          to_ingest_[c("DocID", "Engine", "Model", "Label", "Status")])
-  on.exit(duckdb::duckdb_unregister(con_, "ner_ingest_status"), add = TRUE, after = FALSE)
-
-  engine_ <- to_ingest_$Engine[1]
-  model_ <- to_ingest_$Model[1]
-  n_retry_ <- if (isTRUE(.retry_timeout)) nrow(retry_) else 0L
-
-  DBI::dbBegin(con_)
-  ok_ <- FALSE
-  on.exit(if (!ok_) DBI::dbRollback(con_), add = TRUE, after = FALSE)
-
-  # Retry path: clear the timeout docs from both tables first (scoped to this
-  # combo x the staged retry docs)
-  if (n_retry_ > 0L) {
-    DBI::dbExecute(con_, "
-      DELETE FROM candidates
-      WHERE Engine = ? AND Model = ?
-        AND EXISTS (SELECT 1 FROM ner_ingest_status i
-                    WHERE i.DocID = candidates.DocID AND i.Label = candidates.Label)
-        AND EXISTS (SELECT 1 FROM runs r
-                    WHERE r.DocID = candidates.DocID AND r.Engine = candidates.Engine
-                      AND r.Model = candidates.Model AND r.Label = candidates.Label
-                      AND r.Status = 'timeout')
-    ", params = list(engine_, model_))
-    DBI::dbExecute(con_, "
-      DELETE FROM runs
-      WHERE Engine = ? AND Model = ? AND Status = 'timeout'
-        AND EXISTS (SELECT 1 FROM ner_ingest_status i
-                    WHERE i.DocID = runs.DocID AND i.Label = runs.Label)
-    ", params = list(engine_, model_))
-  }
-
-  # candidates: real hits of the ingest scope only (markers + sentinels excluded)
-  n_cand_ <- DBI::dbExecute(con_, "
-    INSERT INTO candidates (DocID, Start, Stop, Span, Label, LabelRaw, Engine, Model)
-    SELECT s.DocID, s.Start, s.Stop, s.Span, s.Label, s.LabelRaw, s.Engine, s.Model
-    FROM ner_src s
-    WHERE s.Start IS NOT NULL
-      AND EXISTS (SELECT 1 FROM ner_ingest_status i
-                  WHERE i.DocID = s.DocID AND i.Label = s.Label)
-  ")
-
-  # runs: one row per ingested doc combo, with its derived Status
-  DBI::dbExecute(con_, "
-    INSERT INTO runs (DocID, Engine, Model, Label, Status, CreatedAt)
-    SELECT DocID, Engine, Model, Label, Status, now()::TIMESTAMP
-    FROM ner_ingest_status
-  ")
-
-  DBI::dbCommit(con_)
-  ok_ <- TRUE
-
-  if (!.quiet) {
-    msg_ <- paste0("Appended {n_cand_} candidate(s) over {nrow(to_ingest_)} of {n_all_} ",
-                   "document-label pair(s) from {.path {fs::path_file(.parquet)}}")
-    if (n_retry_ > 0L) msg_ <- paste0(msg_, " (incl. {n_retry_} timeout retr{?y/ies})")
-    cli::cli_alert_success(msg_)
-  }
-  return(invisible(list(docs = nrow(to_ingest_), candidates = n_cand_, retried = n_retry_)))
-}
-#' Which documents a combination has not yet been run on
-#'
-#' The question the resumable design rests on. Asked against the ledger rather than against the
-#' candidates table, because a document an engine legitimately found nothing in has no candidates
-#' and must not be re-run forever.
-#'
-#' @param .db_path Character. Path to the DuckDB file.
-#' @param .inputs Character. Parquet file(s) or folder(s) holding the canonical text.
-#' @param .engine Character. Engine name.
-#' @param .model Character. Model name.
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .retry_timeout Logical. TRUE counts prior timeouts as missing.
-#' @param .quiet Logical. Suppress the count message.
-#' @return Character vector of document identifiers.
-ner_db_missing <- function(.db_path, .inputs, .engine, .model, .labels,
-                           .id_col = "DocID", .retry_timeout = FALSE, .quiet = FALSE) {
-  if (FALSE) {
-    .db_path <- file.path(.lP$Cache$NerTest, "test_store.duckdb")
-    .inputs <- fil_sample_dirs$Path[20]
-    .engine <- "spacy"
-    .model <- "en_core_web_sm"
-    .labels <- c("ORG", "GPE")
-    .id_col <- "DocID"
-    .retry_timeout <- FALSE
-    .quiet <- FALSE
-  }
-
-  files_ <- ner_input_files(.inputs)
-
-  con_ <- ner_db_init(.db_path, .quiet = TRUE)
-  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
-
-  files_sql_ <- paste0("'", files_, "'", collapse = ", ")
-  DBI::dbExecute(con_, paste0(
-    "CREATE OR REPLACE TEMP VIEW ner_inputs AS ",
-    "SELECT \"", .id_col, "\" AS DocID FROM read_parquet([", files_sql_, "])"
-  ))
-
-  # Ledger rows counting as done for this combination: always success/nohit; when not retrying,
-  # timeout counts as done too, so a document that was cut off is not re-sent forever.
-  done_ <- dplyr::tbl(con_, "runs") |>
-    dplyr::filter(Engine == !!.engine, Model == !!.model)
-  if (isTRUE(.retry_timeout)) {
-    done_ <- done_ |> dplyr::filter(Status != "timeout")
-  }
-  done_ <- done_ |> dplyr::select(DocID, Label) |> dplyr::collect()
-
-  ids_ <- dplyr::tbl(con_, "ner_inputs") |> dplyr::distinct(DocID) |> dplyr::pull(DocID)
-  n_all_ <- length(ids_)
-
-  # THE RETURN IS A LIST KEYED ON LABEL, not one vector, because the missing set genuinely differs
-  # per label: a policy addition leaves one label missing everywhere while the rest are complete,
-  # and collapsing that to "these documents need work" is what forced a full re-extraction to
-  # obtain a single label.
-  labels_ <- sort(unique(as.character(.labels)))
-  out_ <- purrr::map(labels_, function(.l) {
-    setdiff(ids_, done_$DocID[done_$Label == .l])
-  })
-  names(out_) <- labels_
-
-  if (!.quiet) {
-    retry_msg_ <- if (isTRUE(.retry_timeout)) " (incl. timeout retries)" else ""
-    n_by_ <- purrr::map_int(out_, length)
-    if (length(unique(n_by_)) == 1L) {
-      cli::cli_alert_info(paste0("{(.engine)}/{(.model)}: {n_by_[[1]]} of {n_all_} ",
-                                 "doc(s) missing for each of {length(labels_)} label{?s}",
-                                 "{retry_msg_}."))
-    } else {
-      cli::cli_alert_info(paste0("{(.engine)}/{(.model)}: missing per label{retry_msg_} -- ",
-                                 paste0(names(n_by_), " ", n_by_, collapse = ", "),
-                                 " (of {n_all_})."))
-    }
-  }
-  return(out_)
-}
-#' Time a grid of combinations on a fixed input
-#'
-#' Cost is one of the two inputs to the deployment policy, and it cannot be read off a completed
-#' store: the ledger records that a document was processed, not what it took. Timing has to be
-#' measured while it happens, on a set small enough to run every combination over.
-#'
-#' @param .inputs Character. Parquet file(s) or folder(s) to time against.
-#' @param .grid Tibble or list. Combinations to time.
-#' @param .id_col Character. Document identifier column in the input.
-#' @param .text_col Character. Text column the offsets will index.
-#' @return Tibble of per-combination timings.
-ner_bench <- function(.inputs, .grid, .id_col = "DocID", .text_col = "TextRaw") {
-  if (FALSE) {
-    .inputs <- fil_sample_dirs$Path[20]
-    .grid <- bench_grid
-    .id_col <- "DocID"
-    .text_col <- "TextRaw"
-  }
-
-  # docs in scope, once (for docs/s)
-  files_ <- ner_input_files(.inputs)
-  con_tmp_ <- ner_db_connect()
-  files_sql_ <- paste0("'", files_, "'", collapse = ", ")
-  n_docs_ <- DBI::dbGetQuery(con_tmp_, paste0(
-    "SELECT COUNT(DISTINCT \"", .id_col, "\") AS n FROM read_parquet([", files_sql_, "])"
-  ))$n
-  DBI::dbDisconnect(con_tmp_, shutdown = TRUE)
-  cli::cli_alert_info("Benchmark scope: {n_docs_} doc(s), {nrow(.grid)} setting(s)")
-
-  # background RSS sampler: sums RSS (KB) over all extract_spacy.py processes,
-  # writes the running peak to a file; killed via its pid file after each run
-  rss_file_ <- tempfile(fileext = ".txt")
-  pid_file_ <- tempfile(fileext = ".pid")
-  sampler_ <- tempfile(fileext = ".sh")
-  writeLines(c(
-    "#!/bin/bash",
-    paste0("echo $$ > ", pid_file_),
-    "max=0",
-    "while true; do",
-    "  cur=$(ps -A -o rss=,command= | grep '[e]xtract_spacy.py' | awk '{s+=$1} END {print s+0}')",
-    "  if [ \"$cur\" -gt \"$max\" ]; then max=$cur; fi",
-    paste0("  echo $max > ", rss_file_),
-    "  sleep 0.5",
-    "done"
-  ), sampler_)
-
-  results_ <- vector("list", nrow(.grid))
-
-  for (i_ in seq_len(nrow(.grid))) {
-    row_ <- .grid[i_, ]
-    out_tmp_ <- tempfile(fileext = ".parquet")
-    cli::cli_alert_info(
-      "[{i_}/{nrow(.grid)}] {row_$Engine}/{row_$Model} device={row_$Device} \\
-       n_process={row_$NProcess} batch={row_$BatchSize} chunk={row_$ChunkSize}"
-    )
-
-    is_spacy_ <- row_$Engine == "spacy"
-    if (is_spacy_) {
-      writeLines("0", rss_file_)
-      system2("bash", sampler_, stdout = FALSE, stderr = FALSE, wait = FALSE)
-    }
-
-    t0_ <- Sys.time()
-    ok_ <- tryCatch(
-      {
-        if (is_spacy_) {
-          ner_spacy(
-            .inputs = .inputs, .output = out_tmp_,
-            .id_col = .id_col, .text_col = .text_col,
-            .model = row_$Model, .device = row_$Device,
-            .batch_size = row_$BatchSize, .n_process = row_$NProcess,
-            .overwrite = TRUE, .no_progress = TRUE, .quiet = TRUE
-          )
-        } else {
-          ner_lexnlp(
-            .inputs = .inputs, .output = out_tmp_,
-            .id_col = .id_col, .text_col = .text_col,
-            .n_process = row_$NProcess, .chunk_size = row_$ChunkSize,
-            .overwrite = TRUE, .no_progress = TRUE, .quiet = TRUE
-          )
-        }
-        TRUE
-      },
-      error = function(e) {
-        cli::cli_alert_danger("  FAILED: {conditionMessage(e)}")
-        FALSE
-      }
-    )
-    secs_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
-
-    rss_mb_ <- NA_real_
-    if (is_spacy_) {
-      if (fs::file_exists(pid_file_)) {
-        system2("kill", readLines(pid_file_)[1], stdout = FALSE, stderr = FALSE)
-      }
-      rss_mb_ <- suppressWarnings(as.numeric(readLines(rss_file_)[1])) / 1024
-    }
-    if (fs::file_exists(out_tmp_)) fs::file_delete(out_tmp_)
-
-    results_[[i_]] <- dplyr::bind_cols(
-      row_,
-      tibble::tibble(
-        Ok = ok_,
-        Secs = round(secs_, 1),
-        DocsPerSec = round(n_docs_ / secs_, 2),
-        PeakRssMb = round(rss_mb_, 0)
-      )
-    )
-    res_ <- results_[[i_]]
-    cli::cli_alert_success("  {res_$Secs}s ({res_$DocsPerSec} docs/s), peak {res_$PeakRssMb} MB")
-  }
-
-  dplyr::bind_rows(results_) |>
-    dplyr::arrange(Engine, Model, Secs)
-}
-
-
-#' Verify that stored offsets still index the canonical text
-#'
-#' An offset is an integer into a specific string. If any script disagrees about what a document's
-#' text is, every offset in the project is quietly wrong, is.na() catches nothing, and the numbers
-#' look entirely normal. This rehydrates spans from the text and compares them to the stored Span,
-#' which is the only check that fails loudly when that has happened.
-#'
-#' Slicing is by code point, not byte. Base substr() on this corpus misaligns about ninety-nine per
-#' cent of spans, so stringi::stri_sub() is used throughout.
-#'
-#' @param .tab Tibble of candidates carrying DocID, Start, Stop and Span.
-#' @param .inputs Character. Parquet file(s) or folder(s) holding the canonical text.
-#' @param .text_col Character. Text column the offsets index.
-#' @return Tibble with the rehydrated span beside the stored one and an agreement flag.
-ner_check_offsets <- function(.tab, .inputs, .text_col = "TextRaw") {
-  if (FALSE) {
-    .tab <- arrow::read_parquet(file.path(.lP$Cache$NerTest, "test_regex.parquet"))
-    .inputs <- fil_sample_dirs$Path[20]
-    .text_col <- "TextRaw"
-  }
-
-  files_ <- ner_input_files(.inputs)
-  doc_map_ <- tibble::tibble(
-    Path = files_,
-    DocID = fs::path_ext_remove(fs::path_file(files_))
-  )
-
-  out_ <- .tab |>
-    dplyr::filter(!is.na(Start)) |>
-    dplyr::mutate(Start = as.integer(Start), Stop = as.integer(Stop)) |>
-    dplyr::left_join(doc_map_, by = dplyr::join_by(DocID)) |>
-    dplyr::filter(!is.na(Path)) |>
-    dplyr::group_by(Path) |>
-    dplyr::group_modify(\(.x, .y) {
-      text_ <- arrow::read_parquet(.y$Path, col_select = dplyr::all_of(.text_col))[[.text_col]]
-      dplyr::mutate(.x, Rehydrated = stringi::stri_sub(text_, Start + 1L, Stop))
-    }) |>
-    dplyr::ungroup() |>
-    dplyr::summarise(N = dplyr::n(), OkShare = mean(Rehydrated == Span))
-
-  if (isTRUE(all.equal(out_$OkShare, 1))) {
-    cli::cli_alert_success("Offset round-trip: {out_$N} candidate(s), 100% OK.")
-  } else {
-    cli::cli_alert_danger("Offset round-trip FAILED: OkShare = {round(out_$OkShare, 4)} over {out_$N} candidate(s).")
-  }
-  return(invisible(out_))
-}
-
-#' Explode a combination-keyed tuning bundle into ner_run() arguments
-#'
-#' One bundle in the runbook, keyed by combination, is readable; four parallel per-combination lists
-#' are not. This turns the first into the second, dropping the knobs a combination omits so they
-#' fall through to ner_run()'s own defaults.
-#'
-#' .tuning is required rather than defaulted. It previously defaulted to an object that is defined
-#' nowhere in the project, so a call with no argument failed on lazy evaluation at the point of use
-#' rather than at the call site.
-#'
-#' @param .tuning Named list. One entry per combination token, each a list of knobs.
-#' @return A list with .run, .n_process, .batch_size and .timeout, ready for do.call().
-ner_run_args <- function(.tuning) {
-  pick_ <- function(.knob) purrr::map(.tuning, .knob) |> purrr::compact()
-  list(
-    .run        = names(.tuning),
-    .n_process  = pick_("n_process"),
-    .batch_size = pick_("batch_size"),
-    .timeout    = pick_("timeout")
-  )
-}
-
-# 3. Combination tokens, and clearing a scope --------------------------------------------------------------------------
-
-#' Split a combination token into its engine and model
-#'
-#' The tokens are the vocabulary the whole family speaks in, so parsing them lives in one place. A
-#' spaCy or paper token without a model is an error rather than a default, because a silently
-#' defaulted model produces a store attributing spans to a method nobody chose.
-#'
-#' @param .tok Character. One combination token.
-#' @return A one-row tibble with Engine and Model.
-ner_parse_combo <- function(.tok) {
-  if (FALSE) {
-    .tok <- "spacy:en_core_web_trf"
-  }
-
-  parts_ <- strsplit(.tok, ":", fixed = TRUE)[[1]]
-  engine_ <- parts_[1]
-  if (!engine_ %in% c("spacy", "lexnlp", "paper")) {
-    cli::cli_abort("Unknown engine in {.val {(.tok)}}; expected spacy|lexnlp|paper.")
-  }
-  if (engine_ == "lexnlp") {
-    tibble::tibble(Engine = "lexnlp", Model = "lexnlp")
-  } else if (engine_ == "spacy") {
-    if (length(parts_) < 2L) cli::cli_abort("spaCy needs a model: {.val {(.tok)}}.")
-    tibble::tibble(Engine = "spacy", Model = fs::path_file(paste(parts_[-1], collapse = ":")))
-  } else {
-    if (length(parts_) < 2L) cli::cli_abort("paper needs a model: {.val {(.tok)}}.")
-    tibble::tibble(Engine = "paper", Model = parts_[2])
-  }
-}
-
-
-#' Clear a scope from the store so the next run repopulates it
-#'
-#' The sanctioned lever for anything narrower than a full rebuild. Both tables are cleared in one
-#' transaction and never one alone: clearing candidates without the ledger leaves the documents
-#' marked done and they are never re-run, and clearing the ledger without the candidates duplicates
-#' every span on the next append.
-#'
-#' Candidates carry no Status, so a status-restricted clear removes candidates for the documents
-#' holding that status in the ledger. That mirrors what the append does on a timeout retry.
-#'
-#' @param .db_path Character. Path to the DuckDB file.
-#' @param .run Character. One or more combination tokens.
-#' @param .doc_ids Character or NULL. Restrict to these documents.
-#' @param .status Character or NULL. Restrict to ledger rows of this status: success, nohit or
-#'   timeout.
-#' @param .quiet Logical. Suppress the count message.
-#' @return Invisibly, a list of the row counts removed.
-ner_db_clear <- function(.db_path, .run, .doc_ids = NULL, .status = NULL, .quiet = FALSE) {
-  if (FALSE) {
-    .db_path <- .lP$Cache$NerDB
-    .run <- "lexnlp"
-    .doc_ids <- NULL
-    .status <- "timeout"
-    .quiet <- FALSE
-  }
-
-  if (!fs::file_exists(.db_path)) cli::cli_abort("No NER store at {.path {(.db_path)}}.")
-  if (!is.null(.status)) {
-    .status <- match.arg(.status, c("success", "nohit", "timeout"), several.ok = TRUE)
-  }
-
-  combos_ <- purrr::map(.run, ner_parse_combo) |>
-    dplyr::bind_rows() |>
+    dplyr::select("DocID", "Fail") |>
     dplyr::distinct()
 
-  con_ <- ner_db_init(.db_path, .quiet = TRUE)
-  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+  hit_ <- .tab |>
+    dplyr::filter(!is.na(.data$Start)) |>
+    dplyr::distinct(.data$DocID, .data$Label)
 
-  # Register the scope predicates as temp tables (no string-building of id lists).
-  duckdb::duckdb_register(con_, "ner_clear_combos", as.data.frame(combos_))
-  on.exit(duckdb::duckdb_unregister(con_, "ner_clear_combos"), add = TRUE, after = FALSE)
-
-  has_docs_ <- !is.null(.doc_ids)
-  if (has_docs_) {
-    duckdb::duckdb_register(con_, "ner_clear_docs", data.frame(DocID = unique(.doc_ids)))
-    on.exit(duckdb::duckdb_unregister(con_, "ner_clear_docs"), add = TRUE, after = FALSE)
-  }
-  has_status_ <- !is.null(.status)
-  if (has_status_) {
-    duckdb::duckdb_register(con_, "ner_clear_status", data.frame(Status = .status))
-    on.exit(duckdb::duckdb_unregister(con_, "ner_clear_status"), add = TRUE, after = FALSE)
-  }
-
-  combo_pred_ <- "(Engine, Model) IN (SELECT Engine, Model FROM ner_clear_combos)"
-  doc_pred_   <- if (has_docs_) " AND DocID IN (SELECT DocID FROM ner_clear_docs)" else ""
-  runs_status_pred_ <- if (has_status_) " AND Status IN (SELECT Status FROM ner_clear_status)" else ""
-  cand_status_pred_ <- if (has_status_) {
-    paste0(
-      " AND DocID IN (SELECT DocID FROM runs r ",
-      "WHERE r.Engine = candidates.Engine AND r.Model = candidates.Model ",
-      "AND r.Status IN (SELECT Status FROM ner_clear_status))"
+  led_ <- tidyr::expand_grid(DocID = docs_, Label = .labels) |>
+    dplyr::left_join(dplyr::mutate(hit_, Hit = TRUE), by = dplyr::join_by(DocID, Label)) |>
+    dplyr::left_join(fail_, by = dplyr::join_by(DocID)) |>
+    dplyr::transmute(
+      .data$DocID,
+      Engine = .engine,
+      Model  = .model,
+      .data$Label,
+      Status = dplyr::case_when(
+        !is.na(.data$Fail) ~ .data$Fail,
+        isTRUE(.data$Hit)  ~ "hit",
+        .data$Hit %in% TRUE ~ "hit",
+        .default = "nohit"
+      ),
+      RunAt = Sys.time()
     )
-  } else ""
 
-  DBI::dbBegin(con_)
-  ok_ <- FALSE
-  on.exit(if (!ok_) DBI::dbRollback(con_), add = TRUE, after = FALSE)
-
-  # candidates first: its Status gate reads runs, so delete it before runs is touched.
-  n_cand_ <- DBI::dbExecute(con_, paste0(
-    "DELETE FROM candidates WHERE ", combo_pred_, doc_pred_, cand_status_pred_
+  DBI::dbExecute(.con, glue::glue(
+    "DELETE FROM runs WHERE Engine = '{.engine}' AND Model = '{.model}'
+       AND Label IN ({paste0(\"'\", .labels, \"'\", collapse = ', ')})"
   ))
-  n_runs_ <- DBI::dbExecute(con_, paste0(
-    "DELETE FROM runs WHERE ", combo_pred_, doc_pred_, runs_status_pred_
-  ))
+  DBI::dbAppendTable(.con, "runs", as.data.frame(led_))
+  invisible(nrow(led_))
+}
 
-  DBI::dbCommit(con_)
-  ok_ <- TRUE
-
-  status_msg_ <- if (has_status_) paste0(" [status: ", paste(.status, collapse = "/"), "]") else ""
-  docs_msg_   <- if (has_docs_) paste0(" [", length(unique(.doc_ids)), " doc(s)]") else ""
-  if (!.quiet) {
-    cli::cli_alert_success(
-      paste0("Cleared {n_runs_} ledger row(s) and {n_cand_} candidate(s) across ",
-             "{nrow(combos_)} combo(s){status_msg_}{docs_msg_}. Re-run ner_run() to repopulate.")
-    )
+#' Which documents a combination has not seen
+#'
+#' The question every pass asks before it stages anything. Answered from one table for every engine,
+#' which is what a store split by suite would have cost.
+#'
+#' @param .con Connection.
+#' @param .doc_ids Candidate documents.
+#' @param .engine,.model,.label The combination.
+#' @return Character vector of DocIDs with no ledger entry.
+ner_db_missing <- function(.con, .doc_ids, .engine, .model, .label) {
+  if (FALSE) {
+    .con     <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"))
+    .doc_ids <- c("A", "B")
+    .engine  <- "matcon"
+    .model   <- "dateregex-v3"
+    .label   <- "DATE"
   }
-  return(invisible(list(runs = n_runs_, candidates = n_cand_, combos = combos_)))
+
+  done_ <- DBI::dbGetQuery(.con, glue::glue(
+    "SELECT DISTINCT DocID FROM runs
+      WHERE Engine = '{.engine}' AND Model = '{.model}' AND Label = '{.label}'"
+  ))$DocID
+  setdiff(.doc_ids, done_)
+}
+
+#' Remove one combination entirely
+#'
+#' Spans and ledger together. Removing one without the other leaves a store that reports work done
+#' and holds none of it, or holds rows nothing knows about.
+#'
+#' @param .con Connection.
+#' @param .engine,.model The combination.
+#' @param .labels Labels to clear. NULL clears all of them.
+#' @return Rows removed, invisibly.
+ner_db_clear <- function(.con, .engine, .model, .labels = NULL) {
+  if (FALSE) {
+    .con    <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"))
+    .engine <- "matcon"
+    .model  <- "dateregex-v2"
+    .labels <- NULL
+  }
+
+  n_ <- 0L
+  for (label_ in names(.store_schema)) {
+    if (!is.null(.labels) && !(toupper(label_) %in% toupper(.labels))) next
+    n_ <- n_ + DBI::dbExecute(.con, glue::glue(
+      "DELETE FROM {.store_schema[[label_]]$Table} WHERE Engine = '{.engine}' AND Model = '{.model}'"
+    ))
+  }
+  lab_sql_ <- if (is.null(.labels)) "" else
+    glue::glue(" AND Label IN ({paste0(\"'\", .labels, \"'\", collapse = ', ')})")
+  n_ <- n_ + DBI::dbExecute(.con, glue::glue(
+    "DELETE FROM runs WHERE Engine = '{.engine}' AND Model = '{.model}'{lab_sql_}"
+  ))
+  invisible(n_)
+}
+
+#' What the store holds, by combination and label
+#'
+#' @param .con Connection.
+#' @return Tibble: Engine, Model, Label, Status counts, Docs, Spans.
+ner_db_summary <- function(.con) {
+  if (FALSE) {
+    .con <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"), .read_only = TRUE)
+  }
+
+  led_ <- DBI::dbGetQuery(.con, "
+    SELECT Engine, Model, Label, Status, COUNT(*) AS N
+    FROM runs GROUP BY Engine, Model, Label, Status") |>
+    tibble::as_tibble() |>
+    tidyr::pivot_wider(names_from = "Status", values_from = "N", values_fill = 0L)
+
+  spans_ <- DBI::dbGetQuery(.con, "
+    SELECT Engine, Model, Label, COUNT(*) AS Spans, COUNT(DISTINCT DocID) AS SpanDocs
+    FROM candidates WHERE Start IS NOT NULL
+    GROUP BY Engine, Model, Label") |>
+    tibble::as_tibble()
+
+  led_ |>
+    dplyr::left_join(spans_, by = dplyr::join_by(Engine, Model, Label)) |>
+    dplyr::mutate(dplyr::across(dplyr::where(is.numeric), \(.x) tidyr::replace_na(.x, 0L))) |>
+    dplyr::arrange(.data$Engine, .data$Model, .data$Label)
+}
+
+#' Warn when the LexNLP image no longer matches its sources
+#'
+#' Delegates to contracts-lexnlp/image_spec.py, which hashes the Dockerfile, the extractor, the legal
+#' form vocabulary and the geo entity table, and compares against the LABEL stamped at build time.
+#'
+#' A STALE IMAGE FAILS SILENTLY. The container runs, the parquet is well formed, and the rows are
+#' wrong about their own provenance -- attributed in the store to code that has changed since.
+#'
+#' @param .image Image name.
+#' @param .abort Abort rather than warn.
+#' @return TRUE when current, FALSE otherwise, invisibly.
+ner_lexnlp_check_image <- function(.image = "contracts-lexnlp", .abort = FALSE) {
+  if (FALSE) {
+    .image <- "contracts-lexnlp"
+    .abort <- FALSE
+  }
+
+  script_ <- fs::path(.ner_suite_dir("lexnlp"), "image_spec.py")
+  if (!fs::file_exists(script_)) {
+    cli::cli_warn("image_spec.py not found; cannot verify {(.image)}.")
+    return(invisible(FALSE))
+  }
+  # CAPTURED, NOT DISCARDED. An exit code alone cannot distinguish a stale image from an
+  # environment where docker is not on PATH -- and an R session started from the GUI routinely has a
+  # narrower PATH than a login shell, so the second is the likelier explanation for a check that
+  # fails here and passes in a terminal. Reporting the reason costs nothing and stops a false alarm
+  # from being read as a real one.
+  out_    <- suppressWarnings(system2("python3", c(script_, "--check"),
+                                      stdout = TRUE, stderr = TRUE))
+  status_ <- attr(out_, "status") %||% 0L
+  ok_     <- identical(as.integer(status_), 0L)
+  said_   <- paste(out_, collapse = " ")
+
+  if (!ok_) {
+    unknown_ <- stringi::stri_detect_fixed(said_, "no image, no docker")
+    msg_ <- if (unknown_) c(
+      "Could not verify {(.image)}: {(said_)}",
+      "i" = "Most often docker is absent from this session's PATH rather than the image being
+             stale. Run contracts-lexnlp/image_spec.py --check in a terminal to tell which."
+    ) else c(
+      "{(.image)} does not match its sources: {(said_)}",
+      "i" = "Run contracts-lexnlp/rebuild_lexnlp.sh. Extraction from a stale image is attributed
+             in the store to code that has changed since."
+    )
+    if (.abort) cli::cli_abort(msg_) else cli::cli_warn(msg_)
+  }
+  invisible(ok_)
+}
+
+
+# 5. Benchmarks --------------------------------------------------------------------------------------------------------
+#
+# A LEDGER, NOT A SWITCH. Every render reports the whole grid and measures only the cells not already
+# stored, so the first render pays the full cost and later ones cost seconds. Nothing is skippable
+# and nothing is switched off -- which is the difference between this and an eval: false, and the
+# reason the document can carry an expensive measurement without becoming unrenderable.
+#
+# MACHINE IS IN THE KEY. A timing from a different box is a different measurement, and without it a
+# laptop run would silently overwrite the Mac Studio numbers. Re-measuring means deleting rows, which
+# is an action rather than a setting.
+
+#' This machine, as a benchmark key
+#'
+#' @return Short string identifying the host and its core count.
+ner_machine <- function() {
+  if (FALSE) {
+    # no arguments
+  }
+  paste0(Sys.info()[["sysname"]], "-", Sys.info()[["machine"]], "-", parallel::detectCores(), "c")
+}
+
+#' Measure one benchmark cell, or read it from the store
+#'
+#' Runs the suite, times it, discards the output. Extraction and ingest are separate functions
+#' precisely so this can exist: a benchmark that wrote to the store would pollute what it measures.
+#'
+#' @param .con Connection.
+#' @param .suite One of "spacy", "lexnlp", "matcon".
+#' @param .path_in Staged parquet to run over.
+#' @param .n_doc Documents in that parquet, for the key and the rate.
+#' @param .model Model name, or NULL.
+#' @param .labels Labels to request.
+#' @param .batch Batch size to test.
+#' @param .workers Worker count to test.
+#' @param .machine Machine key.
+#' @return One-row tibble, invisibly.
+ner_bench_cell <- function(.con, .suite, .path_in, .n_doc, .model = NULL,
+                           .labels, .batch, .workers, .machine = ner_machine()) {
+  if (FALSE) {
+    .con     <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"))
+    .suite   <- "matcon"
+    .path_in <- here::here("2_output", "04A-EntityExtract", "sample_text.parquet")
+    .n_doc   <- 4398L
+    .model   <- NULL
+    .labels  <- c("DATE", "TERM")
+    .batch   <- 32L
+    .workers <- 10L
+    .machine <- ner_machine()
+  }
+
+  model_key_ <- .model %||% .suite
+  lab_key_   <- paste(sort(.labels), collapse = "+")
+
+  hit_ <- DBI::dbGetQuery(.con, glue::glue(
+    "SELECT * FROM bench
+      WHERE Suite = '{.suite}' AND Model = '{model_key_}' AND Labels = '{lab_key_}'
+        AND Batch = {.batch} AND Workers = {.workers} AND NDoc = {.n_doc}
+        AND Machine = '{.machine}'"
+  ))
+  if (nrow(hit_) == 1L) return(invisible(tibble::as_tibble(hit_)))
+
+  tmp_ <- fs::path(tempdir(), paste0("bench-", model_key_, "-", .batch, "-", .workers))
+  fs::dir_create(tmp_)
+  on.exit(fs::dir_delete(tmp_), add = TRUE)
+
+  fun_ <- switch(.suite, spacy = ner_spacy, lexnlp = ner_lexnlp, matcon = ner_matcon)
+  out_ <- fun_(
+    .path_in    = .path_in,
+    .out_dir    = tmp_,
+    .model      = .model,
+    .labels     = .labels,
+    .n_process  = .workers,
+    .batch_size = .batch,
+    .timeout    = .ner_timeout,
+    .quiet      = TRUE
+  )
+  secs_ <- attr(out_, "elapsed")
+
+  row_ <- tibble::tibble(
+    Suite = .suite, Model = model_key_, Labels = lab_key_,
+    Batch = as.integer(.batch), Workers = as.integer(.workers), NDoc = as.integer(.n_doc),
+    Machine = .machine, Seconds = secs_, DocPerS = .n_doc / secs_, RunAt = Sys.time()
+  )
+  DBI::dbAppendTable(.con, "bench", as.data.frame(row_))
+  invisible(row_)
+}
+
+#' Run a benchmark grid, measuring only what is missing
+#'
+#' @param .con Connection.
+#' @param .spec Tibble with Suite, Model, Labels (list) -- the combinations to time.
+#' @param .path_in Staged parquet.
+#' @param .n_doc Documents in it.
+#' @param .batches Batch sizes to sweep.
+#' @param .workers Worker counts to sweep.
+#' @return The full grid for this machine, invisibly.
+ner_bench_run <- function(.con, .spec, .path_in, .n_doc,
+                          .batches = c(8L, 32L, 128L), .workers = c(10L)) {
+  if (FALSE) {
+    .con     <- ner_db_connect(.db_path = tempfile(fileext = ".duckdb"))
+    .spec    <- ner_describe() |> dplyr::select("Suite", "Model", "Labels")
+    .path_in <- here::here("2_output", "04A-EntityExtract", "sample_text.parquet")
+    .n_doc   <- 4398L
+    .batches <- c(8L, 32L, 128L)
+    .workers <- c(10L)
+  }
+
+  grid_ <- tidyr::expand_grid(
+    dplyr::mutate(.spec, .row = dplyr::row_number()),
+    Batch   = .batches,
+    Workers = .workers
+  )
+
+  cli::cli_alert_info("Benchmark grid: {nrow(grid_)} cell{?s}. Cells already stored are not re-run.")
+
+  purrr::pwalk(
+    list(grid_$Suite, grid_$Model, grid_$Labels, grid_$Batch, grid_$Workers),
+    \(.s, .m, .l, .b, .w) ner_bench_cell(
+      .con     = .con,
+      .suite   = .s,
+      .path_in = .path_in,
+      .n_doc   = .n_doc,
+      .model   = if (.s == "spacy") .m else NULL,
+      .labels  = .l,
+      .batch   = .b,
+      .workers = .w
+    )
+  )
+
+  out_ <- DBI::dbGetQuery(.con, glue::glue(
+    "SELECT * FROM bench WHERE Machine = '{ner_machine()}' ORDER BY Suite, Model, Batch, Workers"
+  ))
+  invisible(tibble::as_tibble(out_))
 }

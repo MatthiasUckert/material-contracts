@@ -221,12 +221,18 @@ Three passes, one function. They differ only in what they compute per file, and 
 drift apart in how they chunk, how they handle a failure, or which documents they cover. Each writes a cache and skips
 if it is present.
 
+Two arguments exist because a worker is a fresh R session holding the installed packages and nothing else. `.sources`
+names the library each worker must read before it can measure anything; `.args` carries the extra arguments as data.
+Closing a value into an anonymous function reads more naturally, but the closure's environment is this session's global
+environment, which is not sent, so in the worker the configuration list does not exist.
+
 ```{r}
 #| label: measure-errors
 tab_errors <- edg_measure_corpus(
   .tab_idx  = tab_index,               # every document on disk
   .path_out = .lP$Cache$DocErrors,     # cache; present means finished
   .fun      = edg_doc_error,           # reads the parse status recorded at download time
+  .sources  = .path_fun,               # workers are fresh sessions; they source this library
   .workers  = .lP$Param$Workers,       # parallel workers
   .label    = "parse errors"           # shown in progress output
 )
@@ -238,6 +244,7 @@ tab_stats_raw <- edg_measure_corpus(
   .tab_idx  = tab_index,               # every document on disk
   .path_out = .lP$Cache$DocStats,      # cache; present means finished
   .fun      = edg_doc_stats,           # word, character and numeric counts plus the header fields
+  .sources  = .path_fun,               # workers are fresh sessions; they source this library
   .workers  = .lP$Param$Workers,       # parallel workers
   .label    = "text statistics"        # shown in progress output
 )
@@ -246,11 +253,13 @@ tab_stats_raw <- edg_measure_corpus(
 ```{r}
 #| label: measure-stopwords
 tab_stop_raw <- edg_measure_corpus(
-  .tab_idx  = tab_index,                                            # every document on disk
-  .path_out = .lP$Cache$DocStop,                                    # cache; present means finished
-  .fun      = \(.p) edg_doc_stopwords(.p, .lP$Cache$StopWords),     # dictionary path closed over
-  .workers  = .lP$Param$Workers,                                    # parallel workers
-  .label    = "stopword counts"                                     # shown in progress output
+  .tab_idx  = tab_index,                                    # every document on disk
+  .path_out = .lP$Cache$DocStop,                            # cache; present means finished
+  .fun      = edg_doc_stopwords,                            # stopword shares against both lists
+  .args     = list(.path_stop = .lP$Cache$StopWords),       # passed as data, not closed over
+  .sources  = .path_fun,                                    # workers are fresh sessions
+  .workers  = .lP$Param$Workers,                            # parallel workers
+  .label    = "stopword counts"                             # shown in progress output
 )
 ```
 

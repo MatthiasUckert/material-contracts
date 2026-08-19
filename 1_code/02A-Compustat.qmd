@@ -1,0 +1,286 @@
+---
+title: "Compustat Fundamentals (02A)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+```
+
+```{r}
+#| label: setup-sources
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # resolves to 1_code/02A-Compustat.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+Downloads the annual and quarterly Compustat fundamentals and converts each firm-quarter into a date interval, so that
+a filing date can be matched to the quarter it falls in.
+
+This script does not know what a contract is. Separating acquisition from the register that consumes it means the
+register can be rebuilt without carrying the WRDS machinery, and a second external source becomes another script here
+rather than another section of an already long one.
+
+## Matching a filing date to a fiscal quarter
+
+A filing carries a date; Compustat carries fiscal quarters. Matching them means turning each quarter into an interval
+and asking which one contains the filing date -- which is only well defined if a firm has one observation per quarter,
+and Compustat does not guarantee that.
+
+Four deduplications run in order, each keeping the observation with the larger total assets: the same quarter can appear
+under two gvkeys after a restructuring, under two CIKs, or simply twice. Sorting on assets keeps the parent rather than
+a subsidiary shell where the two differ.
+
+Each quarter's interval then runs to the start of the next. A firm that stops reporting would otherwise leave an
+interval running to its next appearance years later, and a filing in that gap would be matched to a quarter it has no
+business being matched to, so any interval longer than one quarter is truncated.
+
+The deduplications have a consequence worth stating: after them the mapping between CIK and gvkey is exactly one to one,
+so a firm that changed gvkey -- through a restructuring, say -- retains one identity and not both. That is what makes
+"the filer is not in Compustat" and "the firm is not in Compustat" the same test, and it is checked below rather than
+assumed.
+
+## Frozen acquisition
+
+Both WRDS calls sit behind `.lP$Param$Acquire`, defaulting to `FALSE`, exactly as the EDGAR downloads do in 01A and
+01B. Credentials are read inside those chunks and nowhere else, so a missing key file is an error only when a
+connection is actually wanted -- the document renders without one.
+
+# Configuration
+
+```{r}
+#| label: config
+.lP <- list(
+  Input = list(
+    Credentials = here::here("0_data", "ApiKeys", "WRDS.txt")    # read only when acquiring
+  ),
+  Output = list(
+    AnnualData   = utils_file_path(.dir_main, "AnnualData.parquet"),     # raw annual fundamentals
+    QuarterData  = utils_file_path(.dir_main, "QuarterData.parquet"),    # raw quarterly fundamentals
+    QuarterRange = utils_file_path(.dir_main, "QuarterRange.parquet"),   # one interval per firm-quarter
+    Figures      = utils_file_path(.dir_main, "Figures")
+  ),
+  Param = list(
+    Acquire = FALSE    # TRUE permits the two WRDS downloads to run
+  )
+)
+
+tibble::tibble(
+  Item   = c(names(.lP$Output), "Credentials"),
+  Path   = c(unname(unlist(.lP$Output)), .lP$Input$Credentials),
+  Exists = fs::file_exists(c(unname(unlist(.lP$Output)), .lP$Input$Credentials)) |
+    fs::dir_exists(c(unname(unlist(.lP$Output)), .lP$Input$Credentials))
+) |>
+  tbl_out(.title = "Paths", .notes = c(Exists = "Credentials are read only when acquiring."))
+```
+
+`rWRDS` is installed from `0_data/Binaries/` and is not on CRAN.
+
+# Acquisition
+
+Both chunks are gated and report what they did either way. `apply_screening_conditions()` is the package's standard
+academic filter; requiring a non-missing CIK is what makes the table joinable to EDGAR at all, since CIK is the only
+identifier the two sources share.
+
+```{r}
+#| label: acquire-annual
+if (isTRUE(.lP$Param$Acquire)) {
+  cred_ <- readLines(.lP$Input$Credentials, warn = FALSE)
+  con_  <- rWRDS::wrds_db_connect(cred_[1], cred_[2])
+  on.exit(rWRDS::wrds_db_disconnect(con_), add = TRUE)
+
+  rWRDS::wrds_get_data(con_, "comp", "funda") |>
+    dplyr::distinct() |>
+    dplyr::mutate(fqtr = 4L) |>                       # annual data is the fourth quarter by convention
+    rWRDS::apply_screening_conditions() |>
+    dplyr::filter(!is.na(.data$cik)) |>               # no CIK means no join to EDGAR
+    arrow::write_parquet(.lP$Output$AnnualData)
+
+  rm(cred_)
+  invisible(gc())
+} else {
+  cli::cli_alert_info("Acquisition is OFF: annual fundamentals were not refreshed.")
+}
+```
+
+```{r}
+#| label: acquire-quarterly
+if (isTRUE(.lP$Param$Acquire)) {
+  cred_ <- readLines(.lP$Input$Credentials, warn = FALSE)
+  con_  <- rWRDS::wrds_db_connect(cred_[1], cred_[2])
+  on.exit(rWRDS::wrds_db_disconnect(con_), add = TRUE)
+
+  rWRDS::wrds_get_data(con_, "comp", "fundq") |>
+    dplyr::distinct() |>
+    rWRDS::apply_screening_conditions() |>
+    dplyr::filter(!is.na(.data$cik)) |>               # no CIK means no join to EDGAR
+    arrow::write_parquet(.lP$Output$QuarterData)
+
+  rm(cred_)
+  invisible(gc())
+} else {
+  cli::cli_alert_info("Acquisition is OFF: quarterly fundamentals were not refreshed.")
+}
+```
+
+```{r}
+#| label: check-inputs
+# Checked after the gate rather than before it, because with acquisition on these are outputs and
+# with it off they are inputs. Either way nothing below can run without them.
+need_ <- c(AnnualData = .lP$Output$AnnualData, QuarterData = .lP$Output$QuarterData)
+miss_ <- need_[!fs::file_exists(need_)]
+if (length(miss_) > 0L) {
+  cli::cli_abort(
+    "Missing fundamentals: {paste(names(miss_), collapse = ', ')}. Set Acquire = TRUE to download."
+  )
+}
+
+fs::file_info(need_) |>
+  dplyr::mutate(Item = names(need_)) |>
+  dplyr::select("Item", "size", "modification_time") |>
+  tbl_out(.title = "Fundamentals on disk")
+```
+
+# The matching frame
+
+```{r}
+#| label: build-range
+tab_range <- cmp_quarter_range(
+  .path_quarter = .lP$Output$QuarterData,     # quarterly fundamentals
+  .path_out     = .lP$Output$QuarterRange     # one interval per firm-quarter
+)
+
+nrow(tab_range)
+```
+
+# Results
+
+```{r}
+#| label: report-all
+cmp_report_all(.tab_range = tab_range)
+```
+
+# Validation
+
+Three checks. Each states its expectation first, so a result that differs is a finding rather than a number to
+interpret afterwards.
+
+```{r}
+#| label: validate-range
+# 1. A firm-quarter should appear once: the four deduplications exist to make that true.
+# 2. Every interval must start before it ends, or a filing date can fall in no quarter at all.
+# 3. No interval should exceed one quarter, which is what the truncation enforces.
+tibble::tibble(
+  nRows        = nrow(tab_range),
+  nCIK         = dplyr::n_distinct(tab_range$CIK),
+  nGvkey       = dplyr::n_distinct(tab_range$gvkey),
+  nPairs       = dplyr::n_distinct(paste(tab_range$CIK, tab_range$gvkey)),
+  DuplicateFQ  = sum(duplicated(tab_range[c("gvkey", "fyear", "fqtr")])),
+  BadInterval  = sum(tab_range$DateStop <= tab_range$DateStart, na.rm = TRUE),
+  OverOneQtr   = sum(tab_range$dQtrs > 1L, na.rm = TRUE),
+  MissingDates = sum(is.na(tab_range$DateStart) | is.na(tab_range$DateStop))
+) |>
+  tbl_out(
+    .title = "Interval consistency",
+    .notes = c(
+      nPairs      = "Equal to nCIK and nGvkey means the identifiers map one to one after deduplication.",
+      DuplicateFQ = "Must be zero: the deduplications are what make one quarter one observation.",
+      OverOneQtr  = "Counted before truncation is applied, so a nonzero value here is expected."
+    )
+  )
+```
+
+# Deployment
+
+Three files. The two downloads are frozen: nothing here rewrites them unless acquisition is switched on, so a render
+costs one read of the quarterly file and the deduplication over it.
+
+```{r}
+#| label: deploy-report
+fs::file_info(unlist(.lP$Output)[1:3]) |>
+  dplyr::mutate(Item = names(unlist(.lP$Output))[1:3]) |>
+  dplyr::select("Item", "size") |>
+  tbl_out(.title = "Written")
+```
+
+# Overview
+
+```{r}
+#| label: fig-coverage
+#| fig-height: 3.4
+#| fig-cap: "Firm-quarters in the matching frame per calendar year. The frame extends well before and
+#|   after the window any sample uses, which is harmless: a filing outside the window is excluded by
+#|   the sample ladder rather than by the absence of a quarter to match it to."
+gg_cov <- tab_range |>
+  dplyr::mutate(Year = lubridate::year(.data$DateStart)) |>
+  dplyr::filter(.data$Year >= 1990L) |>
+  dplyr::summarise(nQuarters = dplyr::n(), .by = "Year") |>
+  ggplot2::ggplot(ggplot2::aes(x = .data$Year, y = .data$nQuarters)) +
+  ggplot2::geom_col(fill = plot_pal_seq(1L)) +
+  plot_scale_y_count() +
+  ggplot2::labs(x = NULL, y = "Firm-quarters") +
+  plot_theme(.grid = "y")
+
+plot_save(
+  .plot    = gg_cov,                    # the figure
+  .name    = "compustat-coverage",      # meaningful filename, not unnamed-chunk-N
+  .dir     = .lP$Output$Figures,        # figure destination
+  .height  = 3.4,                       # from the ladder: a time series is a low panel
+  .width   = 7.5,                       # the fixed project width
+  .formats = c("pdf", "png"),           # manuscript and web
+  .dpi     = 300                        # print resolution
+)
+
+gg_cov
+```
+
+```{r}
+#| label: overview-all
+cmp_report_all(.tab_range = tab_range)
+```
+
+# Next
+
+**02B-Register** reads `QuarterRange.parquet` and joins it to the corpus, applies the sample ladder, and writes the one
+table every downstream script reads.

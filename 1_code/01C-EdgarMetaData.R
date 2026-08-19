@@ -183,40 +183,92 @@ edg_doc_stopwords <- function(.path_doc, .path_stop) {
 #' SKIP IF DONE. The output file is the ledger. Present means finished, so a completed pass costs one
 #' parquet read and the document can run it unconditionally.
 #'
-#' @param .tab_idx The DocID to Path index from 01B.
+#' A DAEMON IS A FRESH R SESSION. It has the installed packages and nothing else: no sourced project
+#' functions, no configuration list, none of the objects the calling session holds. Two consequences
+#' shape this signature.
+#'
+#' First, .sources names the files each worker must source before it can do anything. A measurement
+#' function that calls another function defined in the same library will not find it otherwise, and
+#' the failure arrives per chunk rather than up front.
+#'
+#' Second, extra arguments are passed as .args rather than captured in a closure. Writing
+#' \(.p) f(.p, .lP$Param$X) reads more naturally, but the closure's environment is the calling
+#' session's global environment, which is not sent; in the worker .lP does not exist. A list of plain
+#' values is data, and data crosses.
+#'
+#' @param .tab_idx A table with a Path column naming the documents to measure.
 #' @param .path_out Destination parquet path for this pass.
-#' @param .fun A function of one path, returning a one-row tibble.
+#' @param .fun A function whose first argument is a path, returning a one-row tibble.
+#' @param .args Named list of further arguments to .fun. Must be plain data.
+#' @param .sources Character vector of R files each worker sources before measuring.
 #' @param .workers Integer. Parallel workers; also the number of chunks.
 #' @param .label Character. Name of the pass, for progress reporting.
+#' @param .rows Character. "one" if the measurement returns exactly one row per document, "many" if
+#'   it can return several. The check differs: one row in one row out, against every document
+#'   appearing at least once. A pass that returns several rows checked as though it returned one
+#'   would fail on correct output; a pass that returns one checked as though it returned many would
+#'   pass on a truncated result.
 #' @return The measurement tibble.
-edg_measure_corpus <- function(.tab_idx, .path_out, .fun, .workers = 10L, .label = "measure") {
+edg_measure_corpus <- function(.tab_idx, .path_out, .fun, .args = list(), .sources = character(0),
+                               .workers = 24L, .label = "measure", .rows = c("one", "many")) {
   if (FALSE) {
     .tab_idx  <- tab_index
     .path_out <- .lP$Cache$DocErrors
     .fun      <- edg_doc_error
-    .workers  <- 10L
+    .args     <- list()
+    .sources  <- .path_fun
+    .workers  <- 24L
     .label    <- "parse errors"
+    .rows     <- "one"
   }
+
+  rows_ <- match.arg(.rows)
 
   if (fs::file_exists(.path_out)) {
     cli::cli_alert_info("{(.label)}: already complete, reading from cache.")
     return(arrow::read_parquet(.path_out))
   }
 
-  cli::cli_alert_info("{(.label)}: measuring {nrow(.tab_idx)} documents on {.workers} workers.")
+  cli::cli_alert_info("{(.label)}: measuring {nrow(.tab_idx)} documents on {(.workers)} workers.")
 
   mirai::daemons(.workers)
   on.exit(mirai::daemons(0L), add = TRUE)
 
+  if (length(.sources) > 0L) {
+    mirai::everywhere(
+      .expr = for (p in .paths) source(p, encoding = "UTF-8"),
+      .args = list(.paths = as.character(.sources))
+    )
+  }
+
   paths_  <- unname(.tab_idx$Path)
   chunks_ <- split(paths_, cut(seq_along(paths_), .workers, labels = FALSE))
 
+  # CONSTANTS GO IN .args, NOT IN THE DOTS. mirai_map vectorises over its dots the way pmap does, so
+  # a function passed there is zipped alongside the chunks rather than held fixed, and the map
+  # silently collapses to the length of the shortest input. .args is the constant channel.
+  #
+  # The worker's argument is also named .fn rather than .f, because mirai_map takes .f itself and a
+  # second one would be matched to the same formal.
   out_ <- mirai::mirai_map(
-    .x = chunks_,
-    .f = function(.chunk, .f) dplyr::bind_rows(lapply(.chunk, .f)),
-    .f = .fun
+    .x    = chunks_,
+    .f    = function(.chunk, .fn, .fargs) {
+      dplyr::bind_rows(lapply(.chunk, function(.p) do.call(.fn, c(list(.p), .fargs))))
+    },
+    .args = list(.fn = .fun, .fargs = .args)
   )[.progress] |>
     dplyr::bind_rows()
+
+  # CHECKED BEFORE IT IS WRITTEN. One document in, one row out is the contract of every measurement
+  # function here, and a result of another shape means the map did not do what was asked. Writing
+  # first and checking later caches the wrong answer, and a cache is believed on every later run.
+  n_seen_ <- if (identical(rows_, "one")) nrow(out_) else dplyr::n_distinct(out_$DocID)
+
+  if (n_seen_ != nrow(.tab_idx)) {
+    cli::cli_abort(
+      "{(.label)}: expected {nrow(.tab_idx)} documents, accounted for {n_seen_}. Nothing was cached."
+    )
+  }
 
   arrow::write_parquet(out_, .path_out)
   out_

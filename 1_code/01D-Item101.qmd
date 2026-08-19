@@ -1,0 +1,449 @@
+---
+title: "8-K Item 1.01 Summaries (01D)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+```
+
+```{r}
+#| label: setup-sources
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 01C owns the corpus traversal this document reuses, and the group vocabulary. Sourcing the chain
+# rather than reimplementing either is what keeps one definition of how the corpus is walked.
+purrr::walk(
+  .x = c("01A-EdgarIndex", "01B-EdgarDocuments", "01C-EdgarMetaData"),
+  .f = function(.s) {
+    source(
+      file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+      encoding = "UTF-8"
+    )
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # resolves to 1_code/01D-Item101.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+An 8-K reporting Item 1.01 carries the filer's own summary of a material agreement it has just entered into. This
+locates that section inside the filing's HTML and extracts its text.
+
+Regulation requires the 8-K within four business days of entering the agreement, but leaves the filer discretion over
+whether to attach the contract itself then or defer it to the next periodic report. The summary is therefore the one
+account of the agreement that always exists at the moment of entry, which is what makes it worth extracting separately
+from the contract it describes.
+
+## Why this is a 01-family script
+
+It is a property of a document, derived by opening it, exactly like the word counts in 01C. Nothing about it depends on
+which sample a document ends up in, so running it after sample selection would order it by accident rather than by
+dependency.
+
+That is a deliberate change from the arrangement it replaces, which filtered to the descriptive sample first. The flag
+this produces now means one thing corpus-wide: an 8-K reporting Item 1.01 either has an extracted summary or has a
+recorded reason why not, and never "was never attempted".
+
+## Nothing is pre-filtered
+
+Format is not a filter either. A document that is not markup is attempted with an anchor appropriate to plain text,
+because a heading there is a heading by starting a line rather than by following a tag. Applying the markup anchor to a
+text filing finds one or two boundaries in a document with six, and the first span then runs to the end of the filing.
+
+Every candidate leaves exactly one row carrying one of eight outcomes, which is what makes the failure modes countable.
+
+## Extracted is not the same as correct
+
+Three of those outcomes exist because an earlier version counted their documents as successes.
+
+Some filers set the item list as a table: numbers in one column, bodies in another. The document then reads, in both
+the markup and the rendered text, as *"Item 1.01 Item 3.02 Entry into a Material Definitive Agreement Unregistered
+Sales of Equity Securities"* -- every number, then every title, then the bodies. Slicing between adjacent markers
+returns the few characters between two numbers, which is where thousands of nine-character summaries came from.
+
+Those are now recorded as `heading-only` and not extracted. The test is on what remains after the item code and the
+regulated title are removed, not on total length: the title is a fixed forty characters that says nothing about the
+agreement, and a threshold on the whole string has to be guessed -- guessing it at fifty put two of the three shortest
+extractions in the corpus exactly on the boundary. With the heading subtracted, a bare heading measures zero and a
+one-sentence summary measures eighty-eight.
+
+Taking the following span instead would return this item's body concatenated with the next item's, and for text
+analysis contaminated text is worse than a known gap: a clean exclusion is countable, a silent error is not.
+
+`markers-unparsed` separates a document with no boundaries from one whose boundaries carry no readable item code,
+which happens when a filing agent wraps a heading across nested elements. The two look identical in a coverage
+statistic and need different responses.
+
+## Where the text goes
+
+`Item101.parquet` holds it, keyed on `DocID`. The register in 02 carries a flag and joins to this for the text. Roughly
+a quarter of a million summaries is on the order of a gigabyte, and putting that in the register would make the one
+table nobody can load.
+
+# Configuration
+
+```{r}
+#| label: config
+.dir_meta <- here::here("2_output", "01C-EdgarMetaData")
+.dir_docs <- here::here("2_output", "01B-EdgarDocuments")
+
+.lP <- list(
+  Input = list(
+    MetaData    = fs::path(.dir_meta, "FullMetaData.parquet"),   # written by 01C
+    LandingPage = fs::path(.dir_meta, "LandingPage.parquet"),    # written by 01C, carries the item lists
+    FilePaths   = fs::path(.dir_docs, "FilePaths.parquet")       # written by 01B
+  ),
+  Cache = list(
+    Extracted = utils_file_path(.dir_main, "Cache", "Extracted.parquet")   # the pass over the corpus
+  ),
+  Output = list(
+    Item101 = utils_file_path(.dir_main, "Item101.parquet"),   # spans, outcomes and text
+    Figures = utils_file_path(.dir_main, "Figures")            # figure files for the manuscript
+  ),
+  Param = list(
+    Item     = "1.01",   # the item denoting entry into a material definitive agreement
+    MinChars = 30L,      # body characters, after the heading and title are removed
+    Workers  = 24L       # parallel workers; also the number of chunks the pass is split into
+  )
+)
+
+# Named individually so that a failure says which input is missing rather than that one of them is.
+need_ <- unlist(.lP$Input)
+miss_ <- need_[!fs::file_exists(need_)]
+if (length(miss_) > 0L) {
+  cli::cli_abort("Missing input{?s}: {paste(names(miss_), unname(miss_), sep = ' -> ', collapse = '; ')}")
+}
+
+tibble::tibble(Input = names(need_), Path = unname(need_)) |> tbl_out(.title = "Inputs")
+```
+
+# Candidates
+
+The item list lives on the landing table, at one row per filing and registrant, so a filing's items appear once per
+registrant. Where every registrant agrees the row is kept; where they do not the filing is dropped rather than one
+version being chosen, because there is no basis for choosing and the alternative is a silent coin flip on the variable
+that decides what gets extracted.
+
+02 needs the same rule and sources it from here rather than restating it.
+
+```{r}
+#| label: build-items
+tab_items <- itm_filing_items(.path_landing = .lP$Input$LandingPage)
+
+nrow(tab_items)
+```
+
+Candidates are every 8-K document whose filing reports the item. The code is matched literally: written as a regular
+expression it carries a wildcard in the middle and would also match `1101`, and although no item code has that shape,
+a rule that is accidentally loose is worth not carrying forward.
+
+```{r}
+#| label: build-candidates
+tab_candidates <- itm_candidates(
+  .path_meta   = .lP$Input$MetaData,     # 01C's consolidated table
+  .tab_items   = tab_items,              # filings whose registrants agree on the item list
+  .path_index  = .lP$Input$FilePaths,    # DocID to Path, from 01B
+  .item        = .lP$Param$Item          # "1.01"
+)
+
+nrow(tab_candidates)
+```
+
+# Extraction
+
+The pass reuses 01C's corpus traversal: one function applied to every document, work sent to the workers in chunks
+rather than one file at a time, and the result cached so a completed pass costs one parquet read. The first run opens
+every candidate and is measured in hours.
+
+Each worker is a fresh R session, so it is told to source this document's library before it measures anything, and the
+item code reaches it as data rather than captured in a closure over a configuration list the worker does not have.
+
+For each document: read the HTML with whitespace collapsed and the two entity spellings of a non-breaking space
+replaced, locate every item boundary, take the one that is Item 1.01, and render that span as text.
+
+The anchor depends on the format, because a heading is marked differently in each. In markup a heading follows a
+closing tag, so the pattern is `>\s*ITEM`; without that anchor the word "item" inside a sentence -- and it appears
+inside most agreements -- produces a boundary where there is none. In plain text there are almost no tags, so the same
+anchor finds one or two boundaries in a document with six, and there a heading is a heading by starting a line.
+
+The header window is stripped of tags before the item code is read, and every kind of space is replaced with a plain
+one first. Filing agents set headings with typographic spacing -- thin, hair, en, em, narrow no-break -- written either
+as entities or as the characters themselves, and to a pattern expecting whitespace between "Item" and its number every
+one of them is an ordinary character. A thin space accounts for almost every unparsed heading filed after 2022.
+
+The numeric ranges are enumerated rather than matched loosely, because a pattern wide enough to catch every space
+reference in the U+2000 block also catches the curly quotation marks two positions above it, and those are content.
+
+A signature block is located alongside the items because it terminates the last one; without it the final section would
+run to the end of the document and swallow the exhibit index. Where no signature is found, the last span runs to the end
+regardless: discarding it instead would lose any filing whose only boundary is the item itself, and extracting too much
+is visible in the length distribution whereas extracting nothing leaves no trace.
+
+```{r}
+#| label: extract-items
+tab_extracted <- edg_measure_corpus(
+  .tab_idx  = tab_candidates,                          # the documents to attempt
+  .path_out = .lP$Cache$Extracted,                     # cache; present means finished
+  .fun      = itm_process_doc,                         # locate and render, one document
+  .args     = list(.item = .lP$Param$Item,             # passed as data, not closed over
+                   .min_chars = .lP$Param$MinChars),   # body chars below this: heading, not summary
+  .sources  = .path_fun,                               # workers are fresh sessions; they source this library
+  .workers  = .lP$Param$Workers,                       # parallel workers
+  .label    = "Item 1.01 extraction"                   # shown in progress output
+)
+
+nrow(tab_extracted)
+```
+
+```{r}
+#| label: build-output
+tab_item101 <- tab_extracted |>
+  dplyr::left_join(
+    y  = dplyr::select(tab_candidates, "DocID", "HashIndex", "YQ", "DocTypeMod", "Removed", "Items"),
+    by = dplyr::join_by("DocID")
+  ) |>
+  dplyr::relocate("DocID", "HashIndex", "YQ", "DocTypeMod", "DocExt", "Removed", "Outcome", "Items")
+
+arrow::write_parquet(tab_item101, .lP$Output$Item101)
+nrow(tab_item101)
+```
+
+# Results
+
+```{r}
+#| label: report-outcomes
+itm_report_all(.tab = tab_item101)
+```
+
+The length comparison is the check on the longest-span rule. A filing with a table of contents lists Item 1.01 twice,
+once as a line in the contents and once as the section itself, and an earlier implementation discarded those documents
+entirely for being ambiguous. Taking the longest span keeps them, on the reasoning that a contents entry is a line and a
+section is paragraphs. If that reasoning were wrong the ambiguous group would sit far below the unambiguous one.
+
+## Extracted is not the same as correct
+
+A span that renders is recorded as a success whatever it contains, and two failure modes survive that test. A summary of
+a few dozen characters is a heading whose section is missing, which happens when the next marker sits immediately after
+this one. A summary of a hundred thousand characters is a span that never terminated, which happens when no later
+marker was found and the slice ran to the end of the filing.
+
+Neither is visible in the outcome. The bands below are deliberately coarse -- they are meant to establish whether a
+problem exists, not to fix a threshold -- and the examples show what sits at each end, because a count without an
+example invites a cutoff to be chosen from the number rather than from the documents.
+
+```{r}
+#| label: report-lengths
+itm_length_bands(.tab = tab_item101) |>
+  tbl_out(
+    .title  = "Plausibility of the extracted lengths",
+    .pct    = "Share",
+    .digits = 1L
+  )
+```
+
+```{r}
+#| label: report-examples
+itm_examples(.tab = tab_item101, .n = 3L, .chars = 160L) |>
+  tbl_out(
+    .title = "The shortest and longest extractions",
+    .notes = c(Preview = "The first 160 characters, whitespace collapsed.")
+  )
+```
+
+## Where the failures are
+
+```{r}
+#| label: report-format-detail
+itm_format_detail(.tab = tab_item101, .min = 50L) |>
+  tbl_out(
+    .title  = "Outcomes by file extension",
+    .pct    = "ShareExtracted",
+    .digits = 1L,
+    .notes  = c(Ext = "Formats below fifty documents are pooled. Attempted, not excluded.")
+  )
+```
+
+```{r}
+#| label: report-outcome-year
+itm_outcome_by_year(.tab = tab_item101) |>
+  tbl_out(
+    .title  = "Outcomes by year",
+    .pct    = "ShareExtracted",
+    .digits = 1L,
+    .notes  = c(
+      NoMarkers = "No item boundary found at all: a change in filing format rather than in behaviour.",
+      NotFound  = "Boundaries found but none of them this item: a change in what filers report."
+    )
+  )
+```
+
+A year that falls because documents stopped carrying item markers is a change in filing format; one that falls because
+the markers are present but Item 1.01 is not among them is a change in what filers report. They need different
+responses, and the share alone distinguishes neither.
+
+# Validation
+
+Three checks. Each states its expectation first, so a result that differs is a finding rather than a number to
+interpret afterwards.
+
+```{r}
+#| label: validate-extraction
+# 1. Every candidate should leave exactly one row: the pass is one row in, one row out.
+# 2. DocID identifies a document, so it should be unique.
+# 3. An extracted row must carry text and a span; a failed row must carry neither. A row with an
+#    outcome of extracted and no text would mean the outcome is not describing what happened.
+tibble::tibble(
+  nCandidates    = nrow(tab_candidates),
+  nRows          = nrow(tab_item101),
+  DuplicateDocID = sum(duplicated(tab_item101$DocID)),
+  ExtractedNoText = sum(
+    tab_item101$Outcome %in% c("extracted", "ambiguous-longest") & is.na(tab_item101$ItemText)
+  ),
+  FailedWithText = sum(
+    !tab_item101$Outcome %in% c("extracted", "ambiguous-longest") & !is.na(tab_item101$ItemText)
+  )
+) |>
+  tbl_out(
+    .title = "Extraction consistency",
+    .notes = c(
+      nRows           = "Must equal nCandidates: one row in, one row out, whatever the outcome.",
+      ExtractedNoText = "Nonzero means an outcome claims a success the row does not carry."
+    )
+  )
+```
+
+
+
+# Deployment
+
+`Item101.parquet` is the only artifact of this script. It carries one row per candidate document: the outcome, the span
+if one was found, and the text if it was rendered.
+
+02B reads it to mark each document in the register with whether a summary was extracted, and joins to it for the text
+itself. It also carries the filing's item list, so 02B reads that rather than restating the rule for deduplicating it.
+Nothing here writes into another script's output, and nothing writes back into this one.
+
+```{r}
+#| label: deploy-report
+fs::file_info(.lP$Output$Item101) |>
+  dplyr::select("path", "size") |>
+  tbl_out(.title = "Written")
+```
+
+# Overview
+
+```{r}
+#| label: fig-coverage
+#| fig-height: 3.4
+#| fig-cap: "Item 1.01 extraction per calendar year, split into documents whose summary was recovered
+#|   and those where it was not. The early years are thin because the item structure that makes a
+#|   material-agreement report identifiable dates from the 2004 reform."
+gg_coverage <- itm_plot_coverage(.tab = itm_coverage_by_year(.tab = tab_item101))
+
+plot_save(
+  .plot    = gg_coverage,               # the figure
+  .name    = "item101-coverage",        # meaningful filename, not unnamed-chunk-N
+  .dir     = .lP$Output$Figures,        # figure destination
+  .height  = 3.4,                       # from the ladder: a time series is a low panel
+  .width   = 7.5,                       # the fixed project width
+  .formats = c("pdf", "png"),           # manuscript and web
+  .dpi     = 300                        # print resolution
+)
+
+gg_coverage
+```
+
+```{r}
+#| label: fig-outcome-share
+#| fig-height: 3.4
+#| fig-cap: "How the outcomes compose each year, as shares. Filing volume varies fourfold across the
+#|   period, so counts would show that rather than what is being asked."
+gg_share <- itm_plot_outcome_share(.tab = itm_outcome_by_year(.tab = tab_item101))
+
+plot_save(
+  .plot    = gg_share,                  # the figure
+  .name    = "item101-outcome-share",   # meaningful filename, not unnamed-chunk-N
+  .dir     = .lP$Output$Figures,        # figure destination
+  .height  = 3.4,                       # from the ladder: a time series is a low panel
+  .width   = 7.5,                       # the fixed project width
+  .formats = c("pdf", "png"),           # manuscript and web
+  .dpi     = 300                        # print resolution
+)
+
+gg_share
+```
+
+```{r}
+#| label: fig-length
+#| fig-height: 3.4
+#| fig-cap: "Distribution of summary length, on a log scale because the range spans four orders of
+#|   magnitude. The mass below a few hundred characters and the tail beyond a hundred thousand are
+#|   the two failure modes that pass the outcome test."
+gg_length <- itm_plot_length(.tab = tab_item101)
+
+plot_save(
+  .plot    = gg_length,                 # the figure
+  .name    = "item101-length",          # meaningful filename, not unnamed-chunk-N
+  .dir     = .lP$Output$Figures,        # figure destination
+  .height  = 3.4,                       # from the ladder: a distribution is a low panel
+  .width   = 7.5,                       # the fixed project width
+  .formats = c("pdf", "png"),           # manuscript and web
+  .dpi     = 300                        # print resolution
+)
+
+gg_length
+```
+
+```{r}
+#| label: overview-all
+itm_report_all(.tab = tab_item101)
+```
+
+# Next
+
+**01E-CtoExhibits** does the equivalent for confidential-treatment orders: extracts the exhibit references each order
+names and links them back to the contracts they cover.
+
+**02-SelectSample** reads this to mark the register, and sources `itm_filing_items()` rather than restating the rule
+for deduplicating item lists.

@@ -1,0 +1,370 @@
+---
+title: "The Document Register (02B)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+```
+
+```{r}
+#| label: setup-sources
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 01C owns the group vocabulary this document reports by. Sourcing it rather than restating the
+# mapping is what keeps one definition of what a contract, a report and an order are.
+source(
+  file     = init_create_script_fun(.dir_here = here::here(), .name_script = "01C-EdgarMetaData"),
+  encoding = "UTF-8"
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # resolves to 1_code/02B-Register.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+One row per document, every decision recorded as a column, nothing removed. This is the table every downstream script
+reads: 03 to classify, 04 to extract entities, and any analysis to define its sample.
+
+It joins the corpus to Compustat, applies the sample ladder, and attaches what 01D found in the 8-K reports and what
+01E found in the confidential-treatment orders.
+
+## Nothing is removed
+
+The register has exactly as many rows as 01C published. A document outside the window, one that failed a quality rule,
+one whose filer is not in Compustat, one that matched two fiscal quarters -- each is marked and kept.
+
+That matters for a reason beyond tidiness. If every stage filters, then reconciling two numbers means reconstructing
+which filters each had applied; if nothing filters, every number is a count over one table and the difference between
+any two is a column. Completeness is true by construction rather than by arithmetic.
+
+It is also a change from the arrangement this replaces, which deleted the documents matching more than one Compustat
+quarter. Three hundred and thirty-two of them, which is nothing -- but they were deleted outside the ladder, so no table
+in the paper accounted for them.
+
+## The two samples, and why there are two
+
+**The descriptive sample** is every well-formatted document filed inside the window. It is what the corpus can describe,
+and it does not require the filer to be in Compustat: roughly a fifth of EDGAR registrants never are, being foreign
+private issuers, funds, or firms too small to be covered.
+
+**The estimation sample** is the subset that also matched a Compustat quarter. It is what a regression can use.
+
+Reporting only the second would understate the corpus by whatever share of filers Compustat misses; reporting only the
+first would overstate what the analysis rests on.
+
+## No absolute paths, but the public URL stays
+
+A path written on one machine is wrong on every other. The register carries `DocType`, `YQ` and `DocID`, which together
+determine where a document is, and `utils_doc_path()` rebuilds it at read time. That is what lets this table be archived
+and used by someone who did not run the pipeline.
+
+`UrlDocument` is a different thing and is kept: it is the document's address on EDGAR, identical on every machine, and
+the only way a reader of the archive can fetch the original.
+
+## One table, sorted by group
+
+Contracts, 8-K reports and CT orders are one file rather than three. Parquet keeps minimum and maximum values per row
+group, so sorting by group means a reader asking only for 8-K documents skips the contract row groups without reading
+them. One artifact, and the column sets cannot drift apart.
+
+# Configuration
+
+```{r}
+#| label: config
+.dir_meta <- here::here("2_output", "01C-EdgarMetaData")
+
+.lP <- list(
+  Input = list(
+    MetaData     = fs::path(.dir_meta, "FullMetaData.parquet"),                            # 01C
+    Item101      = here::here("2_output", "01D-Item101", "Item101.parquet"),               # 01D
+    CtoExhibits  = here::here("2_output", "01E-CtoExhibits", "CtoExhibits.parquet"),       # 01E
+    QuarterRange = here::here("2_output", "02A-Compustat", "QuarterRange.parquet")         # 02A
+  ),
+  Output = list(
+    Documents = utils_file_path(.dir_main, "Documents.parquet"),   # the register
+    Overview  = utils_file_path(.dir_main, "Overview"),            # the selection tables
+    Figures   = utils_file_path(.dir_main, "Figures")
+  ),
+  Param = list(
+    YearMin   = 2001L,   # window floor; a research decision, argued below
+    YearMax   = 2024L,   # window ceiling, matching the acquisition frame closed in 01A
+    StepFinal = 6L       # the ladder step denoting the final sample
+  )
+)
+
+# Named individually so that a failure says which input is missing rather than that one of them is.
+need_ <- unlist(.lP$Input)
+miss_ <- need_[!fs::file_exists(need_)]
+if (length(miss_) > 0L) {
+  cli::cli_abort("Missing input{?s}: {paste(names(miss_), unname(miss_), sep = ' -> ', collapse = '; ')}")
+}
+
+tibble::tibble(Input = names(need_), Path = unname(need_)) |> tbl_out(.title = "Inputs")
+```
+
+# Merging
+
+```{r}
+#| label: load-range
+tab_range <- arrow::read_parquet(.lP$Input$QuarterRange)
+
+nrow(tab_range)
+```
+
+The interval join returns more than one row for a document where two of a firm's quarter windows overlap. Something has
+to collapse those, and what is true of such a document is that its filing date does not determine a fiscal quarter --
+so the Compustat fields are set to missing and one row is kept. The ladder then attributes it explicitly, rather than
+its disappearing.
+
+```{r}
+#| label: merge-compustat
+tab_merged <- reg_merge_compustat(
+  .path_meta = .lP$Input$MetaData,   # 01C's consolidated table, every document
+  .tab_range = tab_range             # one interval per firm-quarter, from 02A
+) |>
+  dplyr::mutate(Group = edg_doc_group(.doc_type = .data$DocTypeMod))
+
+c(documents = nrow(tab_merged), groups = dplyr::n_distinct(tab_merged$Group))
+```
+
+# Selection
+
+The ladder below is the sample definition for the entire study, so it is written here rather than hidden behind a
+function call. It is applied to every group identically; the thresholds and their order are the argument a referee would
+want to see.
+
+Order matters. A malformatted document filed outside the window is attributed to the window, not to the quality rule,
+because the window is the prior restriction. A document whose filer is absent from Compustat is attributed to coverage
+rather than to matching, because there was nothing to match against. And a document that matched several quarters is
+attributed after the one that matched none, because both are match failures and this one is the narrower.
+
+```{r}
+#| label: apply-ladder
+tab_flagged <- tab_merged |>
+  dplyr::mutate(
+    SampleStepDesc = dplyr::case_when(
+      !dplyr::between(lubridate::year(.data$DateFiled),
+                      .lP$Param$YearMin, .lP$Param$YearMax) ~ "01-Less: Outside 2001 - 2024",
+      .data$Removed == 1L                                   ~ "02-Less: Malformatted Documents",
+      !.data$CIK %in% tab_range$CIK                         ~ "03-Less: CIK not in Compustat",
+      .data$nQuarters > 1L                                  ~ "04-Less: Matched several Compustat quarters",
+      is.na(.data$gvkey)                                    ~ "05-Less: No Compustat Match on Filing Date",
+      .default                                              = "06-Final Sample"
+    )
+  ) |>
+  reg_sample_flags(.step_final = .lP$Param$StepFinal) |>
+  reg_derive()
+
+dplyr::count(tab_flagged, SampleStepDesc)
+```
+
+The window floor of `r .lP$Param$YearMin` is a research decision rather than a data limit: EDGAR carries filings from
+1993, but the modern 8-K item structure that makes a material definitive agreement identifiable dates from the 2004
+reform, and the years before 2001 are thin enough that including them would add noise without adding statistical power.
+The ceiling matches the acquisition frame closed in 01A, so the two cannot drift apart.
+
+# Attaching
+
+`HasItem101` is zero rather than missing for a document that was never a candidate. A candidate is an 8-K whose filing
+reports the item, so a contract having no summary is not an absence of information -- it is the wrong kind of document
+to have one.
+
+```{r}
+#| label: attach-item101
+tab_flagged <- reg_attach_item101(.tab = tab_flagged, .path_item = .lP$Input$Item101)
+
+c(candidates = sum(!is.na(tab_flagged$Item101Outcome)), extracted = sum(tab_flagged$HasItem101))
+```
+
+One order can cover several exhibits and one contract can be covered by several orders, most often because a grant was
+later extended. Both release dates are kept: the earliest is when any part of the redaction becomes releasable, the
+latest when all of it does, and which matters depends on the question.
+
+```{r}
+#| label: attach-cto
+tab_flagged <- reg_attach_cto(.tab = tab_flagged, .path_cto = .lP$Input$CtoExhibits)
+
+c(covered = sum(tab_flagged$HasCto), withExtension = sum(tab_flagged$CtoIsExtension))
+```
+
+# Deployment
+
+```{r}
+#| label: write-register
+tab_register <- reg_shape(.tab = tab_flagged)
+
+arrow::write_parquet(tab_register, .lP$Output$Documents)
+
+purrr::walk(
+  .x = sort(unique(tab_register$Group)),
+  .f = function(.g) {
+    arrow::write_parquet(
+      x    = reg_sample_table(.tab = tab_register, .group = .g),
+      sink = fs::path(.lP$Output$Overview, paste0("SampleSelect", .g, ".parquet"))
+    )
+  }
+)
+
+c(rows = nrow(tab_register), cols = ncol(tab_register))
+```
+
+Nothing is exported to Stata. Format conversion is not this script's concern: every stage would otherwise carry its own
+exporter, they would drift in how they name and order things, and the tables would be rewritten on every render of a
+document that does not change them. One release script converts everything once, when the pipeline is complete.
+
+A downstream script opens a document by rebuilding its path:
+
+```r
+utils_doc_path(
+  .dir_mirror = here::here("2_output", "01B-EdgarDocuments", "GetEDGAR"),
+  .doc_type   = tab$DocType,
+  .yq         = tab$YQ,
+  .doc_id     = tab$DocID
+)
+```
+
+```{r}
+#| label: deploy-report
+fs::file_info(.lP$Output$Documents) |>
+  dplyr::select("path", "size") |>
+  tbl_out(.title = "Written")
+```
+
+# Results
+
+```{r}
+#| label: report-all
+reg_report_all(.tab = tab_register)
+```
+
+# Validation
+
+Five checks. Each states its expectation first, so a result that differs is a finding rather than a number to interpret
+afterwards.
+
+```{r}
+#| label: validate-register
+# 1. The register must hold every document 01C published: nothing is removed anywhere in this script.
+# 2. DocID identifies a document, so it must be unique.
+# 3. Every estimation-sample row must carry a gvkey; the ladder places a missing one at step 05.
+# 4. The estimation sample is a subset of the descriptive sample by construction.
+# 5. No absolute path may survive into the register, or the table cannot leave this machine.
+n_corpus_ <- arrow::open_dataset(sources = .lP$Input$MetaData) |>
+  dplyr::summarise(n = dplyr::n()) |>
+  dplyr::collect() |>
+  dplyr::pull(.data$n)
+
+tibble::tibble(
+  nCorpus        = n_corpus_,
+  nRegister      = nrow(tab_register),
+  DuplicateDocID = sum(duplicated(tab_register$DocID)),
+  EstiNoGvkey    = sum(tab_register$EstiSample == 1L & is.na(tab_register$gvkey)),
+  EstiNotDesc    = sum(tab_register$EstiSample == 1L & tab_register$DescSample == 0L),
+  PathColumns    = sum(grepl("(?i)path", names(tab_register)))
+) |>
+  tbl_out(
+    .title = "Register consistency",
+    .notes = c(
+      nRegister   = "Must equal nCorpus: this script marks documents, it does not remove them.",
+      PathColumns = "Must be zero: a path is rebuilt from DocType, YQ and DocID at read time."
+    )
+  )
+```
+
+```{r}
+#| label: validate-groups
+# Every group must be complete on its own terms, not only in aggregate: a shortfall in the CT orders
+# would be invisible in a total dominated by contracts.
+tab_register |>
+  dplyr::summarise(nRegister = dplyr::n(), .by = "Group") |>
+  dplyr::left_join(
+    y = arrow::open_dataset(sources = .lP$Input$MetaData) |>
+      dplyr::select("DocTypeMod") |>
+      dplyr::collect() |>
+      dplyr::mutate(Group = edg_doc_group(.doc_type = .data$DocTypeMod)) |>
+      dplyr::summarise(nCorpus = dplyr::n(), .by = "Group"),
+    by = dplyr::join_by("Group")
+  ) |>
+  dplyr::mutate(Difference = .data$nRegister - .data$nCorpus) |>
+  tbl_out(
+    .title = "Completeness by group",
+    .notes = c(Difference = "Must be zero on every row.")
+  )
+```
+
+# Overview
+
+```{r}
+#| label: fig-samples
+#| fig-height: 3.4
+#| fig-cap: "Material contracts per year, split by whether they reach the estimation sample, the
+#|   descriptive sample only, or neither. The gap between the two samples is Compustat coverage,
+#|   which removes far more than the quality rules do."
+gg_samples <- reg_plot_samples(.tab = dplyr::filter(tab_register, .data$Group == "Exhibit10"))
+
+plot_save(
+  .plot    = gg_samples,                # the figure
+  .name    = "register-samples",        # meaningful filename, not unnamed-chunk-N
+  .dir     = .lP$Output$Figures,        # figure destination
+  .height  = 3.4,                       # from the ladder: a time series is a low panel
+  .width   = 7.5,                       # the fixed project width
+  .formats = c("pdf", "png"),           # manuscript and web
+  .dpi     = 300                        # print resolution
+)
+
+gg_samples
+```
+
+```{r}
+#| label: overview-all
+reg_report_all(.tab = tab_register)
+```
+
+# Next
+
+**03** classifies the contracts and **04** extracts named entities, both reading `Documents.parquet` and rebuilding
+document paths with `utils_doc_path()`.
+
+A release script will convert the register and the tables it points at into the formats an analysis needs, once the
+pipeline is complete. Doing it here would mean rewriting a gigabyte on every render of a document that does not change
+it.

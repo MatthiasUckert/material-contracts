@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import sys
 
 from . import LABEL_OWNER, __version__, _io
@@ -82,8 +83,57 @@ def _versions():
             lines.append(f"{module_name}: not installed")
             continue
         mod = _load(module_name)
+        lookup = getattr(mod, "DEFAULT_LOOKUP", None)
+        if lookup is not None and not lookup.exists():
+            lines.append(f"{_io.ENGINE} {mod.MODEL} data-absent ({lookup})")
+            continue
         lines.append(_io.version_line(mod.MODEL, mod.SPEC))
     return "\n".join(lines)
+
+
+def describe():
+    """Every installed extractor's identity, as JSON on stdout.
+
+    WHY R NEEDS THIS. The ledger is keyed on (DocID, Engine, Model, Label), so the orchestrator must
+    know the model tag BEFORE a pass in order to ask what still needs doing. But the model is
+    stamped by the extractor and never typed in R -- that is the rule that keeps a version string
+    out of the runbooks. Something has to bridge the two, and a self-description is cheaper and
+    safer than a second declaration of the same facts on the R side.
+
+    A second declaration is precisely the defect this replaces: the label set used to be declared in
+    R, keyed on the extractor STEM rather than the model, and dateregex-v3 emitting a second label
+    made that declaration silently wrong. Nothing errored -- the request simply asked for one label,
+    the other was filtered out inside Python, and the ledger recorded success.
+
+    Emits, per module: engine, model, module, labels, spec_hash, and whether a data dependency is
+    missing. A caller can therefore verify a pinned version, discover the labels, and refuse to
+    start a pass whose rules have changed under an unchanged tag -- all before reading a document.
+    """
+    out = []
+    have = _available()
+    for module_name in sorted(set(LABEL_OWNER.values())):
+        if module_name not in have:
+            out.append({"module": module_name, "available": False})
+            continue
+        mod = _load(module_name)
+        lookup = getattr(mod, "DEFAULT_LOOKUP", None)
+        ready = lookup is None or lookup.exists()
+        out.append({
+            "module": module_name,
+            "available": True,
+            "ready": ready,
+            "engine": _io.ENGINE,
+            "model": mod.MODEL,
+            "labels": list(mod.LABELS),
+            "extras": list(mod.EXTRAS),
+            # A HASH IS A PROMISE that two runs printing the same value produce the same output.
+            # An extractor whose data dependency is absent can produce no output at all, so it gets
+            # no hash rather than one that merely looks valid.
+            "spec_hash": _io.spec_hash(mod.SPEC) if ready else None,
+            "default_timeout": mod.DEFAULT_TIMEOUT,
+            "default_chunk_size": mod.DEFAULT_CHUNK_SIZE,
+        })
+    return out
 
 
 def main(argv=None):
@@ -108,7 +158,13 @@ def main(argv=None):
     ap.add_argument("--no-progress", action="store_true", help="disable the progress bar")
     ap.add_argument("--version", action="store_true",
                     help="print every extractor's engine, model and spec hash, then exit")
+    ap.add_argument("--describe", action="store_true",
+                    help="print every extractor's identity as JSON, then exit")
     a = ap.parse_args(argv)
+
+    if a.describe:
+        print(json.dumps(describe(), indent=2))
+        return 0
 
     if a.version:
         print(f"matcon-extract {__version__}")

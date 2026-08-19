@@ -1,0 +1,404 @@
+---
+title: "Confidential-Treatment Orders (01E)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+```
+
+```{r}
+#| label: setup-sources
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 01C owns the corpus traversal this document reuses. Sourcing the chain rather than reimplementing
+# it is what keeps one definition of how the corpus is walked.
+purrr::walk(
+  .x = c("01A-EdgarIndex", "01B-EdgarDocuments", "01C-EdgarMetaData"),
+  .f = function(.s) {
+    source(
+      file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+      encoding = "UTF-8"
+    )
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # resolves to 1_code/01E-CtoExhibits.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+A confidential-treatment order is a letter from the SEC granting a filer permission to withhold parts of an exhibit from
+public view, for a stated period. Until 2019 a filer wanting to redact a material contract had to apply for one, so the
+orders are the only direct record of what redaction removed and of when it was due to become public.
+
+This parses those letters and links each exhibit reference back to the contract it covers.
+
+## It is a join, not a matching problem
+
+The letters are a generated form. One template, unchanged from 2008 to 2024; ninety-six per cent name the source form
+type, ninety-eight the source filing date. So the link is `CIK` plus form plus filing date into the master index, then
+exhibit number into that filing. Two exact hops, no fuzzy matching.
+
+That matters because the alternative is expensive. An earlier approach re-downloaded each order as a PDF from the SEC
+and extracted its text, which meant fighting an extractor that inserts spaces inside words -- patterns written as
+`F\s*i\s*l\s*e` rather than `File`, and nine variants of the exhibit pattern to cover what the spacing broke. 01B
+already parsed these documents once, and the text carries no such damage: a thousand orders read in under three
+seconds.
+
+## The reference formats, and why order matters
+
+Most orders list `Exhibit 10.15 through December 31, 2016` and name the source filing once, in the opening paragraph.
+A minority name it per exhibit instead, either inline or as a small table, and those are precisely the orders covering
+exhibits from more than one filing.
+
+So the per-reference formats are tried first. Reading one of those orders with the general pattern would attach every
+exhibit to whichever filing the opening paragraph happened to name, which for these orders is one of several -- an error
+that produces a confident and wrong link rather than a visible failure.
+
+## Status comes from the title
+
+`ORDER GRANTING CONFIDENTIAL TREATMENT` is the title line and says what the order does. Searching the body for "amend"
+instead finds `to a Form 10-K filed on August 23, 2018, as amended`, which describes the source filing; on this corpus
+that mistake marks a fifth of plain grants as amendments. The two are recorded separately.
+
+Denials are rare -- roughly three in a thousand -- and matter out of proportion to that: the filer applied to withhold
+and was refused, and therefore had to disclose.
+
+## Nothing is dropped
+
+Every reference that parses is kept, with the point at which its chain broke recorded: not an Exhibit 10, source filing
+not named, filing not in the index, filing ambiguous, exhibit not in the filing, exhibit ambiguous, linked. An
+unresolved reference is a countable quantity; a discarded one is not.
+
+# Configuration
+
+```{r}
+#| label: config
+.dir_meta <- here::here("2_output", "01C-EdgarMetaData")
+.dir_docs <- here::here("2_output", "01B-EdgarDocuments")
+
+.lP <- list(
+  Input = list(
+    MetaData  = fs::path(.dir_meta, "FullMetaData.parquet"),                         # written by 01C
+    Mirror    = here::here("2_output", "01A-EdgarIndex", "GetEDGAR"),                # 01A's mirror
+    FilePaths = fs::path(.dir_docs, "FilePaths.parquet")                             # written by 01B
+  ),
+  Cache = list(
+    Parsed = utils_file_path(.dir_main, "Cache", "Parsed.parquet")   # the pass over the orders
+  ),
+  Output = list(
+    CtoExhibits = utils_file_path(.dir_main, "CtoExhibits.parquet"),   # one row per reference
+    Figures     = utils_file_path(.dir_main, "Figures")                # figure files for the manuscript
+  ),
+  Param = list(
+    Workers   = 8L,   # the orders are a kilobyte each; more would cost more to start than to use
+    Tolerance = 3L    # days either side, where no filing matches the date exactly
+  )
+)
+
+# Named individually so that a failure says which input is missing rather than that one of them is,
+# and checked before the mirror is resolved so an absent mirror is reported here rather than by
+# whatever tries to read it first. One of these is a directory, so both kinds of existence count.
+need_ <- unlist(.lP$Input)
+miss_ <- need_[!fs::file_exists(need_) & !fs::dir_exists(need_)]
+if (length(miss_) > 0L) {
+  cli::cli_abort("Missing input{?s}: {paste(names(miss_), unname(miss_), sep = ' -> ', collapse = '; ')}")
+}
+
+# The master index comes from 01A's mirror, unrestricted. 01C also publishes one, filtered to
+# filings whose documents were retrieved -- two and a half per cent of EDGAR -- and joining against
+# that would make every filing we hold no documents from look as though EDGAR had never heard of it.
+.lP$Edgar <- rGetEDGAR::get_directories(.lP$Input$Mirror)
+
+tibble::tibble(Input = names(need_), Path = unname(need_)) |> tbl_out(.title = "Inputs")
+```
+
+# The orders
+
+```{r}
+#| label: load-orders
+tab_orders <- arrow::open_dataset(sources = .lP$Input$MetaData) |>
+  dplyr::filter(grepl("^CTO", .data$DocTypeMod)) |>
+  dplyr::select("DocID", "HashIndex", "CIK", "CompanyName", "DateFiled", "YQ", "Removed") |>
+  dplyr::collect() |>
+  dplyr::left_join(
+    y  = dplyr::select(arrow::read_parquet(.lP$Input$FilePaths), "DocID", "Path"),
+    by = dplyr::join_by("DocID")
+  )
+
+nrow(tab_orders)
+```
+
+The volume of orders is itself a result. They run at roughly thirteen hundred a year through 2018 and then collapse:
+the 2019 FAST Act amendments let a filer redact immaterial competitively-harmful information without applying at all.
+Any analysis spanning that change is looking at two different disclosure regimes, and a reader seeing two dozen orders
+in a recent year should see the reason rather than infer a data problem.
+
+```{r}
+#| label: report-volume
+tab_orders |>
+  dplyr::mutate(Year = as.integer(format(.data$DateFiled, "%Y"))) |>
+  dplyr::summarise(nOrders = dplyr::n(), nFilers = dplyr::n_distinct(.data$CIK), .by = "Year") |>
+  dplyr::arrange(.data$Year) |>
+  tbl_out(
+    .title = "Orders per year",
+    .notes = c(nOrders = "The fall after 2018 is the FAST Act, not attrition in the data.")
+  )
+```
+
+# Parsing
+
+One pass over the orders, reusing 01C's traversal. Unlike the passes there, this one returns several rows per document
+-- one per exhibit reference -- so the traversal is told to check that every order is accounted for rather than that
+every order produced exactly one row.
+
+```{r}
+#| label: parse-orders
+tab_parsed <- edg_measure_corpus(
+  .tab_idx  = tab_orders,             # the orders to parse
+  .path_out = .lP$Cache$Parsed,       # cache; present means finished
+  .fun      = cto_parse_order,        # order-level fields plus one row per reference
+  .sources  = .path_fun,              # workers are fresh sessions; they source this library
+  .workers  = .lP$Param$Workers,      # parallel workers
+  .label    = "CTO parsing",          # shown in progress output
+  .rows     = "many"                  # one order yields one row per exhibit it names
+)
+
+nrow(tab_parsed)
+```
+
+```{r}
+#| label: join-orders
+tab_refs <- tab_parsed |>
+  dplyr::left_join(
+    y  = dplyr::select(tab_orders, "DocID", "HashIndex", "CIK", "CompanyName", "DateFiled", "YQ"),
+    by = dplyr::join_by("DocID")
+  ) |>
+  dplyr::relocate("DocID", "CIK", "DateFiled", "Status", "RefFormat", "ExhibitNo", "ReleaseDate")
+
+c(orders = dplyr::n_distinct(tab_refs$DocID), references = sum(!is.na(tab_refs$ExhibitNo)))
+```
+
+# Linking
+
+The filing side of the join, against **every filing EDGAR published** rather than only those we hold documents from.
+That distinction is not pedantic: the restricted index is two and a half per cent of the full one, and joining against
+it reported half of its failures as filings EDGAR had never heard of when they were indexed all along. What we lack in
+those cases is the exhibit, not the filing, and the two are separate limits.
+
+A filer can lodge two filings of the same type on the same day, so `CIK` plus form plus date does not always identify
+one. Where it does not, the reference is left unresolved and counted: taking the first candidate would produce a link
+indistinguishable from a correct one and right about half the time.
+
+Some orders quote the date a filing was accepted rather than the date the index records, which differs by a day either
+side. An exact match is preferred; where there is none, a filing within three days is accepted only if it is the only
+one, and the fact that a tolerance was used is recorded so its effect can be measured and switched off.
+
+Using the full index also exposes ambiguity the restricted one hid, since a filer lodging two filings of a type on one
+day had only one of them in the restricted index. That is worth exposing -- but a reference to an exhibit can only
+resolve to a filing whose exhibits exist, so where exactly one candidate has any, the choice is determined rather than
+guessed. Where two do, the reference stays ambiguous.
+
+```{r}
+#| label: link-filing
+tab_master <- arrow::open_dataset(sources = .lP$Edgar$MasterIndex$DirParquet) |>
+  dplyr::select("CIK", "FormType", "DateFiled", "HashIndex") |>
+  dplyr::collect() |>
+  dplyr::distinct()
+
+# Built before the filing hop rather than after it, because which filings hold exhibits is what
+# breaks a tie between two filings of the same type on the same day.
+tab_exhibits <- arrow::open_dataset(sources = .lP$Input$MetaData) |>
+  dplyr::filter(grepl("^Exhibit10", .data$DocTypeMod)) |>
+  dplyr::select("DocID", "HashIndex", "DocTypeRaw") |>
+  dplyr::collect() |>
+  dplyr::mutate(ExhibitNo = cto_exhibit_number(.x = .data$DocTypeRaw))
+
+tab_linked <- cto_link_filing(
+  .tab_ref   = dplyr::select(tab_refs, -"HashIndex"),   # the order's own filing is not the target
+  .tab_mst   = tab_master,                              # every filing EDGAR published, not just ours
+  .hash_docs = unique(tab_exhibits$HashIndex),          # filings we hold exhibits from, for the tie-break
+  .tolerance = .lP$Param$Tolerance                      # days either side where no date matches
+)
+
+c(
+  before      = nrow(tab_refs),
+  after       = nrow(tab_linked),
+  duplicates  = nrow(tab_refs) - nrow(tab_linked),   # orders listing one exhibit twice, identically
+  oneFiling   = mean(tab_linked$nFilings == 1L)
+)
+```
+
+The exhibit side. The order writes `10.1` and the filing side writes `EX-10.1`, so both are reduced to the bare number.
+An unnumbered `EX-10` reduces to `10` and cannot match a numbered reference, which is the right outcome: the order named
+a specific exhibit and the filer did not number one.
+
+```{r}
+#| label: link-document
+tab_cto <- cto_link_document(.tab_ref = tab_linked, .tab_docs = tab_exhibits)
+
+arrow::write_parquet(tab_cto, .lP$Output$CtoExhibits)
+nrow(tab_cto)
+```
+
+# Results
+
+```{r}
+#| label: report-all
+cto_report_all(.tab = tab_cto)
+```
+
+```{r}
+#| label: report-linkage-year
+cto_link_by_year(.tab = tab_cto) |>
+  tbl_out(
+    .title  = "Linkage by year of the order",
+    .pct    = "ShareLinked",
+    .digits = 1L,
+    .notes  = c(ShareLinked = "A fall in one year is a change in how orders were written, not in \\
+                               how many contracts were redacted.")
+  )
+```
+
+# Validation
+
+Four checks. Each states its expectation first, so a result that differs is a finding rather than a number to interpret
+afterwards.
+
+```{r}
+#| label: validate-parse
+# 1. Every order should be accounted for, whether or not any reference parsed.
+# 2. A linked reference must carry a contract identifier, and an unlinked one must not: a status
+#    that claims a resolution the row does not carry is worse than no status.
+# 3. A linked contract must belong to the filing the reference named.
+tibble::tibble(
+  nOrders        = nrow(tab_orders),
+  nOrdersSeen    = dplyr::n_distinct(tab_cto$DocID),
+  nReferences    = sum(!is.na(tab_cto$ExhibitNo)),
+  LinkedNoDoc    = sum(tab_cto$LinkStatus %in% cto_status_ok() & is.na(tab_cto$DocIDContract)),
+  UnlinkedWithDoc = sum(!tab_cto$LinkStatus %in% cto_status_ok() & !is.na(tab_cto$DocIDContract))
+) |>
+  tbl_out(
+    .title = "Parse and link consistency",
+    .notes = c(
+      nOrdersSeen = "Must equal nOrders: an order with no parsable reference still returns a row.",
+      LinkedNoDoc = "Nonzero means a status claims a link the row does not carry."
+    )
+  )
+```
+
+```{r}
+#| label: validate-contracts
+# 4. A contract should be covered by one order. Where two orders name it, one is usually an
+#    extension of the other, so the count is reported by whether an extension is involved.
+tab_cto |>
+  dplyr::filter(!is.na(.data$DocIDContract)) |>
+  dplyr::summarise(nOrders = dplyr::n_distinct(.data$DocID), .by = "DocIDContract") |>
+  dplyr::summarise(
+    nContracts     = dplyr::n(),
+    nOneOrder      = sum(.data$nOrders == 1L),
+    nSeveralOrders = sum(.data$nOrders > 1L),
+    MaxOrders      = max(.data$nOrders)
+  ) |>
+  tbl_out(
+    .title = "Orders per linked contract",
+    .notes = c(nSeveralOrders = "Usually an extension of an earlier grant, which names the same filing.")
+  )
+```
+
+# Deployment
+
+`CtoExhibits.parquet` is the only artifact of this script: one row per exhibit reference, carrying the order that made
+it, the exhibit and release date, the linked contract where the chain completed, and the point at which it broke where
+it did not.
+
+02 reads it to mark each contract in the register with whether an order covers it. The text of the orders stays in the
+corpus; nothing here writes into another script's output.
+
+What this does **not** yet do is check that a linked contract is actually redacted. The order says the SEC permitted a
+redaction; whether the filed document shows one is a property of its text, and belongs with the entity extraction that
+locates redaction markers. Until that exists, a link is a permission rather than an observation.
+
+```{r}
+#| label: deploy-report
+fs::file_info(.lP$Output$CtoExhibits) |>
+  dplyr::select("path", "size") |>
+  tbl_out(.title = "Written")
+```
+
+# Overview
+
+```{r}
+#| label: fig-linkage
+#| fig-height: 3.4
+#| fig-cap: "Exhibit references per year of the order, split into those linked to a contract and
+#|   those left unresolved. The collapse after 2018 is the FAST Act removing the requirement to
+#|   apply, not a failure of the linkage."
+gg_link <- cto_plot_linkage(.tab = tab_cto)
+
+plot_save(
+  .plot    = gg_link,                   # the figure
+  .name    = "cto-linkage",             # meaningful filename, not unnamed-chunk-N
+  .dir     = .lP$Output$Figures,        # figure destination
+  .height  = 3.4,                       # from the ladder: a time series is a low panel
+  .width   = 7.5,                       # the fixed project width
+  .formats = c("pdf", "png"),           # manuscript and web
+  .dpi     = 300                        # print resolution
+)
+
+gg_link
+```
+
+```{r}
+#| label: overview-all
+cto_report_all(.tab = tab_cto)
+```
+
+# Next
+
+**02-SelectSample** reads this and 01D to mark the register: whether an order covers a contract, and whether an 8-K
+summary was extracted for a filing.
+
+The checks the workflow calls for beyond the linkage -- that a covered contract shows redaction markers, that an
+unredacted version appears after the release date, that a denied application led to disclosure -- all need the text of
+the contracts themselves, and belong downstream of the entity extraction that reads it.
