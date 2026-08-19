@@ -1,0 +1,126 @@
+# 1_code/_quarto.yml -- the pipeline runbooks.
+#
+# WHY THIS FILE IS IN 1_code/ AND NOT AT THE REPOSITORY ROOT.
+#
+# Quarto's project root is wherever _quarto.yml sits, and a project render walks that whole tree
+# twice: once for render targets, and once in projectResourceFiles() for resources. With this file
+# at the repository root the second walk covered 2_output -- 1.87 million parsed EDGAR documents --
+# and cost 162 seconds on every render, measured, before a line of R ran.
+#
+# The `_` prefix on a directory removes it from the RENDER TARGET scan only, not from the resource
+# scan, so renaming the tree did not help. .quartoignore applies to starter templates rather than to
+# rendering. There is no `exclude:` option. The only lever is what lies inside the project root.
+#
+# So the root is 1_code, which holds 211 files. Everything else -- 2_output, renv, _BackUps, the
+# four Python folders -- is outside the project and invisible to Quarto, while sitting exactly where
+# it always did. Nothing moved but this file and _styles.css.
+#
+# TWO CONSEQUENCES.
+#
+# 1. Paths here are relative to 1_code/, which is why output-dir starts with ../ and the stylesheet
+#    sits beside this file.
+# 2. `execute-dir: project` now means 1_code/, not the repository root. Every setup chunk already
+#    calls knitr::opts_knit$set(root.dir = here::here()), and here::here() finds the root by walking
+#    up to material-contracts.Rproj, so chunk code still runs from the repository root and
+#    source("1_code/_Commons/_Initialize.R") still resolves. That override is now load-bearing
+#    rather than belt-and-braces: a document omitting it will run its chunks from 1_code/.
+#
+# HTML ONLY. There is no pdf format. The runbooks are read on screen, they carry console blocks that
+# scroll horizontally and tables wider than a page, and neither survives a fixed page size. What the
+# manuscript needs from this pipeline is figures, and those come from plot_save(), which writes
+# vector PDFs straight to disk and has nothing to do with the format list below.
+#
+# The public site, 3_site/, is a SECOND Quarto project with its own configuration. Since the
+# pipeline project is rooted at 1_code/, the two are siblings with no overlap: neither root contains
+# the other, and a render in one cannot reach the other. That separation used to depend on a render
+# list; now it is structural.
+
+project:
+  # The project root is 1_code/, so this sets the working directory there rather than at the
+  # repository root. The setup chunks redirect knitr with opts_knit$set(root.dir = here::here()),
+  # which is what the source("1_code/...") paths are written against. See consequence 2 above.
+  execute-dir: project
+
+  # Rendered HTML lands at the REPOSITORY root under _rendered/1_code/, exactly where it did before
+  # this file moved, so the site's sync step and every existing path are unchanged.
+  output-dir: ../_rendered/1_code
+
+  # WHAT A BARE `quarto render` BUILDS.
+  #
+  # A DOCUMENT MUST MATCH THIS LIST TO INHERIT THIS FILE. A .qmd that does not match is rendered
+  # standalone by Quarto: no toc, no code folding, no stylesheet, no embedded resources, and no
+  # error saying so. Underscore-prefixed subdirectories (_Commons, _Tests, _BackUp, _Migration,
+  # _Scripts) never match, which is why the layout probe sits here beside the runbooks rather than
+  # in _Tests/, where it was silently rendered unstyled.
+  render:
+    - "*.qmd"
+
+format:
+  html:
+    # embed-resources supersedes self-contained, which is deprecated. One file, no _files/ directory
+    # beside it, so a report can be emailed or copied into docs/reports/ as a single asset.
+    embed-resources: true
+
+    toc: true
+    toc-location: left
+    toc-depth: 4
+    toc-expand: 3
+    toc-title: "Contents"
+
+    # Every section head gets a hover anchor, so a specific finding can be linked to in a mail or a
+    # response memo rather than described as "about two thirds down".
+    anchor-sections: true
+
+    page-layout: article
+    code-fold: true
+    code-overflow: wrap
+    code-line-numbers: true
+    code-copy: true
+
+    # `theme: none` means this project ships no Bootstrap and no theme SCSS: _styles.css carries the
+    # entire look. Kept deliberately -- the site injects a back-link pill by anchoring on
+    # <body class="quarto-light">, and the fixed left rail assumes no competing chrome.
+    #
+    # THE STYLESHEET SITS BESIDE THIS FILE, in 1_code/. Quarto only uses resources inside the
+    # project, and the project is now 1_code/, so a stylesheet at the repository root would be
+    # outside it. The two are one unit: neither means anything without the other.
+    #
+    # mainfont/fontfamily are NOT set here. They are pdf/typst options and set nothing in html. The
+    # html face is set by --mc-font-prose in _styles.css, which also carries the print rules:
+    # browser print-to-PDF works and is styled in section 12 of that sheet.
+    theme: none
+    css: _styles.css
+
+    # FIGURE GEOMETRY -- declared once, here, for every document in the project.
+    #
+    # Width is fixed and never varies. A figure that appears to need a wider canvas almost always
+    # needs shorter labels instead: identifiers built for uniqueness run to eighty characters and
+    # will consume any width they are given. _Plots.R supplies plot_wrap() and the level registry's
+    # short labels for exactly this.
+    #
+    # Height varies with row count, chosen from the ladder in plot_height() rather than typed by
+    # hand. The default below is the ladder's middle rung, so a chunk that forgets to set a height
+    # still lands on the ladder instead of at some arbitrary value.
+    #
+    # This was previously restated in every document's setup chunk. Ten copies of one setting is how
+    # two documents came to render at more than twice the width of the other eight, with no error and
+    # no visible symptom beyond axis text at half size. It is declared once now, and setup chunks
+    # must not override it.
+    fig-align: center
+    fig-width: 7.5
+    fig-height: 3.4
+    out-width: "100%"
+
+knitr:
+  opts_chunk:
+    # ragg rasterises text with the actual system font, so what the HTML shows is what the font
+    # resolution really produced. An SVG device would defer that to whatever the reader's browser has
+    # installed and could silently substitute a different face for the figure font -- the failure
+    # _Plots.R warns about at source time.
+    #
+    # Rasterising costs nothing that matters, because the vector copies the manuscript needs are not
+    # produced by this render at all: plot_save(.formats = c("pdf", "png")) writes them straight to
+    # 2_output/<script>/Figures/ from within the document. That call is unaffected by the removal of
+    # the pdf format and must stay.
+    dev: "ragg_png"
+    dpi: 200

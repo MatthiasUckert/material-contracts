@@ -113,7 +113,6 @@ body {
   line-height: var(--mc-lh-body);
   color: var(--mc-ink);
   background: #fff;
-  margin: 0;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
@@ -122,9 +121,12 @@ p {
   margin: 0 0 1em 0;
 }
 
-/* Quarto's title block. Under `theme: none` it has no styling of its own. */
+/* The title block. Under `theme: none` this is a bare <header id="title-block-header"> holding
+   h1.title, p.subtitle, p.author and p.date -- NOT the .quarto-title-block markup a themed render
+   produces. Both are named so the sheet survives a later change of theme. */
+#title-block-header,
 .quarto-title-block {
-  margin-bottom: 2.4em;
+  margin-bottom: 2.6em;
   padding-bottom: 1.2em;
   border-bottom: 1px solid var(--mc-rule);
 }
@@ -158,6 +160,7 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 /* Document title. */
+#title-block-header h1.title,
 body .quarto-title-block .quarto-title h1,
 body .quarto-title-block h1.title {
   font-size: 30px;
@@ -166,6 +169,7 @@ body .quarto-title-block h1.title {
   margin-bottom: 0.25em;
 }
 
+#title-block-header p.subtitle,
 body .quarto-title-block .quarto-title .subtitle {
   font-size: 17px;
   font-weight: 400;
@@ -173,8 +177,10 @@ body .quarto-title-block .quarto-title .subtitle {
 }
 
 /* Section heads. A top rule on h1 makes the major divisions findable when scrolling a long
-   document, which these are. */
-main h1, article h1 {
+   document, which these are. NOT scoped to main/article: under `theme: none` Quarto emits no such
+   element and the content sits directly inside <body>, so a scoped rule matches nothing. #TOC is
+   excluded by hand instead, because its own heading is a child of body too. */
+h1:not(.title) {
   font-size: 24px;
   font-weight: 700;
   letter-spacing: -0.005em;
@@ -183,32 +189,30 @@ main h1, article h1 {
   border-top: 2px solid var(--mc-rule);
 }
 
-main h1:first-child, article h1:first-child {
-  margin-top: 0;
-  padding-top: 0;
-  border-top: none;
+h1:not(.title):first-of-type {
+  margin-top: 0.6em;
 }
 
-main h2, article h2 {
+h2:not(#toc-title) {
   font-size: 19px;
   font-weight: 650;
   margin: 2.1em 0 0.7em 0;
 }
 
-main h3, article h3 {
+h3 {
   font-size: 16.5px;
   font-weight: 600;
   margin: 1.7em 0 0.55em 0;
 }
 
-main h4, article h4 {
+h4 {
   font-size: 15px;
   font-weight: 600;
   color: var(--mc-ink-soft);
   margin: 1.4em 0 0.45em 0;
 }
 
-main h5, article h5, main h6, article h6 {
+h5, h6 {
   font-size: 14px;
   font-weight: 600;
   color: var(--mc-ink-soft);
@@ -350,18 +354,37 @@ body nav[role="doc-toc"]::-webkit-scrollbar-thumb {
 }
 
 
-/* 4. Content column =============================================================================== */
+/* 4. Content column ============================================================================== */
+/* THE OVERLAP FIX, AND WHY IT LOOKS ODD.
+   Under `theme: none` Quarto emits NO <main>, NO <article> and NO #quarto-document-content. The
+   title header, the TOC nav and every content block are direct children of <body>. A rule written
+   as `main { margin-left: ... }` therefore matches nothing at all, and the fixed rail lands on top
+   of the text -- which is exactly what happened.
 
+   So the column is <body> itself. The rail is position: fixed and thus out of flow, so the body
+   margin does not push it; it stays pinned at left: 0 while everything else clears it.
+
+   The themed selectors are kept alongside for the day this project stops using `theme: none`. They
+   cost one line each and they are the difference between a theme change being a config edit and a
+   stylesheet rewrite. */
+
+body {
+  margin-left: calc(var(--mc-toc-w) + var(--mc-gutter));
+  margin-right: auto;
+  max-width: var(--mc-content-w);
+  padding: 40px var(--mc-pad-x) 140px var(--mc-pad-x);
+  box-sizing: border-box;
+}
+
+/* Present only under a theme; harmless when absent. */
 body main,
 body article,
 body div.quarto-document,
 body #quarto-document-content {
-  margin-left: calc(var(--mc-toc-w) + var(--mc-gutter)) !important;
-  margin-right: auto !important;
-  max-width: var(--mc-content-w) !important;
+  margin-left: 0 !important;
+  max-width: 100% !important;
   width: auto !important;
-  padding: 40px var(--mc-pad-x) 120px var(--mc-pad-x);
-  box-sizing: border-box;
+  padding: 0;
 }
 
 /* Quarto's grid under `page-layout: article`. Collapsed to a single flow, because the rail above is
@@ -504,27 +527,17 @@ pre.sourceCode {
   white-space: pre;
 }
 
-/* Line numbers. Pandoc emits an empty anchor per line and the number comes from CSS, which under
-   `theme: none` Quarto does not always supply. Declared here so `code-line-numbers: true` works
-   whatever is installed. */
-pre.numberLines,
-pre.number-lines {
-  counter-reset: mc-line;
+/* LINE NUMBERS. Pandoc's own scheme, class `numberSource`, which it also ships CSS for: the gutter
+   is produced by pulling each line left by 4em inside a block indented by 3em. That works, so it is
+   restyled rather than replaced -- an independent counter here would number every line twice.
+   (An earlier version of this sheet targeted `numberLines`, which pandoc does not emit.) */
+pre.numberSource {
+  margin-left: 3em;
+  border-left: 1px solid var(--mc-rule);
 }
-pre.numberLines > code > span,
-pre.number-lines > code > span {
-  counter-increment: mc-line;
-}
-pre.numberLines > code > span::before,
-pre.number-lines > code > span::before {
-  content: counter(mc-line);
-  display: inline-block;
-  width: 2.2em;
-  margin-right: 1em;
-  text-align: right;
+pre.numberSource code > span > a:first-child::before {
   color: var(--mc-ink-faint);
-  user-select: none;
-  -webkit-user-select: none;
+  border: none;
 }
 
 /* Fold toggle. A quiet pill rather than a line of code masquerading as prose. */
@@ -578,29 +591,36 @@ details.code-fold > summary code {
 
 
 /* 7. Tables ======================================================================================= */
-/* Booktabs: horizontal rules only. `:not(.sourceCode)` keeps this away from highlight tables.
-   kableExtra sets alignment inline, so text-align is left to it. */
+/* WHAT ARRIVES HERE IS NOT RAW kableExtra. Quarto post-processes the markup: the table carries
+   `class="table table-hover table-condensed caption-top"`, header cells carry
+   `data-quarto-table-cell-role="th"`, and a <colgroup> is inserted assigning every column an equal
+   percentage width. That last one is the reason a five-column table put "Class" and "Documents" in
+   boxes of identical width regardless of content.
 
-main table:not(.sourceCode),
-article table:not(.sourceCode) {
+   NOT scoped to main/article -- see section 4. `:not(.sourceCode)` keeps these rules off the syntax
+   highlighter's own tables. */
+
+table:not(.sourceCode) {
   border-collapse: collapse;
   margin: 1.4em 0;
   font-family: var(--mc-font-ui);
   font-size: 14px;
   line-height: 1.45;
   font-variant-numeric: tabular-nums;   /* digits align down the column */
+  width: auto !important;
   max-width: 100%;
+  border-bottom: 0;
 }
 
-/* kableExtra writes `position: left` as inline margins; this keeps a wide table scrollable rather
-   than letting it push the column. */
-main div.kable-table,
-main .table-responsive {
-  overflow-x: auto;
+/* THE EQUAL-WIDTH COLGROUP, disabled. Quarto writes `width: 20%` on each <col> of a five-column
+   table, so a long category name and a four-digit count are given the same room and both look
+   wrong. Releasing the widths lets the content size the columns. */
+table:not(.sourceCode) > colgroup > col {
+  width: auto !important;
 }
 
-main table:not(.sourceCode) thead th,
-article table:not(.sourceCode) thead th {
+table:not(.sourceCode) thead th,
+table:not(.sourceCode) thead td[data-quarto-table-cell-role="th"] {
   border-top: 1.5px solid var(--mc-rule-firm);
   border-bottom: 1px solid var(--mc-rule-firm);
   padding: 7px 14px;
@@ -609,50 +629,59 @@ article table:not(.sourceCode) thead th {
   white-space: nowrap;
 }
 
-/* Grouped headers from kableExtra::add_header_above(). The library writes an inner div with an
-   inline `border-bottom: 1px solid #ddd`, so overriding it needs this specificity. The spanning
-   row's own top rule is removed: two rules stacked above a header is a boxed table by accident. */
-main table:not(.sourceCode) thead tr:first-child th,
-article table:not(.sourceCode) thead tr:first-child th {
+/* THE SPANNING HEADER ROW from kableExtra::add_header_above(). Quarto passes through an inner
+   <div> carrying an inline `border-bottom: 1px solid #ddd`, and marks the row's cells
+   `border-bottom: hidden` inline as well. Inline styles beat a class selector, so the override
+   needs !important -- the alternative is a table with two stacked rules above its header, which
+   reads as a box drawn by accident. */
+table:not(.sourceCode) thead tr:first-child th {
   font-weight: 600;
   font-size: 12.5px;
   letter-spacing: 0.03em;
   text-transform: uppercase;
   color: var(--mc-ink-soft);
-  border-bottom: none;
+  border-top: 1.5px solid var(--mc-rule-firm);
+  border-bottom: none !important;
   padding-bottom: 3px;
 }
 
-main table:not(.sourceCode) thead tr:first-child th > div,
-article table:not(.sourceCode) thead tr:first-child th > div {
+table:not(.sourceCode) thead tr:first-child th > div {
   border-bottom: 1px solid var(--mc-rule) !important;
   padding-bottom: 4px !important;
 }
 
-main table:not(.sourceCode) thead tr:first-child th:empty,
-main table:not(.sourceCode) thead tr:first-child th[style*="empty-cells"] {
-  border: none;
+/* The second header row then carries the rule under the column names, and no rule above them. */
+table:not(.sourceCode) thead tr:nth-child(2) th {
+  border-top: none;
 }
 
-main table:not(.sourceCode) tbody td,
-article table:not(.sourceCode) tbody td {
+/* An empty spanning cell is a spacer, not a column. */
+table:not(.sourceCode) thead tr:first-child th:empty,
+table:not(.sourceCode) thead tr:first-child th[style*="empty-cells"] {
+  border: none !important;
+}
+
+table:not(.sourceCode) tbody td {
   padding: 5px 14px;
   border: none;
 }
 
-main table:not(.sourceCode) tbody tr:last-child td,
-article table:not(.sourceCode) tbody tr:last-child td {
+table:not(.sourceCode) tbody tr:last-child td {
   border-bottom: 1.5px solid var(--mc-rule-firm);
 }
 
-main table:not(.sourceCode) tbody tr:hover td,
-article table:not(.sourceCode) tbody tr:hover td {
+table:not(.sourceCode) tbody tr:hover td {
+  background: var(--mc-surface);
+}
+
+/* Quarto's own striping and hover, switched off: this is a booktabs table, not a web table. */
+table.table-hover tbody tr:hover td,
+table.table-striped tbody tr:nth-of-type(odd) td {
   background: var(--mc-surface);
 }
 
 /* Footnotes from kableExtra::footnote(). */
-main table:not(.sourceCode) tfoot td,
-article table:not(.sourceCode) tfoot td {
+table:not(.sourceCode) tfoot td {
   border: none;
   padding: 8px 14px 0 0;
   font-size: var(--mc-size-small);
@@ -661,16 +690,15 @@ article table:not(.sourceCode) tfoot td {
   white-space: normal;
 }
 
-main table:not(.sourceCode) tfoot sup,
-main table:not(.sourceCode) tbody sup,
-main table:not(.sourceCode) thead sup {
+table:not(.sourceCode) sup {
   color: var(--mc-accent);
   font-size: 0.75em;
 }
 
-/* Caption above, left, quiet. */
+/* Caption above, left, quiet. `caption-top` is Quarto's class for the same intent. */
 caption,
-table > caption {
+table > caption,
+table.caption-top > caption {
   caption-side: top;
   text-align: left;
   font-family: var(--mc-font-ui);
@@ -746,34 +774,51 @@ figcaption,
 
 
 /* 10. Links, lists and rules ====================================================================== */
+/* Unscoped, for the reason in section 4. #TOC is excluded by hand: its links have their own
+   treatment in section 3 and would otherwise pick up the content underline. */
 
-main a:not(.anchorjs-link),
-article a:not(.anchorjs-link) {
+a:not(.anchorjs-link):not(.quarto-anchored):not(#TOC a):not(.code-copy-button) {
   color: var(--mc-accent);
   text-decoration: none;
   border-bottom: 1px solid rgba(44, 95, 138, 0.28);
   transition: border-color 0.12s ease;
 }
-main a:not(.anchorjs-link):hover,
-article a:not(.anchorjs-link):hover {
+a:not(.anchorjs-link):not(.quarto-anchored):not(#TOC a):not(.code-copy-button):hover {
   border-bottom-color: var(--mc-accent);
 }
 
-main ul, main ol, article ul, article ol {
+/* The per-line anchors pandoc writes inside numbered code blocks are not links a reader follows. */
+#TOC a,
+pre.sourceCode a,
+div.sourceCode a,
+.code-copy-button {
+  border-bottom: none !important;
+}
+
+ul, ol {
   padding-left: 1.5em;
   margin: 0 0 1em 0;
 }
-main li, article li {
+li {
   margin: 0.3em 0;
 }
 
-main hr, article hr {
+/* The TOC builds its hierarchy from nested lists and must not inherit content list spacing. */
+#TOC ul, #TOC ol, #TOC li {
+  margin: 0;
+  padding-left: 0;
+}
+#TOC ul ul {
+  padding-left: 12px;
+}
+
+hr {
   border: none;
   border-top: 1px solid var(--mc-rule);
   margin: 2.4em 0;
 }
 
-main blockquote, article blockquote {
+blockquote {
   margin: 1.4em 0;
   padding: 2px 0 2px 18px;
   border-left: 3px solid var(--mc-rule);
@@ -804,17 +849,14 @@ strong { font-weight: 650; }
     padding: 20px 24px;
   }
 
-  body main,
-  body article,
-  body div.quarto-document,
-  body #quarto-document-content {
-    margin-left: 0 !important;
-    max-width: 100% !important;
+  body {
+    margin-left: 0;
+    max-width: 100%;
     padding: 28px 20px 80px 20px;
   }
 
-  main h1, article h1 { font-size: 21px; }
-  main h2, article h2 { font-size: 17.5px; }
+  h1:not(.title) { font-size: 21px; }
+  h2:not(#toc-title) { font-size: 17.5px; }
 }
 
 
@@ -830,12 +872,10 @@ strong { font-weight: 650; }
     display: none !important;
   }
 
-  body main,
-  body article,
-  body #quarto-document-content {
-    margin-left: 0 !important;
-    max-width: 100% !important;
-    padding: 0 !important;
+  body {
+    margin-left: 0;
+    max-width: 100%;
+    padding: 0;
   }
 
   details.code-fold > summary { display: none; }
@@ -851,7 +891,7 @@ strong { font-weight: 650; }
     word-break: break-all;
   }
 
-  main h1, article h1 { break-after: avoid; }
+  h1 { break-after: avoid; }
   table, figure { break-inside: avoid; }
   a { border-bottom: none !important; color: var(--mc-ink) !important; }
 }
