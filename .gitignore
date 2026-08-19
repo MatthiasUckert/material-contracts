@@ -21,6 +21,7 @@ __pycache__/
 0_scratch/
 _rendered
 0_data
+_BackUps
 
 /.quarto/
 **/*.quarto_ipynb

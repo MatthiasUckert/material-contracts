@@ -1,269 +1,857 @@
-/* _styles.css -- house style for the material-contracts Quarto reports.
-   Used with `theme: none`, so this sheet carries the full look: Times
-   throughout, h1 bold / h2 italic, a fixed left TOC, academic tables, and
-   readable code. Organised in sections; the !important flags override the
-   bare (theme-less) defaults. */
+/* _styles.css -- house style for the material-contracts runbooks.
+   ==================================================================================================
+   Used with `theme: none`, so this sheet carries the entire look. Nothing else is loaded.
+
+   WHAT CHANGED, AND WHY. The previous sheet styled prose, tables and `pre.sourceCode`. It did not
+   style `.cell-output`, which is where every console block in this project lands -- and console
+   blocks are the primary content of these documents, not an aside. It also did not style
+   `p.table-note`, which `_Tables.R` emits on the rendered path. Both fell through to browser
+   defaults: unbounded monospace at the browser's default size, no surface, no containment, and a
+   fixed-width table from `tbl_fmt()` free to reflow if the viewport was narrow enough.
+
+   The other change is that every dimension, colour and face is a custom property declared once at
+   the top. Two consequences. Changing the look is editing the token block rather than hunting
+   through nine sections. And the shared values the site needs (see the note on units below) are
+   readable from one place.
+
+   UNITS ARE ABSOLUTE, DELIBERATELY. `rem` resolves against the root font size, and the site project
+   and this project set different ones -- which is how the site navbar and the injected report navbar
+   came to disagree about their own height while both being "1.4rem". Anything the site also has an
+   opinion about is pinned in px here. `em` is still used inside components, where it should scale
+   with the component's own size.
+
+   ORGANISATION
+     0. Tokens               every colour, face and dimension, once
+     1. Reset and base       document-level typography
+     2. Headings             the rhythm the TOC depth of 4 implies
+     3. Table of contents    fixed left rail
+     4. Content column       the offset that pairs with the rail
+     5. Cell output          console blocks -- cli, cat, warnings, errors
+     6. Source code          folded chunks, line numbers, inline code
+     7. Tables               booktabs rules, grouped headers, footnotes
+     8. Table notes          p.table-note, emitted by tbl_note()
+     9. Figures              captions and containment
+    10. Links and rules
+    11. Responsive
+    12. Print
+   ================================================================================================== */
 
 
-/* 1. Base ---------------------------------------------------------------- */
+/* 0. Tokens ======================================================================================= */
+
+:root {
+
+  /* ---- TYPEFACE PRESET --------------------------------------------------------------------------
+     Two presets. `modern` is active. To switch to `manuscript`, swap the three --mc-font-* values
+     for the commented block below.
+
+     ONE COUPLING TO KNOW ABOUT. `_Commons/_Plots.R:33` sets `.plot_font <- "Times New Roman"` and
+     every figure is drawn in it, in both the html and the manuscript pdf. Under the `modern` preset
+     the prose is sans and the figures stay Times, which is a visible difference inside the document.
+     Three coherent positions:
+
+       (a) modern here, Times in figures -- figures read as inset manuscript exhibits. Defensible,
+           and it is what most modern methods sites look like.
+       (b) modern here, and change `.plot_font` to match -- consistent on screen, but the figures
+           then no longer match the paper they also appear in.
+       (c) manuscript preset here -- everything Times, everything consistent, least modern.
+
+     Active choice is (a). It is one line to change to either of the others.
+  --------------------------------------------------------------------------------------------------*/
+
+  /* preset: modern */
+  --mc-font-prose: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --mc-font-ui:    -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  --mc-font-mono:  "SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono", ui-monospace, monospace;
+
+  /* preset: manuscript
+  --mc-font-prose: "Times New Roman", Times, serif;
+  --mc-font-ui:    "Times New Roman", Times, serif;
+  --mc-font-mono:  "SF Mono", "Menlo", "Consolas", "DejaVu Sans Mono", ui-monospace, monospace;
+  */
+
+  /* ---- Colour ---- */
+  --mc-ink:        #16181d;   /* body text */
+  --mc-ink-soft:   #5c6370;   /* captions, notes, secondary */
+  --mc-ink-faint:  #8b919c;   /* line numbers, disabled */
+  --mc-accent:     #2c5f8a;   /* links, active TOC item */
+  --mc-accent-bg:  #eaf1f7;   /* active TOC background */
+  --mc-rule:       #e3e6ea;   /* hairlines, borders */
+  --mc-rule-firm:  #16181d;   /* table top and bottom rules */
+  --mc-surface:    #f7f8fa;   /* console and code block background */
+  --mc-surface-2:  #fbfcfd;   /* TOC rail background */
+  --mc-warn:       #9a6b00;   /* table-note-warn text */
+  --mc-warn-bg:    #fdf6e6;   /* table-note-warn background */
+  --mc-err:        #a3312b;   /* genuine error output only */
+
+  /* ---- Type scale ---- */
+  --mc-size-body:  16px;
+  --mc-size-mono:  12.5px;    /* console and code; see the note in section 5 */
+  --mc-size-small: 13px;      /* captions, notes, footnotes */
+  --mc-size-toc:   13.5px;
+  --mc-lh-body:    1.65;
+  --mc-lh-mono:    1.5;
+
+  /* ---- Geometry. Absolute, for the reason given in the header. ---- */
+  --mc-toc-w:      288px;
+  --mc-gutter:     44px;      /* rail to content */
+  --mc-content-w:  1060px;    /* content column cap */
+  --mc-pad-x:      28px;
+  --mc-radius:     6px;
+}
+
+
+/* 1. Reset and base =============================================================================== */
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
 
 body {
-  font-family: "Times New Roman", Times, serif !important;
-  line-height: 1.5;
-  color: #1a1a1a;
+  font-family: var(--mc-font-prose) !important;
+  font-size: var(--mc-size-body);
+  line-height: var(--mc-lh-body);
+  color: var(--mc-ink);
+  background: #fff;
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+p {
+  margin: 0 0 1em 0;
+}
+
+/* Quarto's title block. Under `theme: none` it has no styling of its own. */
+.quarto-title-block {
+  margin-bottom: 2.4em;
+  padding-bottom: 1.2em;
+  border-bottom: 1px solid var(--mc-rule);
+}
+
+.quarto-title-block .quarto-title-meta,
+.quarto-title-block .quarto-title-meta-heading,
+.quarto-title-block .quarto-title-meta-contents {
+  font-family: var(--mc-font-ui);
+  font-size: var(--mc-size-small);
+  color: var(--mc-ink-soft);
+}
+
+.quarto-title-block .quarto-title-meta-heading {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 11px;
+  color: var(--mc-ink-faint);
 }
 
 
-/* 2. Headers ------------------------------------------------------------- */
-/* h1 bold; h2 italic (not bold); h3-h6 plain Times. */
+/* 2. Headings ===================================================================================== */
+/* The TOC runs to depth 4, so four levels have to be distinguishable from each other at a glance.
+   Weight carries h1 and h2; h3 and h4 are separated by size and colour rather than by more weight,
+   because four levels of bold is four levels of nothing. */
 
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--mc-font-prose) !important;
+  color: var(--mc-ink);
+  line-height: 1.25;
+  margin: 0;
+}
+
+/* Document title. */
 body .quarto-title-block .quarto-title h1,
-body .quarto-title-block .title,
-body main h1,
-body article h1,
-body div.quarto-document h1,
-body h1 {
-  font-weight: bold !important;
-  font-family: "Times New Roman", Times, serif !important;
+body .quarto-title-block h1.title {
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin-bottom: 0.25em;
 }
 
-body main h2,
-body article h2,
-body div.quarto-document h2,
-body h2 {
-  font-weight: normal !important;
-  font-style: italic !important;
-  font-family: "Times New Roman", Times, serif !important;
+body .quarto-title-block .quarto-title .subtitle {
+  font-size: 17px;
+  font-weight: 400;
+  color: var(--mc-ink-soft);
 }
 
-body h3, body h4, body h5, body h6 {
-  font-family: "Times New Roman", Times, serif !important;
+/* Section heads. A top rule on h1 makes the major divisions findable when scrolling a long
+   document, which these are. */
+main h1, article h1 {
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.005em;
+  margin: 2.6em 0 0.9em 0;
+  padding-top: 0.7em;
+  border-top: 2px solid var(--mc-rule);
+}
+
+main h1:first-child, article h1:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+main h2, article h2 {
+  font-size: 19px;
+  font-weight: 650;
+  margin: 2.1em 0 0.7em 0;
+}
+
+main h3, article h3 {
+  font-size: 16.5px;
+  font-weight: 600;
+  margin: 1.7em 0 0.55em 0;
+}
+
+main h4, article h4 {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--mc-ink-soft);
+  margin: 1.4em 0 0.45em 0;
+}
+
+main h5, article h5, main h6, article h6 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--mc-ink-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin: 1.3em 0 0.4em 0;
+}
+
+/* Anchor links: present, invisible until hover. */
+.quarto-section-identifier .anchorjs-link,
+h1 > a.anchorjs-link, h2 > a.anchorjs-link,
+h3 > a.anchorjs-link, h4 > a.anchorjs-link {
+  opacity: 0;
+  text-decoration: none;
+  color: var(--mc-ink-faint);
+  transition: opacity 0.15s ease;
+}
+h1:hover > a.anchorjs-link, h2:hover > a.anchorjs-link,
+h3:hover > a.anchorjs-link, h4:hover > a.anchorjs-link {
+  opacity: 1;
 }
 
 
-/* 3. Table of contents (fixed, left) ------------------------------------- */
-/* Multiple selectors cover different Quarto versions. */
+/* 3. Table of contents ============================================================================ */
+/* Fixed left rail. Several selectors because Quarto has moved this element between versions and the
+   documents are rendered by whatever is installed. */
 
 body #TOC,
+body nav#TOC,
+body #quarto-sidebar-toc-left,
 body nav.sidebar-navigation,
 body div.sidebar,
 body .sidebar-menu[role="doc-toc"] {
   position: fixed;
   left: 0;
   top: 0;
-  width: 280px;
-  height: 100%;
+  width: var(--mc-toc-w);
+  height: 100vh;
   overflow-y: auto;
-  padding: 20px;
-  background-color: #fff;
-  border-right: 1px solid #e0e0e0;
+  overscroll-behavior: contain;
+  padding: 28px 18px 40px 22px;
+  box-sizing: border-box;
+  background: var(--mc-surface-2);
+  border-right: 1px solid var(--mc-rule);
   z-index: 1000;
-  font-family: "Times New Roman", Times, serif !important;
+  font-family: var(--mc-font-ui) !important;
+  font-size: var(--mc-size-toc);
+  line-height: 1.4;
 }
 
-/* Level 1 TOC items: bold */
-body #TOC .sidebar-item-container .sidebar-item-text a[data-bs-toggle="collapse"],
-body #TOC .sidebar-item-container .sidebar-item-text a[href*="#sec-"],
-body nav.sidebar-navigation > ul > li > a,
-body .sidebar nav[role="doc-toc"] > ul > li > a,
-body .sidebar-menu[role="doc-toc"] > ul > li > a {
-  font-weight: bold !important;
-  font-family: "Times New Roman", Times, serif !important;
+/* The "Table of contents" heading Quarto emits above the list. */
+body #TOC > h2,
+body #TOC .h2,
+body .sidebar h2,
+body nav[role="doc-toc"] > h2 {
+  font-size: 11px !important;
+  font-weight: 600 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--mc-ink-faint);
+  border: none !important;
+  margin: 0 0 14px 0 !important;
+  padding: 0 !important;
 }
 
-/* Level 2 TOC items: italic, not bold */
-body nav.sidebar-navigation > ul > li > ul > li > a,
-body .sidebar-menu ul.collapse li .sidebar-item-text a,
-body .sidebar nav[role="doc-toc"] > ul > li > ul > li > a,
-body .sidebar-menu[role="doc-toc"] > ul > li > ul > li > a {
-  font-weight: normal !important;
-  font-style: italic !important;
-  font-family: "Times New Roman", Times, serif !important;
+body #TOC ul,
+body nav[role="doc-toc"] ul,
+body .sidebar ul {
+  list-style: none;
+  margin: 0;
+  padding-left: 0;
 }
 
-.sidebar a,
-#TOC a {
-  font-family: "Times New Roman", Times, serif !important;
+body #TOC ul ul,
+body nav[role="doc-toc"] ul ul {
+  padding-left: 12px;
 }
 
-.sidebar-item {
-  white-space: normal;
-  line-height: 1.3;
-  padding-right: 5px;
+body #TOC a,
+body nav[role="doc-toc"] a,
+body .sidebar a {
+  display: block;
+  font-family: var(--mc-font-ui) !important;
+  color: var(--mc-ink-soft);
+  text-decoration: none;
+  padding: 3px 8px;
+  margin: 1px 0;
+  border-radius: 4px;
+  border-left: 2px solid transparent;
+  transition: background 0.12s ease, color 0.12s ease;
 }
 
-/* Level 3+ collapse behaviour */
-.sidebar-item-container .sidebar-item-toggle .bi {
-  transition: transform 0.3s ease;
+body #TOC a:hover,
+body nav[role="doc-toc"] a:hover {
+  background: var(--mc-accent-bg);
+  color: var(--mc-accent);
 }
-.sidebar-item-container .sidebar-item ul.collapse:not(.show) {
-  display: none;
+
+/* Depth 1: the sections a reader navigates by. */
+body #TOC > ul > li > a,
+body nav[role="doc-toc"] > ul > li > a {
+  font-weight: 650;
+  color: var(--mc-ink);
+  margin-top: 8px;
 }
-.sidebar-item-container .sidebar-item-toggle[aria-expanded="true"] .bi {
-  transform: rotate(90deg);
+
+/* Depth 2. */
+body #TOC > ul > li > ul > li > a,
+body nav[role="doc-toc"] > ul > li > ul > li > a {
+  font-weight: 400;
 }
-.sidebar-item-toggle:hover {
-  background-color: #f8f9fa;
-  border-radius: 3px;
+
+/* Depth 3 and 4: smaller and quieter, so the rail stays scannable at depth 4. */
+body #TOC > ul > li > ul > li > ul > li > a,
+body nav[role="doc-toc"] > ul > li > ul > li > ul > li > a {
+  font-size: 12.5px;
+  color: var(--mc-ink-faint);
+}
+
+/* Scroll-spy. Quarto sets .active on the item matching the viewport. */
+body #TOC a.active,
+body nav[role="doc-toc"] a.active,
+body .sidebar a.active {
+  color: var(--mc-accent) !important;
+  background: var(--mc-accent-bg);
+  border-left-color: var(--mc-accent);
+  font-weight: 600;
+}
+
+/* Rail scrollbar: present but not loud. */
+body #TOC::-webkit-scrollbar,
+body nav[role="doc-toc"]::-webkit-scrollbar {
+  width: 8px;
+}
+body #TOC::-webkit-scrollbar-thumb,
+body nav[role="doc-toc"]::-webkit-scrollbar-thumb {
+  background: #d8dce2;
+  border-radius: 4px;
 }
 
 
-/* 4. Main content positioning -------------------------------------------- */
+/* 4. Content column =============================================================================== */
 
 body main,
 body article,
-body div.quarto-document {
-  margin-left: 300px !important;
-  max-width: 64rem !important;   /* wide but capped (~1024px); raise/lower to taste */
+body div.quarto-document,
+body #quarto-document-content {
+  margin-left: calc(var(--mc-toc-w) + var(--mc-gutter)) !important;
+  margin-right: auto !important;
+  max-width: var(--mc-content-w) !important;
   width: auto !important;
-  padding-left: 40px;
-  padding-right: 24px;
+  padding: 40px var(--mc-pad-x) 120px var(--mc-pad-x);
+  box-sizing: border-box;
+}
+
+/* Quarto's grid under `page-layout: article`. Collapsed to a single flow, because the rail above is
+   positioned rather than gridded and the two systems otherwise fight. */
+.page-columns,
+.column-screen,
+.column-page,
+.column-body,
+#quarto-content {
+  display: block !important;
+}
+
+/* Quarto reserves a right margin column for margin content. Nothing here uses it. */
+#quarto-margin-sidebar {
+  display: none !important;
 }
 
 
-/* 5. Tables (academic / booktabs) ---------------------------------------- */
-/* Horizontal rules only -- top rule, header rule, bottom rule, no verticals.
-   Scoped away from code-highlight tables via :not(.sourceCode). kable sets
-   per-column alignment inline, so we leave text-align to it. */
+/* 5. Cell output ================================================================================== */
+/* THE MOST IMPORTANT SECTION IN THIS SHEET, and the one the previous version did not have.
+   `tbl_say()` prints through `cli::cli_verbatim()`, cli writes to the message stream, and knitr
+   wraps message-stream output in `.cell-output-stderr`. So the fixed-width tables that carry most
+   of this project's findings arrive tagged as standard error.
+
+   Two things follow. First, stderr must NOT be styled as a fault -- it is the normal output of these
+   documents, and a red tint on nine tables in a row would be actively misleading. Second, the block
+   must not wrap: `tbl_fmt()` pads columns to a fixed width and a soft wrap destroys the alignment
+   that is the whole point of it. `white-space: pre` and horizontal scroll, never `pre-wrap`.
+
+   `--mc-size-mono` is 12.5px because the widest console table this project produces is about 118
+   characters, and 118 characters of this face at 12.5px is roughly 900px, which fits the content
+   column without a scrollbar. Raising the size starts putting scrollbars under tables. */
+
+.cell {
+  margin: 1.4em 0;
+}
+
+.cell-output,
+.cell-output-stdout,
+.cell-output-stderr,
+.cell-output-display {
+  margin: 0.5em 0;
+}
+
+.cell-output pre,
+.cell-output-stdout pre,
+.cell-output-stderr pre {
+  font-family: var(--mc-font-mono) !important;
+  font-size: var(--mc-size-mono);
+  line-height: var(--mc-lh-mono);
+  color: var(--mc-ink);
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-rule);
+  border-left: 3px solid #ccd2da;
+  border-radius: var(--mc-radius);
+  padding: 12px 14px;
+  margin: 0;
+  white-space: pre;          /* never pre-wrap: fixed-width tables depend on this */
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  tab-size: 2;
+}
+
+.cell-output pre code,
+.cell-output-stdout pre code,
+.cell-output-stderr pre code {
+  font-family: inherit;
+  font-size: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  white-space: inherit;
+}
+
+/* Genuine faults. Quarto tags a real error `.cell-output-error`; ordinary cli output does not land
+   here, so this is the one place a warning colour is honest. */
+.cell-output-error pre {
+  color: var(--mc-err);
+  background: #fdf3f2;
+  border-left-color: var(--mc-err);
+}
+
+/* Horizontal scrollbar on console blocks: visible, so a reader knows the table continues. */
+.cell-output pre::-webkit-scrollbar,
+.cell-output-stderr pre::-webkit-scrollbar,
+.cell-output-stdout pre::-webkit-scrollbar {
+  height: 9px;
+}
+.cell-output pre::-webkit-scrollbar-thumb,
+.cell-output-stderr pre::-webkit-scrollbar-thumb,
+.cell-output-stdout pre::-webkit-scrollbar-thumb {
+  background: #ccd2da;
+  border-radius: 5px;
+}
+.cell-output pre::-webkit-scrollbar-track,
+.cell-output-stderr pre::-webkit-scrollbar-track,
+.cell-output-stdout pre::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+
+/* 6. Source code ================================================================================== */
+
+pre, code, kbd, samp {
+  font-family: var(--mc-font-mono) !important;
+}
+
+/* Inline code. */
+code:not(pre code) {
+  font-size: 0.875em;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-rule);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+  color: #2f3440;
+  white-space: nowrap;
+}
+
+/* Chunk source. Visually distinct from console output: white ground rather than grey, so a reader
+   can tell input from output without reading either. */
+div.sourceCode {
+  margin: 0.6em 0;
+  background: #fff;
+  border: 1px solid var(--mc-rule);
+  border-radius: var(--mc-radius);
+  overflow: hidden;
+}
+
+div.sourceCode pre,
+pre.sourceCode {
+  font-size: var(--mc-size-mono);
+  line-height: var(--mc-lh-mono);
+  background: #fff;
+  border: none;
+  border-radius: 0;
+  margin: 0;
+  padding: 12px 14px;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+/* Line numbers. Pandoc emits an empty anchor per line and the number comes from CSS, which under
+   `theme: none` Quarto does not always supply. Declared here so `code-line-numbers: true` works
+   whatever is installed. */
+pre.numberLines,
+pre.number-lines {
+  counter-reset: mc-line;
+}
+pre.numberLines > code > span,
+pre.number-lines > code > span {
+  counter-increment: mc-line;
+}
+pre.numberLines > code > span::before,
+pre.number-lines > code > span::before {
+  content: counter(mc-line);
+  display: inline-block;
+  width: 2.2em;
+  margin-right: 1em;
+  text-align: right;
+  color: var(--mc-ink-faint);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Fold toggle. A quiet pill rather than a line of code masquerading as prose. */
+details.code-fold {
+  margin: 1em 0 0.6em 0;
+}
+
+details.code-fold > summary {
+  font-family: var(--mc-font-ui);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--mc-ink-soft);
+  cursor: pointer;
+  list-style: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  background: var(--mc-surface);
+  border: 1px solid var(--mc-rule);
+  border-radius: 999px;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+
+details.code-fold > summary::-webkit-details-marker { display: none; }
+
+details.code-fold > summary::before {
+  content: "\25B8";           /* right-pointing triangle */
+  font-size: 10px;
+  transition: transform 0.15s ease;
+}
+details.code-fold[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+details.code-fold > summary:hover {
+  background: var(--mc-accent-bg);
+  color: var(--mc-accent);
+  border-color: #c9dbea;
+}
+
+details.code-fold > summary code {
+  font-family: inherit;
+  font-size: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+}
+
+
+/* 7. Tables ======================================================================================= */
+/* Booktabs: horizontal rules only. `:not(.sourceCode)` keeps this away from highlight tables.
+   kableExtra sets alignment inline, so text-align is left to it. */
 
 main table:not(.sourceCode),
 article table:not(.sourceCode) {
   border-collapse: collapse;
-  margin: 1em auto;
-  font-family: "Times New Roman", Times, serif;
-  font-size: 0.95em;
+  margin: 1.4em 0;
+  font-family: var(--mc-font-ui);
+  font-size: 14px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;   /* digits align down the column */
+  max-width: 100%;
+}
+
+/* kableExtra writes `position: left` as inline margins; this keeps a wide table scrollable rather
+   than letting it push the column. */
+main div.kable-table,
+main .table-responsive {
+  overflow-x: auto;
 }
 
 main table:not(.sourceCode) thead th,
 article table:not(.sourceCode) thead th {
-  border-top: 1.5px solid #000;
-  border-bottom: 1px solid #000;
-  padding: 5px 12px;
-  font-weight: bold;
+  border-top: 1.5px solid var(--mc-rule-firm);
+  border-bottom: 1px solid var(--mc-rule-firm);
+  padding: 7px 14px;
+  font-weight: 650;
   vertical-align: bottom;
+  white-space: nowrap;
+}
+
+/* Grouped headers from kableExtra::add_header_above(). The library writes an inner div with an
+   inline `border-bottom: 1px solid #ddd`, so overriding it needs this specificity. The spanning
+   row's own top rule is removed: two rules stacked above a header is a boxed table by accident. */
+main table:not(.sourceCode) thead tr:first-child th,
+article table:not(.sourceCode) thead tr:first-child th {
+  font-weight: 600;
+  font-size: 12.5px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--mc-ink-soft);
+  border-bottom: none;
+  padding-bottom: 3px;
+}
+
+main table:not(.sourceCode) thead tr:first-child th > div,
+article table:not(.sourceCode) thead tr:first-child th > div {
+  border-bottom: 1px solid var(--mc-rule) !important;
+  padding-bottom: 4px !important;
+}
+
+main table:not(.sourceCode) thead tr:first-child th:empty,
+main table:not(.sourceCode) thead tr:first-child th[style*="empty-cells"] {
+  border: none;
 }
 
 main table:not(.sourceCode) tbody td,
 article table:not(.sourceCode) tbody td {
-  padding: 4px 12px;
+  padding: 5px 14px;
   border: none;
 }
 
 main table:not(.sourceCode) tbody tr:last-child td,
 article table:not(.sourceCode) tbody tr:last-child td {
-  border-bottom: 1.5px solid #000;
+  border-bottom: 1.5px solid var(--mc-rule-firm);
 }
 
-/* subtle row emphasis on hover (HTML only; ignored in PDF) */
-main table:not(.sourceCode) tbody tr:hover td {
-  background-color: #f6f6f6;
+main table:not(.sourceCode) tbody tr:hover td,
+article table:not(.sourceCode) tbody tr:hover td {
+  background: var(--mc-surface);
 }
 
-/* Table captions: italic, left, above the table */
+/* Footnotes from kableExtra::footnote(). */
+main table:not(.sourceCode) tfoot td,
+article table:not(.sourceCode) tfoot td {
+  border: none;
+  padding: 8px 14px 0 0;
+  font-size: var(--mc-size-small);
+  line-height: 1.5;
+  color: var(--mc-ink-soft);
+  white-space: normal;
+}
+
+main table:not(.sourceCode) tfoot sup,
+main table:not(.sourceCode) tbody sup,
+main table:not(.sourceCode) thead sup {
+  color: var(--mc-accent);
+  font-size: 0.75em;
+}
+
+/* Caption above, left, quiet. */
 caption,
 table > caption {
   caption-side: top;
   text-align: left;
-  font-style: italic;
-  font-size: 0.9em;
-  color: #333;
-  padding: 4px 0;
+  font-family: var(--mc-font-ui);
+  font-weight: 600;
+  font-size: var(--mc-size-small);
+  color: var(--mc-ink);
+  padding: 0 0 8px 0;
 }
 
 
-/* 6. Figure captions ----------------------------------------------------- */
+/* 8. Table notes ================================================================================== */
+/* `tbl_note()` emits `<p class="table-note">` on the rendered path, or the warn variant. Neither had
+   any styling, so a caveat about a column arrived as an ordinary paragraph and read as prose rather
+   than as an annotation on the table above it. */
+
+p.table-note {
+  font-family: var(--mc-font-ui);
+  font-size: var(--mc-size-small);
+  line-height: 1.55;
+  color: var(--mc-ink-soft);
+  background: var(--mc-surface);
+  border-left: 3px solid #ccd2da;
+  border-radius: 0 var(--mc-radius) var(--mc-radius) 0;
+  padding: 9px 14px;
+  margin: -0.4em 0 1.4em 0;   /* pulled up: it belongs to the table above it */
+}
+
+p.table-note.table-note-warn {
+  color: var(--mc-warn);
+  background: var(--mc-warn-bg);
+  border-left-color: #e0b34d;
+}
+
+/* Consecutive notes read as one block. */
+p.table-note + p.table-note {
+  margin-top: -1.1em;
+  border-top: 1px solid rgba(0, 0, 0, 0.04);
+  border-radius: 0;
+}
+
+
+/* 9. Figures ====================================================================================== */
+
+.cell-output-display,
+.quarto-figure {
+  margin: 1.6em 0;
+}
+
+.quarto-figure img,
+figure img,
+img.figure-img,
+img.img-fluid {
+  max-width: 100%;
+  height: auto;
+  display: block;
+  margin: 0 auto;
+}
+
+figure {
+  margin: 0;
+}
 
 figcaption,
 .figure-caption,
 .quarto-figure figcaption {
-  font-style: italic;
-  font-size: 0.9em;
+  font-family: var(--mc-font-ui);
+  font-size: var(--mc-size-small);
+  line-height: 1.55;
+  color: var(--mc-ink-soft);
   text-align: center;
-  color: #333;
-  margin-top: 0.5em;
+  margin-top: 0.9em;
 }
 
 
-/* 7. Code ---------------------------------------------------------------- */
+/* 10. Links, lists and rules ====================================================================== */
 
-pre, code {
-  font-family: "Consolas", "Menlo", monospace !important;
-}
-
-/* inline code */
-code:not(pre code) {
-  font-size: 0.9em;
-  color: #24292e;
-}
-
-/* code blocks: bumped up from the old 0.7em for legibility */
-pre.sourceCode,
-div.sourceCode pre {
-  font-size: 0.82em;
-  line-height: 1.45;
-  border: 1px solid #e6e6e6;
-  border-radius: 4px;
-  padding: 0.6em 0.8em;
-  overflow-x: auto;
-}
-
-/* code-fold toggle: small and unobtrusive */
-details.code-fold > summary,
-details.code-fold > summary code {
-  font-family: "Consolas", "Menlo", monospace;
-  font-size: 0.8em;
-  color: #666;
-  cursor: pointer;
-}
-details.code-fold > summary:hover {
-  color: #1a1a1a;
-}
-
-
-/* 8. Links (content only; TOC links keep their own styling) -------------- */
-
-main a:not(.sidebar a),
-article a {
-  color: #1a4f8a;
+main a:not(.anchorjs-link),
+article a:not(.anchorjs-link) {
+  color: var(--mc-accent);
   text-decoration: none;
+  border-bottom: 1px solid rgba(44, 95, 138, 0.28);
+  transition: border-color 0.12s ease;
 }
-main a:not(.sidebar a):hover,
-article a:hover {
-  text-decoration: underline;
-}
-
-
-/* 9. Layout fixes (single-column flow under theme: none) ----------------- */
-
-.page-columns,
-.column-screen,
-.column-page {
-  display: block !important;
+main a:not(.anchorjs-link):hover,
+article a:not(.anchorjs-link):hover {
+  border-bottom-color: var(--mc-accent);
 }
 
+main ul, main ol, article ul, article ol {
+  padding-left: 1.5em;
+  margin: 0 0 1em 0;
+}
+main li, article li {
+  margin: 0.3em 0;
+}
 
-/* 10. Responsive (stack TOC above content on narrow screens) ------------- */
+main hr, article hr {
+  border: none;
+  border-top: 1px solid var(--mc-rule);
+  margin: 2.4em 0;
+}
 
-@media (max-width: 991.98px) {
+main blockquote, article blockquote {
+  margin: 1.4em 0;
+  padding: 2px 0 2px 18px;
+  border-left: 3px solid var(--mc-rule);
+  color: var(--mc-ink-soft);
+}
+
+strong { font-weight: 650; }
+
+
+/* 11. Responsive ================================================================================== */
+/* Below the breakpoint the rail stops being a rail and becomes a collapsed block above the content.
+   Console blocks keep `white-space: pre` here too: a narrow screen gets a scrollbar, which is the
+   correct outcome for a fixed-width table. */
+
+@media (max-width: 1100px) {
   body #TOC,
+  body nav#TOC,
+  body #quarto-sidebar-toc-left,
   body nav.sidebar-navigation,
   body div.sidebar,
   body .sidebar-menu[role="doc-toc"] {
-    display: block;
     position: relative;
     width: 100%;
     height: auto;
+    max-height: 320px;
     border-right: none;
-    border-bottom: 1px solid #e0e0e0;
-    padding-bottom: 20px;
-    margin-bottom: 20px;
+    border-bottom: 1px solid var(--mc-rule);
+    padding: 20px 24px;
   }
 
   body main,
   body article,
-  body div.quarto-document {
+  body div.quarto-document,
+  body #quarto-document-content {
     margin-left: 0 !important;
-    width: 100% !important;
-    padding-left: 0;
+    max-width: 100% !important;
+    padding: 28px 20px 80px 20px;
   }
+
+  main h1, article h1 { font-size: 21px; }
+  main h2, article h2 { font-size: 17.5px; }
+}
+
+
+/* 12. Print ======================================================================================= */
+/* These get printed and attached to correspondence. The rail is not useful on paper and the fold
+   toggles have to be open or the code is simply absent. */
+
+@media print {
+  body #TOC,
+  body nav#TOC,
+  body #quarto-sidebar-toc-left,
+  body .sidebar {
+    display: none !important;
+  }
+
+  body main,
+  body article,
+  body #quarto-document-content {
+    margin-left: 0 !important;
+    max-width: 100% !important;
+    padding: 0 !important;
+  }
+
+  details.code-fold > summary { display: none; }
+  details.code-fold[open] > div.sourceCode { display: block; }
+
+  .cell-output pre,
+  .cell-output-stderr pre,
+  .cell-output-stdout pre,
+  div.sourceCode {
+    border: 1px solid #bbb;
+    background: #fff;
+    white-space: pre-wrap;      /* paper cannot scroll */
+    word-break: break-all;
+  }
+
+  main h1, article h1 { break-after: avoid; }
+  table, figure { break-inside: avoid; }
+  a { border-bottom: none !important; color: var(--mc-ink) !important; }
 }
