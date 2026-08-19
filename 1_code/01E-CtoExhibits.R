@@ -25,6 +25,19 @@
 # the body for "amend" instead finds "to a Form 10-K filed on August 23, 2018, as amended", which
 # describes the source filing and not the order, and marks a fifth of plain grants as amendments.
 #
+# WHAT IS RECOMPUTED, AND WHAT IS NOT
+# The linkage joins against two tables that dwarf everything else here: every filing EDGAR ever
+# published, and every Exhibit 10 in the corpus. Collecting the first alone is the single most
+# expensive thing this document does -- the orders themselves are sixteen thousand kilobyte letters.
+# Both are a deterministic function of 01A's mirror and 01C's consolidated table, so cto_link_tables()
+# takes .rerun, defaulting to FALSE, and fingerprints both before deciding.
+#
+# The output write is guarded too, and not for its size. 02B reads CtoExhibits.parquet, and a
+# fingerprint downstream is only as stable as the modification time of the file it points at.
+#
+# FIGURES ARE DEFINED HERE AND WRITTEN NOWHERE. The document displays what cto_plot_linkage()
+# returns; the consolidated release script writes the files the manuscript needs.
+#
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new ones; if (FALSE) dev blocks; pure
 # ASCII; parenthesised cli interpolation.
@@ -342,6 +355,134 @@ cto_parse_order <- function(.path) {
 }
 
 
+# 4b. What the linkage joins against ------------------------------------------------------------------------------------
+
+#' The two tables every reference is resolved against
+#'
+#' THE MASTER INDEX IS THE EXPENSIVE ONE, AND IT IS THE FULL ONE. Every filing EDGAR published, not
+#' only those we hold documents from: the restricted index is two and a half per cent of it, and
+#' joining against that reported half of the linkage failures as filings EDGAR had never heard of
+#' when they were indexed all along. Collecting it is minutes and hundreds of megabytes, and its
+#' contents cannot change unless the mirror does.
+#'
+#' THE EXHIBIT TABLE IS BUILT HERE RATHER THAN AFTER THE FILING HOP, because which filings hold
+#' exhibits is what breaks a tie between two filings of the same type on the same day.
+#'
+#' BOTH ARE SORTED. An Arrow scan makes no promise about the order in which record batches come back,
+#' so an unsorted collect writes a different file each time from unchanged input. Nothing here hashes
+#' these tables, but an artifact that changes between runs cannot be checked against a previous copy.
+#'
+#' @param .dir_master Directory of 01A's mirrored master index, unrestricted.
+#' @param .path_meta 01C's consolidated metadata.
+#' @param .paths_out List with exactly the names Master and Exhibits: the two cache destinations.
+#'   Checked rather than assumed, because `$` partial-matches on lists and a near-miss returns NULL.
+#' @param .path_stamp Parquet holding the fingerprint the two were built under.
+#' @param .rerun Logical. TRUE rebuilds regardless of the fingerprint.
+#' @return A named list: Master, Exhibits.
+cto_link_tables <- function(.dir_master, .path_meta, .paths_out, .path_stamp, .rerun = FALSE) {
+  if (FALSE) {
+    .dir_master <- .lP$Edgar$MasterIndex$DirParquet
+    .path_meta  <- .lP$Input$MetaData
+    .paths_out  <- list(Master = .lP$Cache$MasterIndex, Exhibits = .lP$Cache$Exhibits)
+    .path_stamp <- .lP$Cache$TargetStamp
+    .rerun      <- FALSE
+  }
+
+  need_ <- c("Master", "Exhibits")
+  if (!all(need_ %in% names(.paths_out))) {
+    cli::cli_abort(c(
+      "The destination list must carry exactly the names Master and Exhibits.",
+      "i" = "Received: {paste(names(.paths_out), collapse = ', ')}."
+    ))
+  }
+
+  stamp_ <- utils_dir_stamp(.dirs = c(.dir_master, .path_meta))
+
+  fresh_ <- !.rerun &&
+    all(fs::file_exists(as.character(unlist(.paths_out[need_])))) &&
+    identical(utils_stamp_read(.path = .path_stamp), stamp_)
+
+  if (fresh_) {
+    cli::cli_alert_info("Mirror and metadata unchanged: the two link tables were read from cache.")
+    return(purrr::map(.paths_out[need_], \(.p) arrow::read_parquet(file = .p)))
+  }
+
+  if (!.rerun && fs::file_exists(.path_stamp)) {
+    cli::cli_alert_warning("The mirror or the metadata has moved; the link tables are being rebuilt.")
+  }
+
+  master_ <- arrow::open_dataset(sources = .dir_master) |>
+    dplyr::select("CIK", "FormType", "DateFiled", "HashIndex") |>
+    dplyr::collect() |>
+    dplyr::distinct() |>
+    dplyr::arrange(.data$CIK, .data$FormType, .data$DateFiled, .data$HashIndex)
+
+  exhibits_ <- arrow::open_dataset(sources = .path_meta) |>
+    dplyr::filter(grepl("^Exhibit10", .data$DocTypeMod)) |>
+    dplyr::select("DocID", "HashIndex", "DocTypeRaw") |>
+    dplyr::collect() |>
+    dplyr::mutate(ExhibitNo = cto_exhibit_number(.x = .data$DocTypeRaw)) |>
+    dplyr::arrange(.data$DocID)
+
+  out_ <- list(Master = master_, Exhibits = exhibits_)
+
+  purrr::walk2(
+    .x = out_[need_],
+    .y = as.character(unlist(.paths_out[need_])),
+    .f = arrow::write_parquet
+  )
+  arrow::write_parquet(tibble::tibble(Stamp = stamp_), .path_stamp)
+
+  cli::cli_alert_success(
+    "Link tables rebuilt: {format(nrow(master_), big.mark = ',')} filings, \\
+     {format(nrow(exhibits_), big.mark = ',')} exhibits."
+  )
+
+  out_
+}
+
+
+# 4c. Deployment --------------------------------------------------------------------------------------------------------
+
+#' Write the linked references, if what produced them has moved
+#'
+#' NOT GUARDED FOR ITS SIZE. The file is small. It is guarded because 02B reads it, and a fingerprint
+#' downstream is only as stable as the modification time of the file it points at: rewriting this
+#' unconditionally would make every cache keyed on it miss on every render of this document, however
+#' identical the bytes.
+#'
+#' @param .tab The linked references, one row per reference.
+#' @param .path_out Destination parquet path; the published artifact.
+#' @param .stamp Character. The fingerprint of what determined the table, from utils_dir_stamp().
+#' @param .path_stamp Parquet holding the fingerprint .path_out was last written under.
+#' @param .rerun Logical. TRUE writes regardless of the fingerprint.
+#' @return .tab, invisibly.
+cto_write_exhibits <- function(.tab, .path_out, .stamp, .path_stamp, .rerun = FALSE) {
+  if (FALSE) {
+    .tab        <- tab_cto
+    .path_out   <- .lP$Output$CtoExhibits
+    .stamp      <- stamp_output
+    .path_stamp <- .lP$Cache$OutputStamp
+    .rerun      <- FALSE
+  }
+
+  fresh_ <- !.rerun &&
+    fs::file_exists(.path_out) &&
+    identical(utils_stamp_read(.path = .path_stamp), .stamp)
+
+  if (fresh_) {
+    cli::cli_alert_info("Inputs unchanged: {fs::path_file(.path_out)} was left as it stands.")
+    return(invisible(.tab))
+  }
+
+  arrow::write_parquet(.tab, .path_out)
+  arrow::write_parquet(tibble::tibble(Stamp = .stamp), .path_stamp)
+  cli::cli_alert_success("Written: {format(nrow(.tab), big.mark = ',')} references.")
+
+  invisible(.tab)
+}
+
+
 # 5. Linking -----------------------------------------------------------------------------------------------------------
 
 #' Strip an exhibit type down to its number, in a single spelling
@@ -394,17 +535,47 @@ cto_exhibit_number <- function(.x) {
 #' and where exactly one candidate has any the choice is determined rather than guessed. Where two
 #' do, the reference stays ambiguous.
 #'
+#' CACHED ON ITS RESULT, NOT ON ITS LOOKUP TABLES. Four grouped passes run over the full master index
+#' before a single reference is touched -- a distinct, a count, and two grouped filters across some
+#' eighteen million rows -- and that is the whole cost of this step; joining forty thousand references
+#' to the result is free by comparison. Caching those intermediates would mean half a gigabyte of
+#' parquet for tables of fifteen million rows each, where the answer they produce is four megabytes.
+#'
+#' THE KEY COVERS BOTH SIDES. The two link tables enter through their own cache files, so a rebuilt
+#' mirror or metadata invalidates this transitively; the references enter as a hash of their join
+#' keys, sorted so that it does not depend on the order Arrow happened to return them in; and the
+#' tolerance enters directly, because changing it changes which references resolve.
+#'
 #' @param .tab_ref Parsed references, carrying CIK, UseForm and UseFiledOn.
 #' @param .tab_mst The master index. Pass the unrestricted one.
 #' @param .hash_docs Character vector of HashIndex values from which exhibits were acquired.
 #' @param .tolerance Integer. Days either side to accept where no exact match exists. 0 disables it.
+#' @param .stamp Character. Fingerprint of what determines the result, from utils_dir_stamp().
+#' @param .path_cache Parquet holding the linked references and the fingerprint they were built under.
+#' @param .rerun Logical. TRUE re-links regardless of the fingerprint.
 #' @return .tab_ref with nFilings, HashIndex, DateTolerated and TieBroken added.
-cto_link_filing <- function(.tab_ref, .tab_mst, .hash_docs = character(0), .tolerance = 3L) {
+cto_link_filing <- function(.tab_ref, .tab_mst, .hash_docs = character(0), .tolerance = 3L,
+                            .stamp, .path_cache, .rerun = FALSE) {
   if (FALSE) {
-    .tab_ref   <- tab_refs
-    .tab_mst   <- tab_master
-    .hash_docs <- unique(tab_exhibits$HashIndex)
-    .tolerance <- 3L
+    .tab_ref    <- tab_refs
+    .tab_mst    <- tab_master
+    .hash_docs  <- unique(tab_exhibits$HashIndex)
+    .tolerance  <- 3L
+    .stamp      <- stamp_link
+    .path_cache <- .lP$Cache$Linked
+    .rerun      <- FALSE
+  }
+
+  if (!.rerun && identical(utils_stamp_read(.path = .path_cache), .stamp)) {
+    out_ <- dplyr::select(arrow::read_parquet(file = .path_cache), -"Stamp")
+    cli::cli_alert_info(
+      "References and index unchanged: {format(nrow(out_), big.mark = ',')} links read from cache."
+    )
+    return(out_)
+  }
+
+  if (!.rerun && fs::file_exists(.path_cache)) {
+    cli::cli_alert_warning("The references, the index or the tolerance has moved; re-linking.")
   }
 
   key_ <- .tab_mst |>
@@ -438,14 +609,14 @@ cto_link_filing <- function(.tab_ref, .tab_mst, .hash_docs = character(0), .tole
       DateTolerated = 0L
     )
 
-  if (.tolerance <= 0L) return(out_)
+  if (.tolerance <= 0L) return(cto_cache_linked(.tab = out_, .stamp = .stamp, .path_cache = .path_cache))
 
   # Only the references with no exact match are retried, and only a unique neighbour is accepted.
   miss_ <- out_ |>
     dplyr::filter(.data$nFilings == 0L, !is.na(.data$UseForm), !is.na(.data$UseFiledOn)) |>
     dplyr::select(-"HashIndex", -"nFilings", -"DateTolerated", -"TieBroken")
 
-  if (nrow(miss_) == 0L) return(out_)
+  if (nrow(miss_) == 0L) return(cto_cache_linked(.tab = out_, .stamp = .stamp, .path_cache = .path_cache))
 
   near_ <- miss_ |>
     dplyr::distinct(.data$CIK, .data$UseForm, .data$UseFiledOn) |>
@@ -470,7 +641,31 @@ cto_link_filing <- function(.tab_ref, .tab_mst, .hash_docs = character(0), .tole
       HashIndex     = dplyr::if_else(.data$DateTolerated == 1L, .data$NearHash, .data$HashIndex),
       nFilings      = dplyr::if_else(.data$DateTolerated == 1L, 1L, .data$nFilings),
       NearHash      = NULL
-    )
+    ) |>
+    cto_cache_linked(.stamp = .stamp, .path_cache = .path_cache)
+}
+
+#' Write the linked references to their cache and return them
+#'
+#' Split out because cto_link_filing() has three exit points -- tolerance disabled, nothing left to
+#' retry, and the full path -- and a cache written at only some of them is a cache that appears to
+#' work until the day the input takes another branch.
+#'
+#' @param .tab The linked references.
+#' @param .stamp Character. The fingerprint they were built under.
+#' @param .path_cache Destination parquet.
+#' @return .tab, unchanged.
+cto_cache_linked <- function(.tab, .stamp, .path_cache) {
+  if (FALSE) {
+    .tab        <- out_
+    .stamp      <- stamp_link
+    .path_cache <- .lP$Cache$Linked
+  }
+
+  arrow::write_parquet(dplyr::mutate(.tab, Stamp = .stamp), .path_cache)
+  cli::cli_alert_success("Re-linked: {format(nrow(.tab), big.mark = ',')} references, cached.")
+
+  .tab
 }
 
 #' Find the document each reference names, inside its filing
@@ -487,9 +682,12 @@ cto_link_filing <- function(.tab_ref, .tab_mst, .hash_docs = character(0), .tole
 #' rest point at earlier filings. Both are limits worth quoting and neither is a fault, but only
 #' separately.
 #'
+#' THE RESULT IS SORTED. This is what gets published, and an artifact that changes between runs over
+#' unchanged input cannot be checked against a previous copy.
+#'
 #' @param .tab_ref Output of cto_link_filing().
 #' @param .tab_docs Exhibit-10 documents, carrying HashIndex, DocID and a bare exhibit number.
-#' @return .tab_ref with nDocs, nInFiling, DocIDContract and LinkStatus added.
+#' @return .tab_ref with nDocs, nInFiling, DocIDContract and LinkStatus added, ordered.
 cto_link_document <- function(.tab_ref, .tab_docs) {
   if (FALSE) {
     .tab_ref  <- tab_linked
@@ -530,7 +728,8 @@ cto_link_document <- function(.tab_ref, .tab_docs) {
         grepl("\\(", .data$ExhibitNo)                  ~ "8-lettered exhibit number",
         .default                                       = "9-exhibit not among those acquired"
       )
-    )
+    ) |>
+    dplyr::arrange(.data$DocID, .data$ExhibitNo)
 }
 
 
@@ -612,12 +811,53 @@ cto_link_by_year <- function(.tab) {
 #'
 #' @param .tab One row per reference, linked.
 #' @return Invisibly NULL.
-cto_report_all <- function(.tab) {
+#' How the filing hop resolved
+#'
+#' PULLED OUT OF THE REPORTER. It was computed inline inside cto_report_all(), which put a
+#' substantive summary -- how many references resolved exactly, how many needed the tie-break, how
+#' many needed the date tolerance -- inside a function whose job is to print. A compute function
+#' returns it, so the numbers stay available after they have been displayed and the reporter is
+#' called twice without deriving them twice.
+#'
+#' @param .tab The linked references.
+#' @return A one-row tibble: nRefs, nExact, nTieBroken, nTolerated, nAmbiguous, nNotInEdgar.
+cto_filing_hop <- function(.tab) {
   if (FALSE) .tab <- tab_cto
+
+  .tab |>
+    dplyr::filter(!is.na(.data$ExhibitNo)) |>
+    dplyr::summarise(
+      nRefs        = dplyr::n(),
+      nExact       = sum(.data$nFilings == 1L & .data$DateTolerated == 0L & .data$TieBroken == 0L),
+      nTieBroken   = sum(.data$TieBroken == 1L),
+      nTolerated   = sum(.data$DateTolerated == 1L),
+      nAmbiguous   = sum(.data$nFilings > 1L),
+      nNotInEdgar  = sum(.data$nFilings == 0L)
+    )
+}
+
+#' Every report in this document, in order
+#'
+#' TAKES THE FOUR SUMMARIES, DOES NOT COMPUTE THEM. This block is shown twice, in Results and again
+#' in the Overview, and computing them at each call leaves two sets of numbers that must agree by
+#' construction and are derived independently.
+#'
+#' @param .tab_ord Output of cto_order_summary().
+#' @param .tab_fmt Output of cto_format_summary().
+#' @param .tab_hop Output of cto_filing_hop().
+#' @param .tab_lnk Output of cto_link_summary().
+#' @return Invisibly NULL.
+cto_report_all <- function(.tab_ord, .tab_fmt, .tab_hop, .tab_lnk) {
+  if (FALSE) {
+    .tab_ord <- tab_order_summary
+    .tab_fmt <- tab_format_summary
+    .tab_hop <- tab_filing_hop
+    .tab_lnk <- tab_link_summary
+  }
 
   tbl_head("What the orders are")
   tbl_out(
-    .tab   = cto_order_summary(.tab = .tab),
+    .tab   = .tab_ord,
     .title = NULL,
     .notes = c(
       Status      = "Read from the title line, which says what the order does.",
@@ -628,7 +868,7 @@ cto_report_all <- function(.tab) {
 
   tbl_head("Reference formats")
   tbl_out(
-    .tab   = cto_format_summary(.tab = .tab),
+    .tab   = .tab_fmt,
     .title = NULL,
     .notes = c(RefFormat = "inline and table name the source filing per exhibit; plain relies on \\
                             the one named in the opening paragraph.")
@@ -636,16 +876,7 @@ cto_report_all <- function(.tab) {
 
   tbl_head("Filing hop")
   tbl_out(
-    .tab = .tab |>
-      dplyr::filter(!is.na(.data$ExhibitNo)) |>
-      dplyr::summarise(
-        nRefs        = dplyr::n(),
-        nExact       = sum(.data$nFilings == 1L & .data$DateTolerated == 0L & .data$TieBroken == 0L),
-        nTieBroken   = sum(.data$TieBroken == 1L),
-        nTolerated   = sum(.data$DateTolerated == 1L),
-        nAmbiguous   = sum(.data$nFilings > 1L),
-        nNotInEdgar  = sum(.data$nFilings == 0L)
-      ),
+    .tab   = .tab_hop,
     .title = NULL,
     .notes = c(
       nTieBroken = "Several filings matched; exactly one had exhibits, so the choice was determined.",
@@ -655,7 +886,7 @@ cto_report_all <- function(.tab) {
 
   tbl_head("Linkage")
   tbl_out(
-    .tab    = cto_link_summary(.tab = .tab),
+    .tab    = .tab_lnk,
     .title  = NULL,
     .pct    = "Share",
     .digits = 1L,
@@ -668,6 +899,8 @@ cto_report_all <- function(.tab) {
 
 
 # 7. Figures -----------------------------------------------------------------------------------------------------------
+# DEFINED HERE, WRITTEN NOWHERE. The document displays what this returns and the consolidated release
+# script writes the files the manuscript needs.
 
 #' Linkage outcome per year
 #'

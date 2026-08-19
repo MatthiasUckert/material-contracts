@@ -3,7 +3,7 @@
 # WHAT THIS FILE DOES
 # EDGAR publishes a quarterly master index of every filing since 1993. For each filing there is a
 # landing page listing the documents attached to it. 01A mirrors both and parses the landing HTML
-# into one table, LandingPageAll.parquet, holding twenty-one metadata fields per filing.
+# into one table, Output/LandingPageAll.parquet, holding twenty-one metadata fields per filing.
 #
 # It does not download any attachment. That is 01B, which uses the links mirrored here to decide
 # what to fetch. The two are separate scripts because they fail differently and at different scales:
@@ -22,6 +22,30 @@
 # reports it, so an incomplete mirror is a visible result rather than a silent assumption. Gating a
 # step and skipping a step are different things, and only the first is honest.
 #
+# THE CACHE CONTRACT
+# Four steps here are expensive and are each a deterministic function of what the mirror currently
+# holds: selecting the frame, measuring coverage, parsing the landing HTML, and cleaning the parsed
+# tables into one file. Each takes .rerun, defaulting to FALSE, and each stamps its cache with
+# utils_dir_stamp() over the directories it read. Three outcomes, and every one of them says so on
+# the console:
+#
+#   stamp matches   -> the cached result is read; no work is done
+#   stamp differs   -> the input moved, so the step recomputes and restamps
+#   .rerun = TRUE   -> the step recomputes regardless
+#
+# THIS IS NOT eval: false. Every chunk in the document executes, reports and validates on every
+# render. What the stamp removes is recomputation of something provably unchanged, which is exactly
+# what makes it safe to leave every check switched on.
+#
+# WHERE THE STAMP LIVES. A cache parquet carries a Stamp column and the function strips it before
+# returning, so no caller ever sees the bookkeeping. LandingPageAll.parquet is the one exception: it
+# is a published artifact and must carry nothing but its own data, so its stamp sits beside it in
+# Cache/CleanStamp.parquet.
+#
+# FIGURES ARE NOT WRITTEN HERE. This file defines the plot and the document displays it; the
+# consolidated release script calls the same function to write files for the manuscript. A figure
+# written by every script is a figure rewritten on every render of a document that did not change it.
+#
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new ones; if (FALSE) dev blocks; pure
 # ASCII; parenthesised cli interpolation.
@@ -34,7 +58,8 @@ if (FALSE) {
   .path_out    <- .lP$Output$LandingPageAll
   .forms       <- edg_sec_forms()
   .max_year    <- 2024L
-  .workers     <- 10L
+  .workers     <- 24L
+  .rerun       <- FALSE
 }
 
 
@@ -69,29 +94,63 @@ edg_sec_forms <- function() {
 #'
 #' The master index is the population; this is the frame drawn from it. Restricting to the relevant
 #' form types and to filings up to a fixed final year is the entire sample definition at this stage,
-#' which is why it is a function of three explicit arguments rather than of anything read from the
+#' which is why it is a function of explicit arguments rather than of anything read from the
 #' surrounding environment.
 #'
 #' The year ceiling is a closure rule, not a data limit. EDGAR keeps publishing, so an open-ended
 #' frame would grow between renders and no two runs of the pipeline would describe the same corpus.
 #'
+#' CACHED, BECAUSE IT SCANS THE WHOLE MASTER INDEX to answer a question whose answer moves only when
+#' the index is re-acquired or the form vocabulary changes. Both enter the stamp, so an edit to
+#' edg_sec_forms() invalidates the cache without anyone having to remember to delete it.
+#'
+#' THE RESULT IS SORTED, AND THAT IS LOAD-BEARING RATHER THAN TIDY. A multi-file Arrow scan makes no
+#' promise about the order in which record batches come back, so two runs over identical input can
+#' return the same identifiers in a different order. edg_link_coverage() takes this vector into its
+#' own stamp, and an unsorted frame would hash differently on every render and defeat that cache.
+#'
 #' @param .dir_master Directory of master-index parquet files.
 #' @param .forms Character vector of form types to keep; see edg_sec_forms().
 #' @param .max_year Integer. Latest year-quarter to include, as a four-digit year.
-#' @return Character vector of unique HashIndex values.
-edg_select_index <- function(.dir_master, .forms, .max_year) {
+#' @param .path_cache Parquet holding the frame and the stamp it was built under.
+#' @param .rerun Logical. TRUE rebuilds regardless of the stamp.
+#' @return Character vector of unique HashIndex values, sorted.
+edg_select_index <- function(.dir_master, .forms, .max_year, .path_cache, .rerun = FALSE) {
   if (FALSE) {
     .dir_master <- .lP$Edgar$MasterIndex$DirParquet
     .forms      <- edg_sec_forms()
     .max_year   <- 2024L
+    .path_cache <- .lP$Cache$FrameIndex
+    .rerun      <- FALSE
   }
 
-  arrow::open_dataset(sources = .dir_master) |>
+  stamp_ <- utils_dir_stamp(
+    .dirs  = .dir_master,
+    .extra = list(Forms = sort(.forms), MaxYear = .max_year)
+  )
+
+  if (!.rerun && identical(utils_stamp_read(.path = .path_cache), stamp_)) {
+    out_ <- arrow::read_parquet(file = .path_cache, col_select = "HashIndex")[["HashIndex"]]
+    cli::cli_alert_info("Frame unchanged: {format(length(out_), big.mark = ',')} filings, read from cache.")
+    return(out_)
+  }
+
+  if (!.rerun && fs::file_exists(.path_cache)) {
+    cli::cli_alert_warning("The master index or the form vocabulary has moved; the frame is being rebuilt.")
+  }
+
+  out_ <- arrow::open_dataset(sources = .dir_master) |>
     dplyr::filter(.data$FormType %in% .forms) |>
     dplyr::filter(.data$YearQuarter <= .max_year) |>
     dplyr::distinct(.data$HashIndex) |>
     dplyr::collect() |>
-    dplyr::pull(.data$HashIndex)
+    dplyr::pull(.data$HashIndex) |>
+    sort()
+
+  arrow::write_parquet(tibble::tibble(HashIndex = out_, Stamp = stamp_), .path_cache)
+  cli::cli_alert_success("Frame rebuilt: {format(length(out_), big.mark = ',')} filings, cached.")
+
+  out_
 }
 
 
@@ -99,7 +158,7 @@ edg_select_index <- function(.dir_master, .forms, .max_year) {
 
 #' How much of the selected frame has been mirrored
 #'
-#' The one number that decides whether the acquisition switch needs turning on. It is computed on
+#' The one number that decides whether the acquisition switch needs turning on. It is reported on
 #' every render, whether or not anything was acquired, because a document that cannot say how
 #' complete its own inputs are is not reporting a result.
 #'
@@ -108,21 +167,38 @@ edg_select_index <- function(.dir_master, .forms, .max_year) {
 #' were fetched whose document lists could not be parsed.
 #'
 #' THE FRAME IS PASSED IN, NOT RECOMPUTED. Selecting it scans the whole master index, and the
-#' document needs the same answer three times: to drive acquisition, to report coverage, and again in
-#' the overview. Computing it once and passing it is the difference between one scan and three.
+#' document needs the same answer twice: to drive acquisition and to report coverage.
+#'
+#' CACHED, BECAUSE THE MEASUREMENT SCANS EVERY MIRRORED QUARTER. Distinct HashIndex values across the
+#' landing-page datasets, plus a row count over the link tables, is minutes of work to restate a
+#' number that moves only when the mirror does. The frame enters the stamp alongside both
+#' directories, so a changed selection invalidates the cache even where the mirror stood still.
 #'
 #' @param .frame Character vector of HashIndex values in the selected frame.
 #' @param .path_htmls Directory of mirrored landing-page HTML.
 #' @param .path_links Directory of mirrored document-link tables.
+#' @param .path_cache Parquet holding the coverage row and the stamp it was measured under.
+#' @param .rerun Logical. TRUE re-measures regardless of the stamp.
 #' @return A one-row tibble: Selected, Mirrored, Missing, ShareMirrored, nLinkRows.
-edg_link_coverage <- function(.frame, .path_htmls, .path_links) {
+edg_link_coverage <- function(.frame, .path_htmls, .path_links, .path_cache, .rerun = FALSE) {
   if (FALSE) {
     .frame      <- vec_hash_index
     .path_htmls <- .lP$Edgar$DocLinks$DirMain$HTMLs
     .path_links <- .lP$Edgar$DocLinks$DirMain$Links
+    .path_cache <- .lP$Cache$LinkCoverage
+    .rerun      <- FALSE
   }
 
-  sel_ <- .frame
+  stamp_ <- utils_dir_stamp(.dirs = c(.path_htmls, .path_links), .extra = .frame)
+
+  if (!.rerun && identical(utils_stamp_read(.path = .path_cache), stamp_)) {
+    cli::cli_alert_info("Mirror unchanged: coverage read from cache.")
+    return(dplyr::select(arrow::read_parquet(file = .path_cache), -"Stamp"))
+  }
+
+  if (!.rerun && fs::file_exists(.path_cache)) {
+    cli::cli_alert_warning("The mirror or the frame has moved; coverage is being re-measured.")
+  }
 
   have_ <- arrow::open_dataset(sources = .path_htmls) |>
     dplyr::select("HashIndex") |>
@@ -130,15 +206,20 @@ edg_link_coverage <- function(.frame, .path_htmls, .path_links) {
     dplyr::collect() |>
     dplyr::pull(.data$HashIndex)
 
-  miss_ <- length(setdiff(sel_, have_))
+  miss_ <- length(setdiff(.frame, have_))
 
-  tibble::tibble(
-    Selected      = length(sel_),
-    Mirrored      = length(sel_) - miss_,
+  out_ <- tibble::tibble(
+    Selected      = length(.frame),
+    Mirrored      = length(.frame) - miss_,
     Missing       = miss_,
-    ShareMirrored = (length(sel_) - miss_) / length(sel_),
+    ShareMirrored = (length(.frame) - miss_) / length(.frame),
     nLinkRows     = nrow(arrow::open_dataset(sources = .path_links))
   )
+
+  arrow::write_parquet(dplyr::mutate(out_, Stamp = stamp_), .path_cache)
+  cli::cli_alert_success("Coverage re-measured and cached.")
+
+  out_
 }
 
 #' Report mirror coverage
@@ -189,49 +270,75 @@ edg_report_links <- function(.cov, .acquire) {
 #'
 #' Idempotent by inspection rather than by switch. Each year-quarter has one output file; the
 #' function reads whatever is already in it, parses only the HashIndex values not present, and
-#' appends. A completed quarter costs one parquet read. That is what makes it safe for the document
-#' to run this step unconditionally on every render, which in turn is what makes the render honest:
-#' a step cheap enough not to need a switch cannot be left switched off.
+#' appends. Parse failures are kept, not dropped: rGetEDGAR marks them with a non-zero Error column
+#' and edg_clean_landing() filters on it, so discarding them here would make the failure rate
+#' unobservable -- a page never written is indistinguishable from one never fetched.
 #'
 #' WORK IS SENT IN CHUNKS, NOT PER DOCUMENT. The obvious parallel map sends one landing page to a
 #' worker per call, and each landing page is a full HTML document; the serialisation cost then
 #' dominates the parse. Splitting a quarter into one chunk per worker turns tens of thousands of
 #' transfers into one per worker, and moves the same bytes once.
 #'
-#' Parse failures are kept, not dropped. rGetEDGAR marks them with a non-zero Error column, and
-#' edg_clean_landing() filters on it. Discarding them here would make the failure rate unobservable,
-#' since a page that was never written is indistinguishable from one that was never fetched.
-#'
 #' THE SKIP DECISION COSTS TWO COLUMN READS. Both sides are compared on HashIndex alone: the parsed
 #' table is read with col_select, and the source dataset contributes only its HashIndex column. The
 #' obvious formulation -- read the parsed table whole, and let Arrow filter the source -- makes every
-#' completed quarter pull its HTML through a filter to produce nothing, which is most of the runtime
-#' of a render that has no work to do.
+#' completed quarter pull its HTML through a filter to produce nothing.
+#'
+#' THE STAMP SITS IN FRONT OF EVEN THAT. Two column reads for each of a hundred and thirty quarters
+#' still adds up, and none of it can find work when neither the mirrored HTML nor the parsed tables
+#' have moved since the last render. The stamp covers both directories, so deleting a quarter from
+#' the cache invalidates it exactly as adding mirrored HTML does.
+#'
+#' DAEMONS START ON FIRST NEED. Twenty-four fresh R sessions cost seconds to raise and are pure waste
+#' on a render with nothing to parse, which after the first complete run is every render.
 #'
 #' @param .path_htmls Directory of mirrored landing-page HTML, one dataset per year-quarter.
 #' @param .dir_raw Destination directory for the per-quarter parsed tables.
+#' @param .path_cache Parquet holding the per-quarter log and the stamp it was written under.
 #' @param .workers Integer. Parallel workers; also the number of chunks each batch is split into.
 #' @param .batch Integer. Landing pages read into memory at once. Bounds peak memory on a large
 #'   quarter, where the HTML held plus a copy in every worker is what would exhaust it.
+#' @param .rerun Logical. TRUE rescans every quarter regardless of the stamp. It never re-parses a
+#'   HashIndex already present in a quarter's table; that skip is the function's own idempotence and
+#'   is not what .rerun controls.
 #' @param .quiet Logical. Suppress per-quarter progress.
 #' @return A tibble with one row per year-quarter: YQ, nExisting, nParsed, nTotal.
-edg_parse_landing <- function(.path_htmls, .dir_raw, .workers = 24L, .batch = 100000L, .quiet = FALSE) {
+edg_parse_landing <- function(.path_htmls, .dir_raw, .path_cache, .workers = 24L, .batch = 100000L,
+                              .rerun = FALSE, .quiet = FALSE) {
   if (FALSE) {
     .path_htmls <- .lP$Edgar$DocLinks$DirMain$HTMLs
     .dir_raw    <- .lP$Cache$RawExtract
+    .path_cache <- .lP$Cache$ParseLog
     .workers    <- 24L
     .batch      <- 100000L
+    .rerun      <- FALSE
     .quiet      <- FALSE
   }
 
   fs::dir_create(.dir_raw)
 
+  stamp_ <- utils_dir_stamp(.dirs = c(.path_htmls, .dir_raw))
+
+  if (!.rerun && identical(utils_stamp_read(.path = .path_cache), stamp_)) {
+    log_ <- dplyr::select(arrow::read_parquet(file = .path_cache), -"Stamp")
+    cli::cli_alert_info(
+      "Landing HTML unchanged: {nrow(log_)} quarter{?s} already parsed, log read from cache."
+    )
+    return(log_)
+  }
+
+  if (!.rerun && fs::file_exists(.path_cache)) {
+    cli::cli_alert_warning("Mirrored HTML or the parse cache has moved; every quarter is being rescanned.")
+  }
+
   src_ <- utils_list_files(.dirs = .path_htmls, .reg = NULL, .id = "YQ", .rec = FALSE) |>
     dplyr::mutate(YQ = gsub("DocHTMLs_", "", .data$YQ)) |>
     dplyr::arrange(.data$YQ)
 
-  mirai::daemons(.workers)
-  on.exit(mirai::daemons(0L), add = TRUE)
+  # Raised on first need and torn down on exit. started_ is read at exit rather than at registration,
+  # so a run that never parses anything never touches mirai at all.
+  started_ <- FALSE
+  on.exit(if (started_) mirai::daemons(0L), add = TRUE)
 
   out_ <- purrr::map(
     .x = seq_len(nrow(src_)),
@@ -260,6 +367,11 @@ edg_parse_landing <- function(.path_htmls, .dir_raw, .workers = 24L, .batch = 10
       if (!.quiet) cli::cli_alert_info("{yq_}: {length(seen_)} done, {n_todo_} to parse")
 
       if (n_todo_ > 0L) {
+        if (!started_) {
+          mirai::daemons(.workers)
+          started_ <<- TRUE
+        }
+
         # Read in batches. A quarter can hold millions of landing pages, and holding all of their
         # HTML plus a copy in every worker is the one way this step runs out of memory rather than
         # time. Each batch is read, dispatched, reduced to parsed rows, and dropped.
@@ -310,6 +422,17 @@ edg_parse_landing <- function(.path_htmls, .dir_raw, .workers = 24L, .batch = 10
   ) |>
     dplyr::bind_rows()
 
+  # RESTAMPED AFTER THE WORK, NOT BEFORE IT. Parsing writes into .dir_raw, which is half the stamp,
+  # so a stamp taken at the top would record a state that no longer holds and the next render would
+  # rescan every quarter to find nothing.
+  fresh_ <- utils_dir_stamp(.dirs = c(.path_htmls, .dir_raw))
+  arrow::write_parquet(dplyr::mutate(out_, Stamp = fresh_), .path_cache)
+  # THE ORDER MATTERS. cli takes its plural quantity from the LAST interpolation before the {?}
+  # marker, and format() hands it a length-one string, which reads as one. qty() prints nothing and
+  # must therefore sit after the formatted count.
+  n_ <- sum(out_$nParsed)
+  cli::cli_alert_success("Parsed {format(n_, big.mark = ',')} {cli::qty(n_)}landing page{?s}; log cached.")
+
   out_
 }
 
@@ -335,6 +458,12 @@ edg_parse_landing <- function(.path_htmls, .dir_raw, .workers = 24L, .batch = 10
 #' The rows kept are those with Error == 0. Parse failures remain in the per-quarter cache, so the
 #' failure rate stays computable from the two together.
 #'
+#' CACHED AGAINST THE PARSE CACHE, WHICH IS ITS ONLY INPUT. Binding every quarter, casting every
+#' column to character and sorting millions of rows is the single most expensive step in the
+#' document, and it is a pure function of what sits in .dir_raw. THE STAMP DOES NOT LIVE IN THE
+#' OUTPUT. LandingPageAll.parquet is published and read by three downstream scripts, so it carries
+#' nothing but its own columns; the stamp goes to .path_stamp under Cache/ instead.
+#'
 #' THE OUTPUT IS SORTED, AND THE SORT KEY IS CHOSEN FOR COMPRESSION. A multi-file Arrow scan does not
 #' guarantee the order in which record batches are returned, so two runs over identical inputs can
 #' write the same rows in a different order. Nothing downstream depends on order -- every consumer
@@ -348,12 +477,33 @@ edg_parse_landing <- function(.path_htmls, .dir_raw, .workers = 24L, .batch = 10
 #' and filer then break ties deterministically at no cost.
 #'
 #' @param .dir_raw Directory of per-quarter parsed tables written by edg_parse_landing().
-#' @param .path_out Destination parquet path.
-#' @return The cleaned tibble, invisibly; written to .path_out as a side effect.
-edg_clean_landing <- function(.dir_raw, .path_out) {
+#' @param .path_out Destination parquet path; the published artifact.
+#' @param .path_stamp Parquet under Cache/ holding the stamp .path_out was last built under.
+#' @param .rerun Logical. TRUE rebuilds regardless of the stamp.
+#' @return The cleaned tibble; written to .path_out as a side effect.
+edg_clean_landing <- function(.dir_raw, .path_out, .path_stamp, .rerun = FALSE) {
   if (FALSE) {
-    .dir_raw  <- .lP$Cache$RawExtract
-    .path_out <- .lP$Output$LandingPageAll
+    .dir_raw    <- .lP$Cache$RawExtract
+    .path_out   <- .lP$Output$LandingPageAll
+    .path_stamp <- .lP$Cache$CleanStamp
+    .rerun      <- FALSE
+  }
+
+  stamp_ <- utils_dir_stamp(.dirs = .dir_raw)
+  fresh_ <- !.rerun &&
+    fs::file_exists(.path_out) &&
+    identical(utils_stamp_read(.path = .path_stamp), stamp_)
+
+  if (fresh_) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "Parsed tables unchanged: {format(nrow(out_), big.mark = ',')} rows read from the published file."
+    )
+    return(out_)
+  }
+
+  if (!.rerun && fs::file_exists(.path_stamp)) {
+    cli::cli_alert_warning("The parsed tables have moved; the landing table is being rebuilt.")
   }
 
   out_ <- arrow::open_dataset(sources = .dir_raw, unify_schemas = TRUE) |>
@@ -379,7 +529,10 @@ edg_clean_landing <- function(.dir_raw, .path_out) {
     dplyr::arrange(.data$FilingDate, .data$HashIndex, .data$CIK, .data$FilmNo)
 
   arrow::write_parquet(out_, .path_out)
-  invisible(out_)
+  arrow::write_parquet(tibble::tibble(Stamp = stamp_), .path_stamp)
+  cli::cli_alert_success("Landing table rebuilt: {format(nrow(out_), big.mark = ',')} rows written.")
+
+  out_
 }
 
 
@@ -465,16 +618,23 @@ edg_landing_forms <- function(.tab) {
 
 #' Report the landing table
 #'
-#' @param .tab The cleaned landing table.
-#' @return The coverage tibble, invisibly.
-edg_report_landing <- function(.tab) {
-  if (FALSE) .tab <- arrow::read_parquet(.lP$Output$LandingPageAll)
-
-  cov_ <- edg_landing_coverage(.tab = .tab)
+#' TAKES THE TWO SUMMARIES, DOES NOT COMPUTE THEM. Both are group-bys over the full landing table,
+#' and the document shows them twice -- once in Results and once in the Overview -- while the figure
+#' needs the first of them a third time. Computing them once in the document and passing them here
+#' turns three passes over several million rows into one.
+#'
+#' @param .tab_year Output of edg_landing_coverage().
+#' @param .tab_forms Output of edg_landing_forms().
+#' @return .tab_year, invisibly.
+edg_report_landing <- function(.tab_year, .tab_forms) {
+  if (FALSE) {
+    .tab_year  <- tab_year
+    .tab_forms <- tab_forms
+  }
 
   tbl_head("Landing pages by year")
   tbl_out(
-    .tab    = cov_,
+    .tab    = .tab_year,
     .title  = NULL,
     .pct    = c("ShareNoRD", "ShareNoFD"),
     .digits = 1L,
@@ -488,7 +648,7 @@ edg_report_landing <- function(.tab) {
 
   tbl_head("Form-type composition")
   tbl_out(
-    .tab    = edg_landing_forms(.tab = .tab),
+    .tab    = .tab_forms,
     .title  = NULL,
     .pct    = "Share",
     .digits = 1L,
@@ -499,7 +659,7 @@ edg_report_landing <- function(.tab) {
     )
   )
 
-  invisible(cov_)
+  invisible(.tab_year)
 }
 
 #' Duplicate filers and duplicate rows
@@ -542,18 +702,20 @@ edg_landing_duplicates <- function(.tab, .key = c("HashIndex", "CIK", "FilmNo"))
 #' The block to copy out when the mirror needs checking without re-rendering.
 #'
 #' @param .cov Output of edg_link_coverage().
-#' @param .tab The cleaned landing table.
+#' @param .tab_year Output of edg_landing_coverage().
+#' @param .tab_forms Output of edg_landing_forms().
 #' @param .acquire Logical. The value of the acquisition switch.
 #' @return Invisibly NULL.
-edg_report_all_index <- function(.cov, .tab, .acquire) {
+edg_report_all_index <- function(.cov, .tab_year, .tab_forms, .acquire) {
   if (FALSE) {
-    .cov     <- tab_coverage
-    .tab     <- arrow::read_parquet(.lP$Output$LandingPageAll)
-    .acquire <- FALSE
+    .cov       <- tab_coverage
+    .tab_year  <- tab_year
+    .tab_forms <- tab_forms
+    .acquire   <- FALSE
   }
 
   edg_report_links(.cov = .cov, .acquire = .acquire)
-  edg_report_landing(.tab = .tab)
+  edg_report_landing(.tab_year = .tab_year, .tab_forms = .tab_forms)
 
   invisible(NULL)
 }
@@ -629,6 +791,10 @@ edg_check_own_output <- function(.dir_mirror, .own = c("MasterIndex", "DocumentL
 
 
 # 7. Figures -----------------------------------------------------------------------------------------------------------
+# DEFINED HERE, WRITTEN NOWHERE. The document displays what this returns and the consolidated release
+# script writes the files the manuscript needs. A figure saved by every script is a figure rewritten
+# on every render of a document that did not change it, and the manuscript then draws on files
+# produced at twenty different moments.
 
 #' Filings mirrored per year
 #'

@@ -77,7 +77,16 @@ tbl_fmt <- function(.tab, .indent = 2L) {
 
   is_num_ <- purrr::map_lgl(.tab, is.numeric)
   cells_  <- purrr::map2(.tab, is_num_, \(.col, .num) {
-    if (!.num) return(tidyr::replace_na(as.character(.col), "-"))
+    if (!.num) {
+      # A CELL HOLDING A NEWLINE DESTROYS THE COLUMN MODEL. Widths are computed with nchar() and the
+      # row is written as one line, so an embedded line break pushes every later cell of that row
+      # onto a line of its own with nothing above it naming what it is. It arrives whenever a table
+      # carries a condition message, since conditionMessage() keeps the newlines R put there.
+      # Whitespace is squished rather than the cell truncated: the content is usually a diagnostic
+      # and the informative part is at the front.
+      chr_ <- stringi::stri_replace_all_regex(as.character(.col), "\\s+", " ")
+      return(tidyr::replace_na(stringi::stri_trim_both(chr_), "-"))
+    }
     # A count that arrives as a double -- and most do, since n() / total, sum() and nrow() all
     # produce one -- would otherwise print as 874.000, which reads as a measurement carrying three
     # significant decimals rather than as a tally. Whole-valued columns holding anything above one
@@ -234,6 +243,38 @@ tbl_pct_safe <- function(.x, .digits = 1L) {
   dplyr::if_else(is.finite(.x), tbl_pct(.x, .digits = .digits), "-")
 }
 
+#' Fold a note written across several source lines back into one line
+#'
+#' NOTES ARE INTERPOLATED, NOT PARSED. tbl_out() emits a console note as `{(.col)}: {(.note)}`, so the
+#' note arrives as a value and cli never sees its content as a template. An R line continuation --
+#' a trailing backslash before the newline, which every note longer than the 125-column margin needs
+#' -- is therefore not a directive to cli but two literal characters, and the rendered page shows a
+#' stray backslash followed by the source file's indentation. The kable path shows the same thing in
+#' its footnotes. Cleaning here, once, at the only point where both paths converge, is what stops a
+#' formatting rule about source files from leaking into published output.
+#'
+#' Whitespace runs collapse to a single space, which is safe because a note is one sentence of prose
+#' about a column. Anything needing a line break is not a note.
+#'
+#' @param .notes Named character vector or NULL, exactly as a caller wrote it.
+#' @return The same vector with continuations folded and whitespace squished, names preserved; NULL
+#'   passes through so callers need no guard.
+tbl_notes_clean <- function(.notes) {
+  if (FALSE) {
+    .notes <- c(Share = "A handful of types outside the frame appear: the page's own FormType can \\
+                         disagree with the master index.")
+  }
+
+  if (is.null(.notes)) return(NULL)
+
+  out_ <- .notes |>
+    stringi::stri_replace_all_regex(pattern = "\\\\\\s*\\n", replacement = " ") |>
+    stringi::stri_replace_all_regex(pattern = "\\s+", replacement = " ") |>
+    stringi::stri_trim_both()
+
+  purrr::set_names(out_, names(.notes))
+}
+
 #' One table, rendered the way this document is set to render tables
 #'
 #' The single call site a report function needs. It takes the full specification -- what the columns
@@ -258,7 +299,9 @@ tbl_pct_safe <- function(.x, .digits = 1L) {
 #' @param .digits Integer. Decimals for the remaining numeric columns.
 #' @param .acc Numeric. Rounding accuracy for the percentage columns.
 #' @param .notes Named character vector or NULL. Caveats, named by the column each annotates. A note
-#'   naming a column that is absent is still shown, unattached, rather than silently dropped.
+#'   naming a column that is absent is still shown, unattached, rather than silently dropped. Notes
+#'   pass through tbl_notes_clean() first, so one written across several source lines reads as one
+#'   line on both paths.
 #' @param .summary_row Integer or NULL. Row set in bold with a rule above it, conventionally the last.
 #' @param .n Integer or NULL. Show only the first .n rows.
 #' @param .full_width Logical. Stretch to the page width. Rendered path only.
@@ -278,6 +321,10 @@ tbl_out <- function(.tab, .title = NULL, .groups = NULL, .pct = NULL, .digits = 
   }
   tab_ <- if (is.null(.n)) .tab else utils::head(.tab, .n)
 
+  # Cleaned once, before the paths diverge, so the console block and the rendered footnote cannot
+  # disagree about what a note says.
+  notes_ <- tbl_notes_clean(.notes = .notes)
+
   if (identical(tbl_mode(.mode = .mode), "console")) {
     shown_ <- tab_
     if (!is.null(.pct)) {
@@ -285,9 +332,9 @@ tbl_out <- function(.tab, .title = NULL, .groups = NULL, .pct = NULL, .digits = 
         dplyr::mutate(dplyr::across(dplyr::any_of(.pct), \(.x) tbl_pct_safe(.x, .digits = 1L)))
     }
     tbl_say(.tab = shown_, .title = .title)
-    if (!is.null(.notes)) {
+    if (!is.null(notes_)) {
       cli::cli_text("")
-      purrr::iwalk(.notes, function(.note, .col) {
+      purrr::iwalk(notes_, function(.note, .col) {
         if (nzchar(.col)) cli::cli_alert_info("{(.col)}: {(.note)}") else cli::cli_alert_info(.note)
       })
     }
@@ -312,7 +359,7 @@ tbl_out <- function(.tab, .title = NULL, .groups = NULL, .pct = NULL, .digits = 
     .pct         = .pct,
     .digits      = .digits,
     .acc         = .acc,
-    .notes       = .notes,
+    .notes       = notes_,
     .summary_row = .summary_row,
     .full_width  = .full_width
   ))

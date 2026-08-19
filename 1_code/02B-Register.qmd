@@ -8,6 +8,7 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
+here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # message = TRUE is required: cli writes through the message stream under knitr, so suppressing
@@ -21,7 +22,16 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+# TABLE MODE IS DECLARED, NOT DEFAULTED. tbl_out() reads this option and falls back to "console"
+# when nothing sets it, so a document that says nothing still renders console blocks -- but says
+# nothing about whether that was chosen. It is chosen: see "How results are reported" below. Setting
+# this to "kable" previews the styled path, and every chunk producing a table then needs
+# `#| results: asis` or knitr wraps the markup in a code block.
+options(
+  cli.num_colors = 1,          # plain ASCII; ANSI codes paste as garbage
+  cli.width      = 120,        # matches the 125-column source margin
+  mc.table_mode  = "console"   # "console" or "kable"
+)
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -107,6 +117,33 @@ Contracts, 8-K reports and CT orders are one file rather than three. Parquet kee
 group, so sorting by group means a reader asking only for 8-K documents skips the contract row groups without reading
 them. One artifact, and the column sets cannot drift apart.
 
+## What is recomputed, and what is not
+
+Two steps take a `.rerun` argument defaulting to `FALSE`, and each fingerprints its inputs before deciding.
+
+**The interval join** is the expensive one. It runs on three columns rather than forty -- only `DocID`, `CIK` and
+`DateFiled` decide which quarter a document falls in, and carrying the whole consolidated table through a non-equi
+join moves 1.77 million rows of text statistics for nothing. What is cached is the narrow result: six columns per
+document rather than forty-five.
+
+**The write** is guarded for a different reason. Five documents downstream read this register, and a fingerprint
+downstream is only as stable as the modification time of the file it points at. Rewriting it on every render would
+make every cache keyed on it miss although the bytes were identical -- which is precisely what 01C did to five
+documents before it was guarded.
+
+The ladder itself is not cached and runs on every render. It is the sample definition, it costs seconds, and a
+document that skipped it would be reporting a sample it had not applied.
+
+## How results are reported
+
+Tables print as fixed-width console blocks, and figures are displayed rather than saved. Both are deliberate and both
+are the same decision. A runbook is read while it runs and pasted into discussion, where a monospaced block survives
+being quoted into a mail or a chat window and a styled table does not.
+
+The per-group sample-selection tables are in the same category and are no longer written to disk. They are manuscript
+exhibits, `reg_sample_table()` produces them, and the consolidated release script calls it once at the end of the
+pipeline -- alongside the figures, the styled tables and the Stata export. Nothing downstream reads them.
+
 # Configuration
 
 ```{r}
@@ -115,15 +152,17 @@ them. One artifact, and the column sets cannot drift apart.
 
 .lP <- list(
   Input = list(
-    MetaData     = fs::path(.dir_meta, "FullMetaData.parquet"),                            # 01C
-    Item101      = here::here("2_output", "01D-Item101", "Item101.parquet"),               # 01D
-    CtoExhibits  = here::here("2_output", "01E-CtoExhibits", "CtoExhibits.parquet"),       # 01E
-    QuarterRange = here::here("2_output", "02A-Compustat", "QuarterRange.parquet")         # 02A
+    MetaData     = fs::path(.dir_meta, "Output", "FullMetaData.parquet"),                            # 01C
+    Item101      = here::here("2_output", "01D-Item101", "Output", "Item101.parquet"),               # 01D
+    CtoExhibits  = here::here("2_output", "01E-CtoExhibits", "Output", "CtoExhibits.parquet"),       # 01E
+    QuarterRange = here::here("2_output", "02A-Compustat", "Output", "QuarterRange.parquet")         # 02A
+  ),
+  Cache = list(
+    QuarterMatch = utils_file_path(.dir_main, "Cache", "QuarterMatch.parquet"),   # DocID to fiscal quarter
+    OutputStamp  = utils_file_path(.dir_main, "Cache", "OutputStamp.parquet")     # guards the register
   ),
   Output = list(
-    Documents = utils_file_path(.dir_main, "Documents.parquet"),   # the register
-    Overview  = utils_file_path(.dir_main, "Overview"),            # the selection tables
-    Figures   = utils_file_path(.dir_main, "Figures")
+    Documents = utils_file_path(.dir_main, "Output", "Documents.parquet")   # the register
   ),
   Param = list(
     YearMin   = 2001L,   # window floor; a research decision, argued below
@@ -139,7 +178,13 @@ if (length(miss_) > 0L) {
   cli::cli_abort("Missing input{?s}: {paste(names(miss_), unname(miss_), sep = ' -> ', collapse = '; ')}")
 }
 
-tibble::tibble(Input = names(need_), Path = unname(need_)) |> tbl_out(.title = "Inputs")
+# Reported relative to the project root. An absolute path is correct on one machine and wrong on
+# every other, and this page is published.
+tibble::tibble(
+  Input = names(need_),
+  Path  = as.character(fs::path_rel(unname(need_), start = here::here()))
+) |>
+  tbl_out(.title = "Inputs")
 ```
 
 # Merging
@@ -158,9 +203,16 @@ its disappearing.
 
 ```{r}
 #| label: merge-compustat
+stamp_merge <- utils_dir_stamp(
+  .dirs = c(.lP$Input$MetaData, .lP$Input$QuarterRange)   # the two the match is determined by
+)
+
 tab_merged <- reg_merge_compustat(
-  .path_meta = .lP$Input$MetaData,   # 01C's consolidated table, every document
-  .tab_range = tab_range             # one interval per firm-quarter, from 02A
+  .path_meta  = .lP$Input$MetaData,        # 01C's consolidated table, every document
+  .tab_range  = tab_range,                 # one interval per firm-quarter, from 02A
+  .stamp      = stamp_merge,               # computed above
+  .path_cache = .lP$Cache$QuarterMatch,    # DocID to fiscal quarter, and its fingerprint
+  .rerun      = FALSE                      # TRUE rematches regardless of the fingerprint
 ) |>
   dplyr::mutate(Group = edg_doc_group(.doc_type = .data$DocTypeMod))
 
@@ -195,7 +247,11 @@ tab_flagged <- tab_merged |>
   reg_sample_flags(.step_final = .lP$Param$StepFinal) |>
   reg_derive()
 
-dplyr::count(tab_flagged, SampleStepDesc)
+dplyr::count(tab_flagged, SampleStepDesc, name = "nDocs") |>
+  tbl_out(
+    .title = "Where the ladder places each document",
+    .notes = c(nDocs = "Every document is on exactly one step; the per-group tables below split this.")
+  )
 ```
 
 The window floor of `r .lP$Param$YearMin` is a research decision rather than a data limit: EDGAR carries filings from
@@ -227,54 +283,38 @@ tab_flagged <- reg_attach_cto(.tab = tab_flagged, .path_cto = .lP$Input$CtoExhib
 c(covered = sum(tab_flagged$HasCto), withExtension = sum(tab_flagged$CtoIsExtension))
 ```
 
-# Deployment
+# The register
+
+`reg_shape()` drops the path columns, orders the rest into identity, location, content, quality, filer, sample and
+attachment blocks, and sorts by group.
 
 ```{r}
-#| label: write-register
+#| label: shape-register
 tab_register <- reg_shape(.tab = tab_flagged)
-
-arrow::write_parquet(tab_register, .lP$Output$Documents)
-
-purrr::walk(
-  .x = sort(unique(tab_register$Group)),
-  .f = function(.g) {
-    arrow::write_parquet(
-      x    = reg_sample_table(.tab = tab_register, .group = .g),
-      sink = fs::path(.lP$Output$Overview, paste0("SampleSelect", .g, ".parquet"))
-    )
-  }
-)
 
 c(rows = nrow(tab_register), cols = ncol(tab_register))
 ```
 
-Nothing is exported to Stata. Format conversion is not this script's concern: every stage would otherwise carry its own
-exporter, they would drift in how they name and order things, and the tables would be rewritten on every render of a
-document that does not change them. One release script converts everything once, when the pipeline is complete.
+# Results
 
-A downstream script opens a document by rebuilding its path:
-
-```r
-utils_doc_path(
-  .dir_mirror = here::here("2_output", "01B-EdgarDocuments", "GetEDGAR"),
-  .doc_type   = tab$DocType,
-  .yq         = tab$YQ,
-  .doc_id     = tab$DocID
-)
-```
+Both summaries are shown here and again in the Overview, and the sample table is derived once per group. They are
+computed once and passed to both.
 
 ```{r}
-#| label: deploy-report
-fs::file_info(.lP$Output$Documents) |>
-  dplyr::select("path", "size") |>
-  tbl_out(.title = "Written")
-```
+#| label: summarise-register
+tab_group_summary <- reg_group_summary(.tab = tab_register)   # one row per group
 
-# Results
+lst_sample_tables <- sort(unique(tab_register$Group)) |>
+  purrr::set_names() |>
+  purrr::map(\(.g) reg_sample_table(.tab = tab_register, .group = .g))   # the ladder, per group
+```
 
 ```{r}
 #| label: report-all
-reg_report_all(.tab = tab_register)
+reg_report_all(
+  .tab_grp     = tab_group_summary,   # summarised above; the Overview restates the same two
+  .tab_samples = lst_sample_tables
+)
 ```
 
 # Validation
@@ -332,6 +372,64 @@ tab_register |>
   )
 ```
 
+# Deployment
+
+`Output/Documents.parquet` is the only artifact of this script, and it is written only when something that determines
+it has moved. The fingerprint covers all four inputs and the three sample parameters, so editing the window floor
+invalidates it on its own.
+
+That guard matters beyond disk time. Five documents downstream read this register, and a fingerprint downstream is only
+as stable as the modification time of the file it points at.
+
+Nothing else is written. No Stata export, no figure files, no styled tables, and no per-group sample-selection tables:
+one release script converts everything once, when the pipeline is complete. Every stage carrying its own exporter is
+how the naming and ordering of published tables drift apart.
+
+A downstream script opens a document by rebuilding its path:
+
+```r
+utils_doc_path(
+  .dir_mirror = here::here("2_output", "01B-EdgarDocuments", "GetEDGAR"),
+  .doc_type   = tab$DocType,
+  .yq         = tab$YQ,
+  .doc_id     = tab$DocID
+)
+```
+
+```{r}
+#| label: deploy-register
+stamp_register <- utils_dir_stamp(
+  .dirs  = unlist(.lP$Input),   # the corpus, the matching frame, and what 01D and 01E found
+  .extra = .lP$Param            # and the window and ladder parameters
+)
+
+reg_write_register(
+  .tab        = tab_register,          # one row per document
+  .path_out   = .lP$Output$Documents,  # the published artifact
+  .stamp      = stamp_register,        # computed above
+  .path_stamp = .lP$Cache$OutputStamp, # fingerprint the file was last written under
+  .rerun      = FALSE                  # TRUE writes regardless of the fingerprint
+)
+```
+
+```{r}
+#| label: deploy-report
+fs::file_info(path = c(unlist(.lP$Output), unlist(.lP$Cache))) |>
+  dplyr::transmute(
+    Kind    = c(rep("Output", length(.lP$Output)), rep("Cache", length(.lP$Cache))),
+    File    = as.character(fs::path_file(.data$path)),
+    Size    = .data$size,
+    Written = format(.data$modification_time, "%Y-%m-%d %H:%M")
+  ) |>
+  tbl_out(
+    .title = "Written",
+    .notes = c(
+      Kind    = "Only the Output row is read downstream; the rest make a re-render cheap.",
+      Written = "A cache older than this render means that step found its input unchanged."
+    )
+  )
+```
+
 # Overview
 
 ```{r}
@@ -340,24 +438,15 @@ tab_register |>
 #| fig-cap: "Material contracts per year, split by whether they reach the estimation sample, the
 #|   descriptive sample only, or neither. The gap between the two samples is Compustat coverage,
 #|   which removes far more than the quality rules do."
-gg_samples <- reg_plot_samples(.tab = dplyr::filter(tab_register, .data$Group == "Exhibit10"))
-
-plot_save(
-  .plot    = gg_samples,                # the figure
-  .name    = "register-samples",        # meaningful filename, not unnamed-chunk-N
-  .dir     = .lP$Output$Figures,        # figure destination
-  .height  = 3.4,                       # from the ladder: a time series is a low panel
-  .width   = 7.5,                       # the fixed project width
-  .formats = c("pdf", "png"),           # manuscript and web
-  .dpi     = 300                        # print resolution
-)
-
-gg_samples
+reg_plot_samples(.tab = dplyr::filter(tab_register, .data$Group == "Exhibit10"))
 ```
 
 ```{r}
 #| label: overview-all
-reg_report_all(.tab = tab_register)
+reg_report_all(
+  .tab_grp     = tab_group_summary,   # summarised once in Results
+  .tab_samples = lst_sample_tables
+)
 ```
 
 # Next

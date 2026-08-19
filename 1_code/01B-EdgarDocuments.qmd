@@ -8,6 +8,7 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
+here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # message = TRUE is required: cli writes through the message stream under knitr, so suppressing
@@ -21,7 +22,16 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+# TABLE MODE IS DECLARED, NOT DEFAULTED. tbl_out() reads this option and falls back to "console"
+# when nothing sets it, so a document that says nothing still renders console blocks -- but says
+# nothing about whether that was chosen. It is chosen: see "How results are reported" below. Setting
+# this to "kable" previews the styled path, and every chunk producing a table then needs
+# `#| results: asis` or knitr wraps the markup in a code block.
+options(
+  cli.num_colors = 1,          # plain ASCII; ANSI codes paste as garbage
+  cli.width      = 120,        # matches the 125-column source margin
+  mc.table_mode  = "console"   # "console" or "kable"
+)
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -111,11 +121,46 @@ clone refreshed whenever the original differs, and deleting it costs one re-run 
 regenerable duplicate against an ownership rule, and the duplicate is the cheaper thing to give up -- it rebuilds from
 one command, whereas a rule broken once has to be honoured by every script written afterwards.
 
+That is also why the mirror root is named on its own rather than filed under `Cache/` or `Output/`. Anything a later
+script reads goes in `Output/`; anything existing only to make a re-render cheap goes in `Cache/`; and the mirror is
+neither, because it holds both kinds of thing at once. `DocLinks/` is a genuine cache, the clone described above.
+`DocumentData/Parsed/` is the corpus. A heading meaning *safe to delete* over 1.46 million documents that cannot be
+rebuilt without 1.46 million requests is a heading somebody will eventually act on.
+
 ## The parsed tree is the only copy
 
 Documents are fetched with `.keep_orig = FALSE`, which discards the original bytes once parsing succeeds. There is no
 local source to re-parse from, and re-deriving the tree means one request per document at ten per second. That is why
 acquisition is gated, and why nothing in this document deletes anything.
+
+## What is recomputed, and what is not
+
+One step here is expensive: walking the parsed tree to build the `DocID` to `Path` index. It takes about a minute, over
+1.46 million files, and its answer cannot change unless a document was added or removed.
+
+`edg_index_documents()` therefore takes a `.rerun` argument defaulting to `FALSE`, and fingerprints the tree before
+deciding whether to walk it. The fingerprint is not a file listing -- listing the tree is the cost being avoided. It is
+the number of `DocType`/`YQ` directories and their modification times, which move whenever a document is added or
+removed inside one: roughly four hundred `stat` calls in place of one and a half million.
+
+Two consequences, and both are the point. The index stays honest, because it is rebuilt whenever the tree it describes
+has moved rather than whenever somebody remembers to ask. And the same call can be made twice -- once before the
+download to decide what is outstanding, once after to pick up whatever arrived -- with the second costing nothing on the
+common case where nothing arrived.
+
+What a directory timestamp cannot see is a document rewritten in place. Nothing here does that: each parsed document is
+written once and never returned to. Where that assumption needs testing, `.rerun = TRUE` forces the full walk.
+
+## How results are reported
+
+Tables print as fixed-width console blocks, and figures are displayed rather than saved. Both are deliberate and both
+are the same decision. A runbook is read while it runs and pasted into discussion, where a monospaced block survives
+being quoted into a mail or a chat window and a styled table does not.
+
+The publication versions are produced once, at the end of the pipeline, by the consolidated release script: styled
+tables from the same `tbl_out()` specifications, figure files from the same plotting functions. Producing them here
+instead would mean twenty scripts each writing part of the manuscript's exhibits, rewritten on every render of a
+document that changed none of them.
 
 # Configuration
 
@@ -125,15 +170,14 @@ acquisition is gated, and why nothing in this document deletes anything.
 
 .lP <- list(
   Input = list(
-    IndexMirror    = fs::path(.dir_index, "GetEDGAR"),                 # 01A's mirror, read only
-    LandingPageAll = fs::path(.dir_index, "LandingPageAll.parquet")    # written by 01A, read only
+    IndexMirror    = fs::path(.dir_index, "GetEDGAR"),                            # 01A's mirror, read only
+    LandingPageAll = fs::path(.dir_index, "Output", "LandingPageAll.parquet")     # written by 01A, read only
   ),
   Cache = list(
-    Mirror = utils_file_path(.dir_main, "GetEDGAR")   # this script's own root; staged links live here
+    TreeStamp = utils_file_path(.dir_main, "Cache", "TreeStamp.parquet")   # fingerprint the index was built under
   ),
   Output = list(
-    FilePaths = utils_file_path(.dir_main, "FilePaths.parquet"),   # the DocID to Path index
-    Figures   = utils_file_path(.dir_main, "Figures")              # figure files for the manuscript
+    FilePaths = utils_file_path(.dir_main, "Output", "FilePaths.parquet")   # the DocID to Path index
   ),
   Param = list(
     User    = "Matthias.Uckert@Outlook.com",   # SEC requires a contact address on every request
@@ -143,6 +187,11 @@ acquisition is gated, and why nothing in this document deletes anything.
   )
 )
 
+# THE MIRROR ROOT IS NEITHER CACHE NOR OUTPUT, and is named at the top level for that reason. It
+# holds the staged link tables, which are a cache, and the parsed corpus, which is irreplaceable.
+# See "Where the documents land" above.
+.lP$Mirror <- utils_file_path(.dir_main, "GetEDGAR")
+
 # 01A's tree is asserted to exist before it is resolved. get_directories() creates whatever is
 # missing, so calling it on an absent root would silently manufacture an empty mirror inside 01A's
 # directory instead of reporting that 01A has not run.
@@ -151,7 +200,7 @@ stopifnot("01A's mirror is missing; render 01A first" = fs::dir_exists(.lP$Input
 edgar_index_    <- rGetEDGAR::get_directories(.lP$Input$IndexMirror)   # 01A's, read only
 .lP$Input$Links <- edgar_index_$DocLinks$DirMain$Links
 
-.lP$Edgar <- rGetEDGAR::get_directories(.lP$Cache$Mirror)              # this script's own
+.lP$Edgar <- rGetEDGAR::get_directories(.lP$Mirror)                    # this script's own
 
 fs::file_exists(.lP$Input$LandingPageAll)
 ```
@@ -217,31 +266,38 @@ tab_selected <- dplyr::bind_rows(
 nrow(tab_selected)
 ```
 
-What is already on disk is subtracted from that. The parsed tree is itself the ledger: a `DocID` with a file under it
-has been retrieved, and nothing further needs to be remembered. A separate manifest would introduce a record that can
-disagree with the directory it describes, and the directory is the thing that matters.
+What is already on disk is subtracted from that. The parsed tree is the ledger: a `DocID` with a file under it has been
+retrieved, and nothing further needs to be remembered.
 
-The parsed tree is listed once here and the result reused. Walking it costs about a minute, the same answer is needed
-three times over, and re-listing would leave three answers that could differ.
+The index below is that ledger read into a table, not a second record that can drift from it. It is rebuilt whenever the
+tree's fingerprint has moved and reused otherwise, so the two cannot disagree without the disagreement being detected.
+The identical call appears again after the download, and that is the point rather than an oversight: the fingerprint
+moves exactly when the second answer would differ from the first.
 
 ```{r}
-#| label: list-on-disk
-vec_on_disk <- utils_list_files(
-  .dirs = .lP$Edgar$DocumentData$Parsed,   # root of the parsed tree
-  .reg  = NULL,                            # every file
-  .id   = "DocID",                         # identifier taken from the filename
-  .rec  = TRUE                             # descend into DocType and year-quarter
-)$DocID
+#| label: index-on-disk
+tab_index <- edg_index_documents(
+  .dir_parsed = .lP$Edgar$DocumentData$Parsed,   # root of the parsed tree
+  .path_out   = .lP$Output$FilePaths,            # the index downstream reads
+  .path_stamp = .lP$Cache$TreeStamp,             # fingerprint the index was built under
+  .rerun      = FALSE                            # TRUE re-walks regardless of the fingerprint
+)
+
+vec_on_disk <- tab_index$DocID
 
 length(vec_on_disk)
 ```
 
 ```{r}
 #| label: report-outstanding
+tab_outstanding <- edg_outstanding(
+  .tab_sel  = tab_selected,   # everything the rule selects
+  .ids_disk = vec_on_disk     # what is on disk
+)
+
 edg_report_selection(
-  .tab_sel  = tab_selected,        # everything the rule selects
-  .ids_disk = vec_on_disk,         # what is on disk
-  .acquire  = .lP$Param$Acquire    # reported, so a gap and a switch stay distinguishable
+  .tab_out = tab_outstanding,     # summarised above, not recomputed
+  .acquire = .lP$Param$Acquire    # reported, so a gap and a switch stay distinguishable
 )
 
 use_docids <- setdiff(tab_selected$DocID, vec_on_disk)
@@ -265,7 +321,7 @@ document and quantified in 01C rather than suppressed here.
 #| label: acquire-documents
 if (isTRUE(.lP$Param$Acquire) && length(use_docids) > 0L) {
   rGetEDGAR::edgar_download_document(
-    .dir       = .lP$Cache$Mirror,   # this script's own root: links staged in, documents written out
+    .dir       = .lP$Mirror,         # this script's own root: links staged in, documents written out
     .user      = .lP$Param$User,     # contact address sent with every request
     .doc_ids   = use_docids,         # only what is outstanding
     .keep_orig = FALSE,              # discard originals after parsing; see below
@@ -282,16 +338,22 @@ original bytes once parsing succeeds, which is why the parsed tree has no local 
 
 # Index
 
-The index is rebuilt only when something was fetched. Walking the tree takes minutes and its result cannot change unless
-a document was added, so the rebuild is keyed on the acquisition switch rather than on the outstanding count, which
-never reaches zero.
+The identical call from the Selection section, made again now that the download has run. If anything was fetched, the
+directories holding it carry a new modification time, the fingerprint differs and the tree is re-walked. If nothing was
+fetched -- which is every render once the corpus is complete -- the fingerprint is unchanged and this costs one small
+read.
+
+That is what the fingerprint buys over keying the rebuild on the acquisition switch. The switch says whether this render
+was *permitted* to add documents, not whether it did, so a permitted render that fetched nothing used to pay a full
+one-minute walk to reproduce the file it already had.
 
 ```{r}
-#| label: build-file-index
+#| label: rebuild-file-index
 tab_index <- edg_index_documents(
   .dir_parsed = .lP$Edgar$DocumentData$Parsed,   # root of the parsed tree
   .path_out   = .lP$Output$FilePaths,            # the index downstream reads
-  .rerun      = isTRUE(.lP$Param$Acquire)        # re-walk only if this render fetched anything
+  .path_stamp = .lP$Cache$TreeStamp,             # fingerprint the index was built under
+  .rerun      = FALSE                            # TRUE re-walks regardless of the fingerprint
 )
 
 nrow(tab_index)
@@ -299,10 +361,23 @@ nrow(tab_index)
 
 # Results
 
+The composition table is needed twice, here and in the Overview, and each computation groups the whole index. It is
+computed once and passed to both.
+
+```{r}
+#| label: summarise-corpus
+tab_composition <- edg_corpus_composition(.tab_idx = tab_index)   # one row per document type
+```
+
 ```{r}
 #| label: report-corpus
-edg_report_documents(.tab_idx = tab_index)
+edg_report_documents(.tab_cmp = tab_composition)
 ```
+
+The two tables in this document group the 8-K family differently, and the difference is not a discrepancy. Selection
+assigns a `Group` in the chunk above and puts current reports and their amendments together; this table takes `DocType`
+from the parsed tree, where the two are separate directories. The 292,740 8-K documents selected are the 284,240 8-K
+and 8,500 8-KA documents here.
 
 Quarter coverage differs by group because the forms carrying each began at different dates. Exhibit 10 runs the full
 EDGAR history; the 8-K item structure that makes Item 1.01 identifiable dates from the 2004 reform, and CT orders
@@ -347,29 +422,65 @@ Two things about where this script wrote. A nested `GetEDGAR/` inside its own ro
 tree differently from the rest of the document, leaving documents where nothing looks for them. And no document should
 ever appear under 01A's root, which this script reads from and must never write to.
 
+The second is counted rather than tested for existence, and the distinction matters here more than anywhere. Resolving
+01A's tree in the Configuration chunk calls `get_directories()`, which creates whatever is missing -- including a
+`DocumentData/` branch that 01A itself removes at the end of its own render. A check asking whether that directory
+exists therefore reports a violation this document committed against itself by looking. What is being asked is whether
+any *document* landed there, and the answer is a count.
+
+The path is reported relative to the project root. An absolute path is correct on one machine and wrong on every other,
+and this page is published.
+
 ```{r}
 #| label: validate-mirror-root
+# The count recurses, which is instantaneous over an empty tree and slow over a full one. That
+# asymmetry is acceptable: a slow answer here means documents are in a directory this script does
+# not own, which is worth waiting to learn.
+dir_docs_01a_ <- fs::path(.lP$Input$IndexMirror, "DocumentData")
+
 tibble::tibble(
-  ParsedRoot    = as.character(.lP$Edgar$DocumentData$Parsed),
-  StrayNested   = fs::dir_exists(fs::path(.lP$Cache$Mirror, "GetEDGAR")),
-  WroteInto01A  = fs::dir_exists(fs::path(.lP$Input$IndexMirror, "DocumentData"))
+  ParsedRoot  = as.character(fs::path_rel(.lP$Edgar$DocumentData$Parsed, start = here::here())),
+  StrayNested = fs::dir_exists(fs::path(.lP$Mirror, "GetEDGAR")),
+  DocsIn01A   = if (fs::dir_exists(dir_docs_01a_)) {
+    length(fs::dir_ls(path = dir_docs_01a_, recurse = TRUE, type = "file"))
+  } else {
+    0L
+  }
 ) |>
   tbl_out(
     .title = "Where this script wrote",
-    .notes = c(WroteInto01A = "Must be FALSE. Documents under 01A's root mean this script wrote outside its own.")
+    .notes = c(
+      StrayNested = "Must be FALSE. TRUE means the download resolved a different tree from the rest of this document.",
+      DocsIn01A   = "Must be zero. The empty branch itself is created by this document's own get_directories() call."
+    )
   )
 ```
 
 # Deployment
 
-`FilePaths.parquet` is the only artifact of this script, and the single writer of the `DocID` to `Path` mapping. Every
-later script reads it rather than re-walking the tree.
+`Output/FilePaths.parquet` is the only artifact of this script, and the single writer of the `DocID` to `Path` mapping.
+Every later script reads it rather than re-walking the tree.
+
+Nothing else is written. No figure files, no styled tables: those are the release script's job, for the reason set out
+under *How results are reported*. The one other file this script owns is `Cache/TreeStamp.parquet`, which records the
+fingerprint the index was built under and exists solely so the next render can tell whether the walk is needed.
 
 ```{r}
 #| label: deploy-report
-fs::file_info(.lP$Output$FilePaths) |>
-  dplyr::select("path", "size") |>
-  tbl_out(.title = "Written")
+fs::file_info(path = c(.lP$Output$FilePaths, .lP$Cache$TreeStamp)) |>
+  dplyr::transmute(
+    Kind    = c("Output", "Cache"),
+    File    = as.character(fs::path_file(.data$path)),
+    Size    = .data$size,
+    Written = format(.data$modification_time, "%Y-%m-%d %H:%M")
+  ) |>
+  tbl_out(
+    .title = "Written",
+    .notes = c(
+      Kind    = "Only the Output row is read downstream.",
+      Written = "A stamp older than this render means the tree had not moved and no walk was needed."
+    )
+  )
 ```
 
 # Overview
@@ -379,28 +490,15 @@ fs::file_info(.lP$Output$FilePaths) |>
 #| fig-height: 3.4
 #| fig-cap: "Documents retrieved per calendar year by group. The 8-K series begins in 2004, when the
 #|   item structure that makes a material-agreement report identifiable was introduced."
-gg_corpus <- edg_plot_corpus(.tab = edg_corpus_by_quarter(.tab_idx = tab_index))
-
-plot_save(
-  .plot    = gg_corpus,                 # the figure
-  .name    = "corpus-by-year",          # meaningful filename, not unnamed-chunk-N
-  .dir     = .lP$Output$Figures,        # figure destination
-  .height  = 3.4,                       # from the ladder: a time series is a low panel
-  .width   = 7.5,                       # the fixed project width
-  .formats = c("pdf", "png"),           # manuscript and web
-  .dpi     = 300                        # print resolution
-)
-
-gg_corpus
+edg_plot_corpus(.tab = edg_corpus_by_quarter(.tab_idx = tab_index))
 ```
 
 ```{r}
 #| label: overview-all
 edg_report_all_docs(
-  .lp       = .lP,             # configuration, so the reporters resolve their own paths
-  .tab_sel  = tab_selected,    # what the inclusion rule selects
-  .tab_idx  = tab_index,       # the index built above
-  .ids_disk = vec_on_disk      # the single listing of the parsed tree
+  .tab_out = tab_outstanding,     # summarised once above
+  .tab_cmp = tab_composition,     # likewise
+  .acquire = .lP$Param$Acquire    # so the backlog note reads the same as it did the first time
 )
 ```
 

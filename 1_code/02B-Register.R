@@ -49,31 +49,74 @@ if (FALSE) {
 #' fields to missing and keeping one row says what is true: the filing date does not determine a
 #' fiscal quarter for this firm, so no quarter is assigned.
 #'
+#' THE INTERVAL JOIN RUNS ON THREE COLUMNS, NOT ON FORTY. Only DocID, CIK and DateFiled decide which
+#' quarter a document falls in, and a non-equi join carrying the whole of the consolidated metadata
+#' through it moves 1.77 million rows of text statistics and filer flags for nothing. The match is
+#' computed narrow and joined back on DocID.
+#'
+#' CACHED, AND THE CACHE IS THE NARROW TABLE. Six columns per document rather than forty-five, so it
+#' is a few tens of megabytes rather than most of a gigabyte, and it is what the expensive step
+#' actually produces. The consolidated metadata is read either way, because the ladder below needs
+#' every column of it.
+#'
 #' @param .path_meta Path to 01C's consolidated metadata.
 #' @param .tab_range Output of 02A's cmp_quarter_range().
+#' @param .stamp Character. Fingerprint of what determines the match, from utils_dir_stamp().
+#' @param .path_cache Parquet holding the match and the fingerprint it was built under.
+#' @param .rerun Logical. TRUE rematches regardless of the fingerprint.
 #' @return A tibble, one row per document, with the Compustat columns and nQuarters.
-reg_merge_compustat <- function(.path_meta, .tab_range) {
+reg_merge_compustat <- function(.path_meta, .tab_range, .stamp, .path_cache, .rerun = FALSE) {
   if (FALSE) {
-    .path_meta <- .lP$Input$MetaData
-    .tab_range <- tab_range
+    .path_meta  <- .lP$Input$MetaData
+    .tab_range  <- tab_range
+    .stamp      <- stamp_merge
+    .path_cache <- .lP$Cache$QuarterMatch
+    .rerun      <- FALSE
   }
 
-  arrow::open_dataset(sources = .path_meta) |>
-    dplyr::collect() |>
+  cols_ <- c("gvkey", "datadate", "fyear", "fqtr")
+  meta_ <- dplyr::collect(arrow::open_dataset(sources = .path_meta))
+
+  fresh_ <- !.rerun && identical(utils_stamp_read(.path = .path_cache), .stamp)
+
+  if (fresh_) {
+    link_ <- dplyr::select(arrow::read_parquet(file = .path_cache), -"Stamp")
+    cli::cli_alert_info(
+      "Corpus and matching frame unchanged: the quarter match was read from cache."
+    )
+    return(dplyr::left_join(meta_, link_, by = dplyr::join_by("DocID")))
+  }
+
+  if (!.rerun && fs::file_exists(.path_cache)) {
+    cli::cli_alert_warning("The corpus or the matching frame has moved; the quarter match is being rebuilt.")
+  }
+
+  link_ <- meta_ |>
+    dplyr::select("DocID", "CIK", "DateFiled") |>
     dplyr::left_join(
-      y  = dplyr::select(.tab_range, "CIK", "gvkey", "datadate", "fyear", "fqtr",
-                         "DateStart", "DateStop"),
+      y  = dplyr::select(.tab_range, "CIK", dplyr::all_of(cols_), "DateStart", "DateStop"),
       by = dplyr::join_by("CIK", "DateFiled" >= "DateStart", "DateFiled" < "DateStop")
     ) |>
     dplyr::mutate(nQuarters = dplyr::n(), .by = "DocID") |>
     dplyr::mutate(
       dplyr::across(
-        .cols = dplyr::all_of(c("gvkey", "datadate", "fyear", "fqtr")),
+        .cols = dplyr::all_of(cols_),
         .fns  = \(.x) dplyr::if_else(.data$nQuarters > 1L, NA, .x)
       )
     ) |>
-    dplyr::distinct(.data$DocID, .keep_all = TRUE) |>
-    dplyr::select(-dplyr::any_of(c("DateStart", "DateStop")))
+    # Selected before the deduplication rather than after it. Once the Compustat fields of an
+    # ambiguous document are missing, its several rows differ only in the window bounds, and
+    # dropping those first makes the surviving row identical whichever one distinct() keeps.
+    dplyr::select("DocID", dplyr::all_of(cols_), "nQuarters") |>
+    dplyr::distinct() |>
+    dplyr::arrange(.data$DocID)
+
+  arrow::write_parquet(dplyr::mutate(link_, Stamp = .stamp), .path_cache)
+  cli::cli_alert_success(
+    "Quarter match rebuilt: {format(nrow(link_), big.mark = ',')} documents, cached."
+  )
+
+  dplyr::left_join(meta_, link_, by = dplyr::join_by("DocID"))
 }
 
 
@@ -265,6 +308,53 @@ reg_shape <- function(.tab) {
 }
 
 
+# 4b. Deployment ---------------------------------------------------------------------------------------------------------
+
+#' Write the register, if what produced it has moved
+#'
+#' THE REASON IS NOT DISK TIME. Five documents downstream -- 03A, 03F, 04A, 04C and any analysis --
+#' read this file, and a fingerprint downstream is only as stable as the modification time of the
+#' file it points at. Rewriting it unconditionally moves that timestamp on every render of this
+#' document, so every cache keyed on it misses although the bytes are identical. 01C produced
+#' exactly that failure for five documents before it was guarded.
+#'
+#' THE REGISTER IS BUILT EITHER WAY. Only the write is guarded, so every check below runs on the
+#' object in memory and a skipped write leaves nothing unverified.
+#'
+#' @param .tab The register.
+#' @param .path_out Destination parquet path.
+#' @param .stamp Character. Fingerprint of what determines it, from utils_dir_stamp().
+#' @param .path_stamp Parquet under Cache/ holding the fingerprint it was last written under.
+#' @param .rerun Logical. TRUE writes regardless of the fingerprint.
+#' @return .tab, invisibly.
+reg_write_register <- function(.tab, .path_out, .stamp, .path_stamp, .rerun = FALSE) {
+  if (FALSE) {
+    .tab        <- tab_register
+    .path_out   <- .lP$Output$Documents
+    .stamp      <- stamp_register
+    .path_stamp <- .lP$Cache$OutputStamp
+    .rerun      <- FALSE
+  }
+
+  fresh_ <- !.rerun &&
+    fs::file_exists(.path_out) &&
+    identical(utils_stamp_read(.path = .path_stamp), .stamp)
+
+  if (fresh_) {
+    cli::cli_alert_info("Inputs unchanged: {fs::path_file(.path_out)} was left as it stands.")
+    return(invisible(.tab))
+  }
+
+  arrow::write_parquet(.tab, .path_out)
+  arrow::write_parquet(tibble::tibble(Stamp = .stamp), .path_stamp)
+  cli::cli_alert_success(
+    "Written: {format(nrow(.tab), big.mark = ',')} rows, {ncol(.tab)} columns."
+  )
+
+  invisible(.tab)
+}
+
+
 # 5. Reports -------------------------------------------------------------------------------------------------------------
 
 #' The sample selection table, as it appears in the paper
@@ -362,14 +452,22 @@ reg_group_summary <- function(.tab) {
 
 #' Every report in this document, in order
 #'
-#' @param .tab The register.
+#' TAKES THE SUMMARIES, DOES NOT COMPUTE THEM. This block is shown twice, in Results and again in the
+#' Overview, and the sample table is derived once per group -- so computed in place it was eight
+#' traversals of the register producing answers that must agree by construction.
+#'
+#' @param .tab_grp Output of reg_group_summary().
+#' @param .tab_samples Named list of reg_sample_table() results, one per group.
 #' @return Invisibly NULL.
-reg_report_all <- function(.tab) {
-  if (FALSE) .tab <- tab_register
+reg_report_all <- function(.tab_grp, .tab_samples) {
+  if (FALSE) {
+    .tab_grp     <- tab_group_summary
+    .tab_samples <- lst_sample_tables
+  }
 
   tbl_head("What the register contains")
   tbl_out(
-    .tab   = reg_group_summary(.tab = .tab),
+    .tab   = .tab_grp,
     .title = NULL,
     .notes = c(
       nAttachments = "Distinct attachments; a document fetched under several registrants counts once.",
@@ -377,12 +475,12 @@ reg_report_all <- function(.tab) {
     )
   )
 
-  purrr::walk(
-    .x = sort(unique(.tab$Group)),
-    .f = function(.g) {
+  purrr::iwalk(
+    .x = .tab_samples,
+    .f = function(.tab, .g) {
       tbl_head("Sample selection: {(.g)}")
       tbl_out(
-        .tab   = reg_sample_table(.tab = .tab, .group = .g),
+        .tab   = .tab,
         .title = NULL,
         .notes = c(
           nFilesUni = "Distinct attachments; documents fetched under several registrants count once.",
@@ -397,6 +495,9 @@ reg_report_all <- function(.tab) {
 
 
 # 6. Figures -------------------------------------------------------------------------------------------------------------
+# DEFINED HERE, WRITTEN NOWHERE. The document displays what this returns and the consolidated release
+# script writes the file the manuscript needs -- as it does the per-group sample-selection tables,
+# which reg_sample_table() produces and this script no longer writes to disk.
 
 #' Documents per year, by what they are in
 #'

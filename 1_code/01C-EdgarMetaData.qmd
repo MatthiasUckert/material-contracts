@@ -8,6 +8,7 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
+here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # message = TRUE is required: cli writes through the message stream under knitr, so suppressing
@@ -21,7 +22,16 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+# TABLE MODE IS DECLARED, NOT DEFAULTED. tbl_out() reads this option and falls back to "console"
+# when nothing sets it, so a document that says nothing still renders console blocks -- but says
+# nothing about whether that was chosen. It is chosen: see "How results are reported" below. Setting
+# this to "kable" previews the styled path, and every chunk producing a table then needs
+# `#| results: asis` or knitr wraps the markup in a code block.
+options(
+  cli.num_colors = 1,          # plain ASCII; ANSI codes paste as garbage
+  cli.width      = 120,        # matches the 125-column source margin
+  mc.table_mode  = "console"   # "console" or "kable"
+)
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -127,10 +137,46 @@ Every parsed document begins with the SEC's own header block: `<TYPE>`, `<SEQUEN
 Those words are counted along with the contract's, so an attachment containing nothing but a header does not measure as
 empty. `nWordsAdj` subtracts them, and the emptiness rule is applied to that rather than to the raw count.
 
-## Cost
+## What is recomputed, and what is not
 
-Three passes over 1.8 million documents, each opening every file once: parse status, text statistics, stopword counts.
-Each writes a cache and skips if it is present, so the first run is hours and every later one is seconds.
+Two things here are expensive and neither can produce a different answer while its inputs stand still.
+
+**Measurement** is three passes over 1.8 million documents, each opening every file once: parse status, text
+statistics, stopword counts. Each takes a `.rerun` argument defaulting to `FALSE` and each reconciles its cache
+against the index rather than merely checking that the cache file exists. Whatever the cache does not cover is
+measured and appended, so a first run is hours, a later one with nothing new is seconds, and a later one after 01B
+fetched a thousand documents costs a thousand documents.
+
+That reconciliation is not a refinement. Returning the cache on existence alone is right only while the corpus is
+unchanged; once it grows, the documents missing from the cache join to `NA` in the statistics table and are dropped
+outright by the consolidation's inner join, leaving `FullMetaData.parquet` quietly short. The most expensive step in
+the pipeline had the weakest cache key in it.
+
+**Restriction** cuts three corpus-sized tables -- thirty-two million link rows, the whole master index, twenty-one
+million landing rows -- down to the retrieved documents. That is minutes of semi-joins for an answer determined by the
+mirror and the index, so it is fingerprinted against both, together with the identifier set itself. A re-acquisition
+upstream or a changed corpus invalidates it without anyone having to remember.
+
+Neither of these is a suppressed chunk. Every chunk below executes, reports and validates on every render, and each
+step says on the console which path it took.
+
+## How results are reported
+
+Tables print as fixed-width console blocks, and figures are displayed rather than saved. Both are deliberate and both
+are the same decision. A runbook is read while it runs and pasted into discussion, where a monospaced block survives
+being quoted into a mail or a chat window and a styled table does not.
+
+The publication versions are produced once, at the end of the pipeline, by the consolidated release script: styled
+tables from the same `tbl_out()` specifications, figure files from the same plotting functions.
+
+Reports sit with the step that produced them rather than in one `# Results` section, because each is the argument for
+the step above it: parse failures belong beside the measurement, exclusion rates beside the rules, redundancy beside
+the consolidation. The Overview restates all three together.
+
+## Where things are written
+
+Anything a later script reads goes in `Output/`. Anything that exists only to make a re-render cheap goes in `Cache/`.
+This script reads 01A's mirror and 01B's index and writes into neither.
 
 # Configuration
 
@@ -141,9 +187,9 @@ Each writes a cache and skips if it is present, so the first run is hours and ev
 
 .lP <- list(
   Input = list(
-    Mirror         = fs::path(.dir_index, "GetEDGAR"),                  # the mirror 01A established
-    LandingPageAll = fs::path(.dir_index, "LandingPageAll.parquet"),    # unfiltered, written by 01A
-    FilePaths      = fs::path(.dir_docs, "FilePaths.parquet"),          # DocID to Path, written by 01B
+    Mirror         = fs::path(.dir_index, "GetEDGAR"),                            # the mirror 01A established
+    LandingPageAll = fs::path(.dir_index, "Output", "LandingPageAll.parquet"),    # unfiltered, written by 01A
+    FilePaths      = fs::path(.dir_docs, "Output", "FilePaths.parquet"),          # DocID to Path, written by 01B
     # Both point at the short list. That is what produced the published measurements and is kept
     # deliberately; the validation section below reports that the two dictionaries are identical
     # rather than leaving it to be discovered from a file path.
@@ -151,25 +197,34 @@ Each writes a cache and skips if it is present, so the first run is hours and ev
     StopLong       = here::here("0_data", "Dictionaries", "LoughranMcDonald", "StopWords_Generic.txt")
   ),
   Cache = list(
-    StopWords = utils_file_path(.dir_main, "Cache", "StopWords.parquet"),   # standardised dictionary
-    DocErrors = utils_file_path(.dir_main, "Cache", "DocErrors.parquet"),   # pass 1: parse status
-    DocStats  = utils_file_path(.dir_main, "Cache", "DocStats.parquet"),    # pass 2: text statistics
-    DocStop   = utils_file_path(.dir_main, "Cache", "DocStop.parquet")      # pass 3: stopword counts
+    StopWords     = utils_file_path(.dir_main, "Cache", "StopWords.parquet"),      # standardised dictionary
+    DocErrors     = utils_file_path(.dir_main, "Cache", "DocErrors.parquet"),      # pass 1: parse status
+    DocStats      = utils_file_path(.dir_main, "Cache", "DocStats.parquet"),       # pass 2: text statistics
+    DocStop       = utils_file_path(.dir_main, "Cache", "DocStop.parquet"),        # pass 3: stopword counts
+    RestrictStamp = utils_file_path(.dir_main, "Cache", "RestrictStamp.parquet"),  # guards the restricted tables
+    OutputStamp   = utils_file_path(.dir_main, "Cache", "OutputStamp.parquet")     # guards the three derived tables
   ),
   Output = list(
-    DocStats     = utils_file_path(.dir_main, "DocStats.parquet"),       # per-document measurements
-    RemovedDocs  = utils_file_path(.dir_main, "RemovedDocs.parquet"),    # what the rules flagged, and why
-    LinkData     = utils_file_path(.dir_main, "LinkData.parquet"),       # links, restricted to retrieved
-    MasterIndex  = utils_file_path(.dir_main, "MasterIndex.parquet"),    # index, restricted to retrieved
-    LandingPage  = utils_file_path(.dir_main, "LandingPage.parquet"),    # landing, restricted to retrieved
-    FullMetaData = utils_file_path(.dir_main, "FullMetaData.parquet"),   # the one table downstream reads
-    Figures      = utils_file_path(.dir_main, "Figures")                 # figure files for the manuscript
+    DocStats     = utils_file_path(.dir_main, "Output", "DocStats.parquet"),       # per-document measurements
+    RemovedDocs  = utils_file_path(.dir_main, "Output", "RemovedDocs.parquet"),    # what the rules flagged, and why
+    LinkData     = utils_file_path(.dir_main, "Output", "LinkData.parquet"),       # links, restricted to retrieved
+    MasterIndex  = utils_file_path(.dir_main, "Output", "MasterIndex.parquet"),    # index, restricted to retrieved
+    LandingPage  = utils_file_path(.dir_main, "Output", "LandingPage.parquet"),    # landing, restricted to retrieved
+    FullMetaData = utils_file_path(.dir_main, "Output", "FullMetaData.parquet")    # the one table downstream reads
   ),
   Param = list(
-    Workers = 10L    # parallel workers; also the number of chunks each pass is split into
+    Workers      = 10L,   # parallel workers; also the number of chunks each pass is split into
+    # The quality thresholds. Stated here rather than inside the rule function because they are the
+    # numbers a referee is most likely to query, and they are argued in the Purpose section above.
+    MaxWords     = 10L,   # rule 1: words after the header, at or below which a document is a stub
+    MaxStop      = 20,    # rule 2: stopword percentage, at or below which a document is not prose
+    MaxWordsStop = 100L,  # rule 2: and only among documents at or below this length
+    MinNums      = 75     # rule 3: percentage of numeric tokens at or above which it is a table
   )
 )
 
+# Resolving 01A's tree creates whatever branch is missing, including an empty DocumentData/ that
+# belongs to 01B. It is read-only here and 01A removes it on its next render.
 .lP$Edgar <- rGetEDGAR::get_directories(.lP$Input$Mirror)
 
 # Named individually so that a failure says which input is missing rather than that one of them is.
@@ -184,7 +239,13 @@ if (length(miss_) > 0L) {
   cli::cli_abort("Missing input{?s}: {paste(names(miss_), unname(miss_), sep = ' -> ', collapse = '; ')}")
 }
 
-tibble::tibble(Input = names(need_), Path = unname(need_)) |> tbl_out(.title = "Inputs")
+# Reported relative to the project root. An absolute path is correct on one machine and wrong on
+# every other, and this page is published.
+tibble::tibble(
+  Input = names(need_),
+  Path  = as.character(fs::path_rel(unname(need_), start = here::here()))
+) |>
+  tbl_out(.title = "Inputs")
 ```
 
 Failing here, rather than three passes later, is deliberate: a missing input should stop the document at the point the
@@ -234,7 +295,8 @@ tab_errors <- edg_measure_corpus(
   .fun      = edg_doc_error,           # reads the parse status recorded at download time
   .sources  = .path_fun,               # workers are fresh sessions; they source this library
   .workers  = .lP$Param$Workers,       # parallel workers
-  .label    = "parse errors"           # shown in progress output
+  .label    = "parse errors",          # shown in progress output
+  .rerun    = FALSE                    # FALSE measures only what the cache does not already cover
 )
 ```
 
@@ -246,7 +308,8 @@ tab_stats_raw <- edg_measure_corpus(
   .fun      = edg_doc_stats,           # word, character and numeric counts plus the header fields
   .sources  = .path_fun,               # workers are fresh sessions; they source this library
   .workers  = .lP$Param$Workers,       # parallel workers
-  .label    = "text statistics"        # shown in progress output
+  .label    = "text statistics",       # shown in progress output
+  .rerun    = FALSE                    # FALSE measures only what the cache does not already cover
 )
 ```
 
@@ -259,13 +322,26 @@ tab_stop_raw <- edg_measure_corpus(
   .args     = list(.path_stop = .lP$Cache$StopWords),       # passed as data, not closed over
   .sources  = .path_fun,                                    # workers are fresh sessions
   .workers  = .lP$Param$Workers,                            # parallel workers
-  .label    = "stopword counts"                             # shown in progress output
+  .label    = "stopword counts",                            # shown in progress output
+  .rerun    = FALSE                                         # FALSE measures only what is not covered
 )
+```
+
+Both summaries are wanted twice, here and in the Overview, and the first joins two tables of 1.77 million rows. They
+are computed once and passed to both.
+
+```{r}
+#| label: summarise-errors
+tab_error_summary  <- edg_error_summary(.tab_err = tab_errors, .tab_idx = tab_index)   # one row per group
+tab_error_messages <- edg_error_messages(.tab_err = tab_errors)                        # one row per message
 ```
 
 ```{r}
 #| label: report-errors
-edg_report_errors(.tab_err = tab_errors, .tab_idx = tab_index)
+edg_report_errors(
+  .tab_sum = tab_error_summary,     # summarised above, not recomputed
+  .tab_msg = tab_error_messages     # likewise
+)
 ```
 
 The three passes are joined into one table per document. The adjusted word count is computed here, and the numeric share
@@ -280,29 +356,44 @@ tab_docstats <- edg_doc_statistics(
   .tab_stop  = tab_stop_raw     # stopword pass
 )
 
-arrow::write_parquet(tab_docstats, .lP$Output$DocStats)
 nrow(tab_docstats)
 ```
 
 # Selection
 
-The three rules below decide what is analysable, so they are written out here rather than hidden behind a function call.
-Thresholds and their order are the argument a referee would want to see.
+The three rules decide what is analysable, so their thresholds are stated here rather than buried in the library. Each
+is passed by name, and each sits far from anything a real agreement produces: that distance is what makes the rules
+defensible as data cleaning rather than as a research decision in disguise.
 
 ```{r}
 #| label: flag-removals
 tab_removed <- edg_flag_removals(
-  .tab_stats = tab_docstats,   # the per-document measurements
-  .tab_idx   = tab_index       # supplies the document type for reporting
+  .tab_stats      = tab_docstats,             # the per-document measurements
+  .tab_idx        = tab_index,                # supplies the document type for reporting
+  .max_words      = .lP$Param$MaxWords,       # 10: an agreement cannot be stated in ten words
+  .max_stop       = .lP$Param$MaxStop,        # 20 pct: ordinary English runs far above this
+  .max_words_stop = .lP$Param$MaxWordsStop,   # 100: a LONG document low on stopwords is a schedule
+  .min_nums       = .lP$Param$MinNums         # 75 pct numeric: a financial table, not a contract
 )
 
-arrow::write_parquet(tab_removed, .lP$Output$RemovedDocs)
 nrow(tab_removed)
+```
+
+The rules are applied in that order and a document caught by two is attributed to the first, so the counts below are a
+partition rather than three overlapping sets.
+
+```{r}
+#| label: summarise-removals
+tab_removal_summary <- edg_removal_summary(.tab_rem = tab_removed, .tab_idx = tab_index)   # by rule
+tab_survival        <- edg_survival_summary(.tab_rem = tab_removed, .tab_idx = tab_index)  # by group
 ```
 
 ```{r}
 #| label: report-removals
-edg_report_removals(.tab_rem = tab_removed, .tab_idx = tab_index)
+edg_report_removals(
+  .tab_sum  = tab_removal_summary,   # summarised above; the figure and the Overview reuse it
+  .tab_surv = tab_survival           # likewise
+)
 ```
 
 # Restriction
@@ -311,42 +402,38 @@ Three upstream tables are restricted to the filings whose documents were actuall
 stay where 01A and 01B wrote them, because they are the denominators for every coverage statement made later, and a
 pipeline that overwrites its own denominator cannot report how much it lost.
 
+The restriction is by document first and filing second. Links are cut to the documents on disk; the filings those links
+belong to then define the master-index and landing subsets. Cutting all three on the same identifier would be wrong,
+because a filing is in scope when *one* of its attachments was retrieved rather than when all of them were.
+
 ```{r}
 #| label: restrict-upstream
-use_ids_ <- tab_index$DocID
-
-tab_links <- arrow::open_dataset(sources = .lP$Edgar$DocLinks$DirMain$Links) |>
-  dplyr::filter(.data$DocID %in% use_ids_) |>
-  dplyr::rename(
-    YQ = "YearQuarter", DocSeq = "Seq", DocDesc = "Description",
-    DocName = "Document", DocType = "Type", DocSize = "Size"
-  ) |>
-  dplyr::collect()
-
-use_idx_ <- unique(tab_links$HashIndex)
-
-tab_master <- arrow::open_dataset(sources = .lP$Edgar$MasterIndex$DirParquet) |>
-  dplyr::filter(.data$HashIndex %in% use_idx_) |>
-  dplyr::rename(YQ = "YearQuarter") |>
-  dplyr::select(-dplyr::any_of(c("Year", "Quarter"))) |>
-  dplyr::collect()
-
-tab_landing <- arrow::open_dataset(sources = .lP$Input$LandingPageAll) |>
-  dplyr::filter(.data$HashIndex %in% use_idx_) |>
-  dplyr::collect()
-
-purrr::walk2(
-  .x = list(tab_links, tab_master, tab_landing),
-  .y = c(.lP$Output$LinkData, .lP$Output$MasterIndex, .lP$Output$LandingPage),
-  .f = arrow::write_parquet
+lst_restricted <- edg_restrict_upstream(
+  .tab_idx      = tab_index,                             # the corpus that actually exists
+  .dir_links    = .lP$Edgar$DocLinks$DirMain$Links,      # 01A's mirrored link tables
+  .dir_master   = .lP$Edgar$MasterIndex$DirParquet,      # 01A's mirrored master index
+  .path_landing = .lP$Input$LandingPageAll,              # 01A's unfiltered landing table
+  .paths_out    = list(                                  # named for the function, not the config
+    Links   = .lP$Output$LinkData,                       # links, restricted to retrieved documents
+    Master  = .lP$Output$MasterIndex,                    # index, restricted to their filings
+    Landing = .lP$Output$LandingPage                     # landing pages, restricted to their filings
+  ),
+  .path_stamp   = .lP$Cache$RestrictStamp,               # fingerprint the three were built under
+  .rerun        = FALSE                                  # TRUE rebuilds regardless of the fingerprint
 )
+
+tab_links   <- lst_restricted$Links
+tab_master  <- lst_restricted$Master
+tab_landing <- lst_restricted$Landing
 
 c(Links = nrow(tab_links), Master = nrow(tab_master), Landing = nrow(tab_landing))
 ```
 
-# Deployment
+# Consolidation
 
-`FullMetaData.parquet` joins the three restricted tables to the document statistics. Two derived columns are added.
+The consolidated table joins the three restricted tables to the document statistics. Two derived columns are added. It
+is built here and written in Deployment, after the checks below have run: an artifact three script families read should
+not reach disk before the checks that would have caught a fault in it.
 
 `MultFiler` and `nCIK` mark documents listed under more than one registrant. `FilerCopiesAgree` records whether those
 copies match on all three length measures, and `PrimaryFiler` designates exactly one of them.
@@ -385,18 +472,27 @@ tab_metadata <- tab_links |>
 
 tab_metadata <- edg_flag_filer_copies(.tab = tab_metadata)
 
-arrow::write_parquet(tab_metadata, .lP$Output$FullMetaData)
 nrow(tab_metadata)
 ```
 
 ```{r}
+#| label: summarise-filer-copies
+tab_filer_summary      <- edg_filer_summary(.tab = tab_metadata)        # one row per group
+tab_filer_distribution <- edg_filer_distribution(.tab = tab_metadata)   # registrants per attachment
+```
+
+```{r}
 #| label: report-filer-copies
-edg_report_filer_copies(.tab = tab_metadata)
+edg_report_filer_copies(
+  .tab_sum  = tab_filer_summary,        # summarised above, restated in the Overview
+  .tab_dist = tab_filer_distribution    # likewise
+)
 ```
 
 `nGroupsDiffer` is the check that matters. Copies of one attachment should agree on character, word and numeric-token
 count, because they are the same file fetched twice. A group that disagrees means two requests for one URL returned
-different content, which would be an acquisition fault rather than a counting one.
+different content, which would be an acquisition fault rather than a counting one. One group disagrees, and the
+Validation section below shows which and whether it reaches the analysis sample.
 
 # Validation
 
@@ -471,8 +567,9 @@ tab_metadata |>
   )
 ```
 
-Where copies of one attachment disagree, the count alone is not actionable: which attachment, how far apart the copies
-are, and under how many registrants they were filed is what decides whether it matters. An empty table here is the pass.
+Where copies of one attachment disagree, the count alone is not actionable. Which attachment, how far apart the copies
+are, how many registrants filed it, and whether the quality rules already removed it are what decide whether it
+matters, so all four are reported.
 
 ```{r}
 #| label: validate-disagreements
@@ -480,7 +577,76 @@ edg_filer_disagreements(.tab = tab_metadata) |>
   utils::head(10L) |>
   tbl_out(
     .title = "Attachments whose copies disagree",
-    .notes = c(SpreadChars = "Characters between the shortest and longest copy of one attachment.")
+    .notes = c(
+      nRemoved    = "Copies the quality rules flagged. A disagreement among discarded copies changes nothing.",
+      SpreadChars = "Characters between the shortest and longest copy of one attachment."
+    )
+  )
+```
+
+One attachment in 1.49 million disagrees, and every copy of it was already flagged. Eight registrants filed it and the
+copies split between 187 and 219 characters, which is a stub under either measurement and far below anything the
+emptiness rule keeps; `nRemoved` is eight of eight. The disagreement therefore never reaches the analysis sample, which
+is what makes it a curiosity rather than a fault to chase.
+
+The check earns its place regardless of how little it finds. What it exists to catch is two requests for one URL
+returning different content, and at any scale that would place every downstream count of distinct attachments on copies
+that are not copies of each other.
+
+# Deployment
+
+Six artifacts. Three were written by the restriction step above, because there they are cache and published table at
+once; the other three are written here, so that nothing is committed to disk before the checks above have passed.
+
+The write is guarded, and the reason is not disk time. Five documents downstream -- 01D, 01E, 02B, 03A and 04C --
+fingerprint their own caches against `FullMetaData.parquet`. Rewriting it unconditionally moves its modification time on
+every render of this document, so every one of those caches misses and rebuilds although the bytes are identical. A
+fingerprint is only as stable as the file it points at.
+
+All three are a deterministic function of the same things: the three measurement caches, the restriction, and the four
+quality thresholds. One fingerprint therefore covers all three, and it is computed here rather than inside the writer so
+that what determines the outputs is visible next to them.
+
+```{r}
+#| label: write-outputs
+stamp_outputs <- utils_dir_stamp(
+  .dirs  = unlist(.lP$Cache[c("DocErrors", "DocStats", "DocStop", "RestrictStamp")]),   # what was measured
+  .extra = .lP$Param[c("MaxWords", "MaxStop", "MaxWordsStop", "MinNums")]               # and under which rules
+)
+
+edg_write_metadata(
+  .tabs = list(
+    DocStats     = tab_docstats,    # per-document measurements
+    RemovedDocs  = tab_removed,     # what the rules flagged, and why
+    FullMetaData = tab_metadata     # the one table downstream reads
+  ),
+  .paths_out  = .lP$Output[c("DocStats", "RemovedDocs", "FullMetaData")],   # names checked, not matched
+  .stamp      = stamp_outputs,      # computed above
+  .path_stamp = .lP$Cache$OutputStamp,
+  .rerun      = FALSE               # TRUE writes regardless of the fingerprint
+)
+
+c(DocStats = nrow(tab_docstats), Removed = nrow(tab_removed), MetaData = nrow(tab_metadata))
+```
+
+Nothing else is written. No figure files, no styled tables: those are the release script's job, for the reason set out
+under *How results are reported*.
+
+```{r}
+#| label: deploy-report
+fs::file_info(path = c(unlist(.lP$Output), unlist(.lP$Cache))) |>
+  dplyr::transmute(
+    Kind    = c(rep("Output", length(.lP$Output)), rep("Cache", length(.lP$Cache))),
+    File    = as.character(fs::path_file(.data$path)),
+    Size    = .data$size,
+    Written = format(.data$modification_time, "%Y-%m-%d %H:%M")
+  ) |>
+  tbl_out(
+    .title = "Written",
+    .notes = c(
+      Kind    = "Only the Output rows are read downstream; the rest make a re-render cheap.",
+      Written = "A cache older than this render means that step found its input unchanged."
+    )
   )
 ```
 
@@ -492,28 +658,18 @@ edg_filer_disagreements(.tab = tab_metadata) |>
 #| fig-cap: "Documents flagged by each quality rule, split by group. Rules are applied in order, so a
 #|   document caught by two is attributed to the first. Rule 1 is the emptiness test, 2 the prose
 #|   test, 3 the numeric test."
-gg_removals <- edg_plot_removals(.tab = edg_removal_summary(.tab_rem = tab_removed, .tab_idx = tab_index))
-
-plot_save(
-  .plot    = gg_removals,               # the figure
-  .name    = "removals-by-rule",        # meaningful filename, not unnamed-chunk-N
-  .dir     = .lP$Output$Figures,        # figure destination
-  .height  = 2.4,                       # from the ladder: three rows is a low panel
-  .width   = 7.5,                       # the fixed project width
-  .formats = c("pdf", "png"),           # manuscript and web
-  .dpi     = 300                        # print resolution
-)
-
-gg_removals
+edg_plot_removals(.tab = tab_removal_summary)   # summarised in Selection; the release script writes the file
 ```
 
 ```{r}
 #| label: overview-all
 edg_report_all_meta(
-  .tab_err  = tab_errors,      # parse status per document
-  .tab_rem  = tab_removed,     # what the rules flagged
-  .tab_idx  = tab_index,       # the corpus, as denominator
-  .tab_meta = tab_metadata     # the consolidated table
+  .err_sum  = tab_error_summary,          # summarised once in Measurement
+  .err_msg  = tab_error_messages,         # likewise
+  .rem_sum  = tab_removal_summary,        # summarised once in Selection
+  .rem_surv = tab_survival,               # likewise
+  .fil_sum  = tab_filer_summary,          # summarised once in Consolidation
+  .fil_dist = tab_filer_distribution      # likewise
 )
 ```
 

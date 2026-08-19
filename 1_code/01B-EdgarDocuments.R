@@ -28,6 +28,27 @@
 # succeeds. There is no local source to re-parse from, and re-deriving the tree means one request
 # per document at ten per second. That is why acquisition is gated and why nothing here deletes.
 #
+# WHERE THINGS ARE WRITTEN
+# Anything a later script reads goes in Output/. Anything that exists only to make a re-render cheap
+# goes in Cache/. The mirror root is neither and is named on its own, because it holds both kinds of
+# thing at once: DocLinks/ is a clone of 01A's that one command rebuilds, and DocumentData/Parsed/
+# is the corpus. A heading meaning "safe to delete" over 1.46 million irreplaceable documents is a
+# heading somebody will eventually act on.
+#
+# THE INDEX IS STAMPED AGAINST THE TREE
+# edg_index_documents() takes .rerun, defaulting to FALSE, and fingerprints the parsed tree with
+# utils_tree_stamp() before deciding whether to walk it. Walking 1.46 million files costs about a
+# minute; the fingerprint costs about four hundred stat calls. That is what lets the same call serve
+# twice -- once before the download to say what is on disk, once after to pick up what arrived --
+# and cost nothing the second time when nothing arrived.
+#
+# This replaces keying the rebuild on the acquisition switch. The switch says whether this render was
+# PERMITTED to add documents, not whether it did, so a permitted render that fetched nothing paid a
+# full re-walk for no reason.
+#
+# FIGURES ARE DEFINED HERE AND WRITTEN NOWHERE. The document displays what edg_plot_corpus() returns;
+# the consolidated release script writes the files the manuscript needs.
+#
 # PARALLELISM
 # Documents are fetched through rGetEDGAR, which parallelises internally with furrr. Parallel work
 # written for this pipeline uses mirai; the two coexist because the download loop belongs to the
@@ -42,8 +63,10 @@ if (FALSE) {
   .path_landing <- .lP$Input$LandingPageAll
   .dir_parsed   <- .lP$Edgar$DocumentData$Parsed
   .path_out     <- .lP$Output$FilePaths
+  .path_stamp   <- .lP$Cache$TreeStamp
   .mod          <- "Exhibit 10"
   .item         <- "1.01"
+  .rerun        <- FALSE
 }
 
 
@@ -253,23 +276,24 @@ edg_outstanding <- function(.tab_sel, .ids_disk) {
 
 #' Report selection against what is on disk
 #'
-#' @param .tab_sel Tibble of selected link rows, carrying DocID and Group.
-#' @param .ids_disk Character vector of DocID values present in the parsed tree.
+#' TAKES THE OUTSTANDING TABLE, DOES NOT COMPUTE IT. The document shows this twice, once in Selection
+#' and once in the Overview, and each computation tests membership of a million and a half
+#' identifiers. Computing it once in the document and passing it here also guarantees the two
+#' statements agree, which recomputation does not.
+#'
+#' @param .tab_out Output of edg_outstanding().
 #' @param .acquire Logical. The acquisition switch, reported alongside the backlog so that an
 #'   incomplete corpus and a disabled download are never read as the same thing.
-#' @return The outstanding tibble, invisibly.
-edg_report_selection <- function(.tab_sel, .ids_disk, .acquire) {
+#' @return .tab_out, invisibly.
+edg_report_selection <- function(.tab_out, .acquire) {
   if (FALSE) {
-    .tab_sel  <- tab_selected
-    .ids_disk <- vec_on_disk
-    .acquire  <- FALSE
+    .tab_out <- tab_outstanding
+    .acquire <- FALSE
   }
-
-  out_ <- edg_outstanding(.tab_sel = .tab_sel, .ids_disk = .ids_disk)
 
   tbl_head("Selected against retrieved")
   tbl_out(
-    .tab    = out_,
+    .tab    = .tab_out,
     .title  = NULL,
     .pct    = "ShareRetrieved",
     .digits = 1L,
@@ -278,7 +302,7 @@ edg_report_selection <- function(.tab_sel, .ids_disk, .acquire) {
     )
   )
 
-  n_ <- sum(out_$nOutstanding)
+  n_ <- sum(.tab_out$nOutstanding)
   if (n_ == 0L) {
     tbl_note("Every selected document is on disk.")
   } else if (isTRUE(.acquire)) {
@@ -291,7 +315,7 @@ edg_report_selection <- function(.tab_sel, .ids_disk, .acquire) {
     )
   }
 
-  invisible(out_)
+  invisible(.tab_out)
 }
 
 
@@ -303,28 +327,73 @@ edg_report_selection <- function(.tab_sel, .ids_disk, .acquire) {
 #' is produced. Two independently constructed indexes of a corpus this size can disagree and nothing
 #' would report it, which is why the mapping has a single writer.
 #'
-#' REBUILT ONLY WHEN SOMETHING WAS FETCHED. Walking the tree is minutes of work and its result cannot
-#' change unless a document was added. The rebuild is therefore keyed on the acquisition switch
-#' rather than on the outstanding count, which is a proxy that reaches zero for two different
-#' reasons -- nothing left to fetch, or nothing left that can be fetched -- and cannot distinguish
-#' them. The switch states directly whether this render was permitted to add anything.
+#' THE INDEX IS THE TREE READ INTO A TABLE, NOT A SECOND RECORD OF IT. A manifest that is written
+#' once and trusted thereafter can drift from the directory it describes, and the directory is the
+#' thing that matters. utils_tree_stamp() closes that gap: the index is rebuilt whenever the number
+#' of DocType/YQ directories or any of their modification times has moved, which is whenever a
+#' document was added or removed. Walking 1.46 million files costs about a minute and the fingerprint
+#' costs about four hundred stat calls, so keeping the two in agreement is three orders of magnitude
+#' cheaper than the walk it replaces.
+#'
+#' WHICH IS WHY THIS IS CALLED TWICE. The document needs to know what is on disk before the download,
+#' to build the queue, and again afterwards, to pick up whatever arrived. The identical call serves
+#' both: the fingerprint has moved exactly when the second answer differs from the first, and costs
+#' nothing when it has not.
+#'
+#' THIS REPLACES KEYING THE REBUILD ON THE ACQUISITION SWITCH. The switch states whether a render was
+#' permitted to add documents, not whether it did, so a permitted render that fetched nothing -- the
+#' common case once the corpus is complete -- paid a full re-walk to produce the file it already had.
 #'
 #' @param .dir_parsed Root of the parsed-document tree.
-#' @param .path_out Destination parquet path.
-#' @param .rerun Logical. TRUE re-walks the tree; FALSE reuses the file if it exists.
+#' @param .path_out Destination parquet path; the published artifact.
+#' @param .path_stamp Parquet under Cache/ holding the fingerprint .path_out was last built under.
+#' @param .rerun Logical. TRUE re-walks the tree regardless of the fingerprint. Use it where a
+#'   document may have been rewritten in place, which the fingerprint cannot see.
 #' @return A tibble: DocID, DocType, YQ, Path.
-edg_index_documents <- function(.dir_parsed, .path_out, .rerun = FALSE) {
+edg_index_documents <- function(.dir_parsed, .path_out, .path_stamp, .rerun = FALSE) {
   if (FALSE) {
     .dir_parsed <- .lP$Edgar$DocumentData$Parsed
     .path_out   <- .lP$Output$FilePaths
+    .path_stamp <- .lP$Cache$TreeStamp
     .rerun      <- FALSE
   }
 
-  utils_list_project_files(
+  stamp_ <- utils_tree_stamp(.dirs = .dir_parsed, .depth = 2L)
+
+  fresh_ <- !.rerun &&
+    fs::file_exists(.path_out) &&
+    identical(utils_stamp_read(.path = .path_stamp), stamp_)
+
+  if (fresh_) {
+    out_  <- arrow::read_parquet(file = .path_out)
+    n_    <- nrow(out_)
+    # THE ORDER MATTERS. cli takes its plural quantity from the LAST interpolation before the {?}
+    # marker, and format() hands it a length-one string, which reads as one. qty() states the
+    # number without printing anything, so it has to sit after the formatted count, not before it.
+    cli::cli_alert_info(
+      "Tree unchanged: {format(n_, big.mark = ',')} {cli::qty(n_)}document{?s}, index read from cache."
+    )
+    return(out_)
+  }
+
+  if (!.rerun && fs::file_exists(.path_stamp)) {
+    cli::cli_alert_warning("The parsed tree has moved; the index is being rebuilt.")
+  }
+
+  # .rerun = TRUE unconditionally: the fingerprint above has already made the decision, and letting
+  # the helper make it again on its own weaker test would reuse a file this function just judged
+  # stale.
+  out_ <- utils_list_project_files(
     .dir_data = .dir_parsed,
     .path_out = .path_out,
-    .rerun    = .rerun
+    .rerun    = TRUE
   )
+
+  arrow::write_parquet(tibble::tibble(Stamp = stamp_), .path_stamp)
+  n_ <- nrow(out_)
+  cli::cli_alert_success("Index rebuilt: {format(n_, big.mark = ',')} {cli::qty(n_)}document{?s}.")
+
+  out_
 }
 
 #' Composition of the retrieved corpus
@@ -358,16 +427,17 @@ edg_corpus_by_quarter <- function(.tab_idx) {
 
 #' Report the retrieved corpus
 #'
-#' @param .tab_idx The DocID to Path index.
-#' @return The composition tibble, invisibly.
-edg_report_documents <- function(.tab_idx) {
-  if (FALSE) .tab_idx <- arrow::read_parquet(.lP$Output$FilePaths)
-
-  cmp_ <- edg_corpus_composition(.tab_idx = .tab_idx)
+#' TAKES THE COMPOSITION TABLE, DOES NOT COMPUTE IT. Shown once in Results and again in the Overview,
+#' and the group-by runs over the whole index each time.
+#'
+#' @param .tab_cmp Output of edg_corpus_composition().
+#' @return .tab_cmp, invisibly.
+edg_report_documents <- function(.tab_cmp) {
+  if (FALSE) .tab_cmp <- tab_composition
 
   tbl_head("Retrieved corpus")
   tbl_out(
-    .tab    = cmp_,
+    .tab    = .tab_cmp,
     .title  = NULL,
     .pct    = "Share",
     .digits = 1L,
@@ -376,38 +446,34 @@ edg_report_documents <- function(.tab_idx) {
     )
   )
 
-  invisible(cmp_)
+  invisible(.tab_cmp)
 }
 
 #' Every report in this document, in order
 #'
 #' The block to copy out when the corpus needs checking without re-rendering.
 #'
-#' @param .lp The configuration list.
-#' @param .tab_sel Tibble of selected link rows.
-#' @param .tab_idx The DocID to Path index.
-#' @param .ids_disk Character vector of DocID values present in the parsed tree.
+#' @param .tab_out Output of edg_outstanding().
+#' @param .tab_cmp Output of edg_corpus_composition().
+#' @param .acquire Logical. The acquisition switch.
 #' @return Invisibly NULL.
-edg_report_all_docs <- function(.lp, .tab_sel, .tab_idx, .ids_disk) {
+edg_report_all_docs <- function(.tab_out, .tab_cmp, .acquire) {
   if (FALSE) {
-    .lp       <- .lP
-    .tab_sel  <- tab_selected
-    .tab_idx  <- arrow::read_parquet(.lP$Output$FilePaths)
-    .ids_disk <- vec_on_disk
+    .tab_out <- tab_outstanding
+    .tab_cmp <- tab_composition
+    .acquire <- FALSE
   }
 
-  edg_report_selection(
-    .tab_sel  = .tab_sel,
-    .ids_disk = .ids_disk,
-    .acquire  = .lp$Param$Acquire
-  )
-  edg_report_documents(.tab_idx = .tab_idx)
+  edg_report_selection(.tab_out = .tab_out, .acquire = .acquire)
+  edg_report_documents(.tab_cmp = .tab_cmp)
 
   invisible(NULL)
 }
 
 
 # 4. Figures -----------------------------------------------------------------------------------------------------------
+# DEFINED HERE, WRITTEN NOWHERE. The document displays what this returns and the consolidated release
+# script writes the files the manuscript needs.
 
 #' Retrieved documents per year, stacked by type
 #'

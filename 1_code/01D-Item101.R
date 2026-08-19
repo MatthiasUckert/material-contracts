@@ -20,6 +20,19 @@
 # a flag; the text is one join away. Putting it in the register would make the one table nobody can
 # load.
 #
+# WHAT IS RECOMPUTED, AND WHAT IS NOT
+# Two steps take .rerun, defaulting to FALSE, and each fingerprints its inputs before deciding.
+# itm_candidates() scans 01C's consolidated table and 01B's index, half a gigabyte of parquet, to
+# answer a question fixed by those two files and the item code. itm_write_item101() writes the
+# gigabyte of extracted text, which is a pure function of the extraction cache and the candidate set.
+#
+# itm_filing_items() is deliberately NOT cached. 02 sources it and calls it there, so a cache path
+# belonging to this script's output directory would mean another script writing into it. A function
+# shared across scripts stays pure.
+#
+# FIGURES ARE DEFINED HERE AND WRITTEN NOWHERE. The document displays what the three plot functions
+# return; the consolidated release script writes the files the manuscript needs.
+#
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new ones; if (FALSE) dev blocks; pure
 # ASCII; parenthesised cli interpolation.
@@ -29,6 +42,7 @@ if (FALSE) {
   .path_meta    <- .lP$Input$MetaData
   .path         <- tab_candidates$Path[1]
   .item         <- "1.01"
+  .rerun        <- FALSE
 }
 
 
@@ -44,8 +58,15 @@ if (FALSE) {
 #' THIS LIVES HERE BECAUSE THIS IS THE FIRST SCRIPT THAT NEEDS IT. 02 needs the same rule and sources
 #' it from here. Two implementations of "which filings report which items" would be two answers.
 #'
+#' THE RESULT IS SORTED, AND THAT IS LOAD-BEARING RATHER THAN TIDY. An Arrow scan makes no promise
+#' about the order in which record batches are returned -- within one file as much as across many,
+#' because row groups are read in parallel -- and neither distinct() nor a grouped filter reorders
+#' what it is given. Two runs over an unchanged file therefore return the same rows in a different
+#' order. itm_candidates() takes this table into its own fingerprint, so an unsorted result hashes
+#' differently on every render and defeats that cache entirely.
+#'
 #' @param .path_landing Path to the landing table restricted to retrieved filings.
-#' @return A tibble: HashIndex, Items.
+#' @return A tibble: HashIndex, Items, ordered by HashIndex.
 itm_filing_items <- function(.path_landing) {
   if (FALSE) .path_landing <- .lP$Input$LandingPage
 
@@ -55,7 +76,8 @@ itm_filing_items <- function(.path_landing) {
     dplyr::collect() |>
     dplyr::mutate(Items = gsub("\n", "|", .data$Items)) |>
     dplyr::distinct() |>
-    dplyr::filter(dplyr::n() == 1L, .by = "HashIndex")
+    dplyr::filter(dplyr::n() == 1L, .by = "HashIndex") |>
+    dplyr::arrange(.data$HashIndex)
 }
 
 #' Documents to attempt extraction on
@@ -67,22 +89,60 @@ itm_filing_items <- function(.path_landing) {
 #' middle and would also match "1101"; no item code has that shape, so the two agree, but a rule that
 #' is accidentally loose is worth not carrying forward.
 #'
+#' CACHED, BECAUSE IT SCANS HALF A GIGABYTE TO ANSWER A FIXED QUESTION. The consolidated metadata and
+#' the document index are read in full, and which documents are candidates cannot change unless one
+#' of those files, the item list or the item code changes. All four enter the fingerprint, so an
+#' edit to any of them invalidates the cache without anyone having to remember.
+#'
+#' The Path column is cached along with the rest and is machine-specific. That is correct here and
+#' would not be in an Output artifact: this file exists to make a re-render cheap on the machine that
+#' wrote it, and it is rebuilt from scratch anywhere else.
+#'
 #' @param .path_meta Path to 01C's consolidated metadata.
 #' @param .tab_items Output of itm_filing_items().
 #' @param .path_index Path to 01B's DocID to Path index.
 #' @param .item Character. Item code, e.g. "1.01".
+#' @param .path_cache Parquet holding the candidate set and the fingerprint it was built under.
+#' @param .rerun Logical. TRUE rebuilds regardless of the fingerprint.
 #' @return A tibble: DocID, Path, DocTypeMod, YQ, Items.
-itm_candidates <- function(.path_meta, .tab_items, .path_index, .item = "1.01") {
+itm_candidates <- function(.path_meta, .tab_items, .path_index, .item = "1.01",
+                           .path_cache, .rerun = FALSE) {
   if (FALSE) {
     .path_meta  <- .lP$Input$MetaData
     .tab_items  <- tab_items
     .path_index <- .lP$Input$FilePaths
     .item       <- "1.01"
+    .path_cache <- .lP$Cache$Candidates
+    .rerun      <- FALSE
+  }
+
+  # HASHED AS A PLAIN CHARACTER VECTOR, NOT AS THE TIBBLE. Hashing the object would fold in whatever
+  # attributes dplyr happened to leave on it, and the point of the key is the content. The vector is
+  # deterministic because itm_filing_items() sorts; see the note there for why that matters.
+  stamp_ <- utils_dir_stamp(
+    .dirs  = c(.path_meta, .path_index),
+    .extra = list(
+      Item  = .item,
+      Items = rlang::hash(paste0(.tab_items$HashIndex, "|", .tab_items$Items))
+    )
+  )
+
+  if (!.rerun && identical(utils_stamp_read(.path = .path_cache), stamp_)) {
+    out_ <- dplyr::select(arrow::read_parquet(file = .path_cache), -"Stamp")
+    n_   <- nrow(out_)
+    cli::cli_alert_info(
+      "Candidates unchanged: {format(n_, big.mark = ',')} {cli::qty(n_)}document{?s}, read from cache."
+    )
+    return(out_)
+  }
+
+  if (!.rerun && fs::file_exists(.path_cache)) {
+    cli::cli_alert_warning("The metadata, the index or the item list has moved; candidates are being rebuilt.")
   }
 
   hit_ <- .tab_items$HashIndex[grepl(.item, .tab_items$Items, fixed = TRUE)]
 
-  arrow::open_dataset(sources = .path_meta) |>
+  out_ <- arrow::open_dataset(sources = .path_meta) |>
     dplyr::filter(grepl("^8-K", .data$DocTypeMod)) |>
     dplyr::filter(.data$HashIndex %in% hit_) |>
     dplyr::select("DocID", "HashIndex", "DocTypeMod", "YQ", "Removed") |>
@@ -91,7 +151,13 @@ itm_candidates <- function(.path_meta, .tab_items, .path_index, .item = "1.01") 
       y  = dplyr::select(arrow::read_parquet(.path_index), "DocID", "Path"),
       by = dplyr::join_by("DocID")
     ) |>
-    dplyr::left_join(.tab_items, by = dplyr::join_by("HashIndex"))
+    dplyr::left_join(.tab_items, by = dplyr::join_by("HashIndex")) |>
+    dplyr::arrange(.data$DocID)
+
+  arrow::write_parquet(dplyr::mutate(out_, Stamp = stamp_), .path_cache)
+  cli::cli_alert_success("Candidates rebuilt: {format(nrow(out_), big.mark = ',')} documents, cached.")
+
+  out_
 }
 
 
@@ -393,6 +459,55 @@ itm_process_doc <- function(.path, .item = "1.01", .min_chars = 30L) {
 }
 
 
+# 3b. Deployment -------------------------------------------------------------------------------------------------------
+
+#' Write the extracted summaries, if what produced them has moved
+#'
+#' A GIGABYTE IS NOT WRITTEN TO PRODUCE A FILE THAT ALREADY EXISTS. Roughly a quarter of a million
+#' summaries carry the text itself, and rewriting them on every render is the single most expensive
+#' thing this document does after the extraction pass. What the file contains is fixed by the
+#' extraction cache and the candidate set, so both enter the fingerprint.
+#'
+#' THE TABLE IS BUILT EITHER WAY. Only the write is guarded: the join that produces it costs seconds
+#' and every report below reads it, so skipping the computation would save nothing and leave the
+#' reports describing a file rather than an object.
+#'
+#' @param .tab The joined table, one row per candidate.
+#' @param .path_out Destination parquet path; the published artifact.
+#' @param .path_source The extraction cache the table was derived from.
+#' @param .path_stamp Parquet under Cache/ holding the fingerprint .path_out was last written under.
+#' @param .rerun Logical. TRUE writes regardless of the fingerprint.
+#' @return .tab, invisibly.
+itm_write_item101 <- function(.tab, .path_out, .path_source, .path_stamp, .rerun = FALSE) {
+  if (FALSE) {
+    .tab         <- tab_item101
+    .path_out    <- .lP$Output$Item101
+    .path_source <- .lP$Cache$Extracted
+    .path_stamp  <- .lP$Cache$OutputStamp
+    .rerun       <- FALSE
+  }
+
+  stamp_ <- utils_dir_stamp(.dirs = .path_source, .extra = .tab$DocID)
+
+  fresh_ <- !.rerun &&
+    fs::file_exists(.path_out) &&
+    identical(utils_stamp_read(.path = .path_stamp), stamp_)
+
+  if (fresh_) {
+    cli::cli_alert_info("Extraction unchanged: {fs::path_file(.path_out)} was left as it stands.")
+    return(invisible(.tab))
+  }
+
+  arrow::write_parquet(.tab, .path_out)
+  arrow::write_parquet(tibble::tibble(Stamp = stamp_), .path_stamp)
+  cli::cli_alert_success(
+    "Written: {format(nrow(.tab), big.mark = ',')} rows to {fs::path_file(.path_out)}."
+  )
+
+  invisible(.tab)
+}
+
+
 # 4. Reports -----------------------------------------------------------------------------------------------------------
 
 #' Which outcomes count as a recovered summary
@@ -609,14 +724,27 @@ itm_examples <- function(.tab, .n = 3L, .chars = 160L) {
 
 #' Every report in this document, in order
 #'
-#' @param .tab Output of the extraction pass.
+#' TAKES THE FOUR SUMMARIES, DOES NOT COMPUTE THEM. This block is shown twice, in Results and again
+#' in the Overview, and two of the four are also shown separately in between. Computing them at each
+#' call means the same numbers are derived six times over from a table carrying the text of a quarter
+#' of a million summaries.
+#'
+#' @param .tab_out Output of itm_outcome_summary().
+#' @param .tab_fmt Output of itm_format_detail().
+#' @param .tab_len Output of itm_length_summary().
+#' @param .tab_band Output of itm_length_bands().
 #' @return Invisibly NULL.
-itm_report_all <- function(.tab) {
-  if (FALSE) .tab <- tab_item101
+itm_report_all <- function(.tab_out, .tab_fmt, .tab_len, .tab_band) {
+  if (FALSE) {
+    .tab_out  <- tab_outcome_summary
+    .tab_fmt  <- tab_format_detail
+    .tab_len  <- tab_length_summary
+    .tab_band <- tab_length_bands
+  }
 
   tbl_head("Outcomes by file format")
   tbl_out(
-    .tab    = itm_outcome_summary(.tab = .tab),
+    .tab    = .tab_out,
     .title  = NULL,
     .pct    = "ShareExtracted",
     .digits = 1L,
@@ -628,7 +756,7 @@ itm_report_all <- function(.tab) {
 
   tbl_head("Outcomes by file extension")
   tbl_out(
-    .tab    = itm_format_detail(.tab = .tab),
+    .tab    = .tab_fmt,
     .title  = NULL,
     .pct    = "ShareExtracted",
     .digits = 1L
@@ -636,7 +764,7 @@ itm_report_all <- function(.tab) {
 
   tbl_head("Length of the extracted summaries")
   tbl_out(
-    .tab   = itm_length_summary(.tab = .tab),
+    .tab   = .tab_len,
     .title = NULL,
     .notes = c(Median = "Ambiguous and unambiguous should agree; a shorter ambiguous group would \\
                          mean a contents entry was taken for a section.")
@@ -644,7 +772,7 @@ itm_report_all <- function(.tab) {
 
   tbl_head("Are the lengths plausible?")
   tbl_out(
-    .tab    = itm_length_bands(.tab = .tab),
+    .tab    = .tab_band,
     .title  = NULL,
     .pct    = "Share",
     .digits = 1L,
@@ -657,6 +785,8 @@ itm_report_all <- function(.tab) {
 
 
 # 5. Figures -----------------------------------------------------------------------------------------------------------
+# DEFINED HERE, WRITTEN NOWHERE. The document displays what these return and the consolidated release
+# script writes the files the manuscript needs.
 
 #' How the outcomes compose each year
 #'

@@ -18,8 +18,28 @@
 #
 # MEASUREMENT IS THE EXPENSIVE PART
 # Three passes over the corpus, each reading every document once: parse errors, text statistics, and
-# stopword counts. Each writes a cache and skips if it is present. First run is hours; every later
-# one is seconds.
+# stopword counts. Each takes .rerun, defaulting to FALSE, and each reconciles its cache against the
+# index rather than merely testing that the cache file exists: whatever the cache does not cover is
+# measured and appended. First run is hours; a later one with nothing new is seconds; a later one
+# after 01B fetched a thousand documents costs a thousand documents, not the corpus.
+#
+# That reconciliation closed a silent hole. Returning the cache on existence alone is correct only
+# while the corpus is unchanged, and once it grows the missing documents join to NA in
+# edg_doc_statistics() and are dropped outright by the consolidation's inner join.
+#
+# THE RESTRICTION IS STAMPED
+# edg_restrict_upstream() cuts three corpus-sized tables down to the retrieved documents, which is
+# minutes of semi-joins for an answer that cannot change while the mirror and the index stand still.
+# Its fingerprint covers both mirror directories, the landing table and the identifier set. The three
+# outputs are published artifacts, so they carry no stamp column and the fingerprint sits under
+# Cache/ beside them.
+#
+# WHERE THINGS ARE WRITTEN
+# Anything a later script reads goes in Output/. Anything existing only to make a re-render cheap
+# goes in Cache/. This script reads 01A's mirror and 01B's index and writes into neither.
+#
+# FIGURES ARE DEFINED HERE AND WRITTEN NOWHERE. The document displays what edg_plot_removals()
+# returns; the consolidated release script writes the files the manuscript needs.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new ones; if (FALSE) dev blocks; pure
@@ -31,6 +51,7 @@ if (FALSE) {
   .path_stop  <- .lP$Cache$StopWords
   .path_out   <- .lP$Output$FullMetaData
   .workers    <- 10L
+  .rerun      <- FALSE
 }
 
 
@@ -196,8 +217,8 @@ edg_doc_stopwords <- function(.path_doc, .path_stop) {
 #' session's global environment, which is not sent; in the worker .lP does not exist. A list of plain
 #' values is data, and data crosses.
 #'
-#' @param .tab_idx A table with a Path column naming the documents to measure.
-#' @param .path_out Destination parquet path for this pass.
+#' @param .tab_idx A table with DocID and Path columns naming the documents to measure.
+#' @param .path_out Destination parquet path for this pass; also the ledger of what is done.
 #' @param .fun A function whose first argument is a path, returning a one-row tibble.
 #' @param .args Named list of further arguments to .fun. Must be plain data.
 #' @param .sources Character vector of R files each worker sources before measuring.
@@ -208,9 +229,12 @@ edg_doc_stopwords <- function(.path_doc, .path_stop) {
 #'   appearing at least once. A pass that returns several rows checked as though it returned one
 #'   would fail on correct output; a pass that returns one checked as though it returned many would
 #'   pass on a truncated result.
-#' @return The measurement tibble.
+#' @param .rerun Logical. TRUE discards the cache and measures the whole corpus again. FALSE measures
+#'   whatever the cache does not already cover, which is nothing on a corpus that has not changed.
+#' @return The measurement tibble, covering exactly the documents in .tab_idx.
 edg_measure_corpus <- function(.tab_idx, .path_out, .fun, .args = list(), .sources = character(0),
-                               .workers = 24L, .label = "measure", .rows = c("one", "many")) {
+                               .workers = 24L, .label = "measure", .rows = c("one", "many"),
+                               .rerun = FALSE) {
   if (FALSE) {
     .tab_idx  <- tab_index
     .path_out <- .lP$Cache$DocErrors
@@ -220,16 +244,45 @@ edg_measure_corpus <- function(.tab_idx, .path_out, .fun, .args = list(), .sourc
     .workers  <- 24L
     .label    <- "parse errors"
     .rows     <- "one"
+    .rerun    <- FALSE
   }
 
   rows_ <- match.arg(.rows)
 
-  if (fs::file_exists(.path_out)) {
-    cli::cli_alert_info("{(.label)}: already complete, reading from cache.")
-    return(arrow::read_parquet(.path_out))
+  # THE CACHE IS RECONCILED AGAINST THE INDEX, NOT MERELY TESTED FOR EXISTENCE. An earlier version
+  # returned the cached table whenever the file was present, which is correct only while the corpus
+  # is unchanged. Once 01B fetches anything, the index grows, the cache does not, and this pass
+  # returns a table missing the new documents -- after which edg_doc_statistics() joins them to NA
+  # and the consolidation drops them from FullMetaData.parquet outright. No error, no warning, and
+  # the most expensive step in the pipeline had the weakest cache key in it.
+  #
+  # Restricting the cache to the index first also handles the other direction: a document no longer
+  # in the corpus leaves the measurement rather than lingering in it.
+  done_ <- if (!.rerun && fs::file_exists(.path_out)) {
+    arrow::read_parquet(.path_out) |>
+      dplyr::filter(.data$DocID %in% .tab_idx$DocID)
+  } else {
+    NULL
   }
 
-  cli::cli_alert_info("{(.label)}: measuring {nrow(.tab_idx)} documents on {(.workers)} workers.")
+  todo_ <- if (is.null(done_)) .tab_idx else dplyr::filter(.tab_idx, !.data$DocID %in% done_$DocID)
+
+  if (nrow(todo_) == 0L) {
+    n_ <- nrow(.tab_idx)
+    cli::cli_alert_info(
+      "{(.label)}: {format(n_, big.mark = ',')} {cli::qty(n_)}document{?s} already measured, read from cache."
+    )
+    return(done_)
+  }
+
+  if (!is.null(done_)) {
+    cli::cli_alert_warning(
+      "{(.label)}: the cache covers {format(nrow(done_), big.mark = ',')} of \\
+       {format(nrow(.tab_idx), big.mark = ',')} documents; measuring the remainder."
+    )
+  }
+
+  cli::cli_alert_info("{(.label)}: measuring {nrow(todo_)} documents on {(.workers)} workers.")
 
   mirai::daemons(.workers)
   on.exit(mirai::daemons(0L), add = TRUE)
@@ -241,8 +294,8 @@ edg_measure_corpus <- function(.tab_idx, .path_out, .fun, .args = list(), .sourc
     )
   }
 
-  paths_  <- unname(.tab_idx$Path)
-  chunks_ <- split(paths_, cut(seq_along(paths_), .workers, labels = FALSE))
+  paths_  <- unname(todo_$Path)
+  chunks_ <- split(paths_, cut(seq_along(paths_), min(.workers, length(paths_)), labels = FALSE))
 
   # CONSTANTS GO IN .args, NOT IN THE DOTS. mirai_map vectorises over its dots the way pmap does, so
   # a function passed there is zipped alongside the chunks rather than held fixed, and the map
@@ -250,7 +303,7 @@ edg_measure_corpus <- function(.tab_idx, .path_out, .fun, .args = list(), .sourc
   #
   # The worker's argument is also named .fn rather than .f, because mirai_map takes .f itself and a
   # second one would be matched to the same formal.
-  out_ <- mirai::mirai_map(
+  new_ <- mirai::mirai_map(
     .x    = chunks_,
     .f    = function(.chunk, .fn, .fargs) {
       dplyr::bind_rows(lapply(.chunk, function(.p) do.call(.fn, c(list(.p), .fargs))))
@@ -258,6 +311,8 @@ edg_measure_corpus <- function(.tab_idx, .path_out, .fun, .args = list(), .sourc
     .args = list(.fn = .fun, .fargs = .args)
   )[.progress] |>
     dplyr::bind_rows()
+
+  out_ <- dplyr::bind_rows(done_, new_)
 
   # CHECKED BEFORE IT IS WRITTEN. One document in, one row out is the contract of every measurement
   # function here, and a result of another shape means the map did not do what was asked. Writing
@@ -351,6 +406,193 @@ edg_doc_statistics <- function(.tab_stats, .tab_stop) {
 }
 
 
+# 4b. Restricting the upstream tables ----------------------------------------------------------------------------------
+
+#' Restrict 01A's and 01B's tables to the filings whose documents were retrieved
+#'
+#' Three upstream tables cut down to the corpus that actually exists. The unrestricted versions stay
+#' where 01A and 01B wrote them: they are the denominators for every coverage statement made later,
+#' and a pipeline that overwrites its own denominator cannot report how much it lost.
+#'
+#' THE MOST EXPENSIVE STEP IN THIS DOCUMENT AFTER MEASUREMENT, AND THE ONE THAT MOVES LEAST. Each of
+#' the three is a semi-join of a corpus-sized dataset -- thirty-two million link rows, the whole
+#' master index, twenty-one million landing rows -- against 1.77 million identifiers, and the answer
+#' cannot change while the mirror and the index stand still. It is therefore stamped: the mirror
+#' directories, the landing table and the identifier set all enter the key, so a re-acquisition
+#' upstream or a changed corpus invalidates it without anyone having to remember.
+#'
+#' THE THREE OUTPUTS ARE BOTH CACHE AND PUBLISHED ARTIFACT, so they carry no stamp column of their
+#' own and the fingerprint sits beside them under Cache/. That is the same arrangement 01A uses for
+#' LandingPageAll.parquet, and for the same reason: a table three downstream scripts read should hold
+#' nothing but its own columns.
+#'
+#' THE RESTRICTION IS BY DOCUMENT FIRST AND FILING SECOND. Links are cut to the documents on disk;
+#' the filings those links belong to then define the master-index and landing-page subsets. Cutting
+#' all three on the same identifier would be wrong: a filing is in scope because one of its
+#' attachments was retrieved, not because all of them were.
+#'
+#' @param .tab_idx The DocID to Path index.
+#' @param .dir_links Directory of 01A's mirrored document-link tables.
+#' @param .dir_master Directory of 01A's mirrored master index.
+#' @param .path_landing 01A's unfiltered landing table.
+#' @param .paths_out List with exactly the names Links, Master and Landing: the three destinations.
+#'   Checked rather than assumed, because `$` partial-matches on lists: a list named after the
+#'   configuration keys instead would return NULL for one element and a path for the other two, and
+#'   the failure would surface much later as a recycling error in an unrelated call.
+#' @param .path_stamp Parquet under Cache/ holding the fingerprint the three were built under.
+#' @param .rerun Logical. TRUE rebuilds regardless of the fingerprint.
+#' @return A named list of the three restricted tibbles: Links, Master, Landing.
+edg_restrict_upstream <- function(.tab_idx, .dir_links, .dir_master, .path_landing,
+                                  .paths_out, .path_stamp, .rerun = FALSE) {
+  if (FALSE) {
+    .tab_idx      <- tab_index
+    .dir_links    <- .lP$Edgar$DocLinks$DirMain$Links
+    .dir_master   <- .lP$Edgar$MasterIndex$DirParquet
+    .path_landing <- .lP$Input$LandingPageAll
+    .paths_out    <- list(
+      Links   = .lP$Output$LinkData,
+      Master  = .lP$Output$MasterIndex,
+      Landing = .lP$Output$LandingPage
+    )
+    .path_stamp   <- .lP$Cache$RestrictStamp
+    .rerun        <- FALSE
+  }
+
+  need_ <- c("Links", "Master", "Landing")
+  if (!all(need_ %in% names(.paths_out))) {
+    cli::cli_abort(c(
+      "The destination list must carry exactly the names Links, Master and Landing.",
+      "i" = "Received: {paste(names(.paths_out), collapse = ', ')}.",
+      "x" = "Partial name matching would return NULL for a missing element rather than raising here."
+    ))
+  }
+
+  out_paths_ <- as.character(unlist(.paths_out[need_]))
+
+  stamp_ <- utils_dir_stamp(
+    .dirs  = c(.dir_links, .dir_master, .path_landing),
+    .extra = .tab_idx$DocID
+  )
+
+  fresh_ <- !.rerun &&
+    all(fs::file_exists(out_paths_)) &&
+    identical(utils_stamp_read(.path = .path_stamp), stamp_)
+
+  if (fresh_) {
+    cli::cli_alert_info("Upstream unchanged: the three restricted tables were read from disk.")
+    return(purrr::map(.paths_out[need_], \(.p) arrow::read_parquet(file = .p)))
+  }
+
+  if (!.rerun && fs::file_exists(.path_stamp)) {
+    cli::cli_alert_warning("The mirror or the corpus has moved; the restricted tables are being rebuilt.")
+  }
+
+  use_ids_ <- .tab_idx$DocID
+
+  links_ <- arrow::open_dataset(sources = .dir_links) |>
+    dplyr::filter(.data$DocID %in% use_ids_) |>
+    dplyr::rename(
+      YQ = "YearQuarter", DocSeq = "Seq", DocDesc = "Description",
+      DocName = "Document", DocType = "Type", DocSize = "Size"
+    ) |>
+    dplyr::collect()
+
+  use_idx_ <- unique(links_$HashIndex)
+
+  master_ <- arrow::open_dataset(sources = .dir_master) |>
+    dplyr::filter(.data$HashIndex %in% use_idx_) |>
+    dplyr::rename(YQ = "YearQuarter") |>
+    dplyr::select(-dplyr::any_of(c("Year", "Quarter"))) |>
+    dplyr::collect()
+
+  landing_ <- arrow::open_dataset(sources = .path_landing) |>
+    dplyr::filter(.data$HashIndex %in% use_idx_) |>
+    dplyr::collect()
+
+  out_ <- list(Links = links_, Master = master_, Landing = landing_)
+
+  purrr::walk2(
+    .x = out_[need_],
+    .y = out_paths_,
+    .f = arrow::write_parquet
+  )
+  arrow::write_parquet(tibble::tibble(Stamp = stamp_), .path_stamp)
+
+  cli::cli_alert_success(
+    "Restricted tables rebuilt: {format(nrow(links_), big.mark = ',')} link rows, \\
+     {format(nrow(master_), big.mark = ',')} index rows, \\
+     {format(nrow(landing_), big.mark = ',')} landing rows."
+  )
+
+  out_
+}
+
+
+# 4c. Deployment -------------------------------------------------------------------------------------------------------
+
+#' Write the three derived tables, if what produced them has moved
+#'
+#' FOUR HUNDRED AND FORTY MEGABYTES ARE NOT REWRITTEN TO PRODUCE FILES THAT ALREADY EXIST. All three
+#' are a deterministic function of the measurement caches, the restriction and the four quality
+#' thresholds, so those are what the fingerprint covers.
+#'
+#' THE REASON IS NOT DISK TIME, IT IS THE MODIFICATION TIME. Five documents downstream -- 01D, 01E,
+#' 02B, 03A and 04C -- fingerprint their own caches against FullMetaData.parquet. Rewriting it
+#' unconditionally moves its timestamp on every render of this document, so every one of those
+#' caches misses and rebuilds even though the bytes are identical. A fingerprint is only as stable as
+#' the file it points at.
+#'
+#' THE TABLES ARE BUILT EITHER WAY. Only the write is guarded. Every check in this document runs on
+#' the objects in memory, so a skipped write leaves nothing unverified; what it skips is producing a
+#' second copy of a file that already holds the same rows.
+#'
+#' @param .tabs List with exactly the names DocStats, RemovedDocs and FullMetaData.
+#' @param .paths_out List with the same three names: where each is written.
+#' @param .stamp Character. The fingerprint of what determined the three, from utils_dir_stamp().
+#' @param .path_stamp Parquet under Cache/ holding the fingerprint they were last written under.
+#' @param .rerun Logical. TRUE writes regardless of the fingerprint.
+#' @return Invisibly, the names written, or character(0) where nothing was.
+edg_write_metadata <- function(.tabs, .paths_out, .stamp, .path_stamp, .rerun = FALSE) {
+  if (FALSE) {
+    .tabs <- list(DocStats = tab_docstats, RemovedDocs = tab_removed, FullMetaData = tab_metadata)
+    .paths_out  <- .lP$Output[c("DocStats", "RemovedDocs", "FullMetaData")]
+    .stamp      <- stamp_outputs
+    .path_stamp <- .lP$Cache$OutputStamp
+    .rerun      <- FALSE
+  }
+
+  need_ <- c("DocStats", "RemovedDocs", "FullMetaData")
+  if (!all(need_ %in% names(.tabs)) || !all(need_ %in% names(.paths_out))) {
+    cli::cli_abort(c(
+      "Both lists must carry exactly the names DocStats, RemovedDocs and FullMetaData.",
+      "i" = "Tables: {paste(names(.tabs), collapse = ', ')}.",
+      "i" = "Paths: {paste(names(.paths_out), collapse = ', ')}.",
+      "x" = "Partial name matching would return NULL for a missing element rather than raising here."
+    ))
+  }
+
+  fresh_ <- !.rerun &&
+    all(fs::file_exists(as.character(unlist(.paths_out[need_])))) &&
+    identical(utils_stamp_read(.path = .path_stamp), .stamp)
+
+  if (fresh_) {
+    cli::cli_alert_info("Inputs unchanged: the three derived tables were left as they stand.")
+    return(invisible(character(0)))
+  }
+
+  purrr::walk2(
+    .x = .tabs[need_],
+    .y = as.character(unlist(.paths_out[need_])),
+    .f = arrow::write_parquet
+  )
+  arrow::write_parquet(tibble::tibble(Stamp = .stamp), .path_stamp)
+
+  cli::cli_alert_success("Written: {paste(need_, collapse = ', ')}.")
+
+  invisible(need_)
+}
+
+
 # 5. The quality rules -------------------------------------------------------------------------------------------------
 
 #' Documents too damaged to analyse
@@ -370,32 +612,46 @@ edg_doc_statistics <- function(.tab_stats, .tab_stop) {
 #'   3. MOSTLY DIGITS. Three quarters or more of the tokens numeric. That is a financial table, not
 #'      an agreement.
 #'
+#' THE THRESHOLDS ARE ARGUMENTS, NOT LITERALS. They are the one set of numbers in this document a
+#' referee is certain to query, so they are passed from the runbook where they can be read alongside
+#' the prose that argues for them, rather than sitting four hundred lines into a library.
+#'
 #' RemClass records which rule fired first, in that order, so a document caught by two is attributed
 #' to the more fundamental. The counts per rule are reported, because a rule that fires on almost
 #' nothing and one that fires on a tenth of the corpus warrant different scrutiny.
 #'
 #' @param .tab_stats Output of edg_doc_statistics().
 #' @param .tab_idx The DocID to Path index, for the document type.
+#' @param .max_words Integer. Rule 1 fires at or below this many words after the header.
+#' @param .max_stop Numeric. Rule 2 fires at or below this stopword percentage.
+#' @param .max_words_stop Integer. Rule 2 additionally requires a document at or below this length.
+#' @param .min_nums Numeric. Rule 3 fires at or above this percentage of numeric tokens.
 #' @return A tibble of the documents to flag, one row each, with RemClass.
-edg_flag_removals <- function(.tab_stats, .tab_idx) {
+edg_flag_removals <- function(.tab_stats, .tab_idx, .max_words = 10L, .max_stop = 20,
+                              .max_words_stop = 100L, .min_nums = 75) {
   if (FALSE) {
-    .tab_stats <- tab_docstats
-    .tab_idx   <- tab_index
+    .tab_stats      <- tab_docstats
+    .tab_idx        <- tab_index
+    .max_words      <- 10L
+    .max_stop       <- 20
+    .max_words_stop <- 100L
+    .min_nums       <- 75
   }
 
   .tab_stats |>
     dplyr::mutate(
-      RemWords = as.integer(.data$nWordsAdj <= 10),
-      RemStop  = as.integer(.data$pStopShort <= 20 & .data$nWordsAdj <= 100),
-      RemNums  = as.integer(.data$pNums >= 75),
+      RemWords = as.integer(.data$nWordsAdj <= .max_words),
+      RemStop  = as.integer(.data$pStopShort <= .max_stop & .data$nWordsAdj <= .max_words_stop),
+      RemNums  = as.integer(.data$pNums >= .min_nums),
       RemDoc   = pmax(.data$RemWords, .data$RemStop, .data$RemNums)
     ) |>
     dplyr::filter(.data$RemDoc == 1L) |>
     dplyr::mutate(
       RemClass = dplyr::case_when(
-        .data$RemWords == 1L ~ "1-Too short: 10 words or fewer after the header",
-        .data$RemStop  == 1L ~ "2-Not prose: under 20 pct stopwords in a document under 100 words",
-        .data$RemNums  == 1L ~ "3-Mostly digits: 75 pct or more of tokens numeric"
+        .data$RemWords == 1L ~ paste0("1-Too short: ", .max_words, " words or fewer after the header"),
+        .data$RemStop  == 1L ~ paste0("2-Not prose: under ", .max_stop, " pct stopwords in a document under ",
+                                      .max_words_stop, " words"),
+        .data$RemNums  == 1L ~ paste0("3-Mostly digits: ", .min_nums, " pct or more of tokens numeric")
       )
     ) |>
     dplyr::left_join(
@@ -494,6 +750,10 @@ edg_filer_summary <- function(.tab) {
 #' different content, and which attachment it was, how far the copies diverge and under which
 #' registrants they were filed are the things that decide whether it matters.
 #'
+#' nRemoved IS WHAT MAKES THE ROW ACTIONABLE. A disagreement among copies of a document the quality
+#' rules already threw out is a curiosity; the same disagreement among copies that survive is an
+#' acquisition fault feeding the analysis sample. Without the column a reader has to go and look.
+#'
 #' @param .tab The consolidated metadata table.
 #' @return A tibble, one row per disagreeing attachment.
 edg_filer_disagreements <- function(.tab) {
@@ -504,6 +764,7 @@ edg_filer_disagreements <- function(.tab) {
     dplyr::summarise(
       nFilers   = dplyr::n(),
       nDistinct = dplyr::n_distinct(.data$nChars),
+      nRemoved  = sum(.data$Removed),
       MinChars  = min(.data$nChars),
       MaxChars  = max(.data$nChars),
       .by       = "HashDocument"
@@ -529,12 +790,19 @@ edg_filer_distribution <- function(.tab) {
 
 #' Report repeated documents
 #'
-#' @param .tab The consolidated metadata table.
-#' @return The summary tibble, invisibly.
-edg_report_filer_copies <- function(.tab) {
-  if (FALSE) .tab <- tab_metadata
+#' TAKES THE TWO SUMMARIES, DOES NOT COMPUTE THEM. Both group the consolidated table twice over, and
+#' both are shown here and again in the Overview.
+#'
+#' @param .tab_sum Output of edg_filer_summary().
+#' @param .tab_dist Output of edg_filer_distribution().
+#' @return .tab_sum, invisibly.
+edg_report_filer_copies <- function(.tab_sum, .tab_dist) {
+  if (FALSE) {
+    .tab_sum  <- tab_filer_summary
+    .tab_dist <- tab_filer_distribution
+  }
 
-  sum_ <- edg_filer_summary(.tab = .tab)
+  sum_ <- .tab_sum
 
   tbl_head("Attachments fetched under several registrants")
   tbl_out(
@@ -550,7 +818,7 @@ edg_report_filer_copies <- function(.tab) {
 
   tbl_head("Registrants per attachment, by group")
   tbl_out(
-    .tab   = edg_filer_distribution(.tab = .tab) |> dplyr::filter(.data$nFilers <= 8L),
+    .tab   = dplyr::filter(.tab_dist, .data$nFilers <= 8L),
     .title = NULL,
     .notes = c(nFilers = "Truncated at eight; the tail runs much further on registration statements.")
   )
@@ -600,16 +868,19 @@ edg_error_messages <- function(.tab_err) {
 
 #' Report parse failures
 #'
-#' @param .tab_err Output of the parse-error pass.
-#' @param .tab_idx The DocID to Path index, which supplies the group.
-#' @return The summary tibble, invisibly.
-edg_report_errors <- function(.tab_err, .tab_idx) {
+#' TAKES THE TWO SUMMARIES, DOES NOT COMPUTE THEM. Both are shown here and again in the Overview, and
+#' the first joins two tables of 1.77 million rows to produce four.
+#'
+#' @param .tab_sum Output of edg_error_summary().
+#' @param .tab_msg Output of edg_error_messages().
+#' @return .tab_sum, invisibly.
+edg_report_errors <- function(.tab_sum, .tab_msg) {
   if (FALSE) {
-    .tab_err <- tab_errors
-    .tab_idx <- tab_index
+    .tab_sum <- tab_error_summary
+    .tab_msg <- tab_error_messages
   }
 
-  sum_ <- edg_error_summary(.tab_err = .tab_err, .tab_idx = .tab_idx)
+  sum_ <- .tab_sum
 
   tbl_head("Parse failures by group")
   tbl_out(
@@ -621,7 +892,7 @@ edg_report_errors <- function(.tab_err, .tab_idx) {
   )
 
   tbl_head("What the failures were")
-  tbl_out(.tab = edg_error_messages(.tab_err = .tab_err), .title = NULL, .n = 15L)
+  tbl_out(.tab = .tab_msg, .title = NULL, .n = 15L)
   tbl_note("PDF conversion is the bulk of it and is expected; a failure concentrated in a file type \\
             that previously converted is not.")
 
@@ -684,20 +955,24 @@ edg_survival_summary <- function(.tab_rem, .tab_idx) {
 
 #' Report the quality rules
 #'
-#' @param .tab_rem Output of edg_flag_removals().
-#' @param .tab_idx The DocID to Path index.
-#' @return The removal summary, invisibly.
-edg_report_removals <- function(.tab_rem, .tab_idx) {
+#' TAKES THE TWO SUMMARIES, DOES NOT COMPUTE THEM. The removal summary is wanted three times over --
+#' here, in the figure, and in the Overview -- and computing it each time leaves three answers that
+#' could differ.
+#'
+#' @param .tab_sum Output of edg_removal_summary().
+#' @param .tab_surv Output of edg_survival_summary().
+#' @return .tab_sum, invisibly.
+edg_report_removals <- function(.tab_sum, .tab_surv) {
   if (FALSE) {
-    .tab_rem <- tab_removed
-    .tab_idx <- tab_index
+    .tab_sum  <- tab_removal_summary
+    .tab_surv <- tab_survival
   }
 
-  sum_ <- edg_removal_summary(.tab_rem = .tab_rem, .tab_idx = .tab_idx)
+  sum_ <- .tab_sum
 
   tbl_head("What survives, by group")
   tbl_out(
-    .tab    = edg_survival_summary(.tab_rem = .tab_rem, .tab_idx = .tab_idx),
+    .tab    = .tab_surv,
     .title  = NULL,
     .pct    = "ShareKept",
     .digits = 1L
@@ -722,28 +997,38 @@ edg_report_removals <- function(.tab_rem, .tab_idx) {
 #'
 #' The block to copy out when the metadata needs checking without re-rendering.
 #'
-#' @param .tab_err Output of the parse-error pass.
-#' @param .tab_rem Output of edg_flag_removals().
-#' @param .tab_idx The DocID to Path index.
-#' @param .tab_meta The consolidated metadata table.
+#' Six summaries rather than four tables, because every one of them is computed once in the body of
+#' the document and restated here. Recomputing them would traverse the corpus a second time to
+#' produce numbers that must agree with the first by construction.
+#'
+#' @param .err_sum Output of edg_error_summary().
+#' @param .err_msg Output of edg_error_messages().
+#' @param .rem_sum Output of edg_removal_summary().
+#' @param .rem_surv Output of edg_survival_summary().
+#' @param .fil_sum Output of edg_filer_summary().
+#' @param .fil_dist Output of edg_filer_distribution().
 #' @return Invisibly NULL.
-edg_report_all_meta <- function(.tab_err, .tab_rem, .tab_idx, .tab_meta) {
+edg_report_all_meta <- function(.err_sum, .err_msg, .rem_sum, .rem_surv, .fil_sum, .fil_dist) {
   if (FALSE) {
-    .tab_err  <- tab_errors
-    .tab_rem  <- tab_removed
-    .tab_idx  <- tab_index
-    .tab_meta <- tab_metadata
+    .err_sum  <- tab_error_summary
+    .err_msg  <- tab_error_messages
+    .rem_sum  <- tab_removal_summary
+    .rem_surv <- tab_survival
+    .fil_sum  <- tab_filer_summary
+    .fil_dist <- tab_filer_distribution
   }
 
-  edg_report_errors(.tab_err = .tab_err, .tab_idx = .tab_idx)
-  edg_report_removals(.tab_rem = .tab_rem, .tab_idx = .tab_idx)
-  edg_report_filer_copies(.tab = .tab_meta)
+  edg_report_errors(.tab_sum = .err_sum, .tab_msg = .err_msg)
+  edg_report_removals(.tab_sum = .rem_sum, .tab_surv = .rem_surv)
+  edg_report_filer_copies(.tab_sum = .fil_sum, .tab_dist = .fil_dist)
 
   invisible(NULL)
 }
 
 
 # 8. Figures -----------------------------------------------------------------------------------------------------------
+# DEFINED HERE, WRITTEN NOWHERE. The document displays what this returns and the consolidated release
+# script writes the files the manuscript needs.
 
 #' Flagged documents by rule and group
 #'

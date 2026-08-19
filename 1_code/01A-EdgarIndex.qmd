@@ -22,7 +22,16 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+# TABLE MODE IS DECLARED, NOT DEFAULTED. tbl_out() reads this option and falls back to "console"
+# when nothing sets it, so a document that says nothing still renders console blocks -- but says
+# nothing about whether that was chosen. It is chosen: see "How results are reported" below. Setting
+# this to "kable" previews the styled path, and every chunk producing a table then needs
+# `#| results: asis` or knitr wraps the markup in a code block.
+options(
+  cli.num_colors = 1,          # plain ASCII; ANSI codes paste as garbage
+  cli.width      = 120,        # matches the 125-column source margin
+  mc.table_mode  = "console"   # "console" or "kable"
+)
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -60,7 +69,7 @@ This is the first step of the pipeline. Everything downstream is derived from wh
 
 EDGAR publishes a quarterly master index listing every filing since 1993, and for each filing a landing page listing the
 documents attached to it. This document mirrors both locally and parses the landing HTML into a single table,
-`LandingPageAll.parquet`, holding twenty-one metadata fields per filing.
+`Output/LandingPageAll.parquet`, holding twenty-one metadata fields per filing.
 
 No attachment is downloaded here. The landing pages say *what* each filing contains; fetching the contents is 01B, which
 reads the link tables mirrored below. The two are separate scripts because they fail differently and at different
@@ -89,14 +98,62 @@ and reports the shortfall, whether or not it fetched anything.
 
 The distinction is the whole design. A flag that suppressed the work and the diagnostic together would let a document
 with a badly incomplete mirror render exactly like a complete one: no error, no warning, and a coverage figure that was
-never computed. Gating only the network call costs one parquet scan per render and turns the state of the mirror into a
-reported result.
+never computed. Gating only the network call turns the state of the mirror into a reported result.
 
-Local work is not gated at all. Parsing already-mirrored HTML is idempotent by inspection -- it looks at what it has
-already produced and does only the remainder -- so it is cheap when complete, and a step cheap enough not to need a
-switch cannot be left switched off.
+## What is recomputed, and what is not
 
-## The mirror
+Four steps here are expensive: selecting the frame, measuring coverage, parsing the landing HTML, and cleaning the
+parsed tables into one file. Each is a deterministic function of what the mirror currently holds, and none of them can
+produce a different answer while the mirror stands still. Recomputing all four on a render that changes nothing is most
+of the cost of this document.
+
+Each therefore takes a `.rerun` argument, defaulting to `FALSE`, and each caches its result under `Cache/`. **The cache
+is keyed on the input, not on the file name.** `utils_dir_stamp()` fingerprints the directories the step read -- file
+count, total size, latest modification time -- and stores that stamp beside the result. Three outcomes, and the console
+says which one happened every time:
+
+| Situation | What happens |
+|:--|:--|
+| Stamp matches | The cached result is read. No work is done. |
+| Stamp differs | The input moved. The step recomputes and restamps. |
+| `.rerun = TRUE` | The step recomputes regardless. |
+
+This is not a suppressed chunk. Every chunk below executes, reports and validates on every render, and every number on
+this page is computed from the artifact that exists right now. What the stamp removes is recomputation of something
+provably unchanged, and that is precisely what makes it affordable to leave every check switched on.
+
+The fingerprint is metadata rather than content, because the directories it guards hold hundreds of gigabytes and
+reading them would cost more than the computation being cached. The trade is explicit: an edit that preserved file
+count, total size and modification time would go undetected. Nothing in this pipeline rewrites a mirrored file in
+place, so the case does not arise -- but a step where it could must pass `.rerun = TRUE` rather than trust the stamp.
+
+**To force a full rebuild**, set the relevant `.rerun` to `TRUE` rather than deleting anything. Deleting a cache file
+works too and costs the same recomputation; the argument is preferred because it leaves a record on the page of what
+was rebuilt and why.
+
+## How results are reported
+
+Tables print as fixed-width console blocks, and figures are displayed rather than saved. Both are
+deliberate and both are the same decision. A runbook is read while it runs and pasted into
+discussion, where a monospaced block survives being quoted into a mail or a chat window and a styled
+table does not.
+
+The publication versions are produced once, at the end of the pipeline, by the consolidated release
+script: styled tables from the same `tbl_out()` specifications, figure files from the same plotting
+functions. Producing them here instead would mean twenty scripts each writing part of the
+manuscript's exhibits, rewritten on every render of a document that changed none of them, and a
+manuscript drawing on files produced at twenty different moments.
+
+The choice is set in this document's setup chunk rather than left to a default, because a default is
+a decision nobody reviewed and two documents in this repository already disagree about it without
+saying so.
+
+## Where things are written
+
+Anything a later script reads goes in `Output/`. Anything that exists only to make this document cheap to re-render
+goes in `Cache/`. The mirror is the one exception and keeps its own root: `GetEDGAR/` holds millions of files that no
+other script opens by path, and moving it under `Output/` would say it is an artifact to be published rather than a
+local copy of a public archive.
 
 `rGetEDGAR` derives its entire directory tree from a single root, and this script's root is `GetEDGAR/` inside its own
 output directory. 01B writes the `DocumentData/` branch of that same tree: the package resolves link tables and
@@ -112,11 +169,15 @@ This document has no `Input` section. Its input is EDGAR.
 #| label: config
 .lP <- list(
   Cache = list(
-    RawExtract = utils_file_path(.dir_main, "Cache", "RawExtract")       # one parsed table per year-quarter
+    RawExtract   = utils_file_path(.dir_main, "Cache", "RawExtract"),            # one parsed table per year-quarter
+    FrameIndex   = utils_file_path(.dir_main, "Cache", "FrameIndex.parquet"),    # the selected frame, plus its stamp
+    LinkCoverage = utils_file_path(.dir_main, "Cache", "LinkCoverage.parquet"),  # mirror coverage, plus its stamp
+    ParseLog     = utils_file_path(.dir_main, "Cache", "ParseLog.parquet"),      # per-quarter parse counts, plus stamp
+    # Guards the published landing table, which carries no stamp column of its own.
+    CleanStamp   = utils_file_path(.dir_main, "Cache", "CleanStamp.parquet")
   ),
   Output = list(
-    LandingPageAll = utils_file_path(.dir_main, "LandingPageAll.parquet"),   # the one downstream artifact
-    Figures        = utils_file_path(.dir_main, "Figures")                   # figure files for the manuscript
+    LandingPageAll = utils_file_path(.dir_main, "Output", "LandingPageAll.parquet")   # the one downstream artifact
   ),
   Param = list(
     User    = "Matthias.Uckert@Outlook.com",   # SEC requires a contact address on every request
@@ -158,12 +219,22 @@ if (isTRUE(.lP$Param$Acquire)) {
 }
 ```
 
+Selecting the frame scans every quarterly index file, so it is cached against the index directory together with the two
+parameters that define the selection. Editing `edg_sec_forms()` or `MaxYear` therefore invalidates the cache on its own,
+which is the case a name-keyed cache would have got wrong.
+
+The result is returned sorted, and that is not tidiness. A multi-file Arrow scan makes no promise about the order in
+which record batches come back, and the coverage step below takes this vector into its own fingerprint; an unsorted
+frame would hash differently on every render and defeat that cache for no reason.
+
 ```{r}
 #| label: index-select
 vec_hash_index <- edg_select_index(
   .dir_master = .lP$Edgar$MasterIndex$DirParquet,   # the mirrored master index
   .forms      = .lP$Param$Forms,                    # the seventeen types in scope
-  .max_year   = .lP$Param$MaxYear                   # frame closure year
+  .max_year   = .lP$Param$MaxYear,                  # frame closure year
+  .path_cache = .lP$Cache$FrameIndex,               # frame and stamp
+  .rerun      = FALSE                               # TRUE rebuilds regardless of the stamp
 )
 
 length(vec_hash_index)
@@ -189,21 +260,25 @@ if (isTRUE(.lP$Param$Acquire)) {
 }
 ```
 
-Coverage of the frame, computed on every render regardless of the switch.
+Coverage is reported on every render regardless of the switch, and is measured once and reported twice: here, and again
+in the overview.
 
-Coverage is computed once and reported twice: here, and again in the overview. Recomputing it there would rescan the
-mirror to restate numbers already established.
+The measurement itself scans every mirrored quarter, so it is cached against both mirror directories and the frame. It
+composes correctly with acquisition: a render that fetches pages moves the directories underneath, the stamp taken
+afterwards differs from the stored one, and coverage re-measures without being asked.
 
 ```{r}
 #| label: landing-coverage
 tab_coverage <- edg_link_coverage(
   .frame      = vec_hash_index,                    # the filings the form-type restriction selects
   .path_htmls = .lP$Edgar$DocLinks$DirMain$HTMLs,  # mirrored landing pages
-  .path_links = .lP$Edgar$DocLinks$DirMain$Links   # mirrored link tables
+  .path_links = .lP$Edgar$DocLinks$DirMain$Links,  # mirrored link tables
+  .path_cache = .lP$Cache$LinkCoverage,            # coverage row and stamp
+  .rerun      = FALSE                              # TRUE re-measures regardless of the stamp
 )
 
 edg_report_links(
-  .cov     = tab_coverage,       # computed above
+  .cov     = tab_coverage,       # measured above
   .acquire = .lP$Param$Acquire   # reported, so a gap and a switch stay distinguishable
 )
 ```
@@ -213,22 +288,27 @@ serves, and they are lost to any method rather than to this one.
 
 # Parsing
 
-Parsing works on already-mirrored bytes, so it is not gated. It runs on every render and does nothing when there is
-nothing new: each year-quarter has one output file, the function reads the `HashIndex` values already in it, and parses
-only the rest.
+Parsing works on already-mirrored bytes, so it is not gated by the acquisition switch. It is idempotent twice over.
+Each year-quarter has one output file, the function reads the `HashIndex` values already in it, and parses only the
+rest; and the whole scan sits behind a stamp covering both the mirrored HTML and the parsed tables, so a render with
+nothing to do reads one small log and stops.
 
-That comparison is deliberately narrow. Both sides contribute their `HashIndex` column and nothing else, so a completed
-quarter costs two column reads. Reading the parsed table whole, or letting Arrow filter the source dataset, would make
-every completed quarter pull its landing-page HTML through a filter in order to produce no rows -- which on a corpus
-this size is most of the cost of a render that has no work to do.
+The inner comparison is deliberately narrow. Both sides contribute their `HashIndex` column and nothing else, so a
+completed quarter costs two column reads. Reading the parsed table whole, or letting Arrow filter the source dataset,
+would make every completed quarter pull its landing-page HTML through a filter in order to produce no rows.
+
+Parallel workers are raised on first need rather than up front. Twenty-four fresh R sessions take seconds to start and
+are pure waste on a render that parses nothing, which after the first complete run is every render.
 
 ```{r}
 #| label: parse-landing
 tab_parse_log <- edg_parse_landing(
   .path_htmls = .lP$Edgar$DocLinks$DirMain$HTMLs,   # mirrored landing pages, one dataset per quarter
   .dir_raw    = .lP$Cache$RawExtract,               # destination for the per-quarter parsed tables
+  .path_cache = .lP$Cache$ParseLog,                 # per-quarter log and stamp
   .workers    = .lP$Param$Workers,                  # parallel workers; also the chunk count per batch
   .batch      = .lP$Param$Batch,                    # landing pages held in memory at once
+  .rerun      = FALSE,                              # TRUE rescans every quarter regardless of the stamp
   .quiet      = FALSE                               # FALSE reports each quarter as it is processed
 )
 
@@ -257,11 +337,18 @@ structure rather than filing volume, which is why the composition table below re
 Anything joining to this table on `HashIndex` must expect a many-to-one match. 01C joins on `DocID` instead, which is
 unique, and the multi-filer case is carried there as an explicit flag rather than as unexplained repetition.
 
+Binding every quarter, casting every column to character and sorting several million rows is the most expensive single
+step in this document, and its only input is the parse cache. Its stamp is the one that does not live with its result:
+`LandingPageAll.parquet` is published and read by three downstream scripts, so it carries nothing but its own columns
+and the stamp sits in `Cache/CleanStamp.parquet` instead.
+
 ```{r}
 #| label: clean-landing
 tab_landing <- edg_clean_landing(
-  .dir_raw  = .lP$Cache$RawExtract,        # per-quarter parsed tables
-  .path_out = .lP$Output$LandingPageAll    # the cleaned table downstream reads
+  .dir_raw    = .lP$Cache$RawExtract,        # per-quarter parsed tables
+  .path_out   = .lP$Output$LandingPageAll,   # the cleaned table downstream reads
+  .path_stamp = .lP$Cache$CleanStamp,        # stamp for the published file
+  .rerun      = FALSE                        # TRUE rebuilds regardless of the stamp
 )
 
 nrow(tab_landing)
@@ -269,9 +356,22 @@ nrow(tab_landing)
 
 # Results
 
+Both summaries are group-bys over the full landing table, and the document needs each of them more than once -- in this
+section, in the overview, and for the figure. They are computed here and passed everywhere else, so several million
+rows are traversed once rather than three times.
+
+```{r}
+#| label: summarise-landing
+tab_year  <- edg_landing_coverage(.tab = tab_landing)   # one row per calendar year
+tab_forms <- edg_landing_forms(.tab = tab_landing)      # one row per form type
+```
+
 ```{r}
 #| label: report-landing
-edg_report_landing(.tab = tab_landing)
+edg_report_landing(
+  .tab_year  = tab_year,    # summarised above, not recomputed
+  .tab_forms = tab_forms    # likewise
+)
 ```
 
 Report date is absent on a large share of filings by design: 8-K is a current report and covers no period. Filing date
@@ -280,8 +380,8 @@ property of the form.
 
 # Validation
 
-Two consistency checks between what was parsed and what survived cleaning. The prediction in each case is stated first,
-so a result that differs is a finding rather than a number to interpret after the fact.
+Three consistency checks between what was parsed and what survived cleaning. The prediction in each case is stated
+first, so a result that differs is a finding rather than a number to interpret after the fact.
 
 ```{r}
 #| label: validate-parse
@@ -303,6 +403,11 @@ tibble::tibble(
     )
   )
 ```
+
+This check is also what makes the cached path honest. `RowsParsed` comes from the parse log and `RowsKept` from the
+landing table, and the two are cached separately against different directories. A stale cache on either side would
+open a gap here that a fresh render closes, so the reconciliation that would have caught it runs whether or not
+anything was recomputed.
 
 The grain of the table, and how it relates to the frame selected above.
 
@@ -341,10 +446,19 @@ edg_landing_duplicates(
   )
 ```
 
+Two keys repeat, across six rows, and none of the repeats is an exact copy: where a key recurs here the rows genuinely
+disagree about the registrant. That is the case this check exists to find, so the prediction above was wrong and the
+result is a finding rather than a formality. At six rows in 21.6 million it changes nothing measurable, but it does mean
+the table cannot be treated as keyed on filing, registrant and film number.
+
+Nothing downstream treats it that way. 01C joins on `DocID`, which is unique by construction, so the disagreement stays
+visible here rather than propagating as silent row multiplication. It is reported and not repaired for the reason the
+whole document is built on: this script says what the mirror contains, not what it should have contained.
+
 # Deployment
 
-`LandingPageAll.parquet` is written by the cleaning step above and is the only artifact of this script that anything
-downstream reads. 01B selects documents from it; 01C restricts it to the filings whose documents were actually
+`Output/LandingPageAll.parquet` is written by the cleaning step above and is the only artifact of this script that
+anything downstream reads. 01B selects documents from it; 01C restricts it to the filings whose documents were actually
 retrieved and publishes that as `LandingPage.parquet`.
 
 The two are deliberately separate files rather than one filtered in place. The unfiltered version is the denominator
@@ -357,11 +471,32 @@ earlier one. The date leads rather than the filing hash because Parquet encodes 
 lengths: sorting on a hash scatters every correlated column and inflates the file several-fold, while sorting on the
 date preserves the temporal grouping the data already had.
 
+Nothing else is written. No figure files, no styled tables, no Stata export: those are the release
+script's job, for the reason set out under *How results are reported*. One script converts and writes
+everything once, when the pipeline is complete.
+
 ```{r}
 #| label: deploy-report
-fs::file_info(.lP$Output$LandingPageAll) |>
-  dplyr::select("path", "size") |>
-  tbl_out(.title = "Written")
+fs::file_info(path = c(
+  .lP$Output$LandingPageAll,   # the published artifact
+  .lP$Cache$FrameIndex,        # the four caches, in the order the document builds them
+  .lP$Cache$LinkCoverage,
+  .lP$Cache$ParseLog,
+  .lP$Cache$CleanStamp
+)) |>
+  dplyr::transmute(
+    Kind    = c("Output", rep("Cache", 4L)),
+    File    = as.character(fs::path_file(.data$path)),
+    Size    = .data$size,
+    Written = format(.data$modification_time, "%Y-%m-%d %H:%M")
+  ) |>
+  tbl_out(
+    .title = "Written",
+    .notes = c(
+      Kind    = "Only the Output row is read downstream; the rest exist to make a re-render cheap.",
+      Written = "A cache older than the Output row means that step found its input unchanged."
+    )
+  )
 ```
 
 Every script in this pipeline writes inside its own output directory and nowhere else, and this checks that this one
@@ -392,32 +527,21 @@ edg_check_own_output(
 #| fig-height: 3.4
 #| fig-cap: "Filings mirrored per calendar year. The frame closes in 2024, so the final year is
 #|   partial by construction rather than by attrition."
-gg_coverage <- edg_plot_coverage(.tab = edg_landing_coverage(.tab = tab_landing))
-
-plot_save(
-  .plot    = gg_coverage,               # the figure
-  .name    = "coverage-by-year",        # meaningful filename, not unnamed-chunk-N
-  .dir     = .lP$Output$Figures,        # figure destination
-  .height  = 3.4,                       # from the ladder: a time series is a low panel
-  .width   = 7.5,                       # the fixed project width
-  .formats = c("pdf", "png"),           # manuscript and web
-  .dpi     = 300                        # print resolution
-)
-
-gg_coverage
+edg_plot_coverage(.tab = tab_year)   # summarised once in Results; the release script writes the file
 ```
 
 ```{r}
 #| label: overview-all
 edg_report_all_index(
-  .cov     = tab_coverage,      # mirror coverage, computed once above
-  .tab     = tab_landing,       # the cleaned landing table
-  .acquire = .lP$Param$Acquire  # so the backlog note reads the same as it did the first time
+  .cov       = tab_coverage,      # mirror coverage, measured once above
+  .tab_year  = tab_year,          # summarised once above
+  .tab_forms = tab_forms,         # likewise
+  .acquire   = .lP$Param$Acquire  # so the backlog note reads the same as it did the first time
 )
 ```
 
 # Next
 
-**01B-EdgarDocuments** reads the link tables mirrored here together with `LandingPageAll.parquet`, selects the Exhibit-10
-exhibits, CT orders and Item 1.01 8-Ks, downloads and parses them into `GetEDGAR/DocumentData/Parsed/`, and writes the
-`DocID` to `Path` index every later script uses to locate a document's text.
+**01B-EdgarDocuments** reads the link tables mirrored here together with `Output/LandingPageAll.parquet`, selects the
+Exhibit-10 exhibits, CT orders and Item 1.01 8-Ks, downloads and parses them into `GetEDGAR/DocumentData/Parsed/`, and
+writes the `DocID` to `Path` index every later script uses to locate a document's text.
