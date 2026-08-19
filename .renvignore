@@ -1,5 +1,42 @@
-0_data
-0_sample
-contracts-engine/
+# .renvignore -- directories renv must not scan when discovering R dependencies.
+#
+# WHY THIS MATTERS MORE THAN IT LOOKS. renv::activate() runs on every R session start, and its
+# synchronization check calls renv::dependencies(), which reads every file it is not told to skip.
+# A directory missing from this list is a directory parsed in full at every session start. Leaving
+# 2_output out cost 160 seconds per session and printed the corpus tree to the console.
+#
+# The rule for adding a line: does this directory contain R code that the project needs installed
+# packages for? If no, it belongs here. Derived data, Python trees, superseded code and rendered
+# output are all "no".
+#
+# 1_code/ is deliberately absent. That is where the live code is, and it is what the lockfile must
+# be built from.
+
+# Derived data. 2_output is a symlink to _2_output, so BOTH are named: renv would otherwise reach
+# the same 1.87 million files through whichever of the two it happened to follow.
+2_output
+_2_output/
+0_data/
+0_sample/
+0_scratch/
+
+# Superseded code. Old scripts import packages the live pipeline no longer uses, and a lockfile
+# built from them pins dependencies nothing calls.
+_BackUps/
+
+# Rendered output.
+_rendered/
+docs/
+
+# Python. No R code in any of these; contracts-lexnlp carries one R helper that is a container
+# rebuild script rather than pipeline code.
+contracts-classify/
+contracts-extract/
 contracts-lexnlp/
-2_output/
+contracts-spacy/
+_contracts-engine/
+_contracts-extract/
+
+# The public site is a separate Quarto project with its own small set of R helpers. Include it here
+# only while it is absent; remove this line once 3_site/ is back and its dependencies matter.
+3_site/
