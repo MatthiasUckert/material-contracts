@@ -8,10 +8,6 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
-# FIRST LINE, AND LOAD-BEARING. _quarto.yml lives in 1_code/ and rprojroot returns the deepest
-# directory containing one, so a bare here::here() from a document there returns .../1_code and every
-# here::here("2_output", ...) resolves one level too deep -- silently.
-here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # Figure geometry is NOT set here -- it is declared once in _quarto.yml.
@@ -31,18 +27,7 @@ options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste a
 #                is what a table is for while the analysis is being built.
 # Both paths receive the same specification from the same call, so the caveats below each table are
 # written once and appear either as numbered footnotes or as cli lines naming the column.
-# TABLE MODE IS DECLARED, NOT DEFAULTED -- and it is console, on this document's own argument. The
-# prose below the configuration says why: "a table is read on screen and pasted into discussion while
-# an analysis is being built, and styled markup survives neither." It set "kable" while arguing for
-# console, which is a contradiction a reader would have to resolve for themselves. Styled tables are
-# the release script's job (see the pipeline conventions), not a pipeline document's.
-#
-# Flipping this makes every `#| results: asis` in the document vestigial, so they are removed with it.
-options(
-  cli.num_colors = 1,          # plain ASCII; ANSI codes paste as garbage
-  cli.width      = 120,        # matches the 125-column source margin
-  mc.table_mode  = "console"   # "console" or "kable"
-)
+options(mc.table_mode = "kable")
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -129,26 +114,6 @@ excluded from precision, and **both numbers are reported side by side** rather t
 for the other. Reporting only the second is how a table covering a quarter of the corpus comes to look
 competitive with a model that answers everywhere.
 
-## What is recomputed, and what is not
-
-Everything, every render. Nothing here is cached and nothing should be: every step is a group-by over
-a few thousand rows, and the inputs are run metrics the three training stages already produced. A
-cache keyed on a name rather than on the data behind it would serve a comparison of arms that no
-longer exist, which is the one failure this document could not survive.
-
-## How results are reported
-
-Console blocks throughout, via `tbl_out()`; `mc.table_mode` is set to `"console"` in the setup chunk.
-The reason is the one argued below the configuration: a table here is read on screen and pasted into
-discussion while an analysis is being built, and styled markup survives neither. Styled tables are
-produced once, by the release script, from these same functions.
-
-## Where things are written
-
-**Nowhere.** This document writes no artifact and nothing downstream reads it. It has no
-`# Deployment` section for that reason rather than by oversight: it compares arms that other stages
-deployed and deploys none of its own. Its output is the argument on this page.
-
 # Configuration
 
 ```{r}
@@ -195,18 +160,9 @@ Tables render either as styled html or as fixed-width console blocks, set by `mc
 setup chunk. The console path exists because a table is read on screen and pasted into discussion
 while an analysis is being built, and styled markup survives neither.
 
-# Input
-
-Four sources, none of them this document's own. The prepared sample supplies the documents and the
-folds; the three runs roots supply what each engine predicted; and two small files record what the
-training stages **crowned**, which this document reads and does not remake.
-
-A missing runs root is not an error here. The LLM stage may not have run, and the panel is assembled
-from whatever is on disk -- which is why the table below reports what was found rather than assuming
-it.
-
 ```{r}
 #| label: load-prepared-sample
+#| results: asis
 if (!fs::file_exists(.lP$Input$Prepared)) cli::cli_abort("Run 03A before this document")
 tab_prep <- arrow::read_parquet(file = .lP$Input$Prepared)
 
@@ -223,14 +179,13 @@ tibble::tibble(
 if (length(.dir_runs) == 0L) cli::cli_abort("No runs on disk; run 03B before this document")
 ```
 
-# Construction
+# The panel
 
 Which configuration stands for each engine is the study design, so it is assembled in the open.
 
-## The panel
-
 ```{r}
 #| label: build-crowned
+#| results: asis
 # THE TRANSFORMER, AT BOTH CONTEXT LENGTHS. 03B fits one model per task AND per length under
 # model_final/, so the directories there are that stage's deployment decision and reading them gives
 # every length it deployed. The length is this engine's cost knob -- a second full pass over 1.1
@@ -294,30 +249,23 @@ tbl_out(.tab = tab_crowned, .title = "The configuration standing for each engine
 # the positive class only and labels everything else "Original", which is the absence of evidence
 # wearing the name of a class. Left alone the arm appears to cover the whole corpus and every table
 # below would report a coverage it does not have.
-# The long table is kept rather than piped straight into orch_panel(), because the pivot is where
-# "this engine declined" and "this engine never saw the document" become the same NA. Validation
-# below reads the long form, where they are still distinguishable.
-longs <- purrr::map(.lP$Param$Tasks, function(.t) {
-  orch_read(
-    .runs_roots = .dir_runs,                                          # every tree that exists
-    .configs    = tab_crowned |> dplyr::filter(Task == .t) |>
-      dplyr::select(Engine, ConfigName)                               # what stands for each engine
+panels <- purrr::map(.lP$Param$Tasks, function(.t) {
+  orch_panel(
+    .long = orch_read(
+      .runs_roots = .dir_runs,                                        # every tree that exists
+      .configs    = tab_crowned |> dplyr::filter(Task == .t) |>
+        dplyr::select(Engine, ConfigName)                             # what stands for each engine
+    ),
+    .commit_only = if (.t == "AmendType") "Amended" else NULL         # see above
   )
 }) |>
   purrr::set_names(.lP$Param$Tasks)
-
-panels <- purrr::imap(longs, function(.l, .t) {
-  orch_panel(
-    .long        = .l,
-    .commit_only = if (.t == "AmendType") "Amended" else NULL         # see above
-  )
-})
 ```
 
 The panel is the whole data structure: one row per document, one prediction and one score per engine,
 with `NA` where an engine declined. Every table and figure below is a group-by on it.
 
-## The two context lengths
+# Section 0: The two context lengths
 
 The transformer is fitted at two truncation lengths and 03B crowns one per task. Both are on the
 panel, because the length is that engine's cost knob: applying the longer one to the corpus is a
@@ -334,6 +282,7 @@ ceiling in this document it needs the label and nobody can obtain it.
 
 ```{r}
 #| label: windows-all
+#| results: asis
 purrr::iwalk(panels, function(.p, .t) {
   bert_ <- grep("^Bert", orch_engines(.tab = .p), value = TRUE)     # the lengths on this panel
   if (length(bert_) < 2L) {
@@ -352,40 +301,7 @@ purrr::iwalk(panels, function(.p, .t) {
 })
 ```
 
-# Validation
-
-Two checks on the panel itself, before anything is read off it. Both are cheap and both can fail.
-
-The first is the one this document most needs. `orch_panel()` pivots the long table wide, so a
-document an engine **never scored** arrives as `NA` -- the same value that marks a document it
-**scored and declined**. Every table below reads `NA` as an abstention, and the reading taught in the
-next section is correct for a decline and wrong for an absence: an engine that merely ran on fewer
-documents would be charged with declining on the rest, its recall understated and its precision left
-flattering. The two are still separable in the long form, which is why the long tables were kept.
-
-```{r}
-#| label: validate-coverage
-purrr::iwalk(longs, function(.l, .t) {
-  orch_validate_coverage(.long = .l, .label_col = .t)   # one panel per task
-})
-```
-
-The second checks that the engines agree about which fold each document is in. Folds are dealt once,
-in 03A, and every stage carries them through its run folders. A document assigned two folds by two
-engines would mean one was scored under a different sample, and every per-fold comparison here would
-be comparing different things.
-
-```{r}
-#| label: validate-folds
-purrr::iwalk(longs, function(.l, .t) {
-  cli::cli_h2("Fold agreement: {(.t)}")
-  orch_validate_folds(.long = .l)
-})
-```
-
-# Results
-
-## Each engine on its own
+# Section 1: Each engine on its own
 
 Three reference tables per task. Read `Precision` against `Recall`: precision excludes abstentions,
 recall counts them as misses. An abstaining arm therefore shows high precision and low recall, which
@@ -408,6 +324,7 @@ perclass <- purrr::map(panels, function(.p) {
 
 ```{r}
 #| label: perclass-detailed
+#| results: asis
 purrr::iwalk(
   .x = perclass$ClassDetailed,                                        # one table per engine
   .f = \(.t, .e) orch_report_perclass(.tab = .t, .engine = .e, .label_col = "ClassDetailed")
@@ -418,6 +335,7 @@ purrr::iwalk(
 
 ```{r}
 #| label: perclass-broad
+#| results: asis
 purrr::iwalk(
   .x = perclass$ClassBroad,                                        # one table per engine
   .f = \(.t, .e) orch_report_perclass(.tab = .t, .engine = .e, .label_col = "ClassBroad")
@@ -428,6 +346,7 @@ purrr::iwalk(
 
 ```{r}
 #| label: perclass-amendment
+#| results: asis
 purrr::iwalk(
   .x = perclass$AmendType,                                        # one table per engine
   .f = \(.t, .e) orch_report_perclass(.tab = .t, .engine = .e, .label_col = "AmendType")
@@ -441,11 +360,12 @@ the problem this study is actually solving, where the smallest class has under f
 
 ```{r}
 #| label: headline-all
+#| results: asis
 headlines <- purrr::map(panels, orch_headline)
 purrr::iwalk(headlines, \(.h, .t) orch_report_headline(.tab = .h, .label_col = .t))
 ```
 
-## Perfect routing
+# Section 2: Perfect routing
 
 A router can only relabel a document to something an engine already said. Taking the correct answer
 wherever any engine supplied one is therefore an upper bound on every rule at once, at every threshold
@@ -457,6 +377,7 @@ clever can find it.
 
 ```{r}
 #| label: ceiling-all
+#| results: asis
 # The transformer first because it is the baseline, then the cheap arm, then the expensive one. The
 # order matters for the marginal column: it answers what each engine adds OVER what is already there,
 # which is the deployment question rather than the ranking one.
@@ -474,13 +395,7 @@ ceilings <- purrr::imap(panels, function(.p, .t) {
 purrr::iwalk(ceilings, \(.c, .t) orch_report_ceiling(.tab = .c, .label_col = .t))
 ```
 
-# Robustness
-
-Two routing rules, each asked the same question: is there a region of the corpus where the
-transformer is weak enough that another engine should be consulted? Both are stated as rules a
-deployment could actually follow, and both are allowed to fail.
-
-## Low transformer confidence
+# Section 3: Low transformer confidence
 
 The first clue anyone would reach for, and the free one: the transformer already emits a probability,
 and 03B showed it separates errors. So take the documents it is least sure about and hand them to
@@ -520,6 +435,7 @@ resolve_conf <- purrr::imap(panels, function(.p, .t) {
 
 ```{r}
 #| label: resolve-conf-detailed
+#| results: asis
 purrr::iwalk(
   .x = resolve_conf$ClassDetailed,                                    # one table per arm
   .f = \(.t, .e) orch_report_swap(.tab = .t, .engine = .e, .label_col = "ClassDetailed")
@@ -530,6 +446,7 @@ purrr::iwalk(
 
 ```{r}
 #| label: resolve-conf-broad
+#| results: asis
 purrr::iwalk(
   .x = resolve_conf$ClassBroad,                                    # one table per arm
   .f = \(.t, .e) orch_report_swap(.tab = .t, .engine = .e, .label_col = "ClassBroad")
@@ -540,13 +457,14 @@ purrr::iwalk(
 
 ```{r}
 #| label: resolve-conf-amendment
+#| results: asis
 purrr::iwalk(
   .x = resolve_conf$AmendType,                                    # one table per arm
   .f = \(.t, .e) orch_report_swap(.tab = .t, .engine = .e, .label_col = "AmendType")
 )
 ```
 
-## Broad and detailed disagree
+# Section 4: Broad and detailed disagree
 
 A second clue, independent of the first and of the keyword arm entirely. Two transformers were trained
 on the same folds: one predicts the detailed category, the other the broad one. Roll the detailed
@@ -564,6 +482,7 @@ The section covers the detailed task only. `AmendType` has no hierarchy to be in
 
 ```{r}
 #| label: hierarchy-flag
+#| results: asis
 # The two levels can ship different context lengths -- 03B crowns per task -- so each side names its
 # own baseline rather than assuming they match.
 base_det   <- baselines$Baseline[baselines$Task == "ClassDetailed"]
@@ -585,6 +504,7 @@ documents worth a second opinion. Whether another arm can supply one is the next
 
 ```{r}
 #| label: resolve-hierarchy
+#| results: asis
 resolve_hier <- purrr::map(
   .x = setdiff(orch_engines(.tab = panel_hier), base_det),
   .f = \(.e) orch_resolve_hier(.tab = panel_hier, .engine = .e, .baseline = base_det) |>

@@ -657,14 +657,14 @@ kw_hits_engine <- function(.lexicon, .docs, .source, .n_words, .stopwords, .min_
   if (!fs::file_exists(.python)) {
     cli::cli_abort(c(
       "No Python interpreter at {(.python)}.",
-      "i" = "The mining sweep runs through {.path contracts-classify/.venv/bin/python}; the applier \\
+      "i" = "The mining sweep runs through {.path contracts-engine/.venv/bin/python}; the applier \\
              must run through the same one, or it is a different tokenisation."
     ))
   }
   if (!fs::file_exists(.script)) {
     cli::cli_abort(c(
       "No applier script at {(.script)}.",
-      "i" = "Expected {.path contracts-classify/keyword_apply.py}, the companion to keyword_train.py."
+      "i" = "Expected {.path contracts-engine/keyword_apply.py}, the companion to keyword_train.py."
     ))
   }
   text_col_ <- if (identical(.source, "docdesc")) .desc_col else .text_col

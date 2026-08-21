@@ -8,10 +8,6 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
-# FIRST LINE, AND LOAD-BEARING. _quarto.yml lives in 1_code/ and rprojroot returns the deepest
-# directory containing one, so a bare here::here() from a document there returns .../1_code and every
-# here::here("2_output", ...) resolves one level too deep -- silently.
-here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # Figure geometry is NOT set here -- it is declared once in _quarto.yml.
@@ -23,14 +19,7 @@ knitr::opts_chunk$set(
   comment  = ""          # drops the "##" prefix, so console blocks copy verbatim
 )
 
-# TABLE MODE IS DECLARED, NOT DEFAULTED. tbl_out() falls back to "console" when nothing sets it, so a
-# document that says nothing still renders console blocks -- but says nothing about whether that was
-# chosen. It is chosen: see "How results are reported" below.
-options(
-  cli.num_colors = 1,          # plain ASCII; ANSI codes paste as garbage
-  cli.width      = 120,        # matches the 125-column source margin
-  mc.table_mode  = "console"   # "console" or "kable"
-)
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -127,38 +116,6 @@ measures what the model knows about contracts with no help. The `codebook` level
 category. The gap between them is what the taxonomy documentation is worth, which is a number worth
 having, since writing that documentation is the main human cost of adopting this scheme.
 
-## What is recomputed, and what is not
-
-Nothing, on a warm tree, and the reason is worth stating precisely because it is the property this
-document depends on most.
-
-Every model answer is cached under a hash of the document, the assembled prompt, the model tag, the
-context window and whether declining was permitted. Every run directory is named with the prompt hash
-in it. So a configuration whose runs are on disk is skipped without a single call, and a
-configuration whose prompt has changed by one clause finds no directory of that name and re-runs. The
-cache cannot serve an answer to a question that was not asked.
-
-The cost projection is incremental in the same spirit: it measures only prompt shapes absent from
-`rates.parquet` and writes the union back, so a warm rate store costs nothing and a new shape costs
-five documents.
-
-What is *not* cached is the reading of run metrics. That is a few small Parquet files, and a cache
-keyed on a name rather than on the data behind it would serve results from a previous sample without
-raising an error.
-
-## How results are reported
-
-Console blocks throughout, via `tbl_out()`; `mc.table_mode` is set to `"console"` in the setup chunk.
-No raw tibble is printed. Figures live in `# Overview` and nowhere else, and none is written to disk.
-
-## Where things are written
-
-Three places, all under this document's own directory: `runs/` holds one folder per configuration and
-fold in the schema every arm shares, `cache/` holds one file per answered document, and
-`rates.parquet` holds the fitted generation rates keyed on prompt shape. A capped run is redirected to
-a sibling root carrying the cap in its name, so a preview's numbers can never be pooled with a full
-pass's or picked up by the orchestrator as an arm.
-
 # Configuration
 
 ```{r}
@@ -195,13 +152,7 @@ pass's or picked up by the orchestrator as an arm.
     # taxonomies of twelve, seven and two categories, is also a far stronger claim about prompting
     # than one estimate on one taxonomy.
     Tasks       = c("ClassDetailed", "ClassBroad", "AmendType"),
-    # A VECTOR SWEEPS MODEL SIZE. It holds one tag today, and every number this document reports is
-    # therefore qwen3:8b's. qwen3:32b is installed on this machine and deliberately not swept: the
-    # smaller model's shape is now known -- 15 configurations across three tiers and three taxonomies
-    # -- so the question a larger model answers is well posed, but answering it is a night of
-    # inference for a claim about language models rather than about these contracts. Adding the tag
-    # here is the only change required; see `# Next`.
-    Models      = "qwen3:8b",
+    Models      = "qwen3:8b",                 # add "qwen3:32b" once the smaller model's shape is known
     Guidance    = c("labels", "codebook"),    # what the model is told about the taxonomy
     NChars      = 6000L,                      # header window; roughly the transformer's reading span
     Abstain     = FALSE,                      # forced choice: the agreement vote needs every document
@@ -302,24 +253,7 @@ if (nrow(tab_definitions) == 0L) tab_definitions <- NULL
 # create configurations that differ in name only. They would cost no compute -- identical prompts hit
 # identical cache keys -- but they would report a zero difference between two levels that were never
 # actually different, which reads as evidence that documentation does not help.
-# THE CONFIGURATION IS CORRECTED HERE, AND SAYS SO. `Guidance` is declared above as the axis this
-# document would sweep; with no definitions supplied its two levels render identically, so the axis
-# collapses to one and the grid below is half the size the configuration block implies. Reported
-# rather than performed quietly: a reader who takes the grid size from the configuration alone would
-# be wrong, and a silently mutated parameter is the kind of thing that is only noticed when a number
-# does not reconcile.
-if (is.null(tab_definitions)) {
-  .lP$Param$Guidance <- "labels"
-  cli::cli_alert_info(
-    "No definitions supplied: the guidance axis collapses to {.val labels}, so every grid below is \\
-     half the size the configuration declares."
-  )
-}
-
-cli::cli_alert_info(
-  "Effective axes: {length(.lP$Param$Tasks)} task{?s}, {length(.lP$Param$Models)} model{?s}, \\
-   {length(.lP$Param$Guidance)} guidance level{?s}, {length(.lP$Param$Shots)} shot count{?s}."
-)
+if (is.null(tab_definitions)) .lP$Param$Guidance <- "labels"
 ```
 
 Nothing here is cached at the document level by name. Every model answer is stored under a hash of
@@ -327,13 +261,6 @@ the document, the assembled prompt, the model tag, the context window and whethe
 permitted, so changing one clause of the instruction misses the cache and re-asks. That is the
 property a name-keyed cache fails to provide, and it is why this project treats name-keyed caches as
 a trap.
-
-# Input
-
-One file, and one service. `prepared.parquet` supplies the documents, their labels and the folds;
-Ollama supplies the model. The fold column is the load-bearing part: this arm does not train, so the
-folds are not a training device here but the only thing standing between a tuned prompt and the
-documents it was tuned on.
 
 ```{r}
 #| label: load-prepared-sample
@@ -346,7 +273,7 @@ clf_report_folds(
 )
 ```
 
-## What the model is shown
+# What the model is shown
 
 The label set is read from the data rather than written as a constant, so a taxonomy revision cannot
 leave the prompt describing categories that no longer exist. It is presented alphabetically: ordering
@@ -374,13 +301,7 @@ cat(llm_prompt(
 ))
 ```
 
-# Construction
-
-Three tiers, and the order below is the order they are argued in rather than the order they cost.
-Costing comes first because a sweep at this scale is measured in hours and the projection is what
-makes that number visible before it is spent.
-
-## Cost
+# Cost
 
 A local generation is seconds and the sample is thousands of documents, so a sweep is measured in
 nights rather than minutes. The projection below is fitted on this machine and this model rather than
@@ -498,7 +419,7 @@ Read the per-task rows rather than the total. The sweep skips any configuration 
 already on disk and caches every individual answer besides, so a task that has already run costs
 nothing and its row prices work that will not happen. The total prices a tree with nothing in it.
 
-## The blind sweep
+# The blind sweep
 
 The sweep is idempotent: a configuration whose runs are already on disk is skipped without touching
 the model, and every individual answer is cached besides. The first execution is long; every later
@@ -528,7 +449,7 @@ swept_blind <- llm_sweep(
 )
 ```
 
-## The cross-fold sweep
+# The cross-fold sweep
 
 The blind arm is honest but weak, and the reason is visible in its per-class table rather than its
 headline: it starves some categories and floods others, because nothing in the prompt tells it what
@@ -600,58 +521,6 @@ Every configuration here carries the same name across its five folds, because th
 example *recipe* -- how many per category, drawn from the complement, at a fixed seed -- rather than
 any one fold's draw. No single draw describes the arm, and a name built from the first fold's would
 claim to identify a configuration four fifths of which it never saw.
-
-# Validation
-
-Three checks, none of which calls the model. Each tests something this document asserts elsewhere,
-and each can fail.
-
-The first is the one that matters. Everything above rests on the claim that a crossfold prompt never
-contains a document from the fold it is scoring, and until now that claim has been argued from how
-the code is written rather than demonstrated. Example draws are deterministic given the seed, so each
-fold's draw can be re-derived here and tested against the fold it faced. A leak would make every
-crossfold number optimistic, and it would be invisible in the metrics: a prompt containing the answer
-does not look different from a prompt that reasoned well.
-
-```{r}
-#| label: validate-fold-discipline
-llm_validate_folds(
-  .tab_prep   = tab_prep,             # prepared sample, carrying the fold column
-  .label_cols = .lP$Param$Tasks,      # every task the crossfold tier covers
-  .shots      = .lP$Param$Shots,      # every shot count swept
-  .folds      = .lP$Param$FoldsFull,  # the folds a full-coverage tier is held out on
-  .seed       = 42L                   # the seed the sweep draws under
-)
-```
-
-The second checks that the folds written to disk partition the documents each configuration was
-entitled to. A gap is a fold that failed and went unnoticed; an overlap means two runs claim the same
-document and whichever is read last silently wins.
-
-```{r}
-#| label: validate-partition
-llm_validate_partition(
-  .runs_root = .dir_runs,   # this render's runs, preview root included
-  .tab_prep  = tab_prep     # the eligible population
-)
-```
-
-The third settles what a missing label means. `Abstain` is `FALSE`, so `llm_schema()` builds an enum
-holding the category names and nothing else -- the model is given no refusal token to emit. A
-`(none)` under that regime is therefore **not a decline**: it is a call that failed, timed out, or
-returned something the parser could not read. Coverage below one means different things in the two
-regimes, and reporting it as refusal in both would describe the arm wrongly.
-
-It also checks that every committed answer is a category, which is what catches a response that
-escaped the enum.
-
-```{r}
-#| label: validate-answers
-llm_validate_answers(
-  .runs_root = .dir_runs,   # this render's runs
-  .tab_prep  = tab_prep     # supplies the valid label set per task
-)
-```
 
 # Results
 

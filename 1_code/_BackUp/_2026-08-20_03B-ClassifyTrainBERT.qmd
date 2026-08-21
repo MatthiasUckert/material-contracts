@@ -8,7 +8,6 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
-here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # Figure geometry is NOT set here -- it is declared once in _quarto.yml, and restating it per
@@ -145,8 +144,8 @@ argument can be followed linearly and the evidence inspected as a whole.
     ModelFinal     = utils_file_path(.dir_main, "model_final") # deployable models
   ),
   Engine = list(
-    Python = here::here("contracts-classify", ".venv", "bin", "python"), # training environment
-    Script = here::here("contracts-classify", "classify_train.py")       # training entry point
+    Python = here::here("contracts-engine", ".venv", "bin", "python"), # training environment
+    Script = here::here("contracts-engine", "classify_train.py")       # training entry point
   ),
   Param = list(
     # The two GPU-spending steps are gated separately, because holding one is not a reason to hold

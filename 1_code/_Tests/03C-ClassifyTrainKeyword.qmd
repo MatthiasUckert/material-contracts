@@ -8,7 +8,6 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
-here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # Figure geometry is NOT set here -- it is declared once in _quarto.yml.

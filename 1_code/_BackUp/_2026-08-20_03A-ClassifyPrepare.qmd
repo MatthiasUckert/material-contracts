@@ -8,11 +8,6 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
-# FIRST LINE, AND LOAD-BEARING. _quarto.yml lives in 1_code/ and rprojroot returns the deepest
-# directory containing one, so a bare here::here() from a document there returns .../1_code and every
-# here::here("2_output", ...) resolves one level too deep -- silently. i_am() declares the anchor
-# instead of letting discovery order decide it.
-here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # message = TRUE is required: cli writes through the message stream under knitr, so suppressing
@@ -27,14 +22,7 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-# TABLE MODE IS DECLARED, NOT DEFAULTED. tbl_out() falls back to "console" when nothing sets it, so a
-# document that says nothing still renders console blocks -- but says nothing about whether that was
-# chosen. It is chosen: see "How results are reported" below.
-options(
-  cli.num_colors = 1,          # plain ASCII; ANSI codes paste as garbage
-  cli.width      = 120,        # matches the 125-column source margin
-  mc.table_mode  = "console"   # "console" or "kable"
-)
+options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -123,118 +111,67 @@ by frequency: ordering by size would put a different category first in every fig
 panels incomparable, and taxonomic order additionally places siblings adjacent, so a confusion matrix shows errors that
 stay inside a broad parent next to the diagonal and errors that cross one as a jump away from it.
 
-## What is recomputed, and what is not
-
-Everything. There is no expensive step here to skip: the whole document is one join, four gates and a
-fold deal over roughly 4,400 rows, and the only real cost is reading that many small parquet files.
-Every chunk executes, reports and validates on every render.
-
-The single write is guarded. `prepared.parquet` is read by six documents, and a fingerprint downstream
-is only as stable as the modification time of the file it points at, so the file is rewritten only
-when its content changes. A render that changes nothing leaves it untouched.
-
-## How results are reported
-
-Console blocks throughout, via `tbl_out()`; `mc.table_mode` is set to `"console"` in the setup chunk.
-No raw tibble is printed. Figures live in `# Overview` and nowhere else, and none is written to disk --
-the release script produces figure files once, from these same functions.
-
-## Where things are written
-
-One file: `prepared.parquet`, at the top level of this document's output directory. Nothing is cached,
-because nothing here is expensive enough to be worth the risk of a stale cache.
-
 # Configuration
 
 ```{r}
 #| label: config
 .lP <- list(
-  # INPUTS RESOLVE WITH fs::path(), OUTPUTS WITH utils_file_path(). The latter creates directories as
-  # a side effect, so using it on another script's artifact would create that script's folder -- a
-  # document should not bring into being a directory it does not own.
   Input = list(
-    # The reconciled label spine. Read as CSV rather than Parquet because the export is produced by
-    # hand outside the pipeline; the schema is identical either way.
-    Labels   = fs::path(here::here("0_data", "Labels"), "ClassificationLabels.csv"),
-    # 02B's register: the gate. It carries DocDesc, DocName, the doc type and year-quarter that
-    # locate each document, and every document's position on the sample ladder.
-    Register = fs::path(init_create_script_dir(here::here(), "02B-Register"), "Output", "Documents.parquet")
+    # The reconciled label spine. Read as CSV rather than Parquet because the current export was
+    # produced outside the repository; the schema is identical either way.
+    ClassificationSample = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MaterialContractClassification/DocumentClassification/02-AK_classification_comparison/final_classification.csv",
+    MetaData     = "../pMatDisc/2_output/01-GetEDGAR/Output/FullMetaData.parquet",      # filer titles
+    DirContracts = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/"     # parsed text
+  ),
+  Cache = list(
+    ContractFiles = utils_file_path(.dir_main, "Cache", "ContractFiles.parquet")   # DocID to Path index
   ),
   Output = list(
-    Prepared = utils_file_path(.dir_main, "prepared.parquet")   # the one downstream input
+    Prepared = utils_file_path(.dir_main, "prepared.parquet"),                     # the one downstream input
+    Figures  = utils_file_path(.dir_main, "Figures")                               # figure files for the manuscript
+  ),
+  Runs = list(
+    Bert = here::here("2_output", "03B-ClassifyTrainBERT", "runs"),                # consumers of this output
+    Kw   = here::here("2_output", "03C-ClassifyTrainKeyword", "runs")
   ),
   Param = list(
-    # 01B's parsed mirror. The register stores no path -- doc type, year-quarter and DocID determine
-    # one -- so the mirror root is a parameter and utils_doc_path() rebuilds the rest.
-    DirMirror = fs::path(init_create_script_dir(here::here(), "01B-EdgarDocuments"), "GetEDGAR"),
-    Folds     = 5L,   # cross-validation folds, shared by every method
-    Seed      = 42L   # fixes the fold deal; constant across the whole study
+    Folds = 5L,     # cross-validation folds, shared by every method
+    Seed  = 42L     # fixes the fold deal; constant across the whole study
   )
 )
 
-fs::file_exists(c(.lP$Input$Labels, .lP$Input$Register))
+fs::file_exists(.lP$Input$ClassificationSample)
 ```
 
-Failing here, rather than three chunks later, is deliberate: a missing input should stop the document at the point the
-path is declared.
-
-The label spine is committed to the repository and published with the DOI archive. It is the one input a replication
-reviewer cannot regenerate from EDGAR, since it is the product of hand labelling, so it travels with the code rather
-than beside it.
+Failing here, rather than three chunks later, is deliberate: a missing label spine should stop the document at the point
+the path is declared.
 
 # Input
 
-**Two** sources join on `DocID`, where there were three.
+Three sources join on `DocID`:
 
 - **The label spine** supplies the taxonomy (`DocClassFinal1`, `DocClassFinal2`), the amendment flag, and `Provenance`,
 which records which labelling round each label came from.
-- **02B's register** supplies everything else: `DocDesc` (the filer's own title for the exhibit) and `DocName` (the
-filename), both inputs to the keyword classifier only; the doc type and year-quarter that locate the document; and its
-position on the sample ladder.
-
-## Why the register, and not a directory walk
-
-An earlier version read `FullMetaData.parquet` for the titles and walked the parsed-contract tree for the paths. Both
-are gone, and the reason is not tidiness.
-
-A directory walk makes a **second, independent statement** about what is in the sample, and it can disagree with the
-register without either of them reporting it. The register holds all 1,771,923 documents with their ladder step
-attached, so joining to it makes the labelled sample provably a subset of the corpus -- a claim the walk cannot support
-at all, since a listing knows only what is on a disk at one moment.
-
-The walk was also concretely wrong. Its `DocID`-to-`Path` index was cached on file existence alone, with no fingerprint
-of the tree behind it, and the cached index held paths into a **previous repository**. A re-render would have read its
-text from there and succeeded, silently. Deleting the cache is the fix; repointing it would have left the mechanism
-intact.
-
-The register stores no path. `DocType`, `YQ` and `DocID` determine one, and `utils_doc_path()` rebuilds it, which is why
-the mirror root is a parameter rather than an input.
+- **The metadata** supplies `DocDesc`, the filer's own title for the exhibit, and `DocName`, the filename. Both are
+inputs to the keyword classifier only; the transformer ignores them.
+- **The parsed-contract tree** supplies `Path`, locating each document's text on disk.
 
 ```{r}
 #| label: load-inputs
-# The register, reduced to what this document needs. Columns are selected inside arrow before
-# collect(): the register is 1.77 million rows and fifty columns, and nine of them are wanted.
-fils_register <- arrow::open_dataset(sources = .lP$Input$Register) |>
-  dplyr::select(
-    DocID, DocDesc, DocName, DocTypeMod, YQ,
-    Removed, SampleStepCode, SampleStepDesc, DescSample, EstiSample
-  ) |>
-  dplyr::collect() |>
-  # Rebuild the path each document's text sits at. utils_doc_path() normalises YQ itself -- the
-  # register stores it as a double (2006.3) and the mirror's directories are "2006-3".
-  dplyr::mutate(Path = as.character(utils_doc_path(
-    .dir_mirror = .lP$Param$DirMirror,   # 01B's parsed mirror
-    .doc_type   = .data$DocTypeMod,      # the directory the mirror files it under
-    .yq         = .data$YQ,              # normalised inside the helper
-    .doc_id     = .data$DocID
-  )))
+# Walk the parsed-contract tree once and cache the DocID -> Path index. .rerun = FALSE reuses the
+# cache; set it to TRUE after new contracts have been parsed.
+fils_contract <- utils_list_project_files(
+  .dir_data = .lP$Input$DirContracts,      # root of the parsed-contract tree
+  .path_out = .lP$Cache$ContractFiles,     # where the index is cached
+  .rerun    = FALSE                        # FALSE reuses an existing index
+)
 
 # Read the label spine with readr, not arrow::open_dataset(format = "csv"). Arrow's
 # strings_can_be_null convert option defaults to FALSE, so a bare NA in a character column arrives as
 # the literal two-letter string, silently creating a thirteenth category and making every document
 # appear dual-labelled. readr treats "" and NA as missing by default.
 fils_class_sample <- readr::read_csv(
-  file      = .lP$Input$Labels,                    # reconciled label spine
+  file      = .lP$Input$ClassificationSample,      # reconciled label spine
   col_types = readr::cols(                         # everything character except the dual-class flag
     .default  = readr::col_character(),
     DualClass = readr::col_integer()
@@ -245,20 +182,22 @@ fils_class_sample <- readr::read_csv(
     DocID, AmendType, DocClassFinal1, DocClassFinal2, DualClass,
     Level1, Level2, Provenance
   ) |>
-  # LEFT join, deliberately. An inner join would drop an unregistered document silently and make the
-  # coverage check below unable to fail, and a check that cannot fail is not a check.
+  # Attach the filer title and the filename.
   dplyr::left_join(
-    y  = fils_register,
+    y  = arrow::open_dataset(sources = .lP$Input$MetaData) |>
+      dplyr::select(DocID, DocDesc, DocName) |>
+      dplyr::collect(),
+    by = dplyr::join_by(DocID)
+  ) |>
+  # Attach the path to each document's parsed text.
+  dplyr::left_join(
+    y  = fils_contract,
     by = dplyr::join_by(DocID)
   )
 ```
 
 Coverage of each join, before any filtering. A shortfall here is a join failure; the filtering that follows is reported
 separately, so the two cannot be confused.
-
-Every labelled document is expected to be in the register, because 02B holds every document in the corpus and the
-Compustat restriction it applies is a separate downstream filter rather than a gate on membership. A shortfall here
-would be a finding about the register, not about the labelling.
 
 ```{r}
 #| label: report-raw-input
@@ -268,55 +207,29 @@ tbl_say(
     Source = c(
       "Label rows read",
       "  with a class label",
-      "  found in the 02B register",
-      "  with a filer title (DocDesc)",
-      "  whose path resolves on disk"
+      "  with metadata (DocDesc)",
+      "  with a contract file path"
     ),
     N = c(
       nrow(fils_class_sample),
       sum(!is.na(fils_class_sample$DocClassFinal1)),
-      sum(!is.na(fils_class_sample$DocTypeMod)),
       sum(!is.na(fils_class_sample$DocDesc)),
-      sum(fs::file_exists(fils_class_sample$Path[!is.na(fils_class_sample$Path)]))
+      sum(!is.na(fils_class_sample$Path))
     )
   )
 )
 ```
 
-## Where the labelled documents sit in the sample
-
-The register carries each document's position on 02B's sample ladder, so the join answers a question the old directory
-walk could not: whether the classifier is trained on documents the pipeline's own rules would exclude. It is.
-
-```{r}
-#| label: report-ladder
-clf_report_ladder(.tab = fils_class_sample)
-```
-
-**The training sample is deliberately broader than the estimation sample, and this is the most consequential thing on
-the page.** Roughly a quarter of the labelled documents are excluded from the estimation sample because their filer did
-not match Compustat -- either the CIK is absent from it or no observation matches the filing date.
-
-They are kept here anyway. 03F applies the classifier to every descriptive Exhibit 10 in the corpus regardless of
-whether its filer matched Compustat, so those exclusions select on a property of the **firm**, not of the **contract**.
-Training only on the matched subset would shrink the sample by a quarter and tilt it toward larger, listed filers, while
-the documents the classifier actually meets are not selected that way at all. That is a mismatch between the training
-distribution and the application distribution, introduced for no gain in return.
-
-The documents the quality rules flag as malformatted are a different case, and a much smaller one. Some will not survive
-the text gate below in any event, and those that do are documents 03F will also meet, so training on them is consistent
-with how the classifier is used rather than careless about it.
-
 # Construction
 
-`clf_prepare_sample()` applies four gates in order -- a usable class label, a path (which now means presence in the
-register), a file that exists, and text that is non-empty -- then deals the folds. It narrates each gate as it runs, so
-an unexpected exclusion is visible immediately rather than surfacing as a row-count mismatch three scripts later.
+`clf_prepare_sample()` applies four gates in order -- a usable class label, a file path, a file that exists, and text
+that is non-empty -- then deals the folds. It narrates each gate as it runs, so an unexpected exclusion is visible
+immediately rather than surfacing as a row-count mismatch three scripts later.
 
 ```{r}
 #| label: build-sample
 tab_prep <- clf_prepare_sample(
-  .tab_input = fils_class_sample,     # labels joined to the register, with paths rebuilt
+  .tab_input = fils_class_sample,     # joined labels, metadata and paths
   .round     = NULL,                  # NULL keeps both labelling rounds; see Robustness below
   .k         = .lP$Param$Folds,       # number of cross-validation folds
   .seed      = .lP$Param$Seed         # fixes the fold deal, so the splits are reproducible
@@ -404,11 +317,7 @@ within-category shares, which is where an uneven deal is actually visible.
 
 # Deployment
 
-One file, read by everything downstream -- 03B, 03C, 03D, 03E, 03F and 04A.
-
-The write is guarded on content. Six documents read this file, and a fingerprint downstream is only as stable as the
-modification time of the file it points at, so rewriting an unchanged artifact is how a cache comes to miss forever. A
-render that changes nothing therefore leaves the file, and its timestamp, exactly as they were, and says so.
+One file, read by everything downstream.
 
 ```{r}
 #| label: deploy-prepared
@@ -528,12 +437,7 @@ whether routing between them improves on any one alone. **03F** applies the depl
 them source this document's function file, so the folds, the scoring code and the category vocabulary they share cannot
 drift apart.
 
-One directory must be cleared whenever this document is re-run against a **changed** label spine, because it **does not
-fail loudly**: `2_output/03B-ClassifyTrainBERT/runs/`. Run identity there is derived from hyperparameters alone and
-carries no fingerprint of the sample, so the training engine will skip a run whose metrics already exist and serve
-models fitted on the previous sample without raising anything.
-
-This cuts both ways, and the second edge is useful. Because the skip is keyed on the run rather than on
-`prepared.parquet`, a re-render of this document cannot trigger a retraining sweep by accident -- and with the write
-guarded, an unchanged sample does not even touch the file. Nothing downstream can notice a render that changed nothing,
-which is the point.
+Two directories must be cleared whenever this document is re-run against a changed label spine, because **neither fails
+loudly**: `2_output/_cache/`, since `clf_cache()` keys on a name rather than on the data behind it, and
+`2_output/03B-ClassifyTrainBERT/runs/`, since run identity is derived from hyperparameters alone and carries no
+fingerprint of the sample.

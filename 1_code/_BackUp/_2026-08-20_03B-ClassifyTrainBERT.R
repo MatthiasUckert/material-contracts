@@ -1,7 +1,7 @@
 # 03B-ClassifyTrainBERT: the transformer trainer wrapper (bert_*) ------------------------------------------------------
 #
 # WHAT THIS FILE DOES
-# Deals fold ids to the contracts-classify Python trainer across a command-line and parquet seam, and
+# Deals fold ids to the contracts-engine Python trainer across a command-line and parquet seam, and
 # lets the engine write self-describing run folders. This file is ONLY the trainer wrapper plus the
 # reporting that is specific to a transformer -- calibration, decision margin, risk-coverage. Sample
 # construction, the scoring layer, leaderboards and pooling live in 03A-ClassifyPrepare.R, which the
@@ -43,7 +43,7 @@ if (FALSE) {
 
 # Train one fold -------------------------------------------------------------------------------------------------------
 
-#' Train one fold by invoking the contracts-classify Python trainer
+#' Train one fold by invoking the contracts-engine Python trainer
 #'
 #' Shells out to classify_train.py for a single held-out fold, then reports one
 #' cli line. The engine skips a run whose metrics already exist, so calling this
@@ -76,8 +76,8 @@ bert_train <- function(.path_data,
                        .lr = 2e-5,
                        .seed = 42L,
                        .runs_root = here::here("2_output", "03B-ClassifyTrainBERT", "runs"),
-                       .python = here::here("contracts-classify", ".venv", "bin", "python"),
-                       .script = here::here("contracts-classify", "classify_train.py"),
+                       .python = here::here("contracts-engine", ".venv", "bin", "python"),
+                       .script = here::here("contracts-engine", "classify_train.py"),
                        .save_model = FALSE,
                        .overwrite = FALSE,
                        .smoke = FALSE,
@@ -672,8 +672,8 @@ bert_fit_final <- function(.path_data, .config,
                            .batch_size = 32L,
                            .overwrite = FALSE,
                            .verbose = FALSE,
-                           .python = here::here("contracts-classify", ".venv", "bin", "python"),
-                           .script = here::here("contracts-classify", "classify_train.py")) {
+                           .python = here::here("contracts-engine", ".venv", "bin", "python"),
+                           .script = here::here("contracts-engine", "classify_train.py")) {
   if (FALSE) {
     .path_data <- .lP$Input$Prepared
     .config    <- bert_crowned_config(tab_overall, "ClassDetailed")

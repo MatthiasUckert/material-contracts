@@ -7,11 +7,6 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ```{r}
 #| label: setup
 #| include: false
-#| purl: false
-# FIRST LINE, AND LOAD-BEARING. _quarto.yml lives in 1_code/ and rprojroot returns the deepest
-# directory containing one, so a bare here::here() from a document there returns .../1_code and every
-# here::here("2_output", ...) resolves one level too deep -- silently.
-here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 knitr::opts_chunk$set(
@@ -118,27 +113,6 @@ A second decision rule in a second language is what once put a hand-written subs
 of a lexicon mined under stopword removal: the table committed on 36% of the corpus where it had
 published 52%, and nothing anywhere reported a fault.
 
-## What is recomputed, and what is not
-
-Nothing that is already in the store. Every pass anti-joins the store's own labels and failures, so an
-interrupted run resumes where it stopped and a completed one is a no-op that reports and returns. The
-corpus index is rebuilt only when `Reload` says so.
-
-That is the property this document is built around, because the alternative is unaffordable: a full
-pass is hours, and a design that could only be run start to finish would be a design that is never
-re-run at all.
-
-## How results are reported
-
-Console blocks throughout, via `tbl_out()`; `mc.table_mode` is set to `"console"` in the setup chunk.
-Nothing is written to disk except the store and the release, both in `# Deployment`.
-
-## Where things are written
-
-Two places. `store/labels.duckdb` holds one row per **attachment** actually classified, plus the
-corpus index, the run register, the benchmarks and the failures. `release/` holds the exported file,
-one row per **registrant copy**, which is the fan-out described below.
-
 # Configuration
 
 ```{r}
@@ -152,35 +126,19 @@ one row per **registrant copy**, which is the fan-out described below.
     Prepared  = fs::path(.dir_prep, "prepared.parquet"),
     BertCrown = fs::path(.dir_bert, "model_final", "deployed.parquet"),
     KwCatalog = fs::path(.dir_kw, "table", "catalogue.parquet"),
-    # THE REGISTER IS THE CORPUS. 02B holds every document with its ladder step attached, so
-    # membership, population and deduplication all come from one place. The previous version walked a
-    # parsed tree in a PREVIOUS REPOSITORY, which made a second, independent statement about what is
-    # in the corpus -- one that could disagree with the register without either of them reporting it.
-    Register  = fs::path(init_create_script_dir(here::here(), "02B-Register"), "Output",
-                         "Documents.parquet")
+    DirCorpus = "../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/Exhibit10/"
   ),
   Runs = list(Bert = fs::path(.dir_bert, "runs")),
+  Cache = list(CorpusFiles = utils_file_path(.dir_main, "Cache", "CorpusFiles.parquet")),
   Store = list(Path = utils_file_path(.dir_main, "store", "labels.duckdb")),
   Output = list(Release = utils_file_path(.dir_main, "release")),
   Engine = list(
-    Python  = here::here("contracts-classify", ".venv", "bin", "python"),
-    Bert    = here::here("contracts-classify", "classify_apply.py"),
-    Keyword = here::here("contracts-classify", "keyword_apply.py")
+    Python  = "contracts-engine/.venv/bin/python",
+    Bert    = "contracts-engine/classify_apply.py",
+    Keyword = "contracts-engine/keyword_apply.py"
   ),
   Param = list(
     Tasks = c("ClassDetailed", "ClassBroad", "AmendType"),
-    # 01B's parsed mirror. The register stores no path -- DocTypeMod, YQ and DocID determine one --
-    # so the mirror root is a parameter and utils_doc_path() rebuilds the rest.
-    DirMirror = fs::path(init_create_script_dir(here::here(), "01B-EdgarDocuments"), "GetEDGAR"),
-    # WHICH DOCUMENTS ARE LABELLED. "all" is every Exhibit 10; "descriptive" those surviving the date
-    # window and the quality rules; "estimation" those additionally matched to Compustat.
-    #
-    # "all" is the default and it is close to free. Deduplication removes 18.7% of the copies, so an
-    # "all" pass reads 1,189,805 attachments against "descriptive"'s 1,136,095 -- 4.7% more work for a
-    # store that never needs revisiting. Deduplicated "all" is in fact cheaper than an undeduplicated
-    # "descriptive" pass would have been. Every narrower question is then a filter on a release that
-    # already exists rather than a second pass over the corpus.
-    Population = "all",
     # NULL takes the length 03B crowned for each task. An integer overrides it for every task, which
     # is the cost decision: the longer window is a second full pass over the corpus, and 03E measures
     # what it buys on the labelled sample.
@@ -191,15 +149,6 @@ one row per **registrant copy**, which is the fan-out described below.
     NWords     = NULL,   # NULL takes the truncation window 03C marked as default
     BatchSize  = 32L,
     ChunkSize  = 5000L,  # documents per engine invocation; see the benchmark below
-    # DAEMONS FOR THE CORPUS READ. The read is one arrow::read_parquet() per document and it is the
-    # dominant cost of every pass -- the transformer's benchmark rate of roughly 90 documents a second
-    # INCLUDES it, and inference alone is several times that. The keyword pass, whose engine work is
-    # cheap, took about two hours for the same reason.
-    #
-    # Only the read is parallel. The engine call stays sequential: the transformer holds the GPU,
-    # which is one resource, and processes contending for it are slower than one using it. Reading is
-    # file I/O and scales. Set to 1L to read sequentially and start no daemons.
-    Workers    = 24L,
     # Chunks between progress lines during a pass. The first and last always report, so a short run
     # is never silent. This counts CHUNKS, not minutes, so the cadence moves with ChunkSize: at 5,000
     # documents a chunk every fifth chunk is roughly every six minutes, and at 500 it is roughly
@@ -211,7 +160,7 @@ one row per **registrant copy**, which is the fan-out described below.
     # every combination measured, so it can be widened later without repeating anything.
     BenchLens  = c(256L, 512L),
     BenchBatch = 32L,
-    Reload     = FALSE   # rebuild the corpus index from the register rather than reusing the store's
+    Rewalk     = FALSE   # walk the corpus tree again rather than reading the cached index
   )
 )
 ```
@@ -224,13 +173,6 @@ it to `NULL` to take each task's own crown instead.
 invocation, so a small chunk pays that cost hundreds of times over. The benchmark below measures it
 rather than assuming a value.
 
-# Input
-
-Four sources and a store. The prepared sample supplies the taxonomy and the labelled documents; the
-two crown files record what 03B and 03C deployed; 02B's register supplies the corpus, its ladder and
-its filer flags; and 01B's mirror holds the text. Nothing here is decided in this document -- which
-model, which table, which context length were all settled upstream and are read.
-
 ```{r}
 #| label: load-inputs
 if (!fs::file_exists(.lP$Input$Prepared)) cli::cli_abort("Run 03A before this document")
@@ -241,56 +183,17 @@ tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
 
 con <- app_connect(.path = .lP$Store$Path)
 
-# TWO NUMBERS, KEPT APART DELIBERATELY. `n_classify` is the attachments this population will read and
-# is the denominator for every progress and cost figure; `n_index` is every registrant copy the index
-# holds and is what the release fans out to. Collapsing them is what made an earlier draft project the
-# run 23% too long and report a finished pass as permanently incomplete.
-n_classify <- app_corpus_load(
-  .con           = con,                      # the store
-  .path_register = .lP$Input$Register,       # 02B's register: membership, ladder and filer flags
-  .dir_mirror    = .lP$Param$DirMirror,      # 01B's parsed mirror; paths are rebuilt, not looked up
-  .population    = .lP$Param$Population,     # all / descriptive / estimation
-  .doc_type      = "Exhibit10",              # the corpus this document labels
-  .reload        = .lP$Param$Reload          # TRUE after the register has changed
+n_corpus <- app_corpus_load(
+  .con        = con,                        # the store
+  .dir_corpus = .lP$Input$DirCorpus,        # the parsed-contract tree, Exhibit 10 only
+  .path_cache = .lP$Cache$CorpusFiles,      # walking a million paths is cached, not repeated
+  .rewalk     = .lP$Param$Rewalk            # TRUE after the corpus has grown
 )
-
-n_index <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
 ```
 
 The corpus index lives in the store rather than in a parquet beside it. That is what makes "which
 documents still need labelling" a single anti-join instead of a set operation across two storage
 layers, and it is why the store can answer the three questions above without help.
-
-## One row per attachment, not per copy
-
-A filing can name many registrants and its attachments are listed under each of them, so one
-attachment becomes one file per registrant and **roughly one document in six on disk is a repeat of
-this kind**. 01C measures that and adds a flag without removing anything, leaving the decision here:
-
-> "Whether to analyse one copy or all of them is a downstream decision and differs by task:
-> classification wants one, entity extraction may want each, because the registrant-side metadata
-> differs even where the text does not."
-
-So the pass reads one copy and the release fans back out to all of them. `HashDocument` identifies
-the attachment, `DocID` a registrant's copy of it, and `PrimaryFiler` designates exactly one copy --
-verified across all 1,189,805 attachments before this was written.
-
-**Which primary is read depends on the population in a way worth stating.** `PrimaryFiler` is chosen
-globally, as the lowest `DocID` among copies passing the quality rules, while `EstiSample` depends on
-a Compustat match made **per registrant**. The two criteria therefore disagree: an attachment can have
-its primary copy outside the estimation sample and another copy inside it. There are 4,432 such
-attachments, and none at all for the descriptive sample -- which is exactly where the mechanism
-predicts them, since the descriptive rules are per document and the Compustat match is per registrant.
-
-The pass therefore classifies the primary of every attachment with **at least one** copy in the
-population. Restricting to primaries that are themselves in it would leave those 4,432 unlabelled and
-say nothing. It also makes the store population-independent: a pass run for one population is reused
-verbatim by any other, so widening the population later adds documents rather than repeating them.
-
-**One kind of repetition is deliberately not caught**, and it is inherited rather than introduced
-here. Two parties to one agreement each exhibit their own copy under separate accessions, which
-produces different URLs and therefore different `HashDocument` values. Finding those requires hashing
-the text of every document, which 01C calls "worth doing and not attempted in this version".
 
 ```{r}
 #| label: check-docid
@@ -306,9 +209,8 @@ n_match <- DBI::dbGetQuery(
 )$n[[1]]
 
 tibble::tibble(
-  Check = c("Labelled documents", "Found in the corpus index",
-            "Corpus index (registrant copies)", "To classify (attachments)"),
-  n     = c(nrow(tab_prep), n_match, n_index, n_classify)
+  Check = c("Labelled documents", "Found in the corpus index", "Corpus documents"),
+  n     = c(nrow(tab_prep), n_match, n_corpus)
 ) |>
   tbl_out(.title = "Do the identifiers line up?")
 
@@ -366,12 +268,11 @@ specs |>
 
 ```{r}
 #| label: report-status
-app_report_status(.tab = app_status(.con = con, .specs = specs), .n_corpus = n_classify)
+#| results: asis
+app_report_status(.tab = app_status(.con = con, .specs = specs), .n_corpus = n_corpus)
 ```
 
-# Construction
-
-## Benchmark
+# Benchmark
 
 Before a pass that runs for hours, a pass that runs for minutes. It answers three questions.
 
@@ -421,6 +322,7 @@ as much as the lengths, and the effect being looked for is a factor of two at mo
 
 ```{r}
 #| label: benchmark-run
+#| results: asis
 bench <- app_benchmark(
   .con        = con,                   # the store, which remembers what has been measured
   .docs       = bench_docs,            # the fixed sample
@@ -430,14 +332,14 @@ bench <- app_benchmark(
   .chunk_size = .lP$Param$ChunkSize    # so the model-load cost is timed as it would be paid
 )
 
-app_report_benchmark(.tab = bench, .n_corpus = n_classify)
+app_report_benchmark(.tab = bench, .n_corpus = n_corpus)
 ```
 
 The context length is passed explicitly and never allowed to default. A model applied at a length it
 was not fitted under encodes its input differently from its training data, produces perfectly ordinary
 labels, and says so nowhere.
 
-## The transformer
+# The transformer
 
 Three tasks, each at the context length resolved above. The pass writes every chunk before reading the
 next, so an interruption costs the chunk in flight and nothing else.
@@ -449,6 +351,7 @@ give because it is a function of the first.
 
 ```{r}
 #| label: pass-bert
+#| results: asis
 run_bert <- purrr::map(seq_len(nrow(spec_bert)), function(.i) {
   s_ <- spec_bert[.i, ]
   app_pass(
@@ -464,17 +367,16 @@ run_bert <- purrr::map(seq_len(nrow(spec_bert)), function(.i) {
     )),
     .chunk_size   = .lP$Param$ChunkSize,
     .limit        = NULL,                       # NULL takes everything outstanding
-    .report_every = .lP$Param$ReportEvery,      # chunks between progress lines
-    .workers      = .lP$Param$Workers           # daemons for the READ; inference stays sequential
+    .report_every = .lP$Param$ReportEvery       # chunks between progress lines
   ) |>
     dplyr::mutate(Engine = "bert", Task = s_$Task, .before = 1)
 }) |>
   purrr::list_rbind()
 
-app_report_timing(.tab = run_bert, .n_corpus = n_classify)
+app_report_timing(.tab = run_bert, .n_corpus = n_corpus)
 ```
 
-## The keyword table
+# The keyword table
 
 Two steps per chunk, and the split is the point. `keyword_apply.py` reports which terms of the
 published lexicon occur in each document, under the analyzer the table was mined with. `kw_decide()`
@@ -487,6 +389,7 @@ of the lexicon over the corpus.
 
 ```{r}
 #| label: pass-keyword
+#| results: asis
 run_kw <- purrr::map(seq_len(nrow(spec_kw)), function(.i) {
   s_       <- spec_kw[.i, ]
   classes_ <- sort(unique(tab_prep[[s_$Task]]))
@@ -502,40 +405,20 @@ run_kw <- purrr::map(seq_len(nrow(spec_kw)), function(.i) {
     ),
     .chunk_size   = .lP$Param$ChunkSize,
     .limit        = NULL,
-    .report_every = .lP$Param$ReportEvery,      # chunks between progress lines
-    .workers      = .lP$Param$Workers           # daemons for the READ; the applier stays sequential
+    .report_every = .lP$Param$ReportEvery       # chunks between progress lines
   ) |>
     dplyr::mutate(Engine = "keyword", Task = s_$Task, .before = 1)
 }) |>
   purrr::list_rbind()
 
-app_report_timing(.tab = run_kw, .n_corpus = n_classify)
-```
-
-# Validation
-
-What the store covers, measured rather than declared.
-
-**No population tag is recorded anywhere**, and that is deliberate. A tag records what a run
-*intended*; this measures what it *achieved*, and the two diverge exactly when it matters -- a pass
-over the whole corpus interrupted two thirds of the way through would carry the tag `all` and be wrong
-about itself. Coverage cannot lie, and it adds no state that can go stale.
-
-It is reported on **attachments** rather than copies, because attachments are what the engine reads.
-A population is complete when every attachment it wants carries a label; the copies follow at release.
-
-```{r}
-#| label: validate-coverage
-app_coverage(
-  .con   = con,     # the store
-  .specs = specs    # every run this document defines
-)
+app_report_timing(.tab = run_kw, .n_corpus = n_corpus)
 ```
 
 # Results
 
 ```{r}
 #| label: results-summary
+#| results: asis
 app_summary(.con = con, .specs = specs) |>
   tbl_out(
     .title = "What each run produced",
@@ -554,6 +437,7 @@ app_summary(.con = con, .specs = specs) |>
 
 ```{r}
 #| label: results-distribution
+#| results: asis
 purrr::walk(seq_len(nrow(spec_bert)), function(.i) {
   s_ <- spec_bert[.i, ]
   tbl_out(
@@ -572,6 +456,7 @@ labels are used.
 
 ```{r}
 #| label: results-failures
+#| results: asis
 fail <- app_failures(.con = con)
 if (nrow(fail) == 0L) {
   cli::cli_alert_success("No document failed.")
@@ -586,9 +471,7 @@ if (nrow(fail) == 0L) {
 }
 ```
 
-# Deployment
-
-## The released file
+# The released file
 
 The store is the archive: long, keyed by run, holding every term hit and every timing. This is the
 deliverable -- one row per document, one column per thing a reader needs, in the shape a merge wants.
@@ -608,6 +491,7 @@ through as a category it would grow a phantom class holding half the corpus in e
 
 ```{r}
 #| label: release-write
+#| results: asis
 releases <- purrr::map(lens_, function(.m) {
   specs_ <- if (is.null(.m)) specs else {
     specs |> dplyr::filter(.data$Engine == "keyword" | .data$MaxLen == .m)
@@ -624,7 +508,7 @@ releases <- purrr::map(lens_, function(.m) {
     .specs    = specs_,
     .dir      = .lP$Output$Release,
     .max_len  = .m,                   # stamped into the file name
-    .n_corpus = n_classify            # attachments read, not copies written; see load-inputs
+    .n_corpus = n_corpus              # for the completeness statement
   )
   rel_
 })
@@ -642,6 +526,7 @@ covers.
 
 ```{r}
 #| label: release-schema
+#| results: asis
 tbl_out(
   .tab   = app_release_schema(.tab = releases[[1]]),
   .title = "What the released columns mean",
@@ -650,59 +535,11 @@ tbl_out(
 )
 ```
 
-
-# Overview
-
-What the corpus looks like once it is labelled. Nothing here is new: every figure draws on a table
-already reported above, at the taxonomy's own order and colours, so a panel here and a panel in 03B
-can be read against each other.
-
-```{r}
-#| label: overview-distribution
-#| fig-height: !expr plot_height(12)
-#| fig-cap: "Detailed category shares across the labelled corpus, in taxonomic order. Read against
-#|   03A's distribution of the labelled sample: a category that is common in the sample and rare in
-#|   the corpus, or the reverse, is where the training set and the population part company."
-app_plot_distribution(
-  .con  = con,                                                        # the store
-  .spec = specs |> dplyr::filter(Engine == "bert", Task == "ClassDetailed"),
-  .key  = "ClassDetailed"                                             # registered taxonomic order
-)
-```
-
-```{r}
-#| label: overview-confidence
-#| fig-height: !expr plot_height(7)
-#| fig-cap: "Distribution of the transformer's top-class probability over the corpus. The mass sits
-#|   against one, which is why 03E's routing thresholds run to 0.99: a conventional 0.90 selects a
-#|   few per cent of the corpus rather than its weak tail."
-app_plot_confidence(
-  .con  = con,
-  .spec = specs |> dplyr::filter(Engine == "bert", Task == "ClassDetailed")
-)
-```
-
-```{r}
-#| label: overview-agreement
-#| fig-height: !expr plot_height(12)
-#| fig-cap: "Where the keyword table confirms, contradicts or declines to check the transformer, by
-#|   category. The unchecked share is the keyword arm's abstention, which is a property of the table
-#|   rather than of the document, so a tall unchecked bar marks a category the lexicon never reached."
-app_plot_agreement(
-  .con   = con,
-  .specs = specs,
-  .task  = "ClassDetailed",
-  .key   = "ClassDetailed"
-)
-```
-
 ```{r}
 #| label: disconnect
-# LAST, AND IT HAS TO BE: everything above reads the store, and the Overview figures read it too.
-# Closing before them produced "The store is closed, so it is not possible to plot the distribution"
-# -- which is the guard working, and it says what to do: if a section is added below this chunk, this
-# chunk moves below it. It was written at the end of Deployment when Deployment was last; Overview
-# came after and this did not follow.
+# LAST, and it has to be: everything above reads the store, and the release is the last thing that
+# does. Closing before it produced an "Invalid connection" several frames deep in the engine rather
+# than a sentence saying the store was shut.
 DBI::dbDisconnect(con, shutdown = TRUE)
 ```
 

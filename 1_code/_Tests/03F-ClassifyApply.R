@@ -223,18 +223,10 @@ app_corpus_load <- function(.con, .path_register, .dir_mirror, .population = "al
   }
   .population <- match.arg(.population, c("all", "descriptive", "estimation"))
 
-  # THE EARLY RETURN MUST HAND BACK THE SAME QUANTITY THE FULL PATH DOES. An earlier version returned
-  # COUNT(*) here and the classify count below, so a render that reused an existing index reported
-  # 1,462,939 attachments to classify where the pass would read 1,189,805 -- and the benchmark then
-  # projected the run 23% long. One function, one meaning, on every branch.
-  n_all_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
-  if (n_all_ > 0L && !.reload) {
-    n_cls_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus WHERE Classify")$n[[1]]
-    cli::cli_alert_info(
-      "Corpus index already loaded: {format(n_all_, big.mark = ',')} \\
-       {cli::qty(n_all_)}cop{?y/ies}, {format(n_cls_, big.mark = ',')} to classify."
-    )
-    return(invisible(n_cls_))
+  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
+  if (n_ > 0L && !.reload) {
+    cli::cli_alert_info("Corpus index already loaded: {n_} document{?s}.")
+    return(invisible(n_))
   }
   if (!fs::file_exists(.path_register)) cli::cli_abort("No register at {.path {(.path_register)}}.")
 
@@ -926,8 +918,7 @@ app_bench_docs <- function(.con, .n) {
     .n   <- 2000L
   }
   docs_ <- DBI::dbGetQuery(
-    .con, paste0("SELECT DocID, Path FROM corpus WHERE Classify ORDER BY DocID LIMIT ",
-                 as.integer(.n))
+    .con, paste0("SELECT DocID, Path FROM corpus ORDER BY DocID LIMIT ", as.integer(.n))
   ) |>
     tibble::as_tibble() |>
     app_read_text()
@@ -1473,24 +1464,10 @@ app_write_release <- function(.tab, .con, .specs, .dir, .stem = "contract_labels
   ) |>
     tbl_out(.title = "The released file")
 
-  # ATTACHMENTS BEHIND THE RELEASED COPIES, not the released row count. .n_corpus counts attachments;
-  # .tab counts registrant copies after the fan-out. Subtracting one from the other compared different
-  # units and produced a NEGATIVE shortfall of -272,393 -- which is the deduplication rate with a
-  # minus sign, and the giveaway that the two numbers were never comparable.
-  n_attach_ <- if ("HashDocument" %in% names(.tab)) {
-    dplyr::n_distinct(.tab$HashDocument)
-  } else {
-    nrow(.tab)
-  }
-
   if (is.finite(.n_corpus)) {
     tbl_note(
-      "{format(nrow(.tab), big.mark = ',')} {cli::qty(nrow(.tab))}registrant cop{?y/ies} in the \\
-       file, fanned out from {format(n_attach_, big.mark = ',')} of \\
-       {format(.n_corpus, big.mark = ',')} {cli::qty(.n_corpus)}attachment{?s} the population \\
-       wanted; {format(.n_corpus - n_attach_, big.mark = ',')} \\
-       {cli::qty(.n_corpus - n_attach_)}attachment{?s} {?is/are} missing, because \\
-       at least one pass has not reached them or \\
+      "{nrow(.tab)} of {(.n_corpus)} corpus document{?s} carry every transformer label and are in this \\
+       file; {(.n_corpus - nrow(.tab))} are not, because at least one pass has not reached them or \\
        could not read them."
     )
   }
@@ -1521,22 +1498,6 @@ app_release_schema <- function(.tab) {
     dplyr::mutate(
       Meaning = dplyr::case_when(
         .data$Column == "DocID"                    ~ "Document identifier; the merge key.",
-        # THE FAN-OUT COLUMNS. Added to the release and left undocumented by the first version, which
-        # rendered six blank Meaning cells directly beneath a note promising that a column added
-        # upstream cannot go undocumented. The mechanism reported the gap; it does not fill it.
-        .data$Column == "HashDocument"             ~ paste("Attachment identifier. Copies filed by",
-                                                           "several registrants share it and were",
-                                                           "classified once."),
-        .data$Column == "PrimaryFiler"             ~ paste("TRUE on the one copy that was actually",
-                                                           "read; the others carry its label."),
-        .data$Column == "FilerCopiesAgree"         ~ paste("FALSE where an attachment's copies differ",
-                                                           "on length, so the label describes the",
-                                                           "primary copy's text and not certainly",
-                                                           "this one's."),
-        .data$Column == "DescSample"               ~ paste("In 02B's descriptive sample: inside the",
-                                                           "date window and past the quality rules."),
-        .data$Column == "EstiSample"               ~ paste("In 02B's estimation sample: descriptive,",
-                                                           "and matched to Compustat."),
         .data$Column == "HierConsistent"           ~ "Does the detailed label's parent equal the broad label?",
         grepl("Flag$", .data$Column)               ~ "confirmed / contradicted / unchecked by the lexicon.",
         grepl("^Kw.*Term$", .data$Column)          ~ "The term that fired; NA where the lexicon was silent.",
@@ -1684,9 +1645,7 @@ app_summary <- function(.con, .specs) {
     .con   <- con
     .specs <- dplyr::bind_rows(spec_bert, spec_kw)
   }
-  # WHERE Classify: coverage is a share of what the pass READS, not of every registrant copy. Counting
-  # the copies made a fully finished pass report 81.3% -- the deduplication rate misread as a gap.
-  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus WHERE Classify")$n[[1]]
+  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
   purrr::map(seq_len(nrow(.specs)), function(.i) {
     s_   <- .specs[.i, ]
     tab_ <- if (identical(s_$Engine, "bert")) "bert_labels" else "keyword_labels"

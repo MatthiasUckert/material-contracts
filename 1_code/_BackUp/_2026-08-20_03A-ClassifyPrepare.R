@@ -40,10 +40,7 @@
 if (FALSE) {
   .tab_input  <- fils_class_sample
   .path_data  <- .lP$Output$Prepared
-  .runs_roots <- c(
-      here::here("2_output", "03B-ClassifyTrainBERT", "runs"),
-      here::here("2_output", "03C-ClassifyTrainKeyword", "runs")
-    )
+  .runs_roots <- c(.lP$Runs$Bert, .lP$Runs$Kw)
 }
 
 
@@ -194,6 +191,40 @@ clf_report_vocabulary <- function(.tab) {
 # WARNING: the key is a NAME, not a hash of the data behind it. If the label spine changes, a warm
 # cache serves pre-change results with no error and no visible difference from a correct run. Delete
 # 2_output/_cache/ whenever the sample changes.
+
+#' Compute-once disk cache for a report artifact
+#'
+#' Returns the cached value for .key when present and .overwrite is FALSE; otherwise evaluates .expr,
+#' stores it, and returns it. .expr is lazily evaluated, so on a hit the computation never runs. Flip
+#' every cache at once with options(clf.cache.overwrite = TRUE).
+#'
+#' @param .key Character. Cache name, sanitised into a file name.
+#' @param .expr Expression evaluated only on a miss, untouched on a hit.
+#' @param .overwrite Logical. Recompute and overwrite even when cached.
+#' @param .dir Character. Cache directory, created if absent.
+#' @return The cached or freshly computed value.
+clf_cache <- function(.key, .expr,
+                      .overwrite = getOption("clf.cache.overwrite", FALSE),
+                      .dir = here::here("2_output", "_cache")) {
+  if (FALSE) {
+    .key       <- "kw_overall"
+    .expr      <- clf_load_overall(.lP$Runs$Kw)
+    .overwrite <- FALSE
+    .dir       <- here::here("2_output", "_cache")
+  }
+  fs::dir_create(.dir)
+  safe_ <- gsub("[^A-Za-z0-9_.-]", "_", .key)
+  path_ <- fs::path(.dir, paste0(safe_, ".rds"))
+  if (!.overwrite && fs::file_exists(path_)) {
+    cli::cli_alert_info("cache hit: {(.key)}")
+    return(readRDS(path_))
+  }
+  val_ <- .expr
+  saveRDS(val_, path_)
+  cli::cli_alert_success("cache {if (.overwrite) 'overwrite' else 'write'}: {(.key)}")
+  val_
+}
+
 
 # 3. Sample construction ---------------------------------------------------------------------------------------------
 
@@ -349,35 +380,8 @@ clf_write_prepared <- function(.tab, .path_out) {
     .path_out <- .lP$Output$Prepared
   }
   fs::dir_create(fs::path_dir(.path_out))
-
-  # THE WRITE IS GUARDED, AND DISK TIME IS NOT THE REASON. Six documents read this file -- 03B, 03C,
-  # 03D, 03E, 03F and 04A -- and a fingerprint downstream is only as stable as the modification time
-  # of the file it points at. 01C rewrote FullMetaData.parquet on every render and every cache keyed
-  # on it missed forever. Writing only on a content change means a render that changes nothing leaves
-  # the mtime untouched, so a no-op render is a no-op on disk.
-  #
-  # The comparison is on the object, not on a hash of the bytes: arrow's Parquet output is not
-  # guaranteed byte-identical across versions for identical input, so comparing files would report
-  # spurious changes. identical() on the round-tripped tibble compares values, types and attributes.
-  same_ <- FALSE
-  if (fs::file_exists(.path_out)) {
-    old_  <- tryCatch(arrow::read_parquet(.path_out), error = function(e) NULL)
-    same_ <- !is.null(old_) && identical(old_, .tab)
-  }
-
-  if (same_) {
-    cli::cli_alert_info(
-      "Unchanged, not rewritten: {(fs::path_rel(.path_out, here::here()))} \\
-       ({nrow(.tab)} document{?s}, mtime preserved)"
-    )
-    return(invisible(.path_out))
-  }
-
   arrow::write_parquet(.tab, .path_out)
-  cli::cli_alert_success(
-    "Wrote {(fs::path_rel(.path_out, here::here()))} \\
-     ({nrow(.tab)} document{?s})"
-  )
+  cli::cli_alert_success("Wrote {(.path_out)} ({nrow(.tab)} docs)")
   invisible(.path_out)
 }
 
@@ -410,41 +414,6 @@ clf_report_intake <- function(.tab) {
      {.strong Has a contract file path} is a join or path problem, not a labelling one."
   )
   invisible(intake_)
-}
-
-#' Where the labelled sample sits on 02B's sample ladder
-#'
-#' The question a directory walk cannot answer. The register carries every document's ladder step, so
-#' joining the label spine to it says not merely that each labelled document exists but whether the
-#' pipeline's own rules would have kept it. Reported rather than acted on: see the Input prose for
-#' why the training sample is deliberately broader than the estimation sample.
-#'
-#' @param .tab Tibble carrying SampleStepCode, SampleStepDesc, DescSample and EstiSample.
-#' @return Invisibly the ladder summary tibble.
-clf_report_ladder <- function(.tab) {
-  if (FALSE) .tab <- fils_class_sample
-
-  need_ <- c("SampleStepCode", "SampleStepDesc", "DescSample", "EstiSample")
-  miss_ <- setdiff(need_, names(.tab))
-  if (length(miss_) > 0L) cli::cli_abort("Input missing register columns: {miss_}")
-
-  ladder_ <- .tab |>
-    dplyr::count(.data$SampleStepCode, .data$SampleStepDesc, name = "Docs") |>
-    dplyr::arrange(.data$SampleStepCode) |>
-    dplyr::mutate(Share = tbl_pct(.data$Docs / sum(.data$Docs)))
-
-  cli::cli_h2("Where the labelled documents sit on the sample ladder")
-  ladder_ |> tbl_say()
-  cli::cli_text("")
-
-  n_desc_ <- sum(as.logical(.tab$DescSample), na.rm = TRUE)
-  n_esti_ <- sum(as.logical(.tab$EstiSample), na.rm = TRUE)
-  cli::cli_alert_info(
-    "In the descriptive sample: {n_desc_} of {nrow(.tab)}. \\
-     In the estimation sample: {n_esti_} of {nrow(.tab)}."
-  )
-
-  invisible(ladder_)
 }
 
 #' The three tasks: what each one actually trains on
@@ -787,7 +756,7 @@ clf_report_sample <- function(.tab) {
 #' @return Invisibly the compact tibble.
 clf_report_leaderboard <- function(.tab_overall, .label_col = "ClassDetailed", .n = 15L) {
   if (FALSE) {
-    .tab_overall <- clf_load_overall(here::here("2_output", "03B-ClassifyTrainBERT", "runs"))
+    .tab_overall <- clf_load_overall(.lP$Runs$Bert)
     .label_col   <- "ClassDetailed"
     .n           <- 15L
   }
@@ -845,7 +814,7 @@ clf_report_leaderboard <- function(.tab_overall, .label_col = "ClassDetailed", .
 clf_report_effects <- function(.tab_overall, .label_col = "ClassDetailed",
                                .axes = c("Model", "MaxLen", "Epochs", "ClassWeights", "LR")) {
   if (FALSE) {
-    .tab_overall <- clf_load_overall(here::here("2_output", "03B-ClassifyTrainBERT", "runs"))
+    .tab_overall <- clf_load_overall(.lP$Runs$Bert)
     .label_col   <- "ClassDetailed"
     .axes        <- c("Model", "MaxLen", "Epochs", "ClassWeights", "LR")
   }
@@ -973,12 +942,7 @@ clf_config_label <- function(.config_name, .keep_task = FALSE) {
 #' @param .runs_roots Character vector of one or more runs directories.
 #' @return Tibble of per-configuration-per-fold overall metrics.
 clf_load_overall <- function(.runs_roots) {
-  if (FALSE) {
-    .runs_roots <- c(
-      here::here("2_output", "03B-ClassifyTrainBERT", "runs"),
-      here::here("2_output", "03C-ClassifyTrainKeyword", "runs")
-    )
-  }
+  if (FALSE) .runs_roots <- c(.lP$Runs$Bert, .lP$Runs$Kw)
   paths_ <- .runs_roots |>
     purrr::map(\(.r) fs::dir_ls(.r, recurse = TRUE, glob = "*metrics_overall.parquet")) |>
     purrr::list_c()
@@ -1002,7 +966,7 @@ clf_load_overall <- function(.runs_roots) {
 #' @param .tab_overall Output of clf_load_overall().
 #' @return One row per ConfigName, descending by mean macro-F1.
 clf_leaderboard <- function(.tab_overall) {
-  if (FALSE) .tab_overall <- clf_load_overall(here::here("2_output", "03B-ClassifyTrainBERT", "runs"))
+  if (FALSE) .tab_overall <- clf_load_overall(.lP$Runs$Bert)
   .tab_overall |>
     dplyr::filter(!.data$Smoke) |>
     dplyr::summarise(
@@ -1024,7 +988,7 @@ clf_leaderboard <- function(.tab_overall) {
 #' @return Formatted tibble.
 clf_leaderboard_show <- function(.tab_overall, .label_col = NULL, .n = 20L) {
   if (FALSE) {
-    .tab_overall <- clf_load_overall(here::here("2_output", "03B-ClassifyTrainBERT", "runs"))
+    .tab_overall <- clf_load_overall(.lP$Runs$Bert)
     .label_col   <- "ClassDetailed"
     .n           <- 20L
   }
@@ -1058,7 +1022,7 @@ clf_leaderboard_show <- function(.tab_overall, .label_col = NULL, .n = 20L) {
 #' @return Tibble of marginal means, descending by macro-F1.
 clf_effect <- function(.tab_overall, .axis, .label_col = NULL) {
   if (FALSE) {
-    .tab_overall <- clf_load_overall(here::here("2_output", "03B-ClassifyTrainBERT", "runs"))
+    .tab_overall <- clf_load_overall(.lP$Runs$Bert)
     .axis        <- "Model"
     .label_col   <- "ClassDetailed"
   }
@@ -1091,10 +1055,7 @@ clf_effect <- function(.tab_overall, .axis, .label_col = NULL) {
 #' @return Pooled predictions tibble: DocID, TrueLabel, PredLabel, Score and further columns.
 clf_pool_predictions <- function(.runs_roots, .config_name) {
   if (FALSE) {
-    .runs_roots  <- c(
-      here::here("2_output", "03B-ClassifyTrainBERT", "runs"),
-      here::here("2_output", "03C-ClassifyTrainKeyword", "runs")
-    )
+    .runs_roots  <- c(.lP$Runs$Bert, .lP$Runs$Kw)
     .config_name <- best_
   }
   paths_ <- .runs_roots |>
@@ -1213,13 +1174,7 @@ clf_correct_vec <- function(.tab_pred, .lenient) {
 #' @return Tibble: Label, Precision, Recall, F1, Support, descending by Support.
 clf_perclass <- function(.tab_pred, .lenient = FALSE, .none = "(none)") {
   if (FALSE) {
-    .tab_pred <- clf_pool_predictions(
-      c(
-        here::here("2_output", "03B-ClassifyTrainBERT", "runs"),
-        here::here("2_output", "03C-ClassifyTrainKeyword", "runs")
-      ),
-      best_
-    )
+    .tab_pred <- clf_pool_predictions(c(.lP$Runs$Bert, .lP$Runs$Kw), best_)
     .lenient  <- FALSE
     .none     <- "(none)"
   }
@@ -1532,7 +1487,7 @@ clf_plot_confusion <- function(.tab_pred, .key = "ClassDetailed", .normalize = T
 #' @return A ggplot.
 clf_plot_leaderboard <- function(.tab_overall, .label_col = NULL, .n = 15L) {
   if (FALSE) {
-    .tab_overall <- clf_load_overall(here::here("2_output", "03B-ClassifyTrainBERT", "runs"))
+    .tab_overall <- clf_load_overall(.lP$Runs$Bert)
     .label_col   <- "ClassDetailed"
     .n           <- 15L
   }

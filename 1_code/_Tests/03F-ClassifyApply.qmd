@@ -191,15 +191,6 @@ one row per **registrant copy**, which is the fan-out described below.
     NWords     = NULL,   # NULL takes the truncation window 03C marked as default
     BatchSize  = 32L,
     ChunkSize  = 5000L,  # documents per engine invocation; see the benchmark below
-    # DAEMONS FOR THE CORPUS READ. The read is one arrow::read_parquet() per document and it is the
-    # dominant cost of every pass -- the transformer's benchmark rate of roughly 90 documents a second
-    # INCLUDES it, and inference alone is several times that. The keyword pass, whose engine work is
-    # cheap, took about two hours for the same reason.
-    #
-    # Only the read is parallel. The engine call stays sequential: the transformer holds the GPU,
-    # which is one resource, and processes contending for it are slower than one using it. Reading is
-    # file I/O and scales. Set to 1L to read sequentially and start no daemons.
-    Workers    = 24L,
     # Chunks between progress lines during a pass. The first and last always report, so a short run
     # is never silent. This counts CHUNKS, not minutes, so the cadence moves with ChunkSize: at 5,000
     # documents a chunk every fifth chunk is roughly every six minutes, and at 500 it is roughly
@@ -241,20 +232,14 @@ tab_overall <- clf_load_overall(.runs_roots = .lP$Runs$Bert)
 
 con <- app_connect(.path = .lP$Store$Path)
 
-# TWO NUMBERS, KEPT APART DELIBERATELY. `n_classify` is the attachments this population will read and
-# is the denominator for every progress and cost figure; `n_index` is every registrant copy the index
-# holds and is what the release fans out to. Collapsing them is what made an earlier draft project the
-# run 23% too long and report a finished pass as permanently incomplete.
-n_classify <- app_corpus_load(
+n_corpus <- app_corpus_load(
   .con           = con,                      # the store
   .path_register = .lP$Input$Register,       # 02B's register: membership, ladder and filer flags
   .dir_mirror    = .lP$Param$DirMirror,      # 01B's parsed mirror; paths are rebuilt, not looked up
   .population    = .lP$Param$Population,     # all / descriptive / estimation
   .doc_type      = "Exhibit10",              # the corpus this document labels
-  .reload        = .lP$Param$Reload          # TRUE after the register has changed
+  .rewalk        = .lP$Param$Reload          # TRUE after the register has changed
 )
-
-n_index <- DBI::dbGetQuery(con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
 ```
 
 The corpus index lives in the store rather than in a parquet beside it. That is what makes "which
@@ -306,9 +291,8 @@ n_match <- DBI::dbGetQuery(
 )$n[[1]]
 
 tibble::tibble(
-  Check = c("Labelled documents", "Found in the corpus index",
-            "Corpus index (registrant copies)", "To classify (attachments)"),
-  n     = c(nrow(tab_prep), n_match, n_index, n_classify)
+  Check = c("Labelled documents", "Found in the corpus index", "Corpus documents"),
+  n     = c(nrow(tab_prep), n_match, n_corpus)
 ) |>
   tbl_out(.title = "Do the identifiers line up?")
 
@@ -366,7 +350,7 @@ specs |>
 
 ```{r}
 #| label: report-status
-app_report_status(.tab = app_status(.con = con, .specs = specs), .n_corpus = n_classify)
+app_report_status(.tab = app_status(.con = con, .specs = specs), .n_corpus = n_corpus)
 ```
 
 # Construction
@@ -430,7 +414,7 @@ bench <- app_benchmark(
   .chunk_size = .lP$Param$ChunkSize    # so the model-load cost is timed as it would be paid
 )
 
-app_report_benchmark(.tab = bench, .n_corpus = n_classify)
+app_report_benchmark(.tab = bench, .n_corpus = n_corpus)
 ```
 
 The context length is passed explicitly and never allowed to default. A model applied at a length it
@@ -464,14 +448,13 @@ run_bert <- purrr::map(seq_len(nrow(spec_bert)), function(.i) {
     )),
     .chunk_size   = .lP$Param$ChunkSize,
     .limit        = NULL,                       # NULL takes everything outstanding
-    .report_every = .lP$Param$ReportEvery,      # chunks between progress lines
-    .workers      = .lP$Param$Workers           # daemons for the READ; inference stays sequential
+    .report_every = .lP$Param$ReportEvery       # chunks between progress lines
   ) |>
     dplyr::mutate(Engine = "bert", Task = s_$Task, .before = 1)
 }) |>
   purrr::list_rbind()
 
-app_report_timing(.tab = run_bert, .n_corpus = n_classify)
+app_report_timing(.tab = run_bert, .n_corpus = n_corpus)
 ```
 
 ## The keyword table
@@ -502,14 +485,13 @@ run_kw <- purrr::map(seq_len(nrow(spec_kw)), function(.i) {
     ),
     .chunk_size   = .lP$Param$ChunkSize,
     .limit        = NULL,
-    .report_every = .lP$Param$ReportEvery,      # chunks between progress lines
-    .workers      = .lP$Param$Workers           # daemons for the READ; the applier stays sequential
+    .report_every = .lP$Param$ReportEvery       # chunks between progress lines
   ) |>
     dplyr::mutate(Engine = "keyword", Task = s_$Task, .before = 1)
 }) |>
   purrr::list_rbind()
 
-app_report_timing(.tab = run_kw, .n_corpus = n_classify)
+app_report_timing(.tab = run_kw, .n_corpus = n_corpus)
 ```
 
 # Validation
@@ -624,7 +606,7 @@ releases <- purrr::map(lens_, function(.m) {
     .specs    = specs_,
     .dir      = .lP$Output$Release,
     .max_len  = .m,                   # stamped into the file name
-    .n_corpus = n_classify            # attachments read, not copies written; see load-inputs
+    .n_corpus = n_corpus              # for the completeness statement
   )
   rel_
 })
@@ -650,6 +632,13 @@ tbl_out(
 )
 ```
 
+```{r}
+#| label: disconnect
+# LAST, and it has to be: everything above reads the store, and the release is the last thing that
+# does. Closing before it produced an "Invalid connection" several frames deep in the engine rather
+# than a sentence saying the store was shut.
+DBI::dbDisconnect(con, shutdown = TRUE)
+```
 
 # Overview
 
@@ -694,16 +683,6 @@ app_plot_agreement(
   .task  = "ClassDetailed",
   .key   = "ClassDetailed"
 )
-```
-
-```{r}
-#| label: disconnect
-# LAST, AND IT HAS TO BE: everything above reads the store, and the Overview figures read it too.
-# Closing before them produced "The store is closed, so it is not possible to plot the distribution"
-# -- which is the guard working, and it says what to do: if a section is added below this chunk, this
-# chunk moves below it. It was written at the end of Deployment when Deployment was last; Overview
-# came after and this did not follow.
-DBI::dbDisconnect(con, shutdown = TRUE)
 ```
 
 # Next

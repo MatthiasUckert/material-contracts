@@ -77,14 +77,8 @@ app_connect <- function(.path, .quiet = TRUE) {
     }
   }
 
-  # The corpus table carries the register's own columns rather than a directory listing's. Classify
-  # is the deduplication and the population filter resolved once, at load, so every later query is a
-  # filter rather than a re-derivation; InPopulation records membership for the copy itself, which
-  # differs from Classify wherever an attachment's primary sits outside the population.
   DBI::dbExecute(con_, "CREATE TABLE IF NOT EXISTS corpus (
-      DocID VARCHAR PRIMARY KEY, HashDocument VARCHAR, Path VARCHAR, DocType VARCHAR, YQ VARCHAR,
-      PrimaryFiler BOOLEAN, FilerCopiesAgree BOOLEAN,
-      DescSample BOOLEAN, EstiSample BOOLEAN, InPopulation BOOLEAN, Classify BOOLEAN)")
+      DocID VARCHAR PRIMARY KEY, Path VARCHAR, DocType VARCHAR, YQ VARCHAR)")
 
   # One row per run key. This is what makes drift reportable: the configuration behind rows already
   # written is recorded beside them, so a changed setting can be named rather than merely detected.
@@ -204,127 +198,38 @@ app_run_register <- function(.con, .spec) {
 #' Load the corpus index into the store, walking the tree only once
 #'
 #' A million paths is a slow walk and an unchanging one between renders, so it is done when the table
-#' is empty and skipped otherwise. `.reload` forces it, which is what a changed register needs.
+#' is empty and skipped otherwise. `.rewalk` forces it, which is what a grown corpus needs.
 #'
 #' @param .con Connection.
 #' @param .dir_corpus Character. Root of the parsed-contract tree.
 #' @param .path_cache Character. Parquet the walk is cached to.
-#' @param .reload Logical. Rebuild from the register even if the table holds rows.
-#' @return Invisibly the number of ATTACHMENTS this population will classify -- not the index
-#'   size, which counts every registrant copy. It is the denominator every caller reads against.
-app_corpus_load <- function(.con, .path_register, .dir_mirror, .population = "all",
-                            .doc_type = "Exhibit10", .reload = FALSE) {
+#' @param .rewalk Logical. Walk again even if the table holds rows.
+#' @return Invisibly the number of documents in the index.
+app_corpus_load <- function(.con, .dir_corpus, .path_cache, .rewalk = FALSE) {
   if (FALSE) {
-    .con           <- con
-    .path_register <- .lP$Input$Register
-    .dir_mirror    <- .lP$Param$DirMirror
-    .population    <- "all"
-    .reload        <- FALSE
+    .con         <- con
+    .dir_corpus  <- .lP$Input$DirCorpus
+    .path_cache  <- .lP$Cache$CorpusFiles
+    .rewalk      <- FALSE
   }
-  .population <- match.arg(.population, c("all", "descriptive", "estimation"))
-
-  # THE EARLY RETURN MUST HAND BACK THE SAME QUANTITY THE FULL PATH DOES. An earlier version returned
-  # COUNT(*) here and the classify count below, so a render that reused an existing index reported
-  # 1,462,939 attachments to classify where the pass would read 1,189,805 -- and the benchmark then
-  # projected the run 23% long. One function, one meaning, on every branch.
-  n_all_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
-  if (n_all_ > 0L && !.reload) {
-    n_cls_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus WHERE Classify")$n[[1]]
-    cli::cli_alert_info(
-      "Corpus index already loaded: {format(n_all_, big.mark = ',')} \\
-       {cli::qty(n_all_)}cop{?y/ies}, {format(n_cls_, big.mark = ',')} to classify."
-    )
-    return(invisible(n_cls_))
+  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
+  if (n_ > 0L && !.rewalk) {
+    cli::cli_alert_info("Corpus index already loaded: {n_} document{?s}.")
+    return(invisible(n_))
   }
-  if (!fs::file_exists(.path_register)) cli::cli_abort("No register at {.path {(.path_register)}}.")
+  if (!fs::dir_exists(.dir_corpus)) cli::cli_abort("No corpus tree at {.path {(.dir_corpus)}}.")
 
-  # THE REGISTER IS THE GATE, NOT A DIRECTORY WALK. A walk makes a second, independent statement
-  # about what is in the corpus, and the two can disagree without either reporting it. The register
-  # holds every document with its ladder step attached, so membership and population come from one
-  # place. It stores no path: DocTypeMod, YQ and DocID determine one, and utils_doc_path() rebuilds
-  # it. Verified across all four document types before this was written.
-  reg_ <- arrow::open_dataset(sources = .path_register) |>
-    dplyr::select(
-      "DocID", "HashDocument", "DocTypeMod", "YQ", "CIK",
-      "Removed", "DescSample", "EstiSample",
-      "MultFiler", "nCIK", "PrimaryFiler", "FilerCopiesAgree"
-    ) |>
-    dplyr::filter(.data$DocTypeMod == .doc_type) |>
-    dplyr::collect()
-
-  # WHICH COPIES THE POPULATION WANTS, AND WHICH ATTACHMENT ANSWERS FOR THEM.
-  #
-  # PrimaryFiler is chosen GLOBALLY -- the lowest DocID among copies that passed the quality rules --
-  # while EstiSample depends on a per-CIK Compustat match. The two criteria therefore disagree: an
-  # attachment can have its primary copy outside the estimation sample and another copy inside it.
-  # Measured before this was written: 4,432 such attachments for the estimation sample, and none at
-  # all for the descriptive one, which is exactly where the mechanism predicts them -- the descriptive
-  # rules are per document, the Compustat match is per registrant.
-  #
-  # So the rule is: classify the primary of every attachment with AT LEAST ONE copy in the
-  # population. Restricting to primaries that are themselves in it would leave those 4,432
-  # unlabelled, silently. It also makes the store population-independent, so a pass run for one
-  # population is reused verbatim by any other.
-  in_pop_ <- switch(
-    .population,
-    all         = rep(TRUE, nrow(reg_)),
-    descriptive = as.logical(reg_$DescSample),
-    estimation  = as.logical(reg_$EstiSample)
-  )
-  in_pop_ <- !is.na(in_pop_) & in_pop_
-  hash_want_ <- unique(reg_$HashDocument[in_pop_])
-
-  reg_ <- reg_ |>
-    dplyr::mutate(InPopulation = in_pop_) |>
-    dplyr::mutate(
-      # The row the engine actually reads. One per attachment, by construction: 01C makes exactly one
-      # copy primary and that was verified across all 1,189,805 attachments before this was written.
-      Classify = as.logical(.data$PrimaryFiler) & .data$HashDocument %in% hash_want_
-    ) |>
-    dplyr::arrange(.data$DocID)
+  fils_ <- utils_list_project_files(
+    .dir_data = .dir_corpus, .path_out = .path_cache, .rerun = .rewalk
+  ) |>
+    dplyr::distinct(DocID, .keep_all = TRUE) |>
+    dplyr::select(DocID, Path, dplyr::any_of(c("DocType", "YQ")))
+  for (.c in c("DocType", "YQ")) if (!.c %in% names(fils_)) fils_[[.c]] <- NA_character_
 
   DBI::dbExecute(.con, "DELETE FROM corpus")
-  DBI::dbAppendTable(
-    .con, "corpus",
-    reg_ |>
-      dplyr::transmute(
-        DocID, HashDocument,
-        DocType = .data$DocTypeMod,
-        YQ      = as.character(.data$YQ),
-        Path    = as.character(utils_doc_path(
-          .dir_mirror = .dir_mirror,
-          .doc_type   = .data$DocTypeMod,
-          .yq         = .data$YQ,          # utils_doc_path normalises the register's double form
-          .doc_id     = .data$DocID
-        )),
-        PrimaryFiler     = as.logical(.data$PrimaryFiler),
-        FilerCopiesAgree = as.logical(.data$FilerCopiesAgree),
-        DescSample       = as.logical(.data$DescSample),
-        EstiSample       = as.logical(.data$EstiSample),
-        InPopulation     = .data$InPopulation,
-        Classify         = .data$Classify
-      )
-  )
-
-  n_copy_     <- nrow(reg_)
-  n_attach_   <- dplyr::n_distinct(reg_$HashDocument)
-  n_classify_ <- sum(reg_$Classify)
-
-  cli::cli_alert_success(
-    "Corpus index loaded from the register: {format(n_copy_, big.mark = ',')} \\
-     {cli::qty(n_copy_)}cop{?y/ies} of {format(n_attach_, big.mark = ',')} \\
-     {cli::qty(n_attach_)}attachment{?s}."
-  )
-  # Attachments against attachments. Reporting the count as a share of COPIES read as a selection when
-  # it is not: population "all" wants every attachment, and 81% of copies is the deduplication rate
-  # wearing the language of a filter.
-  cli::cli_alert_info(
-    "Population {.val {(.population)}} wants {format(n_classify_, big.mark = ',')} of them \\
-     ({round(100 * n_classify_ / n_attach_)}%). That count -- attachments, not copies -- is the \\
-     denominator every progress and cost figure below is read against; the release fans back out to \\
-     all {format(n_copy_, big.mark = ',')} copies."
-  )
-  invisible(n_classify_)
+  DBI::dbAppendTable(.con, "corpus", fils_ |> dplyr::select(DocID, Path, DocType, YQ))
+  cli::cli_alert_success("Corpus index loaded: {nrow(fils_)} document{?s}.")
+  invisible(nrow(fils_))
 }
 
 #' Documents this run key still has to label
@@ -345,14 +250,11 @@ app_pending <- function(.con, .run_key, .table = "bert_labels", .limit = NULL) {
     .table   <- "bert_labels"
     .limit   <- 2000L
   }
-  # `c.Classify` is the deduplication and the population filter at once: one row per attachment, and
-  # only attachments the chosen population wants. ORDER BY DocID is not cosmetic -- it fixes chunk
-  # composition, which is what makes a pass reproducible rather than merely repeatable.
   sql_ <- paste0(
     "SELECT c.DocID, c.Path FROM corpus c ",
     "LEFT JOIN (SELECT DISTINCT DocID FROM ", .table, " WHERE RunKey = ?) d ON d.DocID = c.DocID ",
     "LEFT JOIN (SELECT DISTINCT DocID FROM failures WHERE RunKey = ?) f ON f.DocID = c.DocID ",
-    "WHERE c.Classify AND d.DocID IS NULL AND f.DocID IS NULL ORDER BY c.DocID"
+    "WHERE d.DocID IS NULL AND f.DocID IS NULL ORDER BY c.DocID"
   )
   if (!is.null(.limit)) sql_ <- paste0(sql_, " LIMIT ", as.integer(.limit))
   tibble::as_tibble(DBI::dbGetQuery(.con, sql_, params = list(.run_key, .run_key)))
@@ -367,73 +269,12 @@ app_pending <- function(.con, .run_key, .table = "bert_labels", .limit = NULL) {
 #' @param .con Connection.
 #' @param .specs Tibble of the runs this document intends, one row per engine and task.
 #' @return Tibble: Engine, Task, RunKey, nDone, nFailed, nPending, Status, Note.
-#' What the store actually covers, measured against every population
-#'
-#' NO POPULATION TAG IS STORED, DELIBERATELY. A tag records what a run INTENDED; this measures what it
-#' achieved, and the two diverge exactly when it matters -- an interrupted pass over the whole corpus
-#' would carry the tag "all" and be wrong about itself. Coverage cannot lie and adds no state to go
-#' stale.
-#'
-#' Reported per population and per task, on ATTACHMENTS rather than copies, because attachments are
-#' what the engine reads and copies are what the release fans out to.
-#'
-#' @param .con Store connection.
-#' @param .specs Run specifications, as built by the document.
-#' @return Invisibly a tibble: one row per population and task.
-app_coverage <- function(.con, .specs) {
-  if (FALSE) {
-    .con   <- con
-    .specs <- specs
-  }
-  app_require_con(.con = .con, .what = "report coverage")
-
-  pops_ <- c(all = "TRUE", descriptive = "DescSample", estimation = "EstiSample")
-
-  out_ <- purrr::imap(pops_, function(.where, .pop) {
-    # Attachments the population wants: one row per HashDocument with at least one copy in it.
-    want_ <- DBI::dbGetQuery(.con, paste0(
-      "SELECT COUNT(DISTINCT c.HashDocument) AS n FROM corpus c WHERE ", .where
-    ))$n[[1]]
-
-    purrr::map(seq_len(nrow(.specs)), function(.i) {
-      sp_  <- .specs[.i, ]
-      tbl_ <- if (sp_$Engine == "bert") "bert_labels" else "keyword_labels"
-      got_ <- DBI::dbGetQuery(.con, paste0(
-        "SELECT COUNT(DISTINCT c.HashDocument) AS n FROM corpus c ",
-        "INNER JOIN (SELECT DISTINCT DocID FROM ", tbl_, " WHERE RunKey = ?) l ON l.DocID = c.DocID ",
-        "WHERE ", .where
-      ), params = list(sp_$RunKey))$n[[1]]
-      tibble::tibble(
-        Population = .pop, Engine = sp_$Engine, Task = sp_$Task,
-        Wanted = want_, Labelled = got_, Share = got_ / want_
-      )
-    }) |>
-      purrr::list_rbind()
-  }) |>
-    purrr::list_rbind()
-
-  cli::cli_h2("What this store covers")
-  out_ |>
-    dplyr::mutate(Share = tbl_pct(.data$Share)) |>
-    tbl_out(.title = "Attachments labelled, by population")
-  cli::cli_text("")
-  cli::cli_alert_info(
-    "Read this rather than a filename. A pass interrupted part way through the whole corpus and a \\
-     pass run deliberately over one population hold the same documents and differ only in intent; \\
-     coverage distinguishes them and a label would not."
-  )
-  invisible(out_)
-}
-
 app_status <- function(.con, .specs) {
   if (FALSE) {
     .con   <- con
     .specs <- dplyr::bind_rows(spec_bert, spec_kw)
   }
-  # WHERE Classify, because that is what app_pending() serves. Counting every row in `corpus` would
-  # make nPending the copies count while nDone is the attachments count, so a finished pass would sit
-  # at 273,134 pending forever and never report itself complete.
-  n_corpus_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus WHERE Classify")$n[[1]]
+  n_corpus_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
   prev_     <- tibble::as_tibble(DBI::dbGetQuery(.con, "SELECT * FROM runs"))
 
   purrr::map(seq_len(nrow(.specs)), function(.i) {
@@ -480,11 +321,7 @@ app_status <- function(.con, .specs) {
 
     tibble::tibble(
       Engine = s_$Engine, Task = s_$Task, RunKey = s_$RunKey,
-      # as.integer, because DBI returns these as doubles and the table formatter then renders a count
-      # of zero as "0.000" beside a count of 1,189,805 -- two formats for one kind of quantity.
-      nDone    = as.integer(done_),
-      nFailed  = as.integer(fail_),
-      nPending = as.integer(n_corpus_ - done_ - fail_),
+      nDone = done_, nFailed = fail_, nPending = n_corpus_ - done_ - fail_,
       Status = dplyr::case_when(done_ == 0L                     ~ "not started",
                                 done_ + fail_ >= n_corpus_      ~ "complete",
                                 TRUE                            ~ "partial"),
@@ -496,8 +333,7 @@ app_status <- function(.con, .specs) {
 
 #' Report the store's state before anything is run
 #' @param .tab Output of app_status().
-#' @param .n_corpus Integer. Attachments this population classifies, as returned by
-#'   `app_corpus_load()`. NOT the index size: the index holds one row per registrant copy.
+#' @param .n_corpus Integer. Documents in the index.
 #' @return Invisibly .tab.
 app_report_status <- function(.tab, .n_corpus) {
   if (FALSE) {
@@ -527,11 +363,7 @@ app_report_status <- function(.tab, .n_corpus) {
       .type = "warn"
     )
   }
-  tbl_note(
-    "{format(.n_corpus, big.mark = ',')} {cli::qty(.n_corpus)}attachment{?s} to classify under this \\
-     population. The index holds more -- one row per registrant copy -- and the release fans out to \\
-     those; nothing below counts them."
-  )
+  tbl_note("The corpus index holds {(.n_corpus)} document{?s}.")
   invisible(.tab)
 }
 
@@ -546,72 +378,10 @@ app_report_status <- function(.tab, .n_corpus) {
 #'
 #' @param .docs Tibble with DocID and Path.
 #' @return .docs with a Text column.
-app_read_text <- function(.docs, .workers = 1L) {
-  if (FALSE) {
-    .docs    <- pending[1:10, ]
-    .workers <- 24L
-  }
-  if (nrow(.docs) == 0L) return(dplyr::mutate(.docs, Text = character(0)))
-
-  seq_read_ <- function(.d) dplyr::mutate(.d, Text = purrr::map_chr(.data$Path, clf_read_text))
-
-  # Below the threshold the dispatch costs more than the read saves, and the last chunk of a pass is
-  # routinely short.
-  if (.workers <= 1L || nrow(.docs) < 500L) return(seq_read_(.docs))
-
-  # ONE BATCH PER WORKER, not one task per document. 5,000 individual tasks would spend more time in
-  # dispatch than in arrow. Batches are contiguous and split() orders numeric groups numerically, so
-  # unlist() reassembles the original order -- which matters, because the caller pairs Text back onto
-  # .docs positionally.
-  n_    <- nrow(.docs)
-  grp_  <- ceiling(seq_len(n_) / ceiling(n_ / .workers))
-  bats_ <- split(.docs$Path, grp_)
-
-  # mirai does NOT throw when a task fails: it RETURNS the error as a miraiError, which is a character
-  # scalar carrying a class. So a failed batch arrives looking like one text, and 24 failed batches
-  # unlist to a character vector of 24 -- which is exactly how an earlier version reported "24 texts
-  # for 5000 documents" while discarding the 24 messages that said why. They are read here instead.
-  txt_ <- tryCatch(
-    {
-      out_ <- mirai::mirai_map(
-        .x = bats_,
-        .f = function(paths) vapply(paths, clf_read_text, character(1), USE.NAMES = FALSE)
-      )[]
-
-      err_ <- which(vapply(out_, \(.r) inherits(.r, "miraiError"), logical(1)))
-      if (length(err_) > 0L) {
-        cli::cli_alert_danger(
-          "{length(err_)} of {length(out_)} batch{?es} failed in the daemons. First message:"
-        )
-        cli::cli_text("  {as.character(out_[[err_[[1]]]])}")
-        NULL
-      } else {
-        unlist(out_, use.names = FALSE)
-      }
-    },
-    error = function(e) {
-      cli::cli_alert_warning(
-        "Parallel read failed ({conditionMessage(e)}); falling back to a sequential read for this \\
-         chunk. The result is identical, only slower."
-      )
-      NULL
-    }
-  )
-
-  # A SHORT RESULT IS A FAILURE, NOT A PARTIAL SUCCESS. Pairing a short Text vector onto .docs would
-  # recycle it and label documents with other documents' text, which is worse than being slow and
-  # would not announce itself.
-  if (is.null(txt_) || length(txt_) != n_) {
-    if (!is.null(txt_)) {
-      cli::cli_alert_warning(
-        "Parallel read returned {length(txt_)} text{?s} for {n_} document{?s}; reading sequentially. \\
-         A count matching the BATCH count rather than the document count means the tasks failed and \\
-         returned their error messages -- see the line above for the first of them."
-      )
-    }
-    return(seq_read_(.docs))
-  }
-  dplyr::mutate(.docs, Text = txt_)
+app_read_text <- function(.docs) {
+  if (FALSE) .docs <- pending[1:10, ]
+  .docs |>
+    dplyr::mutate(Text = purrr::map_chr(.data$Path, clf_read_text))
 }
 
 #' Split a queue into chunks of a given size
@@ -926,8 +696,7 @@ app_bench_docs <- function(.con, .n) {
     .n   <- 2000L
   }
   docs_ <- DBI::dbGetQuery(
-    .con, paste0("SELECT DocID, Path FROM corpus WHERE Classify ORDER BY DocID LIMIT ",
-                 as.integer(.n))
+    .con, paste0("SELECT DocID, Path FROM corpus ORDER BY DocID LIMIT ", as.integer(.n))
   ) |>
     tibble::as_tibble() |>
     app_read_text()
@@ -1001,8 +770,7 @@ app_benchmark <- function(.con, .docs, .grid, .python, .script, .chunk_size = 50
 
 #' Report the timing grid and what each setting would cost over the corpus
 #' @param .tab Output of app_benchmark().
-#' @param .n_corpus Integer. Attachments this population classifies, as returned by
-#'   `app_corpus_load()`. NOT the index size: the index holds one row per registrant copy.
+#' @param .n_corpus Integer. Documents in the index.
 #' @return Invisibly .tab.
 app_report_benchmark <- function(.tab, .n_corpus) {
   if (FALSE) {
@@ -1023,9 +791,7 @@ app_report_benchmark <- function(.tab, .n_corpus) {
     .notes  = c(
       DocsPerSecond = paste("Over the whole run including reading and writing, not inference alone,",
                             "because that is what the wall clock is made of."),
-      HoursPerTask  = paste("This rate projected to every ATTACHMENT this population classifies, for",
-                            "ONE task -- not to every registrant copy, which deduplication removes.",
-                            "Three",
+      HoursPerTask  = paste("This rate projected to every document in the index, for ONE task. Three",
                             "tasks cost three times this unless they share a pass."),
       Measured      = paste("A row reading recalled was measured on an earlier render and read back",
                             "rather than run again. Nothing here writes a label, so re-running costs",
@@ -1062,16 +828,14 @@ app_report_benchmark <- function(.tab, .n_corpus) {
 #' @param .label_fn Function of one chunk, returning a list with Labels and optionally Hits.
 #' @param .chunk_size Integer. Documents per call to the engine.
 #' @param .limit Integer or NULL. Cap the queue, for a rehearsal.
-#' @param .report_every Integer. Chunks between progress lines.
-#' @param .workers Integer. Daemons for the corpus READ only; the engine call stays sequential.
-#'   1 reads sequentially and starts nothing. The first and last chunks always
+#' @param .report_every Integer. Chunks between progress lines. The first and last chunks always
 #'   report, so a short run is never silent and a long one confirms early that it is alive. Note that
 #'   this counts CHUNKS, so the cadence in minutes moves with .chunk_size: at five thousand documents
 #'   a chunk every fifth chunk is roughly every six minutes, and at five hundred it is roughly every
 #'   forty seconds.
 #' @return Tibble: nDocs, nChunks, Seconds, DocsPerSecond.
 app_pass <- function(.con, .spec, .label_fn, .chunk_size = 5000L, .limit = NULL,
-                     .report_every = 5L, .workers = 1L) {
+                     .report_every = 5L) {
   if (FALSE) {
     .con        <- con
     .spec       <- spec_bert[1, ]
@@ -1082,50 +846,6 @@ app_pass <- function(.con, .spec, .label_fn, .chunk_size = 5000L, .limit = NULL,
   }
   tab_ <- if (identical(.spec$Engine, "bert")) "bert_labels" else "keyword_labels"
   app_run_register(.con = .con, .spec = .spec)
-
-  # DAEMONS ARE STARTED ONCE PER PASS, not once per chunk. Startup is about a second each, and a full
-  # pass is a couple of hundred chunks, so starting them inside the loop would spend more on daemons
-  # than the parallel read saves.
-  #
-  # ONLY THE READ IS PARALLEL. The engines stay sequential and deliberately so: the transformer holds
-  # the GPU, which is one resource, and several processes contending for it is slower than one using
-  # it. Reading is file I/O and scales; that is why this is where the workers go.
-  par_ok_ <- FALSE
-  if (.workers > 1L) {
-    mirai::daemons(.workers)
-    on.exit(mirai::daemons(0L), add = TRUE)
-
-    # A DAEMON IS A FRESH R SESSION AND HOLDS NONE OF THIS ONE'S FUNCTIONS. An earlier version sent
-    # clf_read_text() as a serialized closure and assumed it would carry; it did not, and every task
-    # returned a miraiError instead of text. The reader is sourced into each daemon instead, which is
-    # also what keeps ONE implementation of it: the corpus is read by the same function that read the
-    # labelled sample, not by a copy that happens to agree today.
-    #
-    # The whole chain travels because 03A's library is not inert -- it calls plot_register_levels()
-    # at load time, so _Plots.R has to be in scope before it loads.
-    par_ok_ <- tryCatch({
-      mirai::everywhere(
-        {
-          for (.f in c(file.path("_Commons", "_Initialize.R"), file.path("_Commons", "_Utils.R"),
-                       file.path("_Commons", "_Plots.R"),      file.path("_Commons", "_Tables.R"),
-                       "03A-ClassifyPrepare.R")) {
-            source(file.path(.code, .f), encoding = "UTF-8")
-          }
-        },
-        .code = here::here("1_code")
-      )
-      TRUE
-    }, error = function(e) {
-      cli::cli_alert_warning(
-        "Could not prepare the daemons ({conditionMessage(e)}); this pass reads sequentially."
-      )
-      FALSE
-    })
-
-    if (par_ok_) {
-      cli::cli_alert_success("{(.workers)} daemon{?s} up and carrying the reader.")
-    }
-  }
 
   queue_ <- app_pending(.con = .con, .run_key = .spec$RunKey, .table = tab_, .limit = .limit)
   if (nrow(queue_) == 0L) {
@@ -1143,7 +863,7 @@ app_pass <- function(.con, .spec, .label_fn, .chunk_size = 5000L, .limit = NULL,
   # A plain loop rather than a walk, because the progress line needs a running count and an
   # accumulator reaching out of a closure is a worse way to say the same thing.
   for (.i in seq_along(chunks_)) {
-    ch_    <- app_read_text(.docs = chunks_[[.i]], .workers = if (par_ok_) .workers else 1L)
+    ch_    <- app_read_text(.docs = chunks_[[.i]])
     done_  <- done_ + nrow(chunks_[[.i]])
     bad_ <- ch_ |> dplyr::filter(is.na(.data$Text) | !nzchar(trimws(.data$Text)))
     ok_  <- ch_ |> dplyr::filter(!is.na(.data$Text), nzchar(trimws(.data$Text)))
@@ -1201,8 +921,7 @@ app_pass <- function(.con, .spec, .label_fn, .chunk_size = 5000L, .limit = NULL,
 
 #' Report a set of pass timings and what they imply for the whole corpus
 #' @param .tab Timings, bound across runs, carrying Engine and Task.
-#' @param .n_corpus Integer. Attachments this population classifies, as returned by
-#'   `app_corpus_load()`. NOT the index size: the index holds one row per registrant copy.
+#' @param .n_corpus Integer. Documents in the index.
 #' @return Invisibly .tab.
 app_report_timing <- function(.tab, .n_corpus) {
   if (FALSE) {
@@ -1218,8 +937,7 @@ app_report_timing <- function(.tab, .n_corpus) {
     .notes  = c(
       DocsPerSecond = paste("Measured over the whole pass including reading and writing, not over",
                             "inference alone, because that is what the wall clock is made of."),
-      FullPassHours = paste("This rate projected to every ATTACHMENT this population classifies,",
-                            "not to every registrant copy. On a short",
+      FullPassHours = paste("This rate projected to every document in the index. On a short",
                             "rehearsal it is pessimistic: the first chunk pays for kernel",
                             "compilation on Apple silicon and never recurs.")
     )
@@ -1336,56 +1054,6 @@ app_release <- function(.con, .specs, .tab_prep, .tasks, .none = "(none)") {
   # detailed pass and not yet by the broad one leaves rather than arriving with a hole.
   out_ <- purrr::reduce(blocks_, \(.a, .b) dplyr::inner_join(.a, .b, by = dplyr::join_by(DocID)))
 
-  # THE FAN-OUT. Everything above is keyed on the attachment that was actually classified -- one row
-  # per HashDocument, the primary copy. A filing naming several registrants lists the same attachment
-  # under each of them, so the released file carries one row per REGISTRANT COPY and merges onto
-  # filer-level data directly. Roughly one document in six is a repeat of this kind.
-  #
-  # 01C settled which way this goes: "classification wants one, entity extraction may want each,
-  # because the registrant-side metadata differs even where the text does not." The store holds the
-  # one; the release fans out to the each.
-  #
-  # FilerCopiesAgree GATES THE FAN-OUT. The flag records whether an attachment's copies match on all
-  # three length measures. Where they do not, the text under one registrant is not the text under
-  # another and the label was computed from only one of them, so the copies keep the label and are
-  # marked rather than passed off as equivalent. 01C found one attachment of 1.49 million in this
-  # state and all eight of its copies were already flagged Removed, so this costs nothing today and
-  # is not therefore free to leave unsaid.
-  copies_ <- DBI::dbGetQuery(
-    .con,
-    "SELECT DocID, HashDocument, PrimaryFiler, FilerCopiesAgree, DescSample, EstiSample
-     FROM corpus ORDER BY DocID"
-  ) |>
-    tibble::as_tibble()
-
-  key_ <- copies_ |>
-    dplyr::filter(as.logical(.data$PrimaryFiler)) |>
-    dplyr::select("HashDocument", Primary = "DocID")
-
-  n_attach_ <- nrow(out_)
-  out_ <- out_ |>
-    dplyr::inner_join(y = key_, by = dplyr::join_by(DocID == Primary)) |>
-    dplyr::select(-"DocID") |>
-    # One row per registrant copy. INNER, so a copy with no classified attachment does not arrive
-    # carrying empty label columns.
-    dplyr::inner_join(y = copies_, by = dplyr::join_by(HashDocument), relationship = "one-to-many") |>
-    dplyr::relocate("DocID", "HashDocument", "PrimaryFiler", "FilerCopiesAgree",
-                    "DescSample", "EstiSample") |>
-    dplyr::arrange(.data$DocID)
-
-  n_disagree_ <- sum(!as.logical(out_$FilerCopiesAgree), na.rm = TRUE)
-  cli::cli_alert_info(
-    "Fanned out {format(n_attach_, big.mark = ',')} {cli::qty(n_attach_)}classified attachment{?s} \\
-     to {format(nrow(out_), big.mark = ',')} {cli::qty(nrow(out_))}registrant cop{?y/ies}."
-  )
-  if (n_disagree_ > 0L) {
-    cli::cli_alert_warning(
-      "{format(n_disagree_, big.mark = ',')} {cli::qty(n_disagree_)}cop{?y/ies} belong{?s/} to an \\
-       attachment whose copies do NOT agree on length. \\
-       They carry the label computed from the primary copy and are marked by {.field FilerCopiesAgree}."
-    )
-  }
-
   if (all(c("ClassDetailed", "ClassBroad") %in% .tasks)) {
     map_ <- .tab_prep |>
       dplyr::filter(!is.na(.data$ClassDetailed), !is.na(.data$ClassBroad)) |>
@@ -1415,8 +1083,7 @@ app_release <- function(.con, .specs, .tab_prep, .tasks, .none = "(none)") {
 #' @param .stem Character. File stem; the context length and any partial stamp are appended.
 #' @param .max_len Integer or NULL. Stamped into the name, because two context lengths produce two
 #'   releases and a reader must be able to tell them apart without opening either.
-#' @param .n_corpus Integer. Attachments this population classifies, for the completeness
-#'   report. NOT the index size, which counts every registrant copy the release fans out to.
+#' @param .n_corpus Integer. Documents in the index, for the completeness report.
 #' @return Invisibly a one-row tibble naming both files.
 app_write_release <- function(.tab, .con, .specs, .dir, .stem = "contract_labels",
                               .max_len = NULL, .n_corpus = NA_integer_) {
@@ -1473,24 +1140,10 @@ app_write_release <- function(.tab, .con, .specs, .dir, .stem = "contract_labels
   ) |>
     tbl_out(.title = "The released file")
 
-  # ATTACHMENTS BEHIND THE RELEASED COPIES, not the released row count. .n_corpus counts attachments;
-  # .tab counts registrant copies after the fan-out. Subtracting one from the other compared different
-  # units and produced a NEGATIVE shortfall of -272,393 -- which is the deduplication rate with a
-  # minus sign, and the giveaway that the two numbers were never comparable.
-  n_attach_ <- if ("HashDocument" %in% names(.tab)) {
-    dplyr::n_distinct(.tab$HashDocument)
-  } else {
-    nrow(.tab)
-  }
-
   if (is.finite(.n_corpus)) {
     tbl_note(
-      "{format(nrow(.tab), big.mark = ',')} {cli::qty(nrow(.tab))}registrant cop{?y/ies} in the \\
-       file, fanned out from {format(n_attach_, big.mark = ',')} of \\
-       {format(.n_corpus, big.mark = ',')} {cli::qty(.n_corpus)}attachment{?s} the population \\
-       wanted; {format(.n_corpus - n_attach_, big.mark = ',')} \\
-       {cli::qty(.n_corpus - n_attach_)}attachment{?s} {?is/are} missing, because \\
-       at least one pass has not reached them or \\
+      "{nrow(.tab)} of {(.n_corpus)} corpus document{?s} carry every transformer label and are in this \\
+       file; {(.n_corpus - nrow(.tab))} are not, because at least one pass has not reached them or \\
        could not read them."
     )
   }
@@ -1521,22 +1174,6 @@ app_release_schema <- function(.tab) {
     dplyr::mutate(
       Meaning = dplyr::case_when(
         .data$Column == "DocID"                    ~ "Document identifier; the merge key.",
-        # THE FAN-OUT COLUMNS. Added to the release and left undocumented by the first version, which
-        # rendered six blank Meaning cells directly beneath a note promising that a column added
-        # upstream cannot go undocumented. The mechanism reported the gap; it does not fill it.
-        .data$Column == "HashDocument"             ~ paste("Attachment identifier. Copies filed by",
-                                                           "several registrants share it and were",
-                                                           "classified once."),
-        .data$Column == "PrimaryFiler"             ~ paste("TRUE on the one copy that was actually",
-                                                           "read; the others carry its label."),
-        .data$Column == "FilerCopiesAgree"         ~ paste("FALSE where an attachment's copies differ",
-                                                           "on length, so the label describes the",
-                                                           "primary copy's text and not certainly",
-                                                           "this one's."),
-        .data$Column == "DescSample"               ~ paste("In 02B's descriptive sample: inside the",
-                                                           "date window and past the quality rules."),
-        .data$Column == "EstiSample"               ~ paste("In 02B's estimation sample: descriptive,",
-                                                           "and matched to Compustat."),
         .data$Column == "HierConsistent"           ~ "Does the detailed label's parent equal the broad label?",
         grepl("Flag$", .data$Column)               ~ "confirmed / contradicted / unchecked by the lexicon.",
         grepl("^Kw.*Term$", .data$Column)          ~ "The term that fired; NA where the lexicon was silent.",
@@ -1558,135 +1195,12 @@ app_release_schema <- function(.tab) {
 #' @param .con Connection.
 #' @param .specs The run specification.
 #' @return Tibble: Engine, Task, nLabelled, Coverage, MeanTop1, nFailed.
-#' Category shares across the labelled corpus
-#'
-#' Drawn at the registered taxonomic order and colours, so this panel and 03B's read against each
-#' other bar for bar. Computed in the store rather than pulled into R: the corpus is over a million
-#' rows and a count is a query.
-#'
-#' @param .con Store connection.
-#' @param .spec One run specification, single row.
-#' @param .key Registered level key for order and colour.
-#' @return A ggplot.
-app_plot_distribution <- function(.con, .spec, .key = "ClassDetailed") {
-  if (FALSE) {
-    .con  <- con
-    .spec <- dplyr::filter(specs, Engine == "bert", Task == "ClassDetailed")
-  }
-  app_require_con(.con = .con, .what = "plot the distribution")
-  if (nrow(.spec) != 1L) cli::cli_abort("Expected exactly one run specification.")
-
-  tab_ <- DBI::dbGetQuery(
-    .con, "SELECT Top1Class AS Label, COUNT(*) AS n FROM bert_labels WHERE RunKey = ?
-           GROUP BY Top1Class", params = list(.spec$RunKey)
-  ) |>
-    tibble::as_tibble() |>
-    dplyr::mutate(Share = .data$n / sum(.data$n))
-
-  plot_bar_ranked(
-    .tab  = tab_, .cat = "Label", .val = "Share",
-    .key  = .key,      # registered taxonomic order and colours
-    .pct  = TRUE,      # shares, not counts
-    .desc = FALSE      # taxonomic order, not by size: a panel that reorders cannot be compared
-  )
-}
-
-#' How confident the transformer is across the corpus
-#'
-#' Binned in the store rather than collected: a million probabilities do not need to travel to be
-#' histogrammed. The bin width is stated rather than chosen by a default, because the distribution is
-#' massed against one and a default bin count hides exactly the tail that matters.
-#'
-#' @param .con Store connection.
-#' @param .spec One run specification, single row.
-#' @param .binwidth Probability bin.
-#' @return A ggplot.
-app_plot_confidence <- function(.con, .spec, .binwidth = 0.01) {
-  if (FALSE) {
-    .con  <- con
-    .spec <- dplyr::filter(specs, Engine == "bert", Task == "ClassDetailed")
-  }
-  app_require_con(.con = .con, .what = "plot confidence")
-  if (nrow(.spec) != 1L) cli::cli_abort("Expected exactly one run specification.")
-
-  tab_ <- DBI::dbGetQuery(
-    .con, paste0(
-      "SELECT FLOOR(Top1Prob / ", .binwidth, ") * ", .binwidth, " AS Bin, COUNT(*) AS n ",
-      "FROM bert_labels WHERE RunKey = ? GROUP BY Bin ORDER BY Bin"
-    ), params = list(.spec$RunKey)
-  ) |>
-    tibble::as_tibble() |>
-    dplyr::mutate(Share = .data$n / sum(.data$n))
-
-  # A ranked bar over probability bins would sort the axis by height, which is exactly wrong for a
-  # distribution. Drawn directly, with the bins left in their own order.
-  ggplot2::ggplot(tab_, ggplot2::aes(x = .data$Bin, y = .data$Share)) +
-    ggplot2::geom_col(fill = .plot_ink, width = .binwidth * 0.9) +
-    plot_scale_y_pct() +
-    ggplot2::labs(x = "Top-class probability", y = "Share of the corpus") +
-    plot_theme(.grid = "y")
-}
-
-#' Where the keyword table confirms, contradicts, or never looked
-#'
-#' The three-way flag the release carries, by category. `unchecked` is the keyword arm's abstention:
-#' a property of the lexicon rather than of the document, so a tall unchecked bar marks a category the
-#' table never reached rather than a document that was hard.
-#'
-#' @param .con Store connection.
-#' @param .specs Run specifications; the transformer and keyword runs for `.task` are selected here.
-#' @param .task Task to draw.
-#' @param .key Registered level key for order and colour.
-#' @return A ggplot, or NULL where the task has no keyword run.
-app_plot_agreement <- function(.con, .specs, .task = "ClassDetailed", .key = "ClassDetailed") {
-  if (FALSE) {
-    .con   <- con
-    .specs <- specs
-    .task  <- "ClassDetailed"
-  }
-  app_require_con(.con = .con, .what = "plot agreement")
-
-  kb_ <- .specs |> dplyr::filter(.data$Engine == "bert",    .data$Task == .task)
-  kk_ <- .specs |> dplyr::filter(.data$Engine == "keyword", .data$Task == .task)
-  if (nrow(kb_) != 1L) cli::cli_abort("Expected exactly one transformer run for {(.task)}.")
-  if (nrow(kk_) != 1L) {
-    cli::cli_alert_info("No keyword run for {(.task)}; nothing to compare.")
-    return(invisible(NULL))
-  }
-
-  tab_ <- DBI::dbGetQuery(
-    .con,
-    "SELECT b.Top1Class AS Label,
-            CASE WHEN k.Top1Class IS NULL      THEN 'unchecked'
-                 WHEN k.Top1Class = b.Top1Class THEN 'confirmed'
-                 ELSE 'contradicted' END       AS Agreement,
-            COUNT(*) AS n
-       FROM bert_labels b
-       LEFT JOIN (SELECT DocID, Top1Class FROM keyword_labels WHERE RunKey = ?) k
-         ON k.DocID = b.DocID
-      WHERE b.RunKey = ?
-      GROUP BY Label, Agreement",
-    params = list(kk_$RunKey, kb_$RunKey)
-  ) |>
-    tibble::as_tibble() |>
-    dplyr::mutate(Share = .data$n / sum(.data$n), .by = "Label")
-
-  plot_bar_stacked(
-    .tab   = tab_, .cat = "Label", .val = "Share", .fill = "Agreement",
-    .key   = .key,     # registered taxonomic order and colours
-    .share = TRUE,     # each category sums to one, so the unchecked share is directly readable
-    .desc  = FALSE     # taxonomic order
-  )
-}
-
 app_summary <- function(.con, .specs) {
   if (FALSE) {
     .con   <- con
     .specs <- dplyr::bind_rows(spec_bert, spec_kw)
   }
-  # WHERE Classify: coverage is a share of what the pass READS, not of every registrant copy. Counting
-  # the copies made a fully finished pass report 81.3% -- the deduplication rate misread as a gap.
-  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus WHERE Classify")$n[[1]]
+  n_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1]]
   purrr::map(seq_len(nrow(.specs)), function(.i) {
     s_   <- .specs[.i, ]
     tab_ <- if (identical(s_$Engine, "bert")) "bert_labels" else "keyword_labels"

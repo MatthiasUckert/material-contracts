@@ -8,7 +8,6 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
-here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # Figure geometry is NOT set here -- it is declared once in _quarto.yml.
@@ -157,11 +156,11 @@ invisible to the rule that turns them into labels.
     Union = utils_file_path(.dir_main, "table", "union_terms_detailed.parquet")
   ),
   Engine = list(
-    Python = here::here("contracts-classify", ".venv", "bin", "python"),
-    Script = here::here("contracts-classify", "keyword_train.py"),
+    Python = here::here("contracts-engine", ".venv", "bin", "python"),
+    Script = here::here("contracts-engine", "keyword_train.py"),
     # The applier. One interpreter for both, because a table matched under a different tokenisation
     # from the one it was mined under fires on different documents and says nothing about it.
-    ScriptApply = here::here("contracts-classify", "keyword_apply.py")
+    ScriptApply = here::here("contracts-engine", "keyword_apply.py")
   ),
   Param = list(
     # The promise, and the breadth required of a table before a threshold is acceptable. Both are

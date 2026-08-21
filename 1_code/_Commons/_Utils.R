@@ -65,13 +65,22 @@ utils_doc_path <- function(.dir_mirror, .doc_type, .yq, .doc_id) {
   if (FALSE) {
     .dir_mirror <- here::here("2_output", "01B-EdgarDocuments", "GetEDGAR")
     .doc_type   <- "Exhibit10"
-    .yq         <- "2015-3"
+    .yq         <- 2015.3            # the register's form
     .doc_id     <- "0000060512-b1ef140a0a2bfd14412f722475dcc7b8"
   }
 
+  # The register stores year-quarter as a DOUBLE (2006.3); the mirror's directories are "2006-3".
+  # Normalising here rather than at each call site is deliberate: this is the one function where a
+  # year-quarter becomes a directory name, so it is the one place the format question arises, and no
+  # caller can forget it. The conversion is arithmetic, not as.character(), because how a double
+  # prints is not a property to build a file path on. It is idempotent on the character form --
+  # "2006-3" round-trips to itself -- so callers already passing directory strings are unaffected.
+  qtr_ <- round(suppressWarnings(as.numeric(.yq)) * 10)
+  yq_  <- ifelse(is.na(qtr_), as.character(.yq), paste0(qtr_ %/% 10, "-", qtr_ %% 10))
+
   fs::path(
     .dir_mirror, "DocumentData", "Parsed",
-    .doc_type, .yq, paste0(.doc_id, ".parquet")
+    .doc_type, yq_, paste0(.doc_id, ".parquet")
   )
 }
 
