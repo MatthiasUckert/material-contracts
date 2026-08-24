@@ -18,16 +18,19 @@
 # wearing a shared function's clothes.
 #
 # SOURCE ORDER. This file uses cli, stringi, arrow and the tbl_* helpers, so it is sourced after
-# _Utils.R, _NER.R, _Store.R, _Plots.R and _Tables.R and before the entity's own function file.
+# _Utils.R, _NER.R, _Plots.R and _Tables.R and before the entity's own function file. _Store.R is NOT
+# in that list any more: it was deleted, its three live functions now live in _NER.R, and the per-
+# label schema it declared is gone with the flat store it described.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
 # cli/fs/here; pure ASCII; stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
 
 if (FALSE) {
-  .path_anchors <- .lP$Input$Anchors
-  .path_text    <- .lP$Input$Text
-  .db_path      <- .lP$Input$Store
+  .path_text     <- .lP$Input$Text
+  .path_prepared <- .lP$Input$Prepared
+  .path_register <- .lP$Input$Register
+  .dir_store     <- .lP$Input$Store
 }
 
 
@@ -176,31 +179,80 @@ ent_doc_lens <- function(.path_text) {
 
 #' Per-document anchor facts, one row per contract
 #'
-#' Reads 04A's sample table rather than the EDGAR metadata, so every entity document depends on one
-#' narrow artifact and none of them can drift from the sample 04A extracted. The registered addresses
-#' are carried because the geography rule validates against them, and the filing date because the
-#' date rule measures from it -- both are free here and expensive to reach for later.
+#' THE ANCHORS ARE BUILT HERE AND NOT READ FROM AN ARTIFACT, and that is a change of design rather
+#' than a change of path. An earlier version read a sample_anchors.parquet that 04A was supposed to
+#' write; five documents named it as a hardcoded string and nothing wrote it, so five documents could
+#' not render. The columns are not extraction results -- they are the registrant's own facts -- so
+#' nothing about them belongs to a document that runs extractors. Two reads and a join produce them,
+#' and the join is reported rather than assumed.
+#'
+#' Labels and folds come from 03A's prepared sample, which is the partition every method in the
+#' monorepo scores against. Identity and filing date come from 02B's register. The registered
+#' addresses are the exception: they exist only in 01C's landing page, they are wanted only by the
+#' geography rule, and they are therefore optional -- a missing landing page must not stop the ORG
+#' document from rendering.
 #'
 #' No length floor is applied to the key. AnchorLen is carried and each entity's rule decides what is
 #' long enough for equality and what for containment, which are different questions.
 #'
-#' @param .path_anchors 04A's sample_anchors.parquet.
-#' @return Tibble: one row per document with the labels, the company name and key, the addresses and
-#'   the filing date.
-ent_anchor_keys <- function(.path_anchors) {
-  if (FALSE) .path_anchors <- .lP$Input$Anchors
+#' @param .path_prepared 03A's prepared.parquet: DocID, folds, ClassDetailed, AmendType.
+#' @param .path_register 02B's Documents.parquet: CIK, CompanyName, DateFiled, HashDocument.
+#' @param .path_landing 01C's LandingPage.parquet, for the registered addresses. NULL omits them.
+#' @param .quiet Logical. Suppress the coverage report.
+#' @return Tibble: one row per document with the labels, the company name and key, the filing date
+#'   and, where the landing page was supplied, the two addresses.
+ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL, .quiet = FALSE) {
+  if (FALSE) {
+    .path_prepared <- .lP$Input$Prepared
+    .path_register <- .lP$Input$Register
+    .path_landing  <- .lP$Input$Landing
+    .quiet         <- FALSE
+  }
 
-  raw_ <- arrow::read_parquet(.path_anchors)
+  if (!fs::file_exists(.path_prepared)) {
+    cli::cli_abort("No prepared sample at {.path {(.path_prepared)}}.")
+  }
+  if (!fs::file_exists(.path_register)) {
+    cli::cli_abort("No register at {.path {(.path_register)}}.")
+  }
 
-  # The address columns are used only by the geography document and may be absent from an older
-  # artifact. Missing them should not stop the ORG document from rendering.
-  addr_ <- intersect(c("BusinessAddress", "MailingAddress"), names(raw_))
+  spine_ <- arrow::open_dataset(sources = .path_prepared) |>
+    dplyr::select("DocID", "ClassDetailed", "AmendType", "Fold") |>
+    dplyr::collect()
 
-  raw_ |>
-    dplyr::select(
-      DocID, Fold, ClassDetailed, AmendType, CIK, CompanyName, DateFiled, dplyr::all_of(addr_)
-    ) |>
-    dplyr::rename(Class = ClassDetailed) |>
+  # THE REGISTER IS READ WITH open_dataset AND FILTERED BEFORE COLLECTING, because it holds 1.77
+  # million rows and this needs 4,398 of them. Selecting by name rather than by a relocate list, for
+  # the reason the 03 pass established: any_of() drops silently, so a list of intended columns is
+  # neither a superset nor a subset of what is actually there.
+  reg_ <- arrow::open_dataset(sources = .path_register) |>
+    dplyr::select("DocID", "HashDocument", "HashIndex", "CIK", "CompanyName", "DateFiled",
+                  "nWords", "nChars") |>
+    dplyr::filter(.data$DocID %in% spine_$DocID) |>
+    dplyr::collect()
+
+  # LEFT JOIN AND REPORT, NEVER INNER. A check that cannot fail is not a check: an inner join would
+  # silently drop any labelled document the register does not carry, and the count that matters is
+  # exactly the count it would have hidden.
+  out_ <- dplyr::left_join(spine_, reg_, by = dplyr::join_by(DocID))
+
+  if (!is.null(.path_landing) && fs::file_exists(.path_landing)) {
+    land_ <- arrow::open_dataset(sources = .path_landing)
+    addr_ <- intersect(c("BusinessAddress", "MailingAddress"), names(land_))
+    if (length(addr_) > 0L) {
+      out_ <- out_ |>
+        dplyr::left_join(
+          land_ |>
+            dplyr::select(dplyr::all_of(c("HashIndex", addr_))) |>
+            dplyr::filter(.data$HashIndex %in% out_$HashIndex) |>
+            dplyr::collect() |>
+            dplyr::distinct(.data$HashIndex, .keep_all = TRUE),
+          by = dplyr::join_by(HashIndex)
+        )
+    }
+  }
+
+  out_ <- out_ |>
+    dplyr::rename(Class = "ClassDetailed") |>
     dplyr::mutate(
       CompanyClean = ent_strip_conformed(.x = .data$CompanyName),
       DateFiled    = suppressWarnings(anytime::anydate(as.character(.data$DateFiled))),
@@ -209,60 +261,242 @@ ent_anchor_keys <- function(.path_anchors) {
       AnchorLen    = nchar(.data$AnchorKey),
       AnchorTok    = stringi::stri_count_fixed(.data$AnchorKey, " ") + 1L
     )
+
+  if (!.quiet) {
+    miss_ <- sum(is.na(out_$CompanyName))
+    cli::cli_alert_success(
+      "{format(nrow(out_), big.mark = ',')} {cli::qty(nrow(out_))}anchor{?s} built from the \\
+       prepared sample and the register."
+    )
+    if (miss_ > 0L) {
+      cli::cli_alert_danger(
+        "{format(miss_, big.mark = ',')} {cli::qty(miss_)}document{?s} reached no register row, so \\
+         {?it has/they have} no company name to match against and can only take a fallback party."
+      )
+    } else {
+      cli::cli_alert_success("Every labelled document carries a registered company name.")
+    }
+    addr_have_ <- intersect(c("BusinessAddress", "MailingAddress"), names(out_))
+    if (length(addr_have_) > 0L) {
+      cli::cli_alert_info(
+        "Addresses present on \\
+         {tbl_pct(mean(!is.na(out_[[addr_have_[[1L]]]])))} of documents."
+      )
+    }
+  }
+
+  out_
 }
 
 
-#' Load one label from 04A's store, for one engine combination
+#' The columns a family calls something else
 #'
-#' The store is opened READ-ONLY, so no path through any entity document can write to an artifact it
-#' does not own. Each label sits in its own table carrying its own resolved columns, so the extras
-#' are named by the caller rather than guessed here.
+#' RENAMED ON READ, AND ONLY ON READ. The stores keep each family's own column names, which is what
+#' makes a column traceable to the documentation of the engine that produced it. But two of LexNLP's
+#' names cannot survive contact with R:
 #'
-#' LabelRaw IS A CORE COLUMN AND IS ALWAYS SELECTED. It carries what the engine itself called the
-#' span before the store normalised it -- the gazetteer's GeoClass, the redaction extractor's marker
-#' kind -- and a rule that needs it has no other way to reach it.
+#'   TypeAbbr holds the string "NA" for a National Association -- every national bank in the corpus
+#'   -- and R prints that identically to a missing value. A column whose most common value is
+#'   indistinguishable from absence in every table it appears in is a defect waiting for a reader.
 #'
-#' @param .db_path 04A's candidate store.
-#' @param .lens Tibble from ent_doc_lens().
-#' @param .label Character. Store table: "org", "gpe", "date", "money" or "redact".
-#' @param .combo Character. Engine combination token, e.g. "lexnlp" or "paper:gazetteer-v1".
-#' @param .extras Character vector of label-specific columns to select beside the core ones.
+#'   Name means the resolved company for ORG and the resolved place for GPE. One column called Name
+#'   meaning two different things is the kind of thing that is obvious while writing and invisible
+#'   six weeks later.
+#'
+#' So the rename happens here, in one function, next to the schema it serves -- rather than in the
+#' ingest, where it would have made the store disagree with LexNLP's own documentation.
+.ent_rename <- list(
+  lexnlp = c(
+    NameCore       = "Name",
+    LegalForm      = "TypeAbbr",     # LexNLP's company_type_abbr: CORP, INC, LLC -- and NA
+    LegalFormFull  = "TypeFull",
+    LegalFormLabel = "TypeLabel",
+    GeoName        = "NameEn",
+    GeoAlias       = "Alias",
+    GeoCategory    = "EntityCategory",
+    DateScore      = "Score"
+  ),
+  matcon = c(
+    # Iso2 is a SUBDIVISION code here and never a country; Iso3 is a country code and carries USA on
+    # every US entity, so neither name means what the identical name means in the LexNLP store.
+    SubIso      = "Iso2",
+    CountryIso3 = "Iso3"
+  )
+)
+
+#' What each family emits for one entity, under this project's names
+#'
+#' DECLARED IN ONE PLACE BECAUSE THE FAMILIES NO LONGER SHARE A SCHEMA. Under the flat store every
+#' GPE row carried the union of both producers' columns and a caller named one extras list for both.
+#' One database per family ended that: matcon's gpe table has GeoKey, IsWord, NParent and MatchKind
+#' and no GeoName; LexNLP's has GeoName, GeoAlias and GeoCategory and none of the others. A single
+#' list would have asked each family for the other's columns.
+#'
+#' 04A's numbers say why the two are worth keeping apart rather than reconciling here: they agree on
+#' only 44.5% of GPE mentions while agreeing on boundaries 97.6% of the time where they meet, which
+#' is complements at different tiers rather than rivals at one.
+.ent_extras <- list(
+  lexnlp = list(
+    ORG   = c("NameCore", "LegalForm", "Description"),
+    GPE   = c("GeoName", "GeoAlias", "GeoCategory", "Iso2", "Iso3"),
+    DATE  = c("DateValue", "DateScore"),
+    MONEY = c("Amount", "Currency")
+  ),
+  matcon = list(
+    # THE TWO ISO COLUMNS ARE RENAMED because matcon and LexNLP use the same two names for four
+    # different quantities. matcon's own docstring is explicit: Iso2 resolves "all 50 states, 81% of
+    # populated places, 95% of counties, and NEVER a country", while Iso3 is "every country, and USA
+    # for every US entity". LexNLP's Iso2 is a country code OR a subdivision code and its Iso3 is a
+    # country code on countries alone.
+    #
+    # Mapping both families onto Iso2/Iso3 was a defect that rendered clean: geo_country() reads Iso3
+    # first, matcon's Iso3 happens to be a country code, and the answer came out right by luck while
+    # the ISO-3166-2 prefix recovery sat dead at 0.0% of matcon's rows. A shared column NAME is not a
+    # shared QUANTITY, and the only place that can be settled is the read.
+    GPE    = c("GeoKey", "IsWord", "NParent", "SubIso", "CountryIso3", "MatchKind"),
+    DATE   = c("DateValue"),
+    TERM   = c("TermN", "TermUnit", "TermYears"),
+    MONEY  = c("Amount", "Currency"),
+    REDACT = character()
+  ),
+  spacy = list(
+    ORG    = character(),
+    PERSON = character(),
+    GPE    = character()
+  )
+)
+
+#' The extras one family emits for one entity
+#'
+#' @param .family Family name.
+#' @param .entity Entity name.
+#' @return Character vector, possibly empty.
+ent_extras <- function(.family, .entity) {
+  if (FALSE) {
+    .family <- "matcon"
+    .entity <- "GPE"
+  }
+  fam_ <- .ent_extras[[.family]]
+  if (is.null(fam_)) cli::cli_abort("No extras declared for family {(.family)}.")
+  out_ <- fam_[[toupper(.entity)]]
+  if (is.null(out_)) {
+    cli::cli_abort(c(
+      "{(.family)} declares no {(.entity)} extras.",
+      "i" = "It declares: {paste(names(fam_), collapse = ', ')}."
+    ))
+  }
+  out_
+}
+
+#' Load one entity table out of one family's store
+#'
+#' ONE DATABASE PER FAMILY, so the family is the FILENAME and there is no engine token to type. The
+#' previous design put all families in one file and asked callers for a combination string --
+#' "paper:gazetteer-v1" -- which every 04B document duly typed and which every one of them got wrong
+#' the moment a model version moved. The query then matched nothing, returned an empty tibble, and
+#' the document rendered reporting zero spans as a success. Here a wrong family is a missing file,
+#' and paths fail loudly.
+#'
+#' SENTINELS ARE NO LONGER IN THE ENTITY TABLES. A document processed with nothing found is recorded
+#' in the ledger, not as a null-offset row, so every row in an entity table is a real span and the
+#' `WHERE Start IS NOT NULL` that used to be necessary is now a formality kept for safety.
+#'
+#' LabelRaw IS ALWAYS SELECTED. It carries what the engine itself called the span before anything
+#' normalised it -- the gazetteer's match kind, the redaction extractor's marker class -- and a rule
+#' that needs it has no other way to reach it.
+#'
+#' @param .dir_store Directory holding the family databases, e.g. 04A's Output/.
+#' @param .family Character: "lexnlp", "matcon" or "spacy".
+#' @param .entity Character: "ORG", "GPE", "DATE", "TERM", "MONEY", "REDACT", "PERSON".
+#' @param .lens Tibble from ent_doc_lens(). Supplies DocLen, so an offset becomes a position.
+#' @param .extras Character vector of family-specific columns, named as this file renames them.
+#' @param .model Character. Restrict to one model, for the spaCy store where models compete. NULL
+#'   takes every row, which is correct for the families that version themselves.
 #' @param .quiet Logical. Suppress the count message.
 #' @return Tibble: one row per span, with DocLen joined on.
-ent_load_label <- function(.db_path, .lens, .label, .combo, .extras = character(), .quiet = FALSE) {
+ent_load_entity <- function(.dir_store, .family, .entity, .lens, .extras = character(),
+                           .model = NULL, .quiet = FALSE) {
   if (FALSE) {
-    .db_path <- .lP$Input$Store
-    .lens    <- tab_lens
-    .label   <- "org"
-    .combo   <- "lexnlp"
-    .extras  <- c("NameCore", "LegalForm", "Description")
-    .quiet   <- FALSE
+    .dir_store <- .lP$Input$Store
+    .family    <- "lexnlp"
+    .entity    <- "ORG"
+    .lens      <- tab_lens
+    .extras    <- c("NameCore", "LegalForm", "Description")
+    .model     <- NULL
+    .quiet     <- FALSE
   }
 
-  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
+  path_ <- ner_db_path(.dir = .dir_store, .family = .family)
+  if (!fs::file_exists(path_)) {
+    cli::cli_abort(c(
+      "No {(.family)} store at {.path {(path_)}}.",
+      "i" = "04A writes the sample stores and 04C the corpus stores, one file per family."
+    ))
+  }
+
+  con_ <- ner_db_connect(.db_path = path_, .read_only = TRUE)
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
-  cols_ <- paste(c("DocID", "Start", "Stop", "Span", "LabelRaw", .extras), collapse = ", ")
+  tbl_ <- tolower(.entity)
+  if (!tbl_ %in% ner_db_tables(.con = con_)) {
+    cli::cli_abort(c(
+      "The {(.family)} store holds no {(.entity)} table.",
+      "i" = "It holds: {paste(toupper(ner_db_tables(.con = con_)), collapse = ', ')}."
+    ))
+  }
 
-  raw_ <- DBI::dbGetQuery(con_, paste0(
-    "SELECT ", cols_, " ",
-    "FROM ", .label, " ",
-    "WHERE Start IS NOT NULL ",
-    "  AND (CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END) = '", .combo, "'"
+  # THE SCHEMA IS READ, NOT ASSUMED. Which extras a table carries is a property of the parquet the
+  # ingest created it from, and asking for a column that is not there should say so rather than
+  # arrive as a silently absent name -- which is what any_of() would do, and what turned a documented
+  # rule into a fallback nobody noticed.
+  have_ <- DBI::dbListFields(con_, tbl_)
+  ren_  <- .ent_rename[[.family]]
+  want_ <- if (is.null(ren_)) .extras else dplyr::coalesce(unname(ren_[.extras]), .extras)
+  bad_  <- .extras[!want_ %in% have_]
+  if (length(bad_) > 0L) {
+    cli::cli_abort(c(
+      "{(.family)}/{(.entity)} carries no {paste(bad_, collapse = ', ')}.",
+      "i" = "Columns present: {paste(have_, collapse = ', ')}."
+    ))
+  }
+
+  sel_   <- c("DocID", "Start", "Stop", "Span", "LabelRaw", want_)
+  scope_ <- if (is.null(.model) || !"Model" %in% have_) {
+    ""
+  } else {
+    glue::glue(" AND Model = '{.model}'")
+  }
+
+  raw_ <- DBI::dbGetQuery(con_, glue::glue(
+    "SELECT {paste(sel_, collapse = ', ')} FROM {tbl_}
+      WHERE Start IS NOT NULL{scope_}"
   )) |>
     tibble::as_tibble()
+
+  # Back to this project's vocabulary, and only for the columns the caller asked for by that name.
+  if (length(want_) > 0L) {
+    names(raw_)[match(want_, names(raw_))] <- .extras
+  }
 
   out_ <- raw_ |>
     dplyr::inner_join(.lens, by = dplyr::join_by(DocID)) |>
     dplyr::arrange(.data$DocID, .data$Start)
 
   if (!.quiet) {
+    n_    <- nrow(out_)
+    ndoc_ <- dplyr::n_distinct(out_$DocID)
     cli::cli_alert_success(
-      "{(.combo)} / {(.label)}: {format(nrow(out_), big.mark = ',')} \\
-       span{cli::qty(nrow(out_))}{?s} over \\
-       {format(dplyr::n_distinct(out_$DocID), big.mark = ',')} \\
-       document{cli::qty(dplyr::n_distinct(out_$DocID))}{?s}."
+      "{(.family)} / {(.entity)}: {format(n_, big.mark = ',')} \\
+       {cli::qty(n_)}span{?s} over {format(ndoc_, big.mark = ',')} \\
+       {cli::qty(ndoc_)}document{?s}."
     )
+    lost_ <- nrow(raw_) - n_
+    if (lost_ > 0L) {
+      cli::cli_alert_warning(
+        "{format(lost_, big.mark = ',')} {cli::qty(lost_)}span{?s} dropped: the store holds \\
+         {?a document/documents} the canonical text does not."
+      )
+    }
   }
   out_
 }

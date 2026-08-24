@@ -1,893 +1,1099 @@
-# 04C-EntityCorpus: run the chosen engines over the whole Exhibit-10 corpus -------------------------------------------
+# ======================================================================================================================
+# 04C-EntityCorpus.R -- library for 04C-EntityCorpus.qmd
+# ======================================================================================================================
 #
-# WHAT THIS FILE DOES
-# 04A extracted nine engines over 4,398 labelled contracts and produced the evidence for choosing
-# between them. This file runs the chosen ones over ~1.46 million documents and writes their spans
-# to a store with the same schema. It resolves nothing and selects nothing.
+# The corpus pass. Same extractors, same stores, same offset contract as 04A -- over 1.19 million
+# attachments instead of 4,398.
 #
-# WHY IT CAN RUN BEFORE THE RULES ARE SETTLED
-# Because extraction is rule-independent. Every candidate carries its offsets into the canonical
-# text, every engine reads the whole document, and every window a rule might impose is a WHERE
-# clause over what is already stored. A rule decided in six weeks costs a query; a rule decided
-# before extraction and then changed costs the pass. That asymmetry is the whole argument for
-# running this now and arguing about 04B in parallel.
+# THE POINT OF SOURCING 04A'S EXTRACTION PATH RATHER THAN COPYING IT. The corpus is extracted by the
+# code the sample was extracted with, which is what makes the two sets of stores comparable rather
+# than merely similar. ner_extract() and ner_ingest() are called here unmodified; everything in this
+# file is about WHICH documents reach them and how their text gets off disk.
 #
-# THE ENGINE SET IS DECLARED HERE, NOT READ FROM A POLICY FILE
-# The previous version read extraction_policy.parquet, written by a 04B that measured engines and
-# crowned them. Engine evidence now lives in 04A and the choice is an argument made in prose, so the
-# set is written out in the runbook where a reader can see it beside the reasoning. One fewer
-# artifact, one fewer thing to be stale.
+# THREE THINGS DIFFER FROM 04A, and each is why this file exists:
 #
-# THE LEDGER IS WHAT MAKES A TWO-DAY PASS SURVIVABLE
-# Resumption is not a checkpoint file. ner_run() records a document against an engine when its rows
-# are written, so a pass killed at any point resumes by asking the store what is missing. That also
-# means ADDING AN ENGINE LATER IS INCREMENTAL: spaCy is absent from this set, so persons are not
-# extracted, and adding the transformer afterwards costs one transformer pass and touches nothing
-# already written.
+#   1. The text is not in one parquet. 04A wrote sample_text.parquet and every offset indexes it.
+#      Here the text is 1.19 million individual parquets in 01B's mirror, and reading them is the
+#      dominant cost of the pass -- not the extractors. So the read is parallel and the engines are
+#      not.
+#   2. The queue is resumable. A pass over a corpus is interrupted; the ledger makes resumption a
+#      property rather than a feature, because a document with a ledger row is never sent again.
+#   3. spaCy is absent, on evidence 04A produced. See the configuration.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
-# locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
-# cli/fs/here; pure ASCII; stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
-
-if (FALSE) {
-  .dir_corpus <- .lP$Input$DirCorpus
-  .db_path    <- .lP$Store$NerDB
-  .plan       <- tab_plan
-}
+# locals; .data$ in dplyr verbs; if (FALSE) dev blocks; pure ASCII; stringi::stri_sub never substr.
 
 
-# 1. The corpus index ------------------------------------------------------------------------------------------------
-# Where the documents are and what EDGAR knows about them. Walked once and cached: listing
-# 1.46 million files is not something to repeat on every render.
+# 1. The store -----------------------------------------------------------------------------------------------------------
+#
+# ONE DATABASE PER FAMILY, as in 04A, and each carries its own copy of the corpus index. Duplicating
+# an index of 1.19 million rows across two files costs a few hundred megabytes and buys the property
+# that every family database answers its own questions: what is outstanding is an anti-join inside
+# one file rather than a join across two, and a family can be cleared, moved or shipped alone.
 
-
-#' One row per corpus document, with its path and the facts the release is checked against
+#' Add the corpus index and the failure log to a family database
 #'
-#' The anchor columns are taken here rather than at resolution because they are cheap, they are the
-#' same facts 04B measured against, and carrying them per document means the consistency flags can
-#' be written into the release rather than computed once as a diagnostic.
+#' ner_db_init() creates the tables every store has -- the ledger, the manifest, the benchmark. These
+#' two exist only for a corpus pass, so they are created here rather than there.
 #'
-#' @param .dir_corpus Root of the parsed-contract tree.
-#' @param .path_meta EDGAR document metadata parquet.
-#' @param .path_landing EDGAR landing-page parquet supplying addresses, or NULL.
-#' @param .path_cache Where the file index is cached; walking a million paths is not repeated.
-#' @param .rerun TRUE re-walks the tree.
-#' @param .limit Integer to rehearse on a random draw, NULL for the corpus.
-#' @param .seed Sampling seed, so a limited run draws the same documents each time.
-#' @return Tibble: DocID, Path, and the anchor columns that resolved.
-ent_corpus_index <- function(.dir_corpus, .path_meta, .path_landing = NULL, .path_cache,
-                             .rerun = FALSE, .limit = NULL, .seed = 42L) {
+#' @param .con Connection from ner_db_connect().
+#' @return .con, invisibly.
+cor_db_init <- function(.con) {
   if (FALSE) {
-    .dir_corpus   <- .lP$Input$DirCorpus
-    .path_meta    <- .lP$Input$MetaData
-    .path_landing <- .lP$Input$LandingPage
-    .path_cache   <- .lP$Cache$CorpusFiles
-    .rerun        <- FALSE
-    .limit        <- 2000L
-    .seed         <- 42L
-  }
-  if (!fs::dir_exists(.dir_corpus)) cli::cli_abort("No corpus tree at {(.dir_corpus)}")
-
-  idx_ <- utils_list_project_files(
-    .dir_data = .dir_corpus,
-    .path_out = .path_cache,
-    .rerun    = .rerun
-  ) |>
-    dplyr::select(DocID, Path) |>
-    dplyr::mutate(Path = unname(.data$Path))
-  cli::cli_alert_info("Corpus index: {nrow(idx_)} document{?s}")
-
-  want_ <- c("CIK", "CompanyName", "DateFiled", "HashIndex")
-  avail_ <- arrow::open_dataset(sources = .path_meta)$schema$names
-  idx_ <- idx_ |>
-    dplyr::left_join(
-      arrow::open_dataset(sources = .path_meta) |>
-        dplyr::select(dplyr::all_of(c("DocID", intersect(want_, avail_)))) |>
-        dplyr::collect() |>
-        dplyr::distinct(.data$DocID, .keep_all = TRUE),
-      by = dplyr::join_by(DocID)
-    )
-
-  if (!is.null(.path_landing) && fs::file_exists(.path_landing) && "HashIndex" %in% names(idx_)) {
-    land_ <- arrow::open_dataset(sources = .path_landing)$schema$names
-    take_ <- intersect(c("BusinessAddress", "MailingAddress"), land_)
-    if (length(take_) > 0L && "HashIndex" %in% land_) {
-      idx_ <- idx_ |>
-        dplyr::left_join(
-          arrow::open_dataset(sources = .path_landing) |>
-            dplyr::select(dplyr::all_of(c("HashIndex", take_))) |>
-            dplyr::collect() |>
-            dplyr::distinct(.data$HashIndex, .keep_all = TRUE),
-          by = dplyr::join_by(HashIndex)
-        )
-    }
+    .con <- con_matcon
   }
 
-  # THE CORPUS SIZE TRAVELS WITH THE INDEX, and it has to, because the moment a limit is applied the
-  # index stops knowing how big the corpus is and nrow() silently becomes the rehearsal size. The
-  # throughput projection is computed from that number, so a rehearsal projected onto itself and
-  # reported the corpus pass as taking a tenth of an hour when the true figure was eighty.
+  # Path is STORED rather than rebuilt per query. utils_doc_path() is cheap for one document and not
+  # cheap 1.19 million times inside a loop, and the path is a pure function of three register columns
+  # that never change once written.
   #
-  # A rehearsal is the ONLY time the projection is wanted, which is exactly when nrow() is wrong.
-  n_corpus_ <- nrow(idx_)
+  # Extract is the deduplication and the population filter resolved once, at load. Every later query
+  # is then a filter rather than a re-derivation of the same rule, and a rule applied in one place
+  # cannot disagree with itself.
+  DBI::dbExecute(.con, "
+    CREATE TABLE IF NOT EXISTS corpus (
+      DocID            VARCHAR PRIMARY KEY,
+      HashDocument     VARCHAR,
+      Path             VARCHAR,
+      DocType          VARCHAR,
+      YQ               VARCHAR,
+      PrimaryFiler     BOOLEAN,
+      FilerCopiesAgree BOOLEAN,
+      DescSample       BOOLEAN,
+      EstiSample       BOOLEAN,
+      InPopulation     BOOLEAN,
+      Extract          BOOLEAN
+    )")
 
-  # Total size on disk, taken BEFORE the limit for the same reason as the count: it is the corpus
-  # fingerprint, and a rehearsal that fingerprinted its own ten thousand documents would abort the
-  # release run with "the tree has changed" when nothing had. One stat call per file, once per
-  # render, which is seconds against a pass measured in days.
-  bytes_corpus_ <- sum(as.numeric(fs::file_size(idx_$Path)), na.rm = TRUE)
+  # RETRYABLE BY CONSTRUCTION. A failure is recorded with its reason and excluded from the current
+  # pass; the next pass tries again. A file missing because a mount hiccuped must not be blacklisted
+  # forever, and a document that is genuinely empty simply reappears in the report, which is honest
+  # rather than tidy.
+  DBI::dbExecute(.con, "
+    CREATE TABLE IF NOT EXISTS failures (
+      DocID  VARCHAR,
+      Family VARCHAR,
+      Reason VARCHAR,
+      SeenAt TIMESTAMP
+    )")
 
-  if (!is.null(.limit) && .limit < nrow(idx_)) {
-    idx_ <- withr::with_seed(.seed, dplyr::slice_sample(idx_, n = .limit))
-    cli::cli_alert_warning(
-      "Limited to {nrow(idx_)} document{?s}, drawn at random across the whole tree. This writes to \\
-       the SAME store as a full run and its work counts towards it: the ledger records each \\
-       document against each engine, so setting Limit to NULL continues rather than restarting."
+  invisible(.con)
+}
+
+#' Load the corpus index from 02B's register
+#'
+#' THE REGISTER IS THE GATE, NOT A DIRECTORY WALK. A walk makes a second, independent statement about
+#' what is in the corpus, and the two can disagree without either reporting it -- 03A's walk cache was
+#' found holding paths into a previous repository and returning them on file existence alone. The
+#' register holds every document with its ladder step attached, so membership, population and
+#' deduplication all come from one place. It stores no path: DocTypeMod, YQ and DocID determine one
+#' and utils_doc_path() rebuilds it, verified across all four document types.
+#'
+#' ATTACHMENTS, NOT COPIES, and this is the decision that halves nothing and saves seventeen hours.
+#' 01C left it open -- "classification wants one, entity extraction may want each, because the
+#' registrant-side metadata differs even where the text does not" -- and the resolution is that the
+#' metadata differing is an ANCHORING input, applied downstream of extraction. The text of two copies
+#' of one attachment is identical, extraction reads text, so extracting both produces identical spans
+#' at 23% more cost. One row per attachment here; fan out at release, as 03F does.
+#'
+#' WHICH ATTACHMENT ANSWERS FOR A POPULATION. PrimaryFiler is chosen globally while EstiSample
+#' depends on a per-CIK Compustat match, so an attachment can have its primary outside a population
+#' and another copy inside it -- 4,432 of them for the estimation sample, none for the descriptive
+#' one. So: extract the primary of every attachment with at least one copy in the population.
+#' Restricting to primaries that are themselves in it would leave those unextracted, silently.
+#'
+#' @param .con Connection to one family database.
+#' @param .path_register 02B's Documents.parquet.
+#' @param .dir_mirror 01B's parsed mirror root.
+#' @param .population One of "all", "descriptive", "estimation".
+#' @param .doc_type Register document type.
+#' @param .reload Rebuild the index rather than reusing what the store holds.
+#' @return Attachments this population extracts, invisibly.
+cor_corpus_load <- function(.con, .path_register, .dir_mirror, .population = "all",
+                            .doc_type = "Exhibit10", .reload = FALSE) {
+  if (FALSE) {
+    .con           <- con_matcon
+    .path_register <- .lP$Input$Register
+    .dir_mirror    <- .lP$Params$DirMirror
+    .population    <- "all"
+    .doc_type      <- "Exhibit10"
+    .reload        <- FALSE
+  }
+  .population <- match.arg(.population, c("all", "descriptive", "estimation"))
+
+  # THE EARLY RETURN HANDS BACK THE SAME QUANTITY THE FULL PATH DOES. In 03F an earlier version
+  # returned COUNT(*) here and the extract count below, so a render reusing an existing index
+  # reported the copy count as the work to do and projected the run 23% long. One function, one
+  # meaning, on every branch -- and this branch only runs on a re-render, which is exactly why it
+  # went unexercised there.
+  n_all_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus")$n[[1L]]
+  if (n_all_ > 0L && !.reload) {
+    n_ext_ <- DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus WHERE Extract")$n[[1L]]
+    cli::cli_alert_info(
+      "Corpus index already loaded: {format(n_all_, big.mark = ',')} \\
+       {cli::qty(n_all_)}cop{?y/ies}, {format(n_ext_, big.mark = ',')} to extract."
     )
+    return(invisible(as.integer(n_ext_)))
   }
-  attr(idx_, "NCorpus")     <- as.integer(n_corpus_)
-  attr(idx_, "BytesCorpus") <- bytes_corpus_
-  idx_
-}
+  if (!fs::file_exists(.path_register)) cli::cli_abort("No register at {.path {(.path_register)}}.")
 
-
-#' How many documents the corpus holds, whatever the index was limited to
-#'
-#' The accessor exists so that a call site cannot reach for nrow() by mistake. Under a rehearsal
-#' nrow() is the rehearsal size, and every quantity scaled by it -- the throughput projection above
-#' all -- comes out wrong by whatever factor the limit imposed, silently and in the reassuring
-#' direction.
-#'
-#' @param .index Tibble from ent_corpus_index().
-#' @param .what Which quantity: the document count or the total size on disk.
-#' @return Numeric. The corpus figure, before any limit.
-ent_corpus_n <- function(.index, .what = c("docs", "bytes")) {
-  if (FALSE) {
-    .index <- tab_index
-    .what  <- "docs"
-  }
-  .what <- match.arg(.what)
-  key_  <- if (.what == "docs") "NCorpus" else "BytesCorpus"
-
-  n_ <- attr(.index, key_)
-  if (is.null(n_)) {
-    cli::cli_abort(c(
-      "Index carries no corpus {(.what)} figure.",
-      "i" = "It must come from ent_corpus_index(), which records both before limiting."
-    ))
-  }
-  n_
-}
-
-
-#' Read the text for one chunk; it enters memory here and leaves when the chunk is written
-#' @param .chunk Rows of the index.
-#' @return .chunk with a Text column, unreadable documents dropped.
-ent_read_chunk <- function(.chunk) {
-  if (FALSE) .chunk <- dplyr::slice_head(tab_index, n = 100L)
-
-  out_ <- .chunk |> dplyr::mutate(Text = purrr::map_chr(.data$Path, clf_read_text))
-  n_bad_ <- sum(is.na(out_$Text) | !nzchar(dplyr::coalesce(out_$Text, "")))
-  if (n_bad_ > 0L) {
-    cli::cli_alert_warning("{n_bad_} document{?s} unreadable or empty; dropped from this chunk.")
-  }
-  out_ |> dplyr::filter(!is.na(.data$Text), nzchar(.data$Text))
-}
-
-
-# 2. The plan --------------------------------------------------------------------------------------------------------
-# Which engines run and which labels each is asked for, checked against the dispatch before
-# any work starts.
-
-ent_plan_labels <- function(.plan) {
-  if (FALSE) .plan <- tab_plan
-  purrr::set_names(.plan$Labels, .plan$Combo)
-}
-
-#'
-#' ner_run() dispatches on the combination token through a chain of branches, so one it does not
-#' cover surfaces as an abort from inside the extraction loop -- after the index is built and the
-#' first chunks have run. On a corpus pass that is hours in. Naming the supported set once, here,
-#' lets the plan be checked before any work starts.
-#'
-#' @return Character vector of supported engine and model-stem tokens.
-ent_engine_supported <- function() {
-  c("spacy", "lexnlp", "paper:dateregex", "paper:gazetteer", "paper:redaction", "paper:moneyregex")
-}
-
-
-#' Fail before the pass rather than during it
-#'
-#' Checks every combination in the plan against the dispatch. This exists because the check it
-#' performs was missing: money moved from the transformer to the regex arm, the engine set and the
-#' throughput knobs were updated, and the extractor dispatch was not -- so the plan named an engine
-#' nothing could run and a rehearsal aborted three combinations into the first chunk.
-#'
-#' Also warns on a combination with no throughput knobs. That is not fatal -- the defaults apply --
-#' but on this engine set the defaults are wrong often enough to be worth seeing: the transformer
-#' cannot share a device, LexNLP stalls without a timeout.
-#'
-#' @param .plan Tibble from ent_engine_plan().
-#' @param .knobs Named list of per-combination throughput settings.
-#' @return Invisibly the plan, unchanged.
-ent_check_plan <- function(.plan, .knobs = list()) {
-  if (FALSE) {
-    .plan  <- tab_plan
-    .knobs <- .KNOBS
-  }
-
-  stem_ <- function(.x) {
-    eng_ <- sub(":.*$", "", .x)
-    mod_ <- sub("-v[0-9]+$", "", sub("^[^:]*:", "", .x))
-    dplyr::if_else(grepl(":", .x, fixed = TRUE), paste0(eng_, ":", mod_), eng_)
-  }
-
-  bad_ <- setdiff(stem_(unique(.plan$Combo)), ent_engine_supported())
-  if (length(bad_) > 0L) {
-    cli::cli_abort(c(
-      "The plan names {length(bad_)} engine{?s} this document cannot run: {bad_}.",
-      "i" = "Dispatch covers: {ent_engine_supported()}.",
-      "x" = "Left to the extraction loop this would abort part-way through a corpus pass."
-    ))
-  }
-
-  noknob_ <- setdiff(unique(.plan$Combo), names(.knobs))
-  if (length(noknob_) > 0L) {
-    cli::cli_alert_warning(
-      "No throughput settings for {noknob_}; the defaults apply, which are rarely right."
-    )
-  }
-  cli::cli_alert_success("Plan checked: {nrow(.plan)} engine{?s} dispatchable.")
-  invisible(.plan)
-}
-
-
-# 3. The store fingerprint -------------------------------------------------------------------------------------------
-# The one guard that cannot be recovered after the fact. See ent_corpus_manifest().
-
-
-#' The declared plan as a per-combination label table
-#'
-#' The same shape 04A's ent_labels_resolved() produces, so the manifest comparison and the
-#' relabelling clear are one mechanism across both documents rather than two that drift.
-#'
-#' @param .plan Tibble with Combo and a Labels list column.
-#' @return Tibble: Combo, Labels -- comma-joined and sorted, so it compares as a string.
-ent_plan_resolved <- function(.plan) {
-  if (FALSE) .plan <- tab_plan
-
-  tibble::tibble(
-    Combo  = .plan$Combo,
-    Labels = purrr::map_chr(.plan$Labels, \(.x) paste(sort(.x), collapse = ","))
-  ) |>
-    dplyr::arrange(.data$Combo)
-}
-
-
-#' Fingerprint a named label list as one comparable string
-#'
-#' @param .labels Named list of character vectors, keyed on the combination token.
-#' @return Character scalar: "combo=labels | combo=labels".
-ent_labels_string <- function(.labels) {
-  if (FALSE) .labels <- lst_labels
-
-  if (is.null(.labels) || length(.labels) == 0L) return(NA_character_)
-  keys_ <- sort(names(.labels))
-  paste0(keys_, "=", purrr::map_chr(keys_, \(.k) paste(sort(.labels[[.k]]), collapse = ",")),
-         collapse = " | ")
-}
-
-
-#' What the store already holds, before anything is run
-#'
-#' THE FIRST THING A READER OF A TWO-DAY PASS NEEDS, and its absence caused real confusion: a second
-#' render found every document already extracted, so the loop had nothing to do and printed nothing,
-#' which is indistinguishable from a loop that is broken. Silence is a bad way to say "finished".
-#'
-#' Reports per engine because the ledger is per engine, and a document counts as complete only when
-#' every declared engine has seen it -- adding an engine to the plan makes every document in the
-#' store incomplete again, correctly, and this is where that becomes visible rather than surprising.
-#'
-#' The remaining-time estimate uses the rate already measured in the timing log rather than a
-#' constant, so it sharpens as the pass proceeds and says so when there is nothing to go on yet.
-#'
-#' @param .db_path The corpus candidate store.
-#' @param .n_corpus Integer. Documents in the corpus, from ent_corpus_n().
-#' @param .run Character. Combination tokens the plan declares.
-#' @param .dir Directory holding the _timing log, or NULL to skip the estimate.
-#' @return Invisibly, a tibble of the per-engine figures.
-ent_store_status <- function(.db_path, .n_corpus, .run, .dir = NULL) {
-  if (FALSE) {
-    .db_path  <- .lP$Store$NerDB
-    .n_corpus <- ent_corpus_n(tab_index)
-    .run      <- tab_plan$Combo
-    .dir      <- .dir_store
-  }
-
-  cli::cli_h2("Store status before this run")
-
-  if (!fs::file_exists(.db_path)) {
-    cli::cli_alert_info("No store yet. All {(.n_corpus)} corpus document{?s} are to be extracted.")
-    return(invisible(tibble::tibble()))
-  }
-
-  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
-  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
-
-  combo_ <- "CASE WHEN Engine = Model THEN Engine ELSE Engine || ':' || Model END"
-  per_ <- DBI::dbGetQuery(con_, paste0(
-    "SELECT ", combo_, " AS Combo, COUNT(DISTINCT DocID) AS DocsDone, ",
-    "  SUM(CASE WHEN Status = 'timeout' THEN 1 ELSE 0 END) AS Timeouts FROM runs GROUP BY 1"
-  )) |>
-    tibble::as_tibble()
-  cand_ <- DBI::dbGetQuery(con_, paste0(
-    "SELECT ", combo_, " AS Combo, COUNT(*) AS Candidates FROM candidates GROUP BY 1"
-  )) |>
-    tibble::as_tibble()
-
-  in_ <- paste0("('", paste(.run, collapse = "','"), "')")
-  done_all_ <- DBI::dbGetQuery(con_, paste0(
-    "SELECT COUNT(*) AS N FROM (SELECT DocID FROM runs WHERE ", combo_, " IN ", in_,
-    " GROUP BY DocID HAVING COUNT(DISTINCT ", combo_, ") >= ", length(.run), ")"
-  ))$N
-
-  out_ <- tibble::tibble(Combo = sort(unique(c(.run, per_$Combo)))) |>
-    dplyr::left_join(per_, by = "Combo") |>
-    dplyr::left_join(cand_, by = "Combo") |>
-    dplyr::mutate(
-      Declared   = .data$Combo %in% .run,
-      DocsDone   = dplyr::coalesce(as.integer(.data$DocsDone), 0L),
-      Timeouts   = dplyr::coalesce(as.integer(.data$Timeouts), 0L),
-      Candidates = dplyr::coalesce(as.integer(.data$Candidates), 0L),
-      PctCorpus  = .data$DocsDone / .n_corpus
+  reg_ <- arrow::open_dataset(sources = .path_register) |>
+    dplyr::select(
+      "DocID", "HashDocument", "DocTypeMod", "YQ", "CIK",
+      "Removed", "DescSample", "EstiSample",
+      "MultFiler", "nCIK", "PrimaryFiler", "FilerCopiesAgree"
     ) |>
-    dplyr::select(Combo, Declared, DocsDone, PctCorpus, Timeouts, Candidates)
+    dplyr::filter(.data$DocTypeMod == .doc_type) |>
+    dplyr::collect()
 
-  tbl_say(.tab = dplyr::mutate(out_, PctCorpus = tbl_pct(.data$PctCorpus, 2L)))
+  in_pop_ <- switch(
+    .population,
+    all         = rep(TRUE, nrow(reg_)),
+    descriptive = as.logical(reg_$DescSample),
+    estimation  = as.logical(reg_$EstiSample)
+  )
+  in_pop_    <- !is.na(in_pop_) & in_pop_
+  hash_want_ <- unique(reg_$HashDocument[in_pop_])
 
-  pending_ <- .n_corpus - done_all_
-  cli::cli_alert_info(
-    "{done_all_} of {(.n_corpus)} document{?s} complete on all {length(.run)} declared engine{?s}; \\
-     {pending_} pending."
+  reg_ <- reg_ |>
+    dplyr::mutate(
+      InPopulation = in_pop_,
+      Extract      = as.logical(.data$PrimaryFiler) & .data$HashDocument %in% hash_want_
+    ) |>
+    dplyr::arrange(.data$DocID)
+
+  DBI::dbExecute(.con, "DELETE FROM corpus")
+  DBI::dbAppendTable(
+    .con, "corpus",
+    reg_ |>
+      dplyr::transmute(
+        .data$DocID, .data$HashDocument,
+        DocType = .data$DocTypeMod,
+        YQ      = as.character(.data$YQ),
+        Path    = as.character(utils_doc_path(
+          .dir_mirror = .dir_mirror,
+          .doc_type   = .data$DocTypeMod,
+          .yq         = .data$YQ,          # utils_doc_path normalises the register's double form
+          .doc_id     = .data$DocID
+        )),
+        PrimaryFiler     = as.logical(.data$PrimaryFiler),
+        FilerCopiesAgree = as.logical(.data$FilerCopiesAgree),
+        DescSample       = as.logical(.data$DescSample),
+        EstiSample       = as.logical(.data$EstiSample),
+        InPopulation     = .data$InPopulation,
+        Extract          = .data$Extract
+      ) |>
+      as.data.frame()
   )
 
-  # The estimate uses what has actually been measured here rather than a constant.
-  if (!is.null(.dir) && pending_ > 0L) {
-    logs_ <- fs::dir_ls(fs::path(.dir, "_timing"), glob = "*.parquet", fail = FALSE)
-    if (length(logs_) > 0L) {
-      tim_ <- purrr::map(logs_, arrow::read_parquet) |> purrr::list_rbind()
-      new_ <- if ("nNew" %in% names(tim_)) sum(tim_$nNew) else sum(tim_$nDocs)
-      if (new_ > 0L && sum(tim_$Seconds) > 0) {
-        rate_ <- new_ / sum(tim_$Seconds)
-        cli::cli_alert_info(
-          "At the {round(rate_, 1)} doc/s measured so far: {round(pending_ / rate_ / 3600, 1)}h \\
-           remaining, finishing about {format(Sys.time() + pending_ / rate_, '%a %d %b %H:%M')}."
+  n_copy_    <- nrow(reg_)
+  n_attach_  <- dplyr::n_distinct(reg_$HashDocument)
+  n_extract_ <- sum(reg_$Extract)
+
+  cli::cli_alert_success(
+    "Corpus index loaded from the register: {format(n_copy_, big.mark = ',')} \\
+     {cli::qty(n_copy_)}cop{?y/ies} of {format(n_attach_, big.mark = ',')} \\
+     {cli::qty(n_attach_)}attachment{?s}."
+  )
+  # ATTACHMENTS AGAINST ATTACHMENTS. Reporting this as a share of copies reads as a selection when it
+  # is not: population "all" wants every attachment, and 81% of copies is the deduplication rate
+  # wearing the language of a filter.
+  cli::cli_alert_info(
+    "Population {.val {(.population)}} wants {format(n_extract_, big.mark = ',')} of them \\
+     ({round(100 * n_extract_ / n_attach_)}%). That count -- attachments, not copies -- is the \\
+     denominator every progress and cost figure below is read against."
+  )
+  invisible(as.integer(n_extract_))
+}
+
+
+# 2. The queue -----------------------------------------------------------------------------------------------------------
+
+#' The (model, entity) pairs a family will stamp for the entities requested
+#'
+#' WHAT A FINISHED DOCUMENT LOOKS LIKE, and it has to come from the description rather than from the
+#' ledger. An earlier version of cor_pending() took the target from the ledger it was querying --
+#' the largest number of rows any document had -- which is circular twice over: on an empty store
+#' there is nothing to take it from, and on a partial one the target is whatever the luckiest
+#' document happens to carry. The empty case returned zero outstanding documents and reported a
+#' finished corpus over a store holding nothing.
+#'
+#' It is fewer than models times entities, because the mapping is ragged: dateregex owns DATE and
+#' TERM, gazetteer owns GPE alone. Counting the pairs is the only way to get it right without
+#' restating the package's internals in R.
+#'
+#' @param .describe Output of ner_describe().
+#' @param .family Family name.
+#' @param .entity Entities requested.
+#' @return Tibble: Model, Entity.
+cor_pairs <- function(.describe, .family, .entity) {
+  if (FALSE) {
+    .describe <- tab_describe
+    .family   <- "matcon"
+    .entity   <- c("GPE", "DATE", "TERM", "MONEY", "REDACT")
+  }
+
+  out_ <- .describe |>
+    dplyr::filter(.data$Family == .family, .data$Entity %in% .entity, .data$Ready) |>
+    dplyr::select("Model", "Entity") |>
+    dplyr::distinct() |>
+    dplyr::arrange(.data$Model, .data$Entity)
+
+  if (nrow(out_) == 0L) {
+    cli::cli_abort(c(
+      "{(.family)} produces none of the requested entities.",
+      "i" = "Requested: {paste(.entity, collapse = ', ')}."
+    ))
+  }
+  out_
+}
+
+#' Documents this family has not finished
+#'
+#' THE ANTI-JOIN THE LEDGER EXISTS FOR, and it runs in SQL rather than in R because 1.19 million
+#' identifiers crossed with five entities is six million rows, and pulling them into R to use
+#' setdiff() would cost more than the query it replaces.
+#'
+#' A DOCUMENT IS OUTSTANDING IF ANY REQUESTED PAIR IS MISSING, not all of them. One call to a family
+#' produces every entity it was asked for, so a document needing one entity is sent for all of them
+#' -- and re-ingesting the entities it already has is a delete-then-insert of identical rows, which
+#' costs nothing and keeps the alternative (asking each entity separately, reading each document once
+#' per entity) off the table.
+#'
+#' A ROW IN `failures` DOES NOT EXCLUDE A DOCUMENT. Failures are retried on the next pass by design;
+#' the ledger is what excludes.
+#'
+#' @param .con Connection.
+#' @param .describe Output of ner_describe().
+#' @param .family Family name.
+#' @param .entity Entities requested.
+#' @param .limit Cap for a rehearsal; NULL takes everything outstanding.
+#' @return Tibble: DocID, Path.
+cor_pending <- function(.con, .describe, .family, .entity, .limit = NULL) {
+  if (FALSE) {
+    .con      <- con_matcon
+    .describe <- tab_describe
+    .family   <- "matcon"
+    .entity   <- c("GPE", "DATE", "TERM", "MONEY", "REDACT")
+    .limit    <- NULL
+  }
+
+  pairs_ <- cor_pairs(.describe = .describe, .family = .family, .entity = .entity)
+  want_  <- nrow(pairs_)
+
+  mods_ <- paste0("'", unique(pairs_$Model), "'", collapse = ", ")
+  ents_ <- paste0("'", unique(pairs_$Entity), "'", collapse = ", ")
+  lim_  <- if (is.null(.limit)) "" else glue::glue(" LIMIT {as.integer(.limit)}")
+
+  DBI::dbGetQuery(.con, glue::glue(
+    "SELECT c.DocID, c.Path
+       FROM corpus c
+       LEFT JOIN (
+         SELECT DocID, COUNT(*) AS n FROM runs
+          WHERE Model IN ({mods_}) AND Entity IN ({ents_}) GROUP BY DocID
+       ) r ON r.DocID = c.DocID
+      WHERE c.Extract AND COALESCE(r.n, 0) < {want_}
+      ORDER BY c.DocID{lim_}"
+  )) |>
+    tibble::as_tibble()
+}
+
+#' Record an outcome for a document that never reached an extractor
+#'
+#' A DOCUMENT WITH NO TEXT CANNOT SUCCEED, and the first version retried it on every render forever.
+#' The design said failures are retried rather than blacklisted, which is right for a mount that
+#' hiccuped and wrong for a file that is empty: the queue never emptied, the failure log grew by 736
+#' rows a render, and the status report advised re-rendering to continue -- advice that could not
+#' work.
+#'
+#' The evidence that these are permanent rather than transient is independent: 03F's classification
+#' pass over the same population failed on 736 documents for the same reason. Two passes, different
+#' engines, the same count.
+#'
+#' So the ledger records `error` for every pair the family would have produced. The document is then
+#' excluded, counted honestly in nError, and recoverable by hand -- DELETE FROM runs WHERE Status =
+#' 'error' puts them all back in the queue, which is the same escape hatch a timeout has.
+#'
+#' @param .con Connection.
+#' @param .doc_ids Documents that produced no text.
+#' @param .pairs Output of cor_pairs().
+#' @param .status Ledger status to record.
+#' @return Rows written, invisibly.
+cor_ledger_mark <- function(.con, .doc_ids, .pairs, .status = "error") {
+  if (FALSE) {
+    .con     <- con_matcon
+    .doc_ids <- c("0000001-abc", "0000002-def")
+    .pairs   <- cor_pairs(tab_describe, "matcon", c("GPE", "DATE"))
+    .status  <- "error"
+  }
+  if (length(.doc_ids) == 0L) return(invisible(0L))
+
+  rows_ <- tidyr::expand_grid(DocID = .doc_ids, .pairs) |>
+    dplyr::transmute(.data$DocID, .data$Model, .data$Entity, Status = .status, RunAt = Sys.time())
+
+  mods_ <- paste0("'", unique(.pairs$Model), "'", collapse = ", ")
+  ents_ <- paste0("'", unique(.pairs$Entity), "'", collapse = ", ")
+
+  DBI::dbWriteTable(.con, "tmp_mark", data.frame(DocID = .doc_ids),
+                    temporary = TRUE, overwrite = TRUE)
+  DBI::dbExecute(.con, glue::glue(
+    "DELETE FROM runs
+      WHERE Model IN ({mods_}) AND Entity IN ({ents_})
+        AND DocID IN (SELECT DocID FROM tmp_mark)"
+  ))
+  DBI::dbAppendTable(.con, "runs", as.data.frame(rows_))
+  DBI::dbRemoveTable(.con, "tmp_mark")
+
+  invisible(nrow(rows_))
+}
+
+#' Split a queue into chunks
+#'
+#' @param .docs Tibble.
+#' @param .size Documents per chunk.
+#' @return List of tibbles.
+cor_chunks <- function(.docs, .size) {
+  if (FALSE) {
+    .docs <- queue
+    .size <- 5000L
+  }
+  if (nrow(.docs) == 0L) return(list())
+  split(.docs, ceiling(seq_len(nrow(.docs)) / .size)) |> unname()
+}
+
+#' Read a chunk's text off disk, in parallel
+#'
+#' THE DOMINANT COST OF THE PASS, and not the extractors. One arrow::read_parquet() per document,
+#' 1.19 million times, is most of the wall clock at matcon's throughput and a large part of it at
+#' LexNLP's. So the parallelism goes into the read, where it also cannot change a result -- a read is
+#' pure -- rather than into the engines, which are subprocesses already running their own workers.
+#'
+#' Lifted from 03F with the same three safeguards, each of which cost a diagnosis there:
+#'
+#'   - mirai RETURNS errors as values rather than throwing, so a failed batch arrives looking like one
+#'     text and N failed batches unlist to a vector of N. Detected and the first message printed.
+#'   - A SHORT RESULT IS A FAILURE, not a partial success. Pairing a short vector onto .docs would
+#'     recycle it and give documents other documents' text, which is worse than being slow and would
+#'     not announce itself.
+#'   - Order must survive the round trip, because text is paired on positionally. Batches are
+#'     contiguous, split() orders numeric groups numerically, and mirai_map() returns in input order.
+#'
+#' @param .docs Tibble carrying DocID and Path.
+#' @param .workers Daemons, assumed already started by the caller.
+#' @return .docs with a Text column.
+cor_read_text <- function(.docs, .workers = 1L) {
+  if (FALSE) {
+    .docs    <- queue[1:10, ]
+    .workers <- 24L
+  }
+  if (nrow(.docs) == 0L) return(dplyr::mutate(.docs, Text = character(0)))
+
+  seq_read_ <- function(.d) dplyr::mutate(.d, Text = purrr::map_chr(.data$Path, clf_read_text))
+
+  # Below the threshold the dispatch costs more than the read saves, and the last chunk of a pass is
+  # routinely short.
+  if (.workers <= 1L || nrow(.docs) < 500L) return(seq_read_(.docs))
+
+  n_    <- nrow(.docs)
+  grp_  <- ceiling(seq_len(n_) / ceiling(n_ / .workers))
+  bats_ <- split(.docs$Path, grp_)
+
+  txt_ <- tryCatch(
+    {
+      out_ <- mirai::mirai_map(
+        .x = bats_,
+        .f = function(paths) vapply(paths, clf_read_text, character(1), USE.NAMES = FALSE)
+      )[]
+
+      err_ <- which(vapply(out_, \(.r) inherits(.r, "miraiError"), logical(1)))
+      if (length(err_) > 0L) {
+        cli::cli_alert_danger(
+          "{length(err_)} of {length(out_)} batch{?es} failed in the daemons. First message:"
         )
+        cli::cli_text("  {as.character(out_[[err_[[1L]]]])}")
+        NULL
+      } else {
+        unlist(out_, use.names = FALSE)
       }
-    } else {
-      cli::cli_alert_info("No timings yet; the first chunk will produce an estimate.")
+    },
+    error = function(e) {
+      cli::cli_alert_warning(
+        "Parallel read failed ({conditionMessage(e)}); falling back to a sequential read for this \\
+         chunk. The result is identical, only slower."
+      )
+      NULL
+    }
+  )
+
+  if (is.null(txt_) || length(txt_) != n_) {
+    if (!is.null(txt_)) {
+      cli::cli_alert_warning(
+        "Parallel read returned {length(txt_)} text{?s} for {n_} document{?s}; reading \\
+         sequentially. A count matching the BATCH count rather than the document count means the \\
+         tasks failed and returned their error messages."
+      )
+    }
+    return(seq_read_(.docs))
+  }
+  dplyr::mutate(.docs, Text = txt_)
+}
+
+#' Start daemons and source the reader into them
+#'
+#' A DAEMON IS A FRESH R SESSION AND HOLDS NONE OF THIS ONE'S FUNCTIONS. Sending clf_read_text() as a
+#' serialized closure and assuming it carries does not work, and the failure is silent in the sense
+#' that matters: every task returns a miraiError, which mirai hands back as a value. So the chain is
+#' sourced into each daemon instead -- which also keeps ONE implementation of the reader, so the
+#' corpus is read by the same function that read the labelled sample rather than by a copy that
+#' happens to agree today.
+#'
+#' The whole chain travels because 03A's library is not inert: it registers a vocabulary against
+#' _Plots.R at load time, so _Plots.R must be in scope before it loads.
+#'
+#' @param .workers Daemons to start. 1 or fewer starts none.
+#' @return TRUE where daemons are up and carrying the reader.
+cor_daemons_start <- function(.workers) {
+  if (FALSE) {
+    .workers <- 24L
+  }
+  if (.workers <= 1L) return(FALSE)
+
+  mirai::daemons(.workers)
+
+  ok_ <- tryCatch({
+    mirai::everywhere(
+      {
+        for (.f in c(file.path("_Commons", "_Initialize.R"), file.path("_Commons", "_Utils.R"),
+                     file.path("_Commons", "_Plots.R"),      file.path("_Commons", "_Tables.R"),
+                     "03A-ClassifyPrepare.R")) {
+          source(file.path(.code, .f), encoding = "UTF-8")
+        }
+      },
+      .code = here::here("1_code")
+    )
+    TRUE
+  }, error = function(e) {
+    cli::cli_alert_warning(
+      "Could not prepare the daemons ({conditionMessage(e)}); this pass reads sequentially."
+    )
+    FALSE
+  })
+
+  if (ok_) cli::cli_alert_success("{(.workers)} daemon{?s} up and carrying the reader.")
+  ok_
+}
+
+#' Seconds as something a person reads at three in the morning
+#'
+#' @param .secs Numeric.
+#' @return Character.
+cor_duration <- function(.secs) {
+  if (FALSE) {
+    .secs <- 4210
+  }
+  if (is.na(.secs) || !is.finite(.secs)) return("--")
+  if (.secs < 90) return(paste0(round(.secs), "s"))
+  if (.secs < 5400) return(paste0(round(.secs / 60), "m"))
+  paste0(round(.secs / 3600, 1), "h")
+}
+
+
+# 3. The pass ------------------------------------------------------------------------------------------------------------
+
+#' Run one family over everything it has not finished
+#'
+#' The loop is: take a chunk of the queue, read its text in parallel, stage it as a parquet, hand
+#' that to ner_extract(), ingest what comes back. The staging file is what the engines read -- a
+#' container cannot be handed an R object -- and it is overwritten per chunk rather than accumulated.
+#'
+#' RESUMPTION IS A PROPERTY, NOT A FEATURE. ner_ingest() writes the ledger per chunk, so an
+#' interruption costs at most the chunk in flight. Nothing has to be remembered between renders and
+#' no state exists that could be wrong about itself.
+#'
+#' @param .con Connection to this family's database.
+#' @param .family Family name.
+#' @param .entity Entities to request.
+#' @param .describe Output of ner_describe(), which supplies both the model tags and the count of
+#'   (model, entity) pairs a finished document carries.
+#' @param .stage_path Where each chunk's text is staged. Overwritten per chunk.
+#' @param .stage_dir Where the family writes its output parquets. Cleared per chunk.
+#' @param .chunk_size Documents per engine invocation.
+#' @param .read_workers Daemons for the R-side read.
+#' @param .engine_workers Worker processes INSIDE the extractor. A separate argument from the read
+#'   workers because they are separate resources doing separate work: the daemons read parquet files
+#'   and finish before the container starts, so the two never contend, but they need not be equal and
+#'   one number standing for both would hide that.
+#' @param .batch_size Documents per unit of work inside the engine.
+#' @param .timeout Per-document cap in seconds.
+#' @param .limit Cap the queue for a rehearsal; NULL takes everything.
+#' @param .report_every Chunks between progress lines.
+#' @return One-row tibble: Family, nDocs, nRan, nChunks, nFailed, Seconds, DocsPerSecond. The rate
+#'   is over nRan, so a resumption that finds only unreadable documents reports no rate at all.
+cor_pass <- function(.con, .family, .entity, .describe, .stage_path, .stage_dir,
+                     .chunk_size = 5000L, .read_workers = 24L, .engine_workers = 24L,
+                     .batch_size = 8L, .timeout = 240L, .limit = NULL, .report_every = 5L) {
+  if (FALSE) {
+    .con            <- con_matcon
+    .family         <- "matcon"
+    .entity         <- c("GPE", "DATE", "TERM", "MONEY", "REDACT")
+    .describe       <- tab_describe
+    .stage_path     <- fs::path(.lP$Output$Stage, "chunk.parquet")
+    .stage_dir      <- fs::path(.lP$Output$Stage, "matcon")
+    .chunk_size     <- 5000L
+    .read_workers   <- 24L
+    .engine_workers <- 24L
+    .batch_size     <- 16L
+    .timeout        <- 120L
+    .limit          <- NULL
+    .report_every   <- 5L
+  }
+
+  fs::dir_create(c(fs::path_dir(.stage_path), .stage_dir))
+
+  # ONE CONSTRUCTOR FOR BOTH EXITS. A function with two returns owes them the same shape, and the
+  # first version of this owed and did not pay: nRan was added to the working return and not to the
+  # early one, so a render where nothing was outstanding produced a tibble missing a column the
+  # report then asked for. The early branch only runs on a completed corpus, which is exactly why it
+  # went unexercised until the pass finished -- the same reason 03F's app_corpus_load() carried a
+  # wrong early return through four renders.
+  #
+  # Building the row in one place makes the divergence impossible rather than catchable.
+  row_ <- function(.n_docs, .n_ran, .n_chunks, .n_failed, .secs) {
+    tibble::tibble(
+      Family        = .family,
+      nDocs         = as.integer(.n_docs),
+      nRan          = as.integer(.n_ran),
+      nChunks       = as.integer(.n_chunks),
+      nFailed       = as.integer(.n_failed),
+      Seconds       = as.numeric(.secs),
+      DocsPerSecond = if (.n_ran > 0L) .n_ran / max(as.numeric(.secs), 1e-9) else NA_real_
+    )
+  }
+
+  pairs_ <- cor_pairs(.describe = .describe, .family = .family, .entity = .entity)
+  queue_ <- cor_pending(
+    .con = .con, .describe = .describe, .family = .family, .entity = .entity, .limit = .limit
+  )
+  if (nrow(queue_) == 0L) {
+    cli::cli_alert_success("{(.family)}: nothing outstanding.")
+    return(row_(.n_docs = 0L, .n_ran = 0L, .n_chunks = 0L, .n_failed = 0L, .secs = 0))
+  }
+
+  # DAEMONS ARE STARTED ONCE PER PASS, not once per chunk. Startup is about a second each and a full
+  # pass is a couple of hundred chunks, so starting them inside the loop would spend more on daemons
+  # than the parallel read saves.
+  par_ok_ <- cor_daemons_start(.workers = .read_workers)
+  on.exit(mirai::daemons(0L), add = TRUE)
+
+  chunks_ <- cor_chunks(.docs = queue_, .size = .chunk_size)
+  # THE TARGET IS STATED, so a queue that comes back surprising can be read against the number that
+  # produced it rather than guessed at.
+  cli::cli_alert_info(
+    "{(.family)}: {format(nrow(queue_), big.mark = ',')} {cli::qty(nrow(queue_))}document{?s} \\
+     in {length(chunks_)} chunk{?s} of {format(.chunk_size, big.mark = ',')}, \\
+     {nrow(pairs_)} model-entity pair{?s} each."
+  )
+
+  t0_     <- Sys.time()
+  done_   <- 0L
+  failed_ <- 0L
+
+  for (.i in seq_along(chunks_)) {
+    ch_   <- cor_read_text(.docs = chunks_[[.i]], .workers = if (par_ok_) .read_workers else 1L)
+    done_ <- done_ + nrow(chunks_[[.i]])
+
+    bad_ <- dplyr::filter(ch_, is.na(.data$Text) | !nzchar(trimws(.data$Text)))
+    ok_  <- dplyr::filter(ch_, !is.na(.data$Text), nzchar(trimws(.data$Text)))
+
+    if (nrow(bad_) > 0L) {
+      failed_ <- failed_ + nrow(bad_)
+      # PERMANENT, SO IT IS RECORDED IN THE LEDGER, not only in the failure log. Otherwise the queue
+      # never empties and every render repeats the same futile read.
+      cor_ledger_mark(
+        .con = .con, .doc_ids = bad_$DocID, .pairs = pairs_, .status = "error"
+      )
+      DBI::dbExecute(.con, glue::glue(
+        "DELETE FROM failures WHERE Family = '{.family}' AND Reason = 'no text'
+           AND DocID IN ({paste0(\"'\", bad_$DocID, \"'\", collapse = ', ')})"
+      ))
+      DBI::dbAppendTable(.con, "failures", as.data.frame(tibble::tibble(
+        DocID = bad_$DocID, Family = .family, Reason = "no text", SeenAt = Sys.time()
+      )))
+    }
+
+    if (nrow(ok_) > 0L) {
+      # THE ENGINES READ A FILE, so the chunk is staged. TextRaw rather than Text because that is
+      # what every extractor defaults to and what 04A's canonical text is called -- one name for one
+      # thing, across the R side, the Python side and both stores.
+      arrow::write_parquet(
+        dplyr::transmute(ok_, .data$DocID, TextRaw = .data$Text), .stage_path
+      )
+
+      res_ <- tryCatch({
+        staged_ <- ner_extract(
+          .family     = .family,
+          .model      = NULL,
+          .entity     = .entity,
+          .path_in    = .stage_path,
+          .out_dir    = .stage_dir,
+          .describe   = .describe,
+          .workers    = .engine_workers,   # inside the extractor, not the daemons above
+          .batch_size = .batch_size,
+          .timeout    = .timeout,
+          .quiet      = FALSE
+        )
+        ner_ingest(.con = .con, .staged = staged_, .entity = .entity)
+      }, error = function(e) {
+        cli::cli_alert_danger("Chunk {(.i)} failed: {conditionMessage(e)}")
+        NULL
+      })
+
+      if (is.null(res_)) {
+        failed_ <- failed_ + nrow(ok_)
+        DBI::dbAppendTable(.con, "failures", as.data.frame(tibble::tibble(
+          DocID = ok_$DocID, Family = .family, Reason = "engine error", SeenAt = Sys.time()
+        )))
+      }
+    }
+
+    # PROGRESS IS REPORTED WHATEVER HAPPENED TO THE CHUNK, including one that failed entirely: a run
+    # that goes quiet is indistinguishable from a run that has hung, and the difference matters at
+    # three in the morning. The rate is cumulative rather than per-chunk, so it self-corrects -- the
+    # first chunk pays for container startup and never pays again.
+    if (.i %% .report_every == 0L || .i == 1L || .i == length(chunks_)) {
+      now_     <- Sys.time()
+      elapsed_ <- as.numeric(difftime(now_, t0_, units = "secs"))
+      rate_    <- done_ / max(elapsed_, 1e-9)
+      left_    <- nrow(queue_) - done_
+      eta_     <- left_ / max(rate_, 1e-9)
+      cli::cli_alert_info(
+        "  chunk {(.i)}/{length(chunks_)} | {format(done_, big.mark = ',')}/\\
+         {format(nrow(queue_), big.mark = ',')} | {cor_duration(elapsed_)} elapsed | \\
+         {round(rate_, 1)}/s | \\
+         {if (left_ == 0L) 'done' else paste0('ETA ', cor_duration(eta_), ' (~',
+          format(now_ + eta_, '%a %H:%M'), ')')}"
+      )
     }
   }
-  if (any(!out_$Declared)) {
-    cli::cli_alert_warning(
-      "The store holds {out_$Combo[!out_$Declared]}, which this run does not declare. Those rows \\
-       are left alone; they neither count towards completeness nor get extended."
-    )
-  }
-  invisible(out_)
-}
 
-#' The documents that still need extracting
-#'
-#' ASKED ONCE, UP FRONT, RATHER THAN ONCE PER CHUNK. ner_run() already consults the ledger and skips
-#' what it has seen, so a resumed run was correct without this -- but it was correct expensively.
-#' Every chunk first read its documents' TEXT off disk and wrote a parquet, and only then discovered
-#' there was nothing to extract. On a corpus re-render that is 1.46 million file reads to establish
-#' that the work is already done.
-#'
-#' Asking here instead makes the remaining work the thing that gets chunked, which has three
-#' consequences beyond the saving. Progress is against a denominator that means something. The
-#' throughput rate stops being distorted by chunks that did nothing. And the document reports what
-#' is left before it starts, which is what a reader of a two-day run wants to know first.
-#'
-#' PENDING IS PER DOCUMENT, NOT PER COMBINATION, because the text is read once and handed to every
-#' engine. A document one engine has not seen must be read whatever the other four have done. The
-#' ledger row is what counts as seen, whatever its status: a timeout was tried, and ner_run() only
-#' revisits one when asked with .retry_timeout.
-#'
-#' @param .db_path The corpus candidate store. Absent means everything is pending.
-#' @param .index Tibble from ent_corpus_index().
-#' @param .run Character. Combination tokens the plan declares.
-#' @return .index filtered to pending documents, with its corpus attributes preserved.
-ent_pending <- function(.db_path, .index, .run, .labels) {
-  if (FALSE) {
-    .db_path <- .lP$Store$NerDB
-    .index   <- tab_index
-    .run     <- tab_plan$Combo
-    .labels  <- lst_labels
-  }
-
-  # ATTRIBUTES DO NOT SURVIVE A FILTER. NCorpus and BytesCorpus are carried on the index and dplyr
-  # drops them, so the fingerprint and the projection would both silently lose their denominator.
-  keep_ <- attributes(.index)[c("NCorpus", "BytesCorpus")]
-  restore_ <- function(.t) {
-    attr(.t, "NCorpus")     <- keep_$NCorpus
-    attr(.t, "BytesCorpus") <- keep_$BytesCorpus
-    .t
-  }
-
-  if (!fs::file_exists(.db_path)) {
-    cli::cli_alert_info("No store yet: all {nrow(.index)} document{?s} pending.")
-    return(restore_(.index))
-  }
-
-  con_ <- ner_db_connect(.db_path = .db_path, .read_only = TRUE)
-  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
-
-  # COMPLETE MEANS EVERY DECLARED COMBINATION AND LABEL, not every combination. The ledger is keyed
-  # on the label as well, so a document that has been through LexNLP for three of its four labels
-  # is not done -- and counting combinations alone would call it done and never extract the fourth.
-  # The expected pair count is the sum over combinations of the labels each was asked for.
-  n_pairs_ <- sum(purrr::map_int(.labels[.run], length))
-  in_ <- paste0("('", paste(.run, collapse = "','"), "')")
-  done_ <- DBI::dbGetQuery(con_, paste0(
-    "SELECT DocID FROM ( ",
-    "  SELECT DocID, COUNT(*) AS NPairs ",
-    "  FROM (SELECT DISTINCT DocID, Engine, Model, Label FROM runs ",
-    "        WHERE (CASE WHEN Engine = Model THEN Engine ",
-    "               ELSE Engine || ':' || Model END) IN ", in_, ") ",
-    "  GROUP BY DocID) ",
-    "WHERE NPairs >= ", n_pairs_
-  ))$DocID
-
-  out_ <- dplyr::filter(.index, !.data$DocID %in% done_)
-  n_done_ <- nrow(.index) - nrow(out_)
-  if (n_done_ > 0L) {
-    cli::cli_alert_info(
-      "{n_done_} document{?s} already complete in the store; {nrow(out_)} pending."
-    )
-  } else {
-    cli::cli_alert_info("Nothing in the store yet for this set: {nrow(out_)} pending.")
-  }
-  restore_(out_)
-}
-
-#' What the corpus store was built against
-#'
-#' THE OFFSET CONTRACT, AND IT IS DIFFERENT FROM 04A'S. The sample freezes one canonical text to
-#' disk and every offset indexes that file. A corpus of 1.46 million documents cannot be frozen that
-#' way -- the text alone runs to tens of gigabytes -- so the contract here is the reading function
-#' instead: every offset indexes clf_read_text(Path), which is deterministic and is the same
-#' function 04A derived its canonical text with.
-#'
-#' That holds only while the parsed tree holds. Regenerate the corpus and every offset in the store
-#' silently indexes a different string: is.na() catches nothing, spans rehydrate as plausible
-#' nonsense, and no number changes visibly. This fingerprint is what makes that loud.
-#'
-#' Size on disk rather than character count, because counting characters means reading 1.46 million
-#' files and the fingerprint would then cost more than the thing it guards. A regenerated tree
-#' changes its byte total; a tree that has not been touched does not.
-#'
-#' @param .index Tibble from ent_corpus_index(), unlimited.
-#' @param .run Character. Combination tokens this store is built with.
-#' @param .labels Named list from ent_plan_labels().
-#' @return One-row tibble: NDocs, TotalBytes, Run, Labels, CreatedAt.
-ent_corpus_manifest <- function(.index, .run, .labels) {
-  if (FALSE) {
-    .index  <- tab_index
-    .run    <- tab_plan$Combo
-    .labels <- lst_labels
-  }
-
-  # BOTH FIGURES DESCRIBE THE CORPUS, NOT THE INDEX IN HAND. Under a rehearsal the index holds the
-  # rehearsal, so computing either from it would write a fingerprint of ten thousand documents and
-  # then abort the release run against it -- reporting a regenerated tree when nothing had changed,
-  # which is the one message here a reader would act on immediately and wrongly.
-  tibble::tibble(
-    NDocs      = ent_corpus_n(.index, .what = "docs"),
-    TotalBytes = ent_corpus_n(.index, .what = "bytes"),
-    Run        = paste(sort(.run), collapse = " | "),
-    # PER ENGINE, not a flattened union. A union cannot distinguish "LexNLP was asked for GPE" from
-    # "the gazetteer was asked for GPE", so adding a label to one engine would leave the fingerprint
-    # unchanged and the store would report itself complete under a set it was never built with.
-    # That is exactly how PERSON went missing from the sample store for a full pass.
-    Labels     = ent_labels_string(.labels = .labels),
-    CreatedAt  = Sys.time()
+  # THE RATE IS OVER DOCUMENTS THAT REACHED AN EXTRACTOR, which row_() enforces. A resumption that
+  # finds only unreadable documents left processed 736 of them in a second and reported 1,180 a
+  # second, projecting the corpus at seventeen minutes -- a number measuring how fast this pass can
+  # fail to read an empty file. Where nothing ran, the rate is missing rather than impressive.
+  secs_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+  row_(
+    .n_docs   = nrow(queue_),
+    .n_ran    = nrow(queue_) - failed_,
+    .n_chunks = length(chunks_),
+    .n_failed = failed_,
+    .secs     = secs_
   )
 }
 
-
-#' Compare the corpus fingerprint against the one the store was built under
+#' Report what a pass did, and what it implies
 #'
-#' Same shape as 04A's manifest check and for the same reason: the DuckDB ledger records that a
-#' document was processed by an engine and nothing else. It cannot tell that the document's text has
-#' changed underneath it, so a rebuilt corpus produces a store that reports itself complete and
-#' holds offsets into a string that no longer exists.
-#'
-#' A fingerprint mismatch is fatal here rather than advisory. On the sample a stale store wastes a
-#' render; on the corpus it produces a released dataset whose spans point at the wrong characters.
-#'
-#' The engine inventory is not a fingerprint and is reported rather than enforced: adding an engine
-#' is the ordinary incremental case, and the ledger handles it correctly.
-#'
-#' @param .path_manifest Where the manifest is written.
-#' @param .manifest One-row tibble from ent_corpus_manifest().
-#' @return Invisibly, a tibble of the comparison.
-ent_corpus_manifest_sync <- function(.path_manifest, .manifest) {
+#' @param .tab Bound output of cor_pass().
+#' @param .n_corpus Attachments the population extracts, from cor_corpus_load().
+#' @return .tab, invisibly.
+cor_report_pass <- function(.tab, .n_corpus) {
   if (FALSE) {
-    .path_manifest <- .lP$Store$Manifest
-    .manifest      <- ent_corpus_manifest(tab_index, tab_plan$Combo, lst_labels)
+    .tab      <- tab_pass
+    .n_corpus <- n_corpus
   }
 
-  show_ <- function(.x) {
-    if (is.numeric(.x)) format(.x, scientific = FALSE, trim = TRUE) else as.character(.x)
-  }
-  keys_ <- c("NDocs", "TotalBytes", "Labels", "Run")
-  kind_ <- c("fingerprint", "fingerprint", "fingerprint", "inventory")
-  cur_  <- purrr::map_chr(keys_, \(.k) show_(.manifest[[.k]]))
-
-  if (!fs::file_exists(.path_manifest)) {
-    fs::dir_create(fs::path_dir(.path_manifest))
-    arrow::write_parquet(.manifest, .path_manifest)
-    out_ <- tibble::tibble(Field = keys_, Kind = kind_, Stored = "(new)", Current = cur_,
-                           Match = TRUE, Note = "store created")
-    tbl_say(.tab = out_, .title = "Corpus fingerprint")
-    return(invisible(out_))
+  if (nrow(.tab) == 0L) {
+    cli::cli_alert_info("No pass ran.")
+    return(invisible(.tab))
   }
 
-  old_ <- arrow::read_parquet(.path_manifest)
-  out_ <- tibble::tibble(
-    Field  = keys_,
-    Kind   = kind_,
-    Stored = purrr::map_chr(keys_, \(.k) show_(old_[[.k]])),
-    Current = cur_
-  ) |>
-    dplyr::mutate(Same = .data$Stored == .data$Current)
+  show_ <- .tab |>
+    dplyr::transmute(
+      .data$Family, .data$nDocs, .data$nRan, .data$nChunks, .data$nFailed,
+      Elapsed = purrr::map_chr(.data$Seconds, cor_duration),
+      DocPerS = round(.data$DocsPerSecond, 2),
+      FullRun = purrr::map_chr(
+        .data$DocsPerSecond, \(.r) if (is.na(.r) || .r <= 0) "--" else cor_duration(.n_corpus / .r)
+      )
+    )
+  tbl_say(.tab = show_, .title = "What this render's pass did")
 
-  split_ <- function(.x) if (is.na(.x)) character(0) else trimws(strsplit(.x, "|", fixed = TRUE)[[1]])
-  was_   <- split_(out_$Stored[out_$Field == "Run"])
-  now_   <- split_(out_$Current[out_$Field == "Run"])
+  # THIS RENDER, NOT THE WHOLE PASS. A resumption reports only what it did, so a corpus extracted
+  # over three renders has no single elapsed time here -- the cumulative picture is the coverage
+  # table in the Overview, and saying so beats letting a reader read one for the other.
+  cli::cli_alert_info(
+    "These are this render's numbers. Where a pass resumed, earlier renders did the rest and the \\
+     cumulative position is the coverage table below."
+  )
 
-  out_ <- out_ |>
-    dplyr::mutate(
-      Match = dplyr::if_else(.data$Kind == "inventory", TRUE, .data$Same),
-      Note  = dplyr::case_when(
-        .data$Kind == "inventory" & identical(was_, now_) ~ "unchanged",
-        .data$Kind == "inventory" ~ paste0(length(now_), " asked for, ", length(was_), " stored"),
-        .data$Same ~ "",
-        TRUE ~ "TREE HAS CHANGED -- every offset in the store is suspect"
-      ),
-      Stored  = dplyr::if_else(.data$Kind == "inventory", paste0(length(was_), " combos"), .data$Stored),
-      Current = dplyr::if_else(.data$Kind == "inventory", paste0(length(now_), " combos"), .data$Current)
-    ) |>
-    dplyr::select(Field, Kind, Stored, Current, Match, Note)
+  # THE PROJECTION IS AGAINST ATTACHMENTS, never against the index. The index holds one row per
+  # registrant copy and is 23% larger; using it here is the mistake that made 03F project every run
+  # long, in four separate places, each surviving until a branch reached it.
+  cli::cli_alert_info(
+    "FullRun projects the measured rate over all {format(.n_corpus, big.mark = ',')} \\
+     {cli::qty(.n_corpus)}attachment{?s} the population wants -- not over the index, which is \\
+     larger because it holds one row per registrant copy."
+  )
 
-  tbl_say(.tab = out_, .title = "Corpus fingerprint")
-
-  bad_ <- out_ |> dplyr::filter(.data$Kind == "fingerprint", !.data$Match)
+  # THE DESCRIPTION FOLLOWED THE BEHAVIOUR HERE ON THE SECOND ATTEMPT. This said failures were
+  # "logged for retry" and "not blacklisted", which was true when a failure produced only a log row
+  # and false the moment it produced a ledger row -- and the code changed while the sentence did not.
+  # Nothing mechanical catches that; only reading the rendered claim against what the code does.
+  #
+  # Also: the count is per family, not per document. Summing 736 across two families and calling the
+  # result 1,472 documents is the attachments-versus-copies mistake in another costume.
+  bad_ <- dplyr::filter(.tab, .data$nFailed > 0L)
   if (nrow(bad_) > 0L) {
-    cli::cli_abort(c(
-      "The corpus does not match what this store was built against: {bad_$Field}.",
-      "x" = "Offsets in the store index text that has since been regenerated.",
-      "i" = "Move the store aside and rebuild, or restore the tree it was built from."
-    ))
-  }
-  if (!identical(was_, now_)) arrow::write_parquet(.manifest, .path_manifest)
-  invisible(out_)
-}
-
-
-# 4. Extraction ------------------------------------------------------------------------------------------------------
-
-#' A running account of a pass measured in days
-#'
-#' WRITTEN THREE WAYS, AND NOT THROUGH cli, WHICH IS THE POINT. cli emits a condition through
-#' message(), and anything that handles messages holds them: knitr buffers a chunk's messages until
-#' the chunk ends, so a loop running for two days shows nothing at all until it is over. That is the
-#' opposite of what a progress report is for, and it is why three earlier attempts at this -- a
-#' purrr bar, a cli bar, cli alert lines -- all produced silence.
-#'
-#' cat() to the console bypasses the condition system entirely and flush.console() forces it out
-#' immediately, which covers the interactive case. The LOG FILE covers everything else: it is a
-#' plain text file appended one line per chunk, so progress can be watched with `tail -f` from
-#' another terminal, read after RStudio has been closed, or checked on a machine that is running
-#' the pass headless. On a two-day run that is not a convenience, it is the only way to know the
-#' thing is alive without touching the session.
-#'
-#' sprintf rather than glue or cli interpolation: no dot-literal rules, no evaluation environment to
-#' get wrong, no dependency on a package's formatting decisions in the one function whose job is to
-#' still work when other things are not.
-#'
-#' @param .n_chunks Integer. Chunks in this pass.
-#' @param .n_docs Integer. Documents still to extract.
-#' @param .path_log Character or NULL. Plain text log appended one line per chunk.
-#' @return An environment to hand to ent_progress_step().
-ent_progress_new <- function(.n_chunks, .n_docs, .path_log = NULL) {
-  if (FALSE) {
-    .n_chunks <- length(chunks_)
-    .n_docs   <- nrow(tab_todo)
-    .path_log <- .lP$Store$Progress
-  }
-
-  e_ <- new.env(parent = emptyenv())
-  e_$NChunks <- as.integer(.n_chunks)
-  e_$NDocs   <- as.integer(.n_docs)
-  e_$Chunk   <- 0L
-  e_$Docs    <- 0L
-  e_$Seconds <- 0
-  e_$Log     <- .path_log
-
-  head_ <- sprintf(
-    "== %s | %d chunk(s), %d document(s) to extract ==",
-    format(Sys.time(), "%Y-%m-%d %H:%M:%S"), e_$NChunks, e_$NDocs
-  )
-  cat(head_, "\n", sep = "", file = stdout())
-  utils::flush.console()
-  if (!is.null(.path_log)) {
-    fs::dir_create(fs::path_dir(.path_log))
-    cat(head_, "\n", sep = "", file = .path_log, append = TRUE)
-    cat("Watch it with: tail -f ", as.character(.path_log), "\n", sep = "", file = stdout())
-    utils::flush.console()
-  }
-  e_
-}
-
-#' Report one chunk, and what it implies for the rest
-#'
-#' The rate is cumulative rather than per chunk, so a single slow chunk -- a run of long documents,
-#' a LexNLP stall -- moves the estimate rather than dominating it.
-#'
-#' @param .progress Environment from ent_progress_new().
-#' @param .n_new Documents this chunk actually extracted.
-#' @param .seconds Wall-clock seconds the chunk took.
-#' @return Invisibly, the environment.
-ent_progress_step <- function(.progress, .n_new, .seconds) {
-  if (FALSE) {
-    .progress <- prog_
-    .n_new    <- 2000L
-    .seconds  <- 264
-  }
-
-  .progress$Chunk   <- .progress$Chunk + 1L
-  # Coerced and guarded. A zero-length increment turns the accumulator into integer(0) and every
-  # arithmetic downstream inherits it silently, so the failure surfaces at whichever comparison
-  # touches it first rather than where the value came from.
-  n_new_ <- as.integer(.n_new)
-  if (length(n_new_) != 1L || is.na(n_new_)) n_new_ <- 0L
-  .progress$Docs    <- .progress$Docs + n_new_
-  .progress$Seconds <- .progress$Seconds + as.numeric(.seconds)
-
-  rate_  <- .progress$Docs / max(.progress$Seconds, 1e-9)
-  left_  <- max(.progress$NDocs - .progress$Docs, 0L)
-  eta_h_ <- if (rate_ > 0) left_ / rate_ / 3600 else NA_real_
-  eta_at_ <- if (is.finite(eta_h_)) format(Sys.time() + left_ / rate_, "%a %d %b %H:%M") else "?"
-
-  line_ <- sprintf(
-    "[%s] chunk %d/%d | %s doc in %ds | %.1f doc/s | %s left | %.1fh | ETA %s",
-    format(Sys.time(), "%H:%M:%S"),
-    .progress$Chunk, .progress$NChunks,
-    format(n_new_, big.mark = ","), round(as.numeric(.seconds)),
-    rate_, format(left_, big.mark = ","), eta_h_, eta_at_
-  )
-
-  cat(line_, "\n", sep = "", file = stdout())
-  utils::flush.console()
-  if (!is.null(.progress$Log)) cat(line_, "\n", sep = "", file = .progress$Log, append = TRUE)
-  invisible(.progress)
-}
-
-#' Extract one chunk of the corpus into the shared store
-#'
-#' The chunk exists to bound memory, not to bound work: the text of five hundred documents is held
-#' in R for as long as the extractors need it and then dropped. Resumption is NOT by chunk. It is
-#' the store's own ledger, which records each document against each engine, so an interrupted run
-#' resumes at the document it stopped on rather than at the start of its chunk, and a re-run of a
-#' finished chunk costs one query.
-#'
-#' ner_run() does the extraction, and using it rather than a corpus-specific implementation is the
-#' point: it is the function that built the sample store in 04A, so the two stores are populated by
-#' one piece of code and differ only in what was pointed at them.
-#'
-#' @param .chunk Rows of the corpus index.
-#' @param .db_path The corpus candidate store.
-#' @param .run Character. Combination tokens to run.
-#' @param .labels Named list from ent_plan_labels().
-#' @param .dir_work Scratch directory; the chunk's text parquet is written and deleted here.
-#' @param .knobs Named list of per-combination throughput settings.
-#' @param .device Passed to the spaCy extractor.
-#' @return Invisibly, a one-row tibble: documents read and seconds taken.
-ent_extract_corpus_chunk <- function(.chunk, .db_path, .run, .labels, .dir_work,
-                                     .knobs = list(), .device = "auto") {
-  if (FALSE) {
-    .chunk    <- dplyr::slice_head(tab_index, n = 50L)
-    .db_path  <- .lP$Store$NerDB
-    .run      <- tab_plan$Combo
-    .labels   <- lst_labels
-    .dir_work <- .lP$Work$Dir
-    .knobs    <- .KNOBS
-    .device   <- "auto"
-  }
-
-  t0_    <- Sys.time()
-  docs_  <- ent_read_chunk(.chunk = .chunk)
-  if (nrow(docs_) == 0L) {
-    # THE SAME COLUMNS AS THE NORMAL RETURN, and the omission of nNew here cost a crash at the very
-    # end of the corpus pass. Every document in the final chunk was unreadable, this branch fired,
-    # the caller read out_$nNew as NULL, as.integer(NULL) gave integer(0), and the progress
-    # accumulator became zero-length -- which surfaced three lines later as "argument is of length
-    # zero" from a comparison that had nothing to do with the cause.
-    #
-    # A function with two exits owes them the same shape.
     cli::cli_alert_warning(
-      "Every document in this chunk was unreadable or empty; nothing to extract. These stay \\
-       pending on every render, because a document that cannot be read cannot be recorded as done."
+      "Failed in this render, per family: \\
+       {paste(paste0(bad_$Family, ' ', format(bad_$nFailed, big.mark = ',')), collapse = ', ')}. \\
+       Recorded in the ledger as errors and EXCLUDED from later passes, so re-rendering will not \\
+       retry them."
     )
-    return(invisible(tibble::tibble(
-      nDocs   = 0L,
-      nNew    = 0L,
-      Seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+    cli::cli_alert_info(
+      "To send them again: {.code DELETE FROM runs WHERE Status = 'error'}, then re-render."
+    )
+  }
+
+  invisible(.tab)
+}
+
+
+# 4. Status and validation -------------------------------------------------------------------------------------------
+
+#' How far each family has got
+#'
+#' @param .con Connection.
+#' @param .describe Output of ner_describe().
+#' @param .entity Entities.
+#' @param .family Family name, added as a column.
+#' @return One-row tibble: Family, nExtract, nDone, nUnreadable, nPending, Share. Share counts only
+#'   documents actually extracted, so an unreadable one is neither pending nor complete.
+cor_status <- function(.con, .describe, .entity, .family) {
+  if (FALSE) {
+    .con      <- con_matcon
+    .describe <- tab_describe
+    .entity   <- c("GPE", "DATE")
+    .family   <- "matcon"
+  }
+
+  n_ext_ <- as.integer(
+    DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus WHERE Extract")$n[[1L]]
+  )
+  n_pend_ <- nrow(cor_pending(
+    .con = .con, .describe = .describe, .family = .family, .entity = .entity
+  ))
+
+  # RECORDED AS AN ERROR IS NOT THE SAME AS EXTRACTED, and the share above counts both as done
+  # because both have an outcome. Reporting the unreadable count beside it is what stops "0.999
+  # complete" being read as "0.999 extracted".
+  n_err_ <- as.integer(DBI::dbGetQuery(.con, "
+    SELECT COUNT(*) AS n FROM (SELECT DISTINCT DocID FROM runs WHERE Status = 'error')")$n[[1L]])
+
+  # nDone SUBTRACTS THE ERRORS, and the first version did not -- so it read 1,189,805 beside a Share
+  # of 0.999 in the same row, two columns disagreeing about the same quantity. A document recorded as
+  # unreadable has an outcome, which is why nPending is zero, and it is not extracted, which is why
+  # it belongs in neither nDone nor nPending.
+  tibble::tibble(
+    Family      = .family,
+    nExtract    = n_ext_,
+    nDone       = n_ext_ - n_pend_ - n_err_,
+    nUnreadable = n_err_,
+    nPending    = as.integer(n_pend_),
+    Share       = round((n_ext_ - n_pend_ - n_err_) / max(n_ext_, 1L), 4)
+  )
+}
+
+#' Report status across families
+#'
+#' @param .tab Bound output of cor_status().
+#' @return .tab, invisibly.
+cor_report_status <- function(.tab) {
+  if (FALSE) {
+    .tab <- tab_status
+  }
+  tbl_say(.tab = .tab, .title = "Corpus coverage by family")
+
+  # OUTSTANDING AND UNREADABLE ARE DIFFERENT FINDINGS, and collapsing them produced advice that
+  # could not work: the first version said "re-render to continue" over 736 documents that hold no
+  # text, which no number of renders will change. Now the two are counted apart and only the first
+  # is something a reader can act on.
+  if (all(.tab$nPending == 0L)) {
+    cli::cli_alert_success(
+      "Every family has an outcome recorded for every attachment the population wants."
+    )
+    if (any(.tab$nUnreadable > 0L)) {
+      cli::cli_alert_info(
+        "{max(.tab$nUnreadable)} of them hold no text and are recorded as errors rather than \\
+         extracted. 03F's classification pass failed on the same count, so they are a property of \\
+         the corpus rather than of this run. Clear them with \\
+         {.code DELETE FROM runs WHERE Status = 'error'} to try again."
+      )
+    }
+  } else {
+    cli::cli_alert_info(
+      "{sum(.tab$nPending)} document-family combination{?s} still to do. Re-render to continue; \\
+       the ledger resumes where this stopped."
+    )
+  }
+  invisible(.tab)
+}
+
+#' The offset contract, on a sample of corpus documents
+#'
+#' THE CHECK 04A RUNS OVER EVERY SPAN CANNOT RUN HERE, and the reason is structural rather than a
+#' matter of cost: 04A's spans all index one file, so the text is one read. The corpus text is 1.19
+#' million separate parquets, so verifying every span means reading the corpus again.
+#'
+#' So it is a sample, and the sample is honest about being one. A systematic offset failure -- a byte
+#' rather than code-point slice, a truncation the extractor did not report -- shows in any sample at
+#' all; a failure confined to a handful of documents would not, and nothing here claims otherwise.
+#'
+#' @param .con Connection.
+#' @param .n Documents to draw.
+#' @param .seed Fixed, so a re-render checks the same documents and a new failure is a new finding.
+#' @return Tibble of failures; empty is a pass.
+cor_check_offsets <- function(.con, .n = 500L, .seed = 42L) {
+  if (FALSE) {
+    .con  <- con_matcon
+    .n    <- 500L
+    .seed <- 42L
+  }
+
+  tabs_ <- ner_db_tables(.con = .con)
+  if (length(tabs_) == 0L) return(tibble::tibble())
+
+  pool_ <- DBI::dbGetQuery(.con, glue::glue(
+    "SELECT DocID, Path FROM corpus WHERE Extract ORDER BY DocID"
+  )) |>
+    tibble::as_tibble()
+  if (nrow(pool_) == 0L) return(tibble::tibble())
+
+  # nrow() rather than dplyr::n(): slice_sample() evaluates `n` outside the data mask, so dplyr::n()
+  # raises there. The cap matters because a rehearsal with .limit set has fewer extracted documents
+  # than the draw asks for.
+  set.seed(.seed)
+  docs_ <- dplyr::slice_sample(pool_, n = min(as.integer(.n), nrow(pool_)))
+
+  txt_ <- dplyr::mutate(docs_, TextRaw = purrr::map_chr(.data$Path, clf_read_text)) |>
+    dplyr::filter(!is.na(.data$TextRaw)) |>
+    dplyr::select("DocID", "TextRaw")
+
+  ids_ <- paste0("'", txt_$DocID, "'", collapse = ", ")
+
+  purrr::map(tabs_, \(.t) {
+    DBI::dbGetQuery(.con, glue::glue(
+      "SELECT DocID, Start, Stop, Span FROM {.t}
+        WHERE Start IS NOT NULL AND DocID IN ({ids_})"
+    )) |>
+      tibble::as_tibble() |>
+      dplyr::mutate(Entity = toupper(.t))
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::inner_join(txt_, by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(Cut = stringi::stri_sub(.data$TextRaw, .data$Start + 1L, .data$Stop)) |>
+    dplyr::filter(.data$Cut != .data$Span) |>
+    dplyr::select("DocID", "Entity", "Start", "Stop", "Span", "Cut")
+}
+
+#' Run the corpus validations for one family and report them as one block
+#'
+#' @param .con Connection.
+#' @param .family Family name.
+#' @param .describe Output of ner_describe().
+#' @param .entity Entities.
+#' @param .n_offsets Documents to draw for the offset check.
+#' @return List of results, invisibly.
+cor_report_validation <- function(.con, .family, .describe, .entity, .n_offsets = 500L) {
+  if (FALSE) {
+    .con       <- con_matcon
+    .family    <- "matcon"
+    .describe  <- tab_describe
+    .entity    <- c("GPE", "DATE")
+    .n_offsets <- 500L
+  }
+
+  cli::cli_h3(paste0("Validation -- ", .family))
+
+  tabs_  <- ner_db_tables(.con = .con)
+  nspan_ <- if (length(tabs_) == 0L) {
+    0L
+  } else {
+    sum(purrr::map_dbl(tabs_, \(.t) as.numeric(
+      DBI::dbGetQuery(.con, glue::glue("SELECT COUNT(*) AS n FROM {.t}"))$n[[1L]]
     )))
   }
 
-  fs::dir_create(.dir_work)
-  path_ <- fs::file_temp(pattern = "corpus_", tmp_dir = .dir_work, ext = "parquet")
-  arrow::write_parquet(tibble::tibble(DocID = docs_$DocID, TextRaw = docs_$Text), path_)
-  on.exit(if (fs::file_exists(path_)) fs::file_delete(path_), add = TRUE)
-
-  knob_ <- function(.k) {
-    v_ <- purrr::map(.knobs, .k) |> purrr::compact()
-    if (length(v_) == 0L) NULL else v_
-  }
-
-  run_ <- ner_run(
-    .inputs        = path_,
-    .db_path       = .db_path,
-    .run           = .run,
-    .labels        = .labels,
-    .max_chars     = NULL,        # full text; the window is a resolution-time filter in 04E
-    .retry_timeout = FALSE,
-    .id_col        = "DocID",
-    .text_col      = "TextRaw",
-    .docs_per_run  = NULL,        # the chunk IS the slice; ner_run must not re-chunk it
-    .device        = .device,
-    .n_process     = knob_("n_process")  %||% 16L,
-    .batch_size    = knob_("batch_size") %||% 64L,
-    .timeout       = knob_("timeout")    %||% 0L,
-    .keep_staging  = FALSE,
-    # THE EXTRACTORS' OWN BARS ARE OFF, and this is what makes the loop's bar readable. Each Python
-    # extractor writes a tqdm bar to stderr; five engines per chunk over hundreds of chunks is five
-    # bars per chunk, all writing carriage returns to the same line cli is drawing the pass on. The
-    # inner bars report one extractor on 2,000 documents, which is the wrong unit anyway -- what a
-    # reader of a two-day run needs is how far through the corpus it is.
-    # The live bar stays ON. It rides the subprocess streams, which inherit the terminal and never
-    # reach the rendered document, so it costs nothing there and is the only way to watch a pass
-    # that runs for a day. The cli chatter stays OFF: that goes through the message stream, and at
-    # 730 chunks by five engines it is three and a half thousand lines of "done in 4.2s".
-    .no_progress   = FALSE,
-    .quiet         = TRUE
-  )
-
-  # DOCUMENTS IN THE CHUNK AND DOCUMENTS ACTUALLY EXTRACTED ARE DIFFERENT NUMBERS, and conflating
-  # them corrupts the projection in the flattering direction. A chunk the ledger already covers
-  # returns in seconds while still reporting its full document count, so a rate taken as
-  # nDocs / Seconds over a partly resumed run overstates throughput by whatever share was resumed --
-  # a rehearsal continued from an earlier one reported nine documents a second where the true figure
-  # was seven and a half, and forty-three hours where it was fifty-four.
-  #
-  # nNew is the largest number of documents any single engine had to process. Not the sum, because
-  # five engines over the same document is one document's worth of reading; not the minimum, because
-  # an engine that had already finished says nothing about the four that had not.
-  n_new_ <- if (is.null(run_) || nrow(run_) == 0L) 0L else max(as.integer(run_$Docs), 0L)
-
-  invisible(tibble::tibble(
-    nDocs   = nrow(docs_),
-    nNew    = n_new_,
-    Seconds = as.numeric(difftime(Sys.time(), t0_, units = "secs"))
-  ))
-}
-
-
-# 5. Bookkeeping and report ------------------------------------------------------------------------------------------
-
-#' Record what one chunk cost, beside the output rather than inside it
-#' @param .dir Output directory.
-#' @param .chunk Chunk index.
-#' @param .n_docs Documents resolved.
-#' @param .seconds Wall time.
-#' @param .n_cands Candidates extracted.
-#' @return Invisibly the path written.
-ent_write_timing <- function(.dir, .chunk, .n_docs, .n_new, .seconds) {
-  if (FALSE) {
-    .dir     <- .dir_store
-    .chunk   <- 1L
-    .n_docs  <- 2000L
-    .n_new   <- 2000L
-    .seconds <- 233
-  }
-  dir_ <- fs::path(.dir, "_timing")
-  fs::dir_create(dir_)
-  path_ <- fs::path(dir_, sprintf("timing_%04d.parquet", as.integer(.chunk)))
-  arrow::write_parquet(
-    tibble::tibble(
-      Chunk = as.integer(.chunk), nDocs = as.integer(.n_docs), nNew = as.integer(.n_new),
-      Seconds = as.numeric(.seconds), WrittenAt = Sys.time()
-    ),
-    path_
-  )
-  invisible(path_)
-}
-
-
-#' Measured throughput, and what a full pass would cost at that rate
-#' @param .dir Output directory.
-#' @param .n_corpus Documents a full pass would cover.
-#' @return Invisibly the timing tibble.
-ent_report_throughput <- function(.dir, .n_corpus, .n_cands = NULL) {
-  if (FALSE) {
-    .dir      <- .dir_store
-    .n_corpus <- ent_corpus_n(tab_index)
-    .n_cands  <- sum(.ov$ledger$Candidates)
-  }
-  dir_ <- fs::path(.dir, "_timing")
-  if (!fs::dir_exists(dir_)) {
-    cli::cli_alert_info("Nothing timed yet; run at least one chunk to measure this machine.")
-    return(invisible(NULL))
-  }
-  tab_ <- fs::dir_ls(dir_, glob = "*.parquet") |>
-    purrr::map(arrow::read_parquet) |>
-    purrr::list_rbind()
-  if (nrow(tab_) == 0L) return(invisible(NULL))
-
-  # Per document of NEW work. See ent_extract_corpus_chunk(): a resumed chunk returns its full
-  # document count in a handful of seconds, so nDocs here would flatter the projection by whatever
-  # share of the run was already in the ledger.
-  n_new_  <- if ("nNew" %in% names(tab_)) sum(tab_$nNew) else sum(tab_$nDocs)
-  n_seen_ <- sum(tab_$nDocs)
-  if (n_new_ == 0L) {
-    cli::cli_alert_info("Every chunk was already in the ledger; nothing to time.")
-    return(invisible(tab_))
-  }
-  rate_ <- n_new_ / sum(tab_$Seconds)
-  cli::cli_h2("Measured throughput")
-  tbl_say(
-    .tab = tibble::tibble(
-      Chunks      = nrow(tab_),
-      Documents   = n_seen_,
-      Extracted   = n_new_,
-      Minutes     = round(sum(tab_$Seconds) / 60, 1),
-      DocsPerSec  = round(rate_, 1),
-      CorpusDocs  = as.integer(.n_corpus),
-      FullPassHrs = round(.n_corpus / rate_ / 3600, 1),
-      FullPassDay = round(.n_corpus / rate_ / 3600 / 24, 1),
-      # Candidate figures come from the STORE and only when it has been read. The timing log cannot
-      # supply them: a chunk the ledger had already seen does no work, so its candidate count is
-      # zero and the per-document rate would fall by however much of the run was resumed.
-      Candidates  = if (is.null(.n_cands)) NULL else as.integer(.n_cands),
-      CandsPerDoc = if (is.null(.n_cands)) NULL else round(.n_cands / n_seen_, 1),
-      CorpusMCand = if (is.null(.n_cands)) NULL else {
-        round(.n_cands / n_seen_ * .n_corpus / 1e6, 1)
-      }
-    )
-  )
-  cli::cli_alert_info(
-    "Extraction only; resolution is 04E and costs a fraction of this. CorpusDocs is the tree \\
-     before any limit, so the projection means the same thing whether this run was a rehearsal or \\
-     the release."
-  )
-  if (n_new_ < n_seen_) {
-    cli::cli_alert_info(
-      "{n_seen_ - n_new_} document{?s} in these chunks were already in the ledger. The rate is per \\
-       document EXTRACTED, so the projection is unaffected by how much was resumed."
-    )
-  }
-  if (n_seen_ < .n_corpus) {
+  # AN EMPTY STORE IS NOT A PASS. Both checks below are satisfied by having nothing to check, which
+  # is the shape 04A's first version reported as two green ticks on an empty LexNLP store.
+  if (nspan_ == 0L) {
     cli::cli_alert_warning(
-      "Projected from {n_new_} newly extracted of {(.n_corpus)} documents. The draw is random across the \\
-       whole tree, so it is unbiased on document COUNT -- but cost follows length, and 04A found \\
-       the corpus tail longer than the labelled sample's. Read this as a floor."
+      "The {(.family)} store holds no spans, so NOTHING WAS CHECKED. This is not a pass."
+    )
+    return(invisible(list(Offsets = tibble::tibble(), Pending = NA_integer_)))
+  }
+
+  n_pool_ <- as.integer(
+    DBI::dbGetQuery(.con, "SELECT COUNT(*) AS n FROM corpus WHERE Extract")$n[[1L]]
+  )
+  n_draw_ <- min(as.integer(.n_offsets), n_pool_)
+
+  off_ <- cor_check_offsets(.con = .con, .n = .n_offsets)
+  if (nrow(off_) == 0L) {
+    cli::cli_alert_success(
+      "Offset contract holds on every span in {(n_draw_)} sampled document{?s} \\
+       ({format(nspan_, big.mark = ',')} {cli::qty(nspan_)}span{?s} in the store)."
+    )
+  } else {
+    tbl_say(.tab = utils::head(off_, 20L), .title = "OFFSET FAILURES")
+    cli::cli_abort(
+      "{nrow(off_)} span{?s} in {(.family)} do not round-trip. Nothing downstream can be trusted."
     )
   }
-  invisible(tab_)
+
+  pend_ <- nrow(cor_pending(
+    .con = .con, .describe = .describe, .family = .family, .entity = .entity
+  ))
+  if (pend_ == 0L) {
+    cli::cli_alert_success("Ledger complete: every attachment the population wants has an outcome.")
+  } else {
+    cli::cli_alert_warning(
+      "{format(pend_, big.mark = ',')} {cli::qty(pend_)}attachment{?s} still outstanding, so the \\
+       counts below describe a partial pass."
+    )
+  }
+
+  invisible(list(Offsets = off_, Pending = as.integer(pend_)))
 }
 
 
+# 5. Report --------------------------------------------------------------------------------------------------------------
+
+#' What one family's corpus store holds
+#'
+#' @param .con Connection.
+#' @param .family Family name.
+#' @param .n_corpus Attachments the population wants, as the coverage denominator.
+#' @return Tibble: Family, Model, Entity, NSpan, NDoc, Coverage, nTimeout, nError, SpecHash.
+cor_summary <- function(.con, .family, .n_corpus) {
+  if (FALSE) {
+    .con      <- con_matcon
+    .family   <- "matcon"
+    .n_corpus <- n_corpus
+  }
+
+  sum_ <- ner_db_summary(.con = .con)
+  if (nrow(sum_) == 0L) return(tibble::tibble())
+
+  sum_ |>
+    dplyr::transmute(
+      Family   = .family,
+      .data$Model, .data$Entity, .data$NSpan,
+      NDoc     = .data$nHit,
+      Coverage = round(.data$nHit / .n_corpus, 3),
+      SpansPerDoc = round(.data$NSpan / pmax(.data$nHit, 1L), 1),
+      .data$nTimeout, .data$nError, .data$SpecHash
+    ) |>
+    dplyr::arrange(.data$Entity, .data$Model)
+}
+
+#' Report the corpus stores, and compare them with the labelled sample
+#'
+#' THE COMPARISON IS THE POINT. 04A measured every one of these engines on 4,398 labelled documents;
+#' if the corpus coverage differs sharply from the sample's, either the sample is not representative
+#' of the corpus or something in the pass is wrong -- and both are findings worth having before any
+#' rule is written against these spans.
+#'
+#' @param .tab Bound output of cor_summary().
+#' @param .sample Coverage from 04A, carrying Family, Entity and Coverage. NULL skips the comparison.
+#' @return .tab, invisibly.
+cor_report_summary <- function(.tab, .sample = NULL) {
+  if (FALSE) {
+    .tab    <- tab_summary
+    .sample <- tab_sample_cov
+  }
+
+  tbl_say(.tab = dplyr::select(.tab, -"SpecHash"), .title = "The corpus stores")
+
+  bad_ <- dplyr::filter(.tab, .data$nTimeout > 0L | .data$nError > 0L)
+  if (nrow(bad_) == 0L) {
+    cli::cli_alert_success("No timeouts and no extractor errors anywhere in the corpus pass.")
+  } else {
+    tbl_say(.tab = dplyr::select(bad_, "Family", "Model", "Entity", "nTimeout", "nError"),
+            .title = "TIMEOUTS AND ERRORS")
+    cli::cli_alert_warning(
+      "A crash and a clean miss produce the same empty result, which is why they are counted \\
+       separately from coverage. BOTH ARE EXCLUDED from later passes: a ledger row is a ledger row \\
+       whatever its status, so neither is retried by re-rendering."
+    )
+    # THE TWO HAVE DIFFERENT REMEDIES AND DIFFERENT PROSPECTS, so they are named apart. A timeout
+    # might complete under a longer cap; a document with no text will not, whatever the cap.
+    cli::cli_alert_info(
+      "A timeout may complete under a longer cap -- clear it with \\
+       {.code DELETE FROM runs WHERE Status = 'timeout'} and raise the cap. An error is a document \\
+       that held no text, so raising anything will not help; the same {.code DELETE} with \\
+       {.code Status = 'error'} only repeats the read."
+    )
+  }
+
+  if (!is.null(.sample) && nrow(.sample) > 0L) {
+    cmp_ <- .tab |>
+      dplyr::select("Family", "Entity", Corpus = "Coverage") |>
+      dplyr::inner_join(
+        dplyr::select(.sample, "Family", "Entity", Sample = "Coverage"),
+        by = dplyr::join_by(Family, Entity)
+      ) |>
+      dplyr::mutate(Diff = round(.data$Corpus - .data$Sample, 3)) |>
+      dplyr::arrange(dplyr::desc(abs(.data$Diff)))
+
+    tbl_say(.tab = cmp_, .title = "Corpus coverage against the labelled sample")
+
+    far_ <- dplyr::filter(cmp_, abs(.data$Diff) > 0.1)
+    if (nrow(far_) > 0L) {
+      cli::cli_alert_warning(
+        "{nrow(far_)} combination{?s} differ from the sample by more than ten points. Either the \\
+         sample is not representative of the corpus for {?it/them}, or something in the pass is \\
+         wrong -- and the two are told apart by reading the spans, not by reading this table."
+      )
+    } else {
+      cli::cli_alert_success(
+        "Every combination is within ten points of its rate on the labelled sample."
+      )
+    }
+  }
+
+  # THE MANIFEST IS THE PROVENANCE STATEMENT, and printing it here is what lets a reader of the
+  # rendered page say which version of which extractor produced the corpus without opening a store.
+  tbl_say(
+    .tab   = dplyr::distinct(.tab, .data$Family, .data$Model, .data$SpecHash),
+    .title = "What produced these spans"
+  )
+
+  invisible(.tab)
+}
+
+#' What the pass wrote
+#'
+#' @param .dir Directory holding the family databases.
+#' @param .families Family names.
+#' @return Tibble: Artifact, Exists, MB.
+cor_report_artifacts <- function(.dir, .families) {
+  if (FALSE) {
+    .dir      <- .lP$Output$Store
+    .families <- c("matcon", "lexnlp")
+  }
+
+  out_ <- tibble::tibble(
+    Path = purrr::map_chr(.families, \(.f) as.character(ner_db_path(.dir = .dir, .family = .f)))
+  ) |>
+    dplyr::mutate(
+      Artifact = fs::path_file(.data$Path),
+      Exists   = fs::file_exists(.data$Path),
+      MB       = round(dplyr::if_else(
+        .data$Exists, as.numeric(fs::file_size(.data$Path)) / 1024^2, NA_real_
+      ), 1)
+    ) |>
+    dplyr::select("Artifact", "Exists", "MB")
+
+  tbl_say(.tab = out_, .title = "Written by 04C")
+  invisible(out_)
+}

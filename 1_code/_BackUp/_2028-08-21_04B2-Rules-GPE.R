@@ -48,7 +48,6 @@ if (FALSE) {
   .path_text   <- .lP$Input$Text
   .path_lookup <- .lP$Input$Lookup
   .path_org    <- .lP$Input$Org
-  .dir_store   <- .lP$Input$Store
 }
 
 
@@ -66,13 +65,10 @@ plot_register_levels(
   .short  = c("unique", "nearest", "unresolved", "n/a")
 )
 
-# THE FAMILY IS THE PRODUCER NOW, and the level is named for it. "gazetteer" was the engine token of
-# a flat store that no longer exists; matcon is the family whose gazetteer-v2 model emits these rows,
-# and calling it anything else would put a name in the figures that appears nowhere in the store.
 plot_register_levels(
   .key    = "GeoEngine",
-  .levels = c("lexnlp", "matcon"),
-  .short  = c("lexnlp", "matcon")
+  .levels = c("lexnlp", "gazetteer"),
+  .short  = c("lexnlp", "gazetteer")
 )
 
 
@@ -95,39 +91,22 @@ plot_register_levels(
 
 # 3. Resolution ------------------------------------------------------------------------------------------------------
 
-#' Read the two columns the gazetteer does not emit
+#' Read the gazetteer lookup, one row per name and class
 #'
-#' MOST OF THIS JOIN HAS GONE AWAY, and that is gazetteer-v2 rather than a simplification made here.
-#' The extractor now emits GeoKey, NParent, IsWord, Iso2 and Iso3 on every row it writes, so the
-#' lookup is needed for the two columns it does not: the state a place sits in and that state's
-#' county. Under the flat store none of those arrived and all five were recovered by joining here.
+#' EVERY COLUMN IS PREFIXED Lk. The store's own gpe table already carries Iso2 and Iso3 -- empty on
+#' gazetteer rows, because ingest nulls a column an extractor did not emit -- so an unprefixed join
+#' would suffix both sides to .x and .y and every later reference would silently read the empty one.
 #'
-#' READING THE PACKAGE'S OWN DATA FILE IS CROSSING THE CLI SEAM, and it is safe for a specific
-#' reason rather than by convention. gazetteer.py's spec() folds a content hash of this exact file
-#' into gazetteer-v2's spec hash, so a lookup that changed moves the model's hash and
-#' ner_manifest_write() aborts on the next ingest. The seam is crossed and guarded: this document and
-#' the store cannot silently disagree about which lookup they used.
-#'
-#' EVERY COLUMN IS PREFIXED Lk. The gpe table carries its own Iso2 and Iso3, so an unprefixed join
-#' would suffix both sides to .x and .y and every later reference would silently read whichever one
-#' dplyr happened to put first.
-#'
-#' @param .path_lookup The gazetteer's geo_lookup.parquet, inside the matcon-extract package.
-#' @return Tibble: GeoKey, GeoClass and the two parent columns, prefixed Lk.
+#' @param .path_lookup The gazetteer's geo_lookup.parquet.
+#' @return Tibble: GeoKey and the hierarchy above it, every column prefixed Lk.
 geo_lookup <- function(.path_lookup) {
   if (FALSE) .path_lookup <- .lP$Input$Lookup
 
-  if (!fs::file_exists(.path_lookup)) {
-    cli::cli_abort(c(
-      "No geo lookup at {.path {(.path_lookup)}}.",
-      "i" = "It ships inside matcon-extract; 1_code/_Scripts/rebuild-geo-lookup.R rebuilds it."
-    ))
-  }
-
   arrow::read_parquet(.path_lookup) |>
-    dplyr::select("GeoKey", "GeoClass", "StateName", "ParentCounty") |>
+    dplyr::select(GeoKey, GeoClass, ISO3, Iso2, StateName, ParentCounty, NParent, IsWord) |>
     dplyr::distinct(.data$GeoKey, .data$GeoClass, .keep_all = TRUE) |>
-    dplyr::rename(LkClass = "GeoClass", LkState = "StateName", LkCounty = "ParentCounty")
+    dplyr::rename(LkClass = GeoClass, LkIso3 = ISO3, LkIso2 = Iso2, LkState = StateName,
+                  LkCounty = ParentCounty, LkNParent = NParent, LkIsWord = IsWord)
 }
 
 
@@ -155,66 +134,46 @@ geo_candidates <- function(.path_lookup) {
 }
 
 
-#' Put one family's GPE spans on the shared hierarchy
+#' Put one engine's GPE spans on the shared hierarchy
 #'
-#' TWO PRODUCERS AT DIFFERENT TIERS, not two opinions about one. matcon's gazetteer carries 116,000
-#' entries and reaches cities and counties; LexNLP carries 437 and reaches countries and first-level
-#' subdivisions and stops. 04A measured the consequence: they agree on 44.5% of mentions and, where
-#' they do meet, on boundaries 97.6% of the time. Stacked and marked, never pooled inside a table.
-#'
-#' MATCON NOW ARRIVES PART-RESOLVED. gazetteer-v2 emits GeoKey, NParent, IsWord and two ISO columns
-#' itself, so only the state and county come from the lookup. Its class is still in the core column
-#' LabelRaw, which is what the lookup is keyed on beside the name.
-#'
-#' ITS ISO COLUMNS DO NOT MEAN WHAT LEXNLP'S DO, which is why _Entity.R renames them on read. matcon
-#' resolves a country code on EVERY level -- USA on a state, a city, a county -- and a subdivision
-#' code on everything BUT a country. LexNLP is the other way round: a country code on countries and a
-#' code that may be either elsewhere. Read under one pair of names the two disagree silently, and the
-#' first version of this document did exactly that: it came out right because geo_country() reads the
-#' country column first and matcon's happened to be one, while the subdivision-prefix recovery sat
-#' dead at 0.0% of matcon's rows.
+#' THE GAZETTEER RESOLVES NOTHING IN THE STORE. Its class arrives in the core column LabelRaw and
+#' everything above it is recovered by joining the lookup on the uppercased span. LexNLP arrives
+#' resolved and needs only its category mapped onto the same levels.
 #'
 #' LkState, NOT the lookup's ParentState: a state's parent is not itself, so ParentState is NA on
 #' every US State row, and reading it once reported 179 states at country level. Iso3 is guarded
 #' against the literal string "nan", which an earlier extractor wrote and which reads as a country
 #' code rather than as missing.
 #'
-#' NON-US SUBDIVISIONS -- Ontario, Guangdong, Scotland -- are levelled "Other". They carry no
-#' ISO-3166-3 at all, and that is a fact about the dictionary rather than about the extractor: of its
-#' 437 entities only the 253 countries have a three-letter code. Their country is recovered in
-#' geo_country() from the ISO-3166-2 prefix instead.
+#' NON-US SUBDIVISIONS -- Ontario, Guangdong, Scotland -- are levelled "Other" and keep their ISO
+#' code, so they roll to a country without being reported at a tier this hierarchy does not have.
 #'
-#' @param .spans Tibble from ent_load_entity() for one family.
+#' @param .spans Tibble from ent_load_label() for one engine.
 #' @param .lookup Tibble from geo_lookup(). Ignored for lexnlp.
-#' @param .family Character, "lexnlp" or "matcon".
+#' @param .engine Character, "lexnlp" or "gazetteer".
 #' @return .spans reduced to the shared columns.
-geo_resolve <- function(.spans, .lookup, .family) {
+geo_resolve <- function(.spans, .lookup, .engine) {
   if (FALSE) {
-    .spans  <- lst_raw[["matcon"]]
+    .spans  <- lst_raw[["gazetteer"]]
     .lookup <- tab_lookup
-    .family <- "matcon"
+    .engine <- "gazetteer"
   }
 
-  out_ <- if (identical(.family, "matcon")) {
+  out_ <- if (identical(.engine, "gazetteer")) {
     .spans |>
-      dplyr::mutate(GeoKeyUp = stringi::stri_trans_toupper(.data$GeoKey)) |>
-      dplyr::left_join(.lookup, by = dplyr::join_by(GeoKeyUp == GeoKey, LabelRaw == LkClass)) |>
+      dplyr::mutate(GeoKey = stringi::stri_trans_toupper(.data$Span)) |>
+      dplyr::left_join(.lookup, by = dplyr::join_by(GeoKey, LabelRaw == LkClass)) |>
       dplyr::mutate(
-        GeoKey     = .data$GeoKeyUp,
-        GeoUnit    = stringi::stri_trans_totitle(.data$GeoKeyUp),
+        GeoUnit    = stringi::stri_trans_totitle(.data$GeoKey),
         RawClass   = .data$LabelRaw,
-        NParentOut = dplyr::coalesce(as.integer(.data$NParent), 1L),
-        Ambig      = !is.na(.data$NParent) & .data$NParent > 1L,
-        # matcon's CountryIso3 is a country code on every level -- USA on a state, a city and a
-        # county -- and its SubIso is a subdivision code and never a country. The two are mapped
-        # onto the shared columns here, which is the only place their meaning is known.
-        Iso3Out    = dplyr::na_if(.data$CountryIso3, "nan"),
-        Iso2Out    = dplyr::if_else(.data$Ambig, NA_character_,
-                                    dplyr::na_if(.data$SubIso, "nan")),
+        NParentOut = dplyr::coalesce(.data$LkNParent, 1L),
+        Ambig      = !is.na(.data$LkNParent) & .data$LkNParent > 1L,
+        Iso3Out    = .data$LkIso3,
+        Iso2Out    = dplyr::if_else(.data$Ambig, NA_character_, .data$LkIso2),
         StateOut   = dplyr::if_else(.data$Ambig, NA_character_,
                                     stringi::stri_trans_toupper(.data$LkState)),
         CountyOut  = dplyr::if_else(.data$Ambig, NA_character_, .data$LkCounty),
-        WordLike   = as.integer(.data$IsWord)
+        WordLike   = .data$LkIsWord
       )
   } else {
     .spans |>
@@ -233,11 +192,6 @@ geo_resolve <- function(.spans, .lookup, .family) {
       )
   }
 
-  # THE CATEGORY STRINGS ARE LEXNLP'S OWN, verified against the store rather than assumed: Countries,
-  # US States, and eight subdivision categories -- Canadian Provinces, Chinese Provinces, UK
-  # Countries/Provinces, Mexico States, German States, Australian States, French States, Spanish
-  # Autonomies. No Cities and no Counties, because the dictionary has neither. Those two arms below
-  # are live for matcon alone.
   out_ |>
     dplyr::mutate(
       GeoLevel = dplyr::case_when(
@@ -247,12 +201,12 @@ geo_resolve <- function(.spans, .lookup, .family) {
         stringi::stri_detect_fixed(dplyr::coalesce(.data$RawClass, ""),
                                    "Populated Place")                  ~ "City",
         .data$RawClass %in% c("Cities")                                ~ "City",
-        .default                                                       = "Other"
+        TRUE                                                           ~ "Other"
       )
     ) |>
-    dplyr::select("DocID", "Start", "Stop", "Span", "DocLen", "GeoKey", "GeoUnit", "GeoLevel",
-                  County = "CountyOut", State = "StateOut", Iso2 = "Iso2Out", Iso3 = "Iso3Out",
-                  "RawClass", NParent = "NParentOut", Ambiguous = "Ambig", "WordLike")
+    dplyr::select(DocID, Start, Stop, Span, DocLen, GeoKey, GeoUnit, GeoLevel,
+                  County = CountyOut, State = StateOut, Iso2 = Iso2Out, Iso3 = Iso3Out,
+                  RawClass, NParent = NParentOut, Ambiguous = Ambig, WordLike)
 }
 
 
@@ -330,49 +284,19 @@ geo_city_state <- function(.geo, .cand) {
 geo_country <- function(.geo) {
   if (FALSE) .geo <- tab_geo
 
-  # THE ISO-3166-2 PREFIX IS FREE COUNTRY INFORMATION, and the first version threw it away. It levels
-  # the eight non-US subdivision categories as "Other" and its comment claimed they "keep their ISO
-  # code, so they roll to a country" -- they do not. Of the geo dictionary's 437 entities only the
-  # 253 countries carry an ISO-3166-3, so Iso3 is NA on every Ontario, Guangdong and Scotland, and
-  # CountryIso came out missing for all of them.
-  #
-  # But their ISO-3166-2 is a SUBDIVISION code -- CA-AB, CN-13, GB-ENG -- whose prefix is exactly the
-  # country. Splitting on the hyphen recovers it. A country's own Iso2 has no hyphen and is left
-  # alone, which is why the split is guarded rather than applied to every row.
-  #
-  # IN PRACTICE THIS ARM IS LEXNLP'S. matcon already resolves a country code on every level it emits,
-  # so it reaches the second branch and never the third; LexNLP reaches the third on the 3,444 spans
-  # its dictionary levels as subdivisions. CountryFrom records which branch each span took, so the
-  # split is visible in the render rather than assumed here.
   .geo |>
     dplyr::mutate(
-      PrefixIso = dplyr::if_else(
-        stringi::stri_detect_fixed(dplyr::coalesce(.data$Iso2, ""), "-"),
-        stringi::stri_extract_first_regex(.data$Iso2, "^[A-Z]{2}"),
-        NA_character_
-      ),
       CountryIso = dplyr::case_when(
         .data$GeoLevel %in% c("State", "County", "City") ~ "USA",
         !is.na(.data$Iso3)                               ~ .data$Iso3,
-        !is.na(.data$PrefixIso)                          ~ .data$PrefixIso,
-        .default                                         = NA_character_
+        TRUE                                             ~ NA_character_
       ),
-      # The name is left missing for a recovered subdivision. A two-letter code is not a country
-      # name, and inventing one here would put a value in the release that no source produced --
-      # geo_map_input() draws on CountryIso, which is what the recovery is for.
       CountryName = dplyr::case_when(
         .data$GeoLevel %in% c("State", "County", "City") ~ "United States",
         .data$GeoLevel == "Country"                      ~ .data$GeoUnit,
-        .default                                         = NA_character_
-      ),
-      CountryFrom = dplyr::case_when(
-        .data$GeoLevel %in% c("State", "County", "City") ~ "US level",
-        !is.na(.data$Iso3)                               ~ "ISO-3166-3",
-        !is.na(.data$PrefixIso)                          ~ "ISO-3166-2 prefix",
-        .default                                         = "none"
+        TRUE                                             ~ NA_character_
       )
-    ) |>
-    dplyr::select(-"PrefixIso")
+    )
 }
 
 
@@ -582,7 +506,7 @@ geo_law <- function(.geo, .lens, .path_text) {
 #' given. A document-level variable is a filter on this table; "which party is this the address of"
 #' is a column rather than a question the file cannot answer.
 #'
-#' Per family, stacked, so lexnlp and matcon are separate rows for the same organisation and a
+#' Per engine, stacked, so lexnlp and the gazetteer are separate rows for the same organisation and a
 #' combined view is a choice the reader makes rather than one this file makes.
 #'
 #' NGeoNear is what distinguishes "nothing was beside it" from "several were and none resolved",
@@ -743,20 +667,6 @@ geo_validate <- function(.roles, .keys) {
 }
 
 
-#' A share, or missing where there is nothing to take a share of
-#'
-#' mean(logical(0)) is NaN, which tbl_pct renders as "NaN%" and which a reader cannot tell from a
-#' computation that went wrong. A level a family never emits has no share, and the honest rendering
-#' of that is a dash.
-#'
-#' @param .x Logical vector, possibly empty.
-#' @return The mean, or NA_real_ where .x is empty.
-.geo_mean_or_na <- function(.x) {
-  if (FALSE) .x <- logical(0)
-  if (length(.x) == 0L) NA_real_ else mean(.x)
-}
-
-
 #' Apply every attachment specification, and score each against the registered address
 #'
 #' The sweep reports the thing a reach can be JUDGED on rather than only the thing it obviously moves.
@@ -785,16 +695,13 @@ geo_sweep <- function(.geo, .org, .keys, .specs, .quiet = FALSE) {
       dplyr::select(Combo, CityAddrMatch = PctMatchU)
 
     r_ |>
-      # A MEAN OVER NOTHING IS NOT ZERO AND IS NOT NaN. LexNLP emits no city at any point, so
-      # PctCityAtt is a mean over an empty vector: R returns NaN, tbl_pct renders "NaN%", and a
-      # reader has to work out whether that is a failure or an absence. Missing says absence.
       dplyr::summarise(
         Spans       = dplyr::n(),
         PctAttach   = mean(.data$Attached),
         PctToFiler  = mean(dplyr::coalesce(.data$OrgRole, "") == "filer"),
         MedDist     = stats::median(.data$DistToOrg, na.rm = TRUE),
-        PctStateAtt = .geo_mean_or_na(.data$Attached[.data$GeoLevel == "State"]),
-        PctCityAtt  = .geo_mean_or_na(.data$Attached[.data$GeoLevel == "City"]),
+        PctStateAtt = mean(.data$Attached[.data$GeoLevel == "State"]),
+        PctCityAtt  = mean(.data$Attached[.data$GeoLevel == "City"]),
         .by = Combo
       ) |>
       dplyr::left_join(v_, by = dplyr::join_by(Combo)) |>
@@ -822,13 +729,13 @@ geo_sweep <- function(.geo, .org, .keys, .specs, .quiet = FALSE) {
 #' @param .level Character. "country" or "state".
 #' @param .by_class Logical. Add the contract type, for small multiples.
 #' @return Tibble: one row per area, or per area and class.
-geo_map_input <- function(.roles, .keys, .combo = "matcon", .scope = c("all", "parties",
+geo_map_input <- function(.roles, .keys, .combo = "gazetteer", .scope = c("all", "parties",
                                                                           "counterparty"),
                           .level = c("country", "state"), .by_class = FALSE) {
   if (FALSE) {
     .roles    <- tab_roles
     .keys     <- tab_keys
-    .combo    <- "matcon"
+    .combo    <- "gazetteer"
     .scope    <- "all"
     .level    <- "country"
     .by_class <- FALSE
@@ -865,130 +772,6 @@ geo_map_input <- function(.roles, .keys, .combo = "matcon", .scope = c("all", "p
       dplyr::distinct(.data$DocID, .data$Area) |>
       dplyr::summarise(N = dplyr::n(), .by = Area)
   }
-}
-
-
-#' Which contract types reach outside the United States
-#'
-#' THE TABLE THAT REPLACED TWELVE WORLD MAPS, and the document had already made the argument against
-#' them: its own US map caption says a world map of US contracts is one dark country and a
-#' scattering. Twelve of those is twelve dark countries. The question the maps were asked -- which
-#' contract types reach abroad -- has a country-by-type answer, and a table gives it in one screen.
-#'
-#' The construct they were drawn with is also one this project has abandoned twice. A per-class
-#' tabset built by knit_child() emptied under Quarto's tabset filter in the 03 pass, and here it
-#' failed differently: a plot recorded inside a child is replayed on a device that has not registered
-#' the theme's font, and grid raises "invalid font type" the moment a label is drawn.
-#'
-#' THE UNITED STATES IS EXCLUDED FROM THE COLUMNS AND COUNTED SEPARATELY. Nearly every contract names
-#' it, so a column for it would be near-constant and would crowd out the variation the table exists
-#' to show. PctForeign is the summary: the share of contracts of that type placing a party anywhere
-#' else at all.
-#'
-#' @param .roles Tibble from geo_attach(), carrying CountryIso and CountryName.
-#' @param .keys Tibble from ent_anchor_keys(). Supplies the contract type and the denominator.
-#' @param .combo Character. Which family the table is drawn from.
-#' @param .scope Character. "all" for every span, "parties" for those attached to a filer or a
-#'   counterparty.
-#' @param .n Integer. Countries shown as columns, most frequent first.
-#' @return Tibble: one row per class plus an ALL row, one column per country.
-geo_class_countries <- function(.roles, .keys, .combo = "matcon", .scope = c("parties", "all"),
-                                .n = 10L) {
-  if (FALSE) {
-    .roles <- tab_roles
-    .keys  <- tab_keys
-    .combo <- "matcon"
-    .scope <- "parties"
-    .n     <- 10L
-  }
-  .scope <- match.arg(.scope)
-
-  src_ <- dplyr::filter(.roles, .data$Combo == .combo, !is.na(.data$CountryIso))
-  if (identical(.scope, "parties")) {
-    src_ <- dplyr::filter(src_, .data$Attached, .data$OrgRole %in% c("filer", "counterparty"))
-  }
-
-  # DOCUMENT-WEIGHTED. One table-heavy filing naming a country four hundred times would otherwise
-  # carry its own contract type on its own; a document either names a place or it does not.
-  doc_ <- src_ |>
-    dplyr::distinct(.data$DocID, .data$CountryIso, .data$CountryName) |>
-    dplyr::left_join(dplyr::select(.keys, "DocID", "Class"), by = dplyr::join_by(DocID)) |>
-    dplyr::mutate(Country = dplyr::coalesce(.data$CountryName, .data$CountryIso))
-
-  top_ <- doc_ |>
-    dplyr::filter(.data$CountryIso != "USA") |>
-    dplyr::count(.data$Country, name = "N", sort = TRUE) |>
-    utils::head(.n) |>
-    dplyr::pull(.data$Country)
-
-  denom_ <- dplyr::count(.keys, .data$Class, name = "Docs")
-
-  f_ <- function(.d, .lab) {
-    wide_ <- .d |>
-      dplyr::filter(.data$Country %in% top_) |>
-      dplyr::count(.data$Country, name = "N") |>
-      tidyr::pivot_wider(names_from = "Country", values_from = "N")
-    n_doc_  <- if (identical(.lab, "All documents")) nrow(.keys) else NA_integer_
-    tibble::tibble(Class = .lab, Docs = n_doc_) |>
-      dplyr::bind_cols(wide_)
-  }
-
-  per_ <- doc_ |>
-    dplyr::group_split(.data$Class) |>
-    purrr::map(\(.d) f_(.d, as.character(dplyr::first(.d$Class)))) |>
-    purrr::list_rbind() |>
-    dplyr::select(-"Docs") |>
-    dplyr::left_join(dplyr::mutate(denom_, Class = as.character(.data$Class)),
-                     by = dplyr::join_by(Class)) |>
-    dplyr::relocate("Docs", .after = "Class")
-
-  foreign_ <- doc_ |>
-    dplyr::filter(.data$CountryIso != "USA") |>
-    dplyr::summarise(NForeign = dplyr::n_distinct(.data$DocID), .by = "Class") |>
-    dplyr::mutate(Class = as.character(.data$Class))
-
-  out_ <- per_ |>
-    dplyr::left_join(foreign_, by = dplyr::join_by(Class)) |>
-    dplyr::mutate(
-      PctForeign = dplyr::coalesce(.data$NForeign, 0L) / .data$Docs,
-      .after = "Docs"
-    ) |>
-    dplyr::select(-"NForeign")
-
-  all_ <- f_(doc_, "All documents") |>
-    dplyr::mutate(
-      PctForeign = dplyr::n_distinct(doc_$DocID[doc_$CountryIso != "USA"]) / nrow(.keys),
-      .after = "Docs"
-    )
-
-  lev_ <- plot_levels("ClassDetailed")
-  dplyr::bind_rows(dplyr::arrange(out_, match(.data$Class, lev_)), all_) |>
-    dplyr::mutate(dplyr::across(dplyr::all_of(top_), \(.x) as.integer(dplyr::coalesce(.x, 0L))))
-}
-
-
-#' Print the country-by-type table
-#'
-#' @param .tab Tibble from geo_class_countries().
-#' @param .combo Character, for the title.
-#' @return Invisibly .tab.
-geo_report_class_countries <- function(.tab, .combo = "matcon") {
-  if (FALSE) {
-    .tab   <- tab_class_geo
-    .combo <- "matcon"
-  }
-
-  cli::cli_h2(paste0("Foreign countries by contract type -- ", .combo))
-  .tab |>
-    dplyr::mutate(PctForeign = tbl_pct(.data$PctForeign)) |>
-    tbl_say(.title = "Contracts placing a party in each country, document-weighted")
-
-  cli::cli_alert_info(
-    "The United States is excluded from the columns and summarised by PctForeign, because nearly \\
-     every contract names it and a near-constant column would crowd out the variation this table \\
-     exists to show. Counts are DOCUMENTS: a filing naming a country four hundred times counts once."
-  )
-  invisible(.tab)
 }
 
 
@@ -1167,91 +950,6 @@ geo_report_validate <- function(.tab) {
 }
 
 
-#' What each family's resolved columns actually carry
-#'
-#' THE CHECK THAT WOULD HAVE CAUGHT MY OWN ERROR. 04A's prose asserted that LexNLP emits no ISO codes
-#' -- reasoning from the fact that the codes are dropped as MATCH ALIASES, which is true and does not
-#' follow. The codes are properties of the matched entity, not of the alias that matched it, and the
-#' store carries ISO-3166-2 on 99.99% of LexNLP's GPE rows. A claim about a column belongs in a table
-#' the render produces, not in a paragraph someone reasoned their way to.
-#'
-#' The category coverage is the same shape of question one level up. geo_resolve() maps a family's
-#' raw class onto five levels, and a class string it does not recognise lands silently in "Other". A
-#' family whose Other share is large is either genuinely reaching a tier this hierarchy has no name
-#' for, or being mapped by a rule that has drifted from what it emits -- and the two look identical
-#' until the raw strings are printed beside the count.
-#'
-#' @param .geo Tibble from geo_resolve(), stacked over families.
-#' @return Tibble: one row per family, level and raw class.
-geo_coverage <- function(.geo) {
-  if (FALSE) .geo <- tab_geo
-
-  .geo |>
-    dplyr::summarise(
-      Spans     = dplyr::n(),
-      PctIso2   = mean(!is.na(.data$Iso2)),
-      PctIso3   = mean(!is.na(.data$Iso3)),
-      PctState  = mean(!is.na(.data$State)),
-      PctCounty = mean(!is.na(.data$County)),
-      PctAmbig  = mean(.data$Ambiguous),
-      .by = c(Combo, GeoLevel, RawClass)
-    ) |>
-    dplyr::arrange(.data$Combo, plot_factor(.data$GeoLevel, .key = "GeoLevel"),
-                   dplyr::desc(.data$Spans))
-}
-
-
-#' Print the resolved-column coverage, and say what would be wrong if it moved
-#'
-#' @param .tab Tibble from geo_coverage().
-#' @param .country Tibble from geo_country(), for the rollup report.
-#' @return Invisibly .tab.
-geo_report_coverage <- function(.tab, .country) {
-  if (FALSE) {
-    .tab     <- tab_cover
-    .country <- tab_geo
-  }
-
-  cli::cli_h2("What each family resolves, by raw class")
-  .tab |>
-    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x))) |>
-    tbl_say(.title = "Every class either family emits, and what it fills")
-
-  cli::cli_alert_info(
-    "A COLUMN NAME SHARED ACROSS FAMILIES IS NOT A SHARED QUANTITY. This table is per family for \\
-     that reason: matcon resolves a country code on every level and a subdivision code on everything \\
-     but a country, while LexNLP is the other way round. They are renamed apart on read and only \\
-     mapped together in geo_resolve(), where the mapping is visible."
-  )
-
-  other_ <- dplyr::filter(.tab, .data$GeoLevel == "Other")
-  if (nrow(other_) > 0L) {
-    cli::cli_alert_info(
-      "{nrow(other_)} raw class{?es} land in Other: \\
-       {paste(unique(other_$RawClass), collapse = ', ')}. These are first-level subdivisions of a \\
-       country this hierarchy has no tier for, which is deliberate -- a class arriving here that is \\
-       NOT one of those means the level mapping has drifted from what the family emits."
-    )
-  }
-
-  # THE ROLLUP, REPORTED RATHER THAN ASSERTED. It is the one place a country is inferred rather than
-  # read, so how often it fires and from what belongs on the page beside the number it produces.
-  roll_ <- .country |>
-    dplyr::summarise(Spans = dplyr::n(), .by = c(Combo, CountryFrom)) |>
-    dplyr::mutate(Share = tbl_pct(.data$Spans / sum(.data$Spans)), .by = Combo) |>
-    dplyr::arrange(.data$Combo, dplyr::desc(.data$Spans))
-
-  tbl_say(.tab = roll_, .title = "Where each span's country came from")
-  cli::cli_alert_info(
-    "ISO-3166-2 PREFIX is the recovery: of the geo dictionary's 437 entities only the 253 countries \\
-     carry a three-letter code, so a non-US subdivision has no ISO-3166-3 and its country is read \\
-     from the prefix of its subdivision code instead -- CA-AB is Canada. NONE is a span with no \\
-     country at any tier, which is what a state-level or word-like name should show."
-  )
-  invisible(.tab)
-}
-
-
 #' The attachment sweep
 #' @param .tab Tibble from geo_sweep().
 #' @return Invisibly .tab.
@@ -1286,10 +984,10 @@ geo_report_sweep <- function(.tab) {
 #' @param .doc Tibble from geo_doc_table().
 #' @param .combo Character. Which engine the table covers.
 #' @return Invisibly the summary.
-geo_report_class <- function(.doc, .combo = "matcon") {
+geo_report_class <- function(.doc, .combo = "gazetteer") {
   if (FALSE) {
     .doc   <- tab_doc
-    .combo <- "matcon"
+    .combo <- "gazetteer"
   }
 
   cli::cli_h2(paste0("The released variables, by contract type -- ", .combo))
@@ -1330,7 +1028,7 @@ geo_report_class <- function(.doc, .combo = "matcon") {
 #' @param .validate Tibble from geo_validate().
 #' @param .sweep Tibble from geo_sweep().
 #' @return Invisibly NULL.
-geo_report_all <- function(.geo, .orgtab, .doc, .validate, .sweep, .combo = "matcon") {
+geo_report_all <- function(.geo, .orgtab, .doc, .validate, .sweep, .combo = "gazetteer") {
   if (FALSE) {
     .geo      <- tab_geo
     .orgtab   <- tab_org_geo

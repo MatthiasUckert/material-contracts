@@ -1,8 +1,8 @@
 # 04B3-Rules-DATE: signing, end and duration -------------------------------------------------------------------------
 #
 # WHAT THIS FILE DOES
-# Turns parsed dates and stated terms into a contract duration. Function prefix is `dte_`, so nothing
-# here collides with the `ent_`, `geo_`, `mny_`, `red_` or `plot_` layers.
+# Turns parsed dates into a contract duration. Function prefix is `dte_`, so nothing here collides
+# with the `ent_`, `geo_`, `mny_`, `red_` or `plot_` layers.
 #
 # THE NUMBER THAT MADE THIS DOCUMENT NECESSARY
 # Table 3 Panel B reports contract duration with a mean of 2.38 years, a median of 0.40 and a
@@ -13,24 +13,6 @@
 #
 # The published definition is the first row of the sweep rather than a thing this document replaces
 # sight unseen, and SdOverCap appears in every row: it cannot exceed one half.
-#
-# THE STATED TERM NOW COMES FROM THE STORE, AND THAT IS THE ONE STRUCTURAL CHANGE
-# An earlier version of this file carried dte_term(), which re-implemented stated-term extraction in
-# R with its own regex over the canonical text. It worked and it could never leave the sample: 04C
-# writes no corpus text file -- the text is 1.19 million separate parquets in the mirror -- so any
-# variable built on it stopped at 4,398 documents. dateregex-v3 emits TERM as a second label from the
-# same pass that produces DATE, so the terms arrive in the store with offsets like everything else.
-#
-# THE EXTRACTOR STATES, THE RULE DECIDES. The engine emits every stated period it can find and
-# records WHICH PATTERN found it in LabelRaw. This file chooses which of those patterns count as a
-# contract duration. That was already the shape of the old .term_kinds argument; it is now a filter
-# on provenance the extractor supplies rather than on a distinction re-derived here.
-#
-# AND THE UNIT REPLACES THE PATTERN AS THE DEMOTION RULE. The old code split "term of" from "period
-# of" and demoted the second, because pooling them "put 127 documents at thirty days". The pattern
-# was a proxy: thirty DAYS is a notice window and five YEARS is a term, and the engine emits TermN
-# and TermUnit as columns, so the rule says that directly instead of inferring it from the drafter's
-# choice of noun. Both dials are swept.
 #
 # NO CLUSTERING, AND THAT IS A CORRECTION
 # An earlier version collapsed each document to one row per calendar date, keeping the earliest
@@ -48,7 +30,7 @@
 # unchanged. So the end rule reads the whole document, and the head restriction on the START is a
 # swept row rather than a rule.
 #
-# THE THREE THINGS A CONTRACT CAN SAY ABOUT WHEN IT ENDS, AND A FOURTH THAT IS NOT SILENCE
+# THE THREE THINGS A CONTRACT CAN SAY ABOUT WHEN IT ENDS
 #   1. A STATED TERM -- "for a period of five (5) years from the Effective Date". A duration with no
 #      end date at all, and once the start is known it is arithmetic. This is what the contract SAYS,
 #      rather than a maximum over dates it happens to mention, so it outranks the other two.
@@ -56,23 +38,10 @@
 #   3. NOTHING, in which case the farthest future date is taken and recorded as such. That is the
 #      published definition, and it picks up a patent expiry and a perpetuity boilerplate along with
 #      the contract's own end.
-#   4. AN OPEN-ENDED TERM -- "shall continue until terminated". The engine emits this as a span with
-#      TermYears null, which is a stated term of UNKNOWN length rather than an absent one. It gets
-#      its own DurationSource and a missing duration, because a perpetual agreement has no duration
-#      and saying so is a finding. Under the old code it fell through to the farthest future date,
-#      which is exactly the wrong answer for the one form that says it will not end.
-# DurationSource distinguishes all four, because they are not the same evidence.
+# DurationSource distinguishes all three, because they are not the same evidence.
 #
 # THE CAP DROPS, IT DOES NOT WINSORISE. A duration of exactly thirty years that is not one is worse
 # than a missing value.
-#
-# WHICH FAMILY SUPPLIES THE DATES IS THE RIGHT-TAIL TEST, not a preference. matcon's patterns require
-# a year in the text by construction -- four digits in nine of them, two in one -- so there is no
-# partial match to complete and no clock to complete it from. LexNLP's grammar has no such
-# constraint, and dateregex.py measures the consequence on this sample: of its spans carrying no
-# written year, 76% resolve to the FUTURE at a median of 11.6 years out, and 80.8% of all dates more
-# than fifteen years out are year-less. The duration is therefore computed per family and pooled, and
-# SdOverCap sits beside each -- which is the direct answer to the referee's question.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
@@ -80,7 +49,7 @@
 
 if (FALSE) {
   .path_text <- .lP$Input$Text
-  .dir_store <- .lP$Input$Store
+  .db_path   <- .lP$Input$Store
 }
 
 
@@ -94,24 +63,8 @@ plot_register_levels(
 
 plot_register_levels(
   .key    = "DurationSource",
-  .levels = c("term", "cue", "maxdate", "open", "none"),
-  .short  = c("term", "cue", "maxdate", "open", "none")
-)
-
-# THE ENGINE'S OWN PROVENANCE, ordered by how strong a claim each pattern makes about a DURATION.
-# UnitTerm and ContinueFor say a term outright; PeriodOf and Anniversary say one above a floor;
-# UnitPeriod is a notice, cure or payment window; OpenEnded is unbounded. The order is the precedence
-# a document stating several is resolved by.
-plot_register_levels(
-  .key    = "TermKind",
-  .levels = c("UnitTerm", "ContinueFor", "PeriodOf", "Anniversary", "UnitPeriod", "OpenEnded"),
-  .short  = c("unit term", "continue", "period of", "anniv", "unit period", "open")
-)
-
-plot_register_levels(
-  .key    = "DateEngine",
-  .levels = c("lexnlp", "matcon", "pooled"),
-  .short  = c("lexnlp", "matcon", "pooled")
+  .levels = c("term", "cue", "maxdate", "none"),
+  .short  = c("term", "cue", "maxdate", "none")
 )
 
 plot_register_levels(
@@ -127,14 +80,6 @@ plot_register_levels(
 )
 
 
-# THE THREE VOCABULARIES THAT USED TO LIVE HERE ARE GONE. .dte_number, .dte_ordinal and
-# .dte_unit_years existed to turn "five (5) years" into 5 and "years" into 1.0, inside an R regex
-# that read the canonical text. dateregex-v3 does that in the extractor and emits TermN, TermUnit and
-# TermYears as columns, so the arithmetic happens once, in the language that owns the pattern, and
-# the corpus gets the same answer as the sample. What remains here is the cue list, which is a RULE:
-# it decides which future dates count as a termination and nothing upstream can decide that.
-
-
 # 2. Cues and terms ----------------------------------------------------------------------------------------------------
 # TWO SMALL VOCABULARIES AND A HIT RATE FOR EVERY ENTRY. Neither list is defended by argument: the
 # report prints how often each term fires and on what share of future dates, and a term that fires
@@ -145,6 +90,20 @@ plot_register_levels(
 
 .dte_end_cue <- c("EXPIR", "TERMINAT", "MATURIT", "UNTIL", "THROUGH", "SHALL END", "ENDS ON",
                   "ENDING", "TERM SHALL", "TERM OF THIS")
+
+
+# Written-out numbers, because a contract writes "five (5) years" as often as "5 years" and about as
+# often as "five years". Where the parenthesised digit is present it wins, since it is the drafter's
+# own disambiguation.
+.dte_number <- c(ONE = 1, TWO = 2, THREE = 3, FOUR = 4, FIVE = 5, SIX = 6, SEVEN = 7, EIGHT = 8,
+                 NINE = 9, TEN = 10, ELEVEN = 11, TWELVE = 12, THIRTEEN = 13, FOURTEEN = 14,
+                 FIFTEEN = 15, SIXTEEN = 16, SEVENTEEN = 17, EIGHTEEN = 18, NINETEEN = 19,
+                 TWENTY = 20, THIRTY = 30, FORTY = 40, FIFTY = 50)
+
+.dte_ordinal <- c(FIRST = 1, SECOND = 2, THIRD = 3, FOURTH = 4, FIFTH = 5, SIXTH = 6, SEVENTH = 7,
+                  EIGHTH = 8, NINTH = 9, TENTH = 10, FIFTEENTH = 15, TWENTIETH = 20)
+
+.dte_unit_years <- c(DAY = 1 / 365.25, WEEK = 7 / 365.25, MONTH = 1 / 12, YEAR = 1)
 
 
 # 3. Input -------------------------------------------------------------------------------------------------------------
@@ -158,49 +117,34 @@ plot_register_levels(
 #'   preamble.
 #' @param .end Character. "term" is the full cascade -- stated term, then dated termination, then the
 #'   farthest future date. "cue" drops the term arm; "any" is the published definition.
-#' @param .family Character. Which family's DATE spans the rule reads: "matcon", "lexnlp" or
-#'   "pooled". NOT A PREFERENCE BUT THE RIGHT-TAIL TEST. matcon's patterns require a year in the text
-#'   by construction; LexNLP's grammar does not, and 76% of its year-less spans resolve to the future
-#'   at a median of 11.6 years out. Sweeping this is how the referee's question about the right tail
-#'   gets an answer rather than an assurance. TERM spans always come from matcon, which is the only
-#'   family that emits them.
 #' @param .head_floor Integer. Head width in characters, used only when .start is "head".
 #' @param .head_share Numeric. Head share of document length, taken as max() with the floor.
 #' @param .tail_share Numeric. Tail share, reported in the region table and used by no rule.
 #' @param .cue_win Integer. Characters read before a date for the termination cue.
 #' @param .cap_years Numeric. Durations beyond this are DROPPED, not winsorised: a duration of
 #'   exactly the cap that is not one is worse than a missing value. Inf is the uncapped reference.
-#' @param .require_year Logical. Use only DATE spans whose text carries a four-digit year. Largely
-#'   the same axis as .family -- matcon enforces it upstream -- and kept separate because it applies
-#'   to LexNLP's spans, where the constraint does not exist.
-#' @param .term_kinds Character vector of LabelRaw values admitted as a stated term. These are the
-#'   ENGINE'S OWN pattern names, so the rule filters on provenance the extractor supplied rather than
-#'   on a distinction re-derived in R. UnitPeriod is excluded by default because a "thirty (30) day
-#'   period" is a notice, a cure or a payment window; OpenEnded is excluded here and handled as its
-#'   own outcome rather than as a term of no length.
-#' @param .term_floor Numeric. Shortest stated term admitted as a DURATION, in years. THE UNIT
-#'   REPLACES THE PATTERN as the demotion rule: the old code demoted "period of" because pooling it
-#'   with "term of" put 127 documents at thirty days, but the pattern was a proxy for what the number
-#'   and the unit say directly. Zero admits everything and is a swept row.
+#' @param .require_year Logical. Use only spans that carry a four-digit year. A span without one had
+#'   its year inferred by the parser, and the parser infers the present year -- which is how "Section
+#'   3-1" became 2026-03-01 and "Exhibit 10-15" became 2026-10-15. Swept rather than imposed, because
+#'   a contract does write "expires December 31" and mean the current year.
+#' @param .term_kinds Character vector. Which stated-term families count as a duration. "term of" is
+#'   what a contract calls its own duration; "period of" is a notice period, a cure period or a
+#'   payment window as often as it is a term, and pooling them put 127 documents at thirty days.
 #' @param .label Character or NULL. Overrides the generated label.
 #' @return A named list carrying the specification.
-dte_spec <- function(.start = "latest", .end = "term", .family = "matcon",
-                     .head_floor = 3000L, .head_share = 0.10, .tail_share = 0.20,
-                     .cue_win = 120L, .cap_years = 30, .require_year = FALSE,
-                     .term_kinds = c("UnitTerm", "ContinueFor", "PeriodOf", "Anniversary"),
-                     .term_floor = 0, .label = NULL) {
+dte_spec <- function(.start = "latest", .end = "term", .head_floor = 3000L, .head_share = 0.10,
+                     .tail_share = 0.20, .cue_win = 120L, .cap_years = 30, .require_year = FALSE,
+                     .term_kinds = c("term of", "anniversary"), .label = NULL) {
   if (FALSE) {
-    .start        <- "latest"
-    .end          <- "term"
-    .family       <- "matcon"
-    .head_floor   <- 3000L
-    .head_share   <- 0.10
-    .tail_share   <- 0.20
+    .start      <- "latest"
+    .end        <- "term"
+    .head_floor <- 3000L
+    .head_share <- 0.10
+    .tail_share <- 0.20
     .cue_win      <- 120L
     .cap_years    <- 30
     .require_year <- FALSE
-    .term_kinds   <- c("UnitTerm", "ContinueFor", "PeriodOf", "Anniversary")
-    .term_floor   <- 0
+    .term_kinds   <- c("term of", "anniversary")
     .label        <- NULL
   }
 
@@ -208,145 +152,55 @@ dte_spec <- function(.start = "latest", .end = "term", .family = "matcon",
     cli::cli_abort("{.arg .start} must be latest, head or filed.")
   }
   if (!.end %in% c("term", "cue", "any")) cli::cli_abort("{.arg .end} must be term, cue or any.")
-  if (!.family %in% c("matcon", "lexnlp", "pooled")) {
-    cli::cli_abort("{.arg .family} must be matcon, lexnlp or pooled.")
-  }
 
   lab_ <- if (!is.null(.label)) {
     .label
   } else {
-    paste0(.family, " / ", .start, " / ", .end, " / ",
+    paste0(.start, " / ", .end, " / ",
            if (is.infinite(.cap_years)) "uncapped" else paste0(.cap_years, "y"),
-           if (.require_year) " / year" else "",
-           if (.term_floor > 0) paste0(" / >", .term_floor, "y") else "")
+           if (.require_year) " / year" else "")
   }
 
-  list(Start = .start, End = .end, Family = .family,
-       HeadFloor = as.integer(.head_floor), HeadShare = .head_share,
+  list(Start = .start, End = .end, HeadFloor = as.integer(.head_floor), HeadShare = .head_share,
        TailShare = .tail_share, CueWin = as.integer(.cue_win), CapYears = .cap_years,
-       RequireYear = isTRUE(.require_year), TermKinds = .term_kinds, TermFloor = .term_floor,
-       Label = lab_)
+       RequireYear = isTRUE(.require_year), TermKinds = .term_kinds, Label = lab_)
 }
 
 
-#' Load the DATE spans from both families and keep the ones that parsed
+#' Load the date spans from both engines and keep the ones that parsed
 #'
-#' Both families parse nearly everything they emit -- 99.2% and 99.6% -- so the unparsed remainder is
+#' Both engines parse nearly everything they emit -- 99.2% and 99.6% -- so the unparsed remainder is
 #' a rounding error rather than a population. That is worth saying because the same is not true of
-#' spaCy, which the corpus pass does not run and which emits no date at all.
+#' spaCy, which the corpus pass does not run.
 #'
 #' NO CLUSTERING. Every span survives, because the cue has to be tested where the drafter wrote it
 #' and a collapsed row can only be tested once.
 #'
-#' @param .dir_store Directory holding the family databases.
+#' @param .db_path 04A's candidate store.
 #' @param .lens Tibble from ent_doc_lens().
-#' @param .families Character vector of family names.
+#' @param .combos Named character vector of engine tokens.
 #' @param .quiet Logical. Suppress the count messages.
 #' @return Tibble: one row per span, with Combo and DateValue.
-dte_load <- function(.dir_store, .lens, .families = c("lexnlp", "matcon"), .quiet = FALSE) {
+dte_load <- function(.db_path, .lens, .combos, .quiet = FALSE) {
   if (FALSE) {
-    .dir_store <- .lP$Input$Store
-    .lens      <- tab_lens
-    .families  <- .lP$Params$Families
-    .quiet     <- FALSE
+    .db_path <- .lP$Input$Store
+    .lens    <- tab_lens
+    .combos  <- .lP$Params$Combos
+    .quiet   <- FALSE
   }
 
-  purrr::map(.families, \(.fam) ent_load_entity(
-    .dir_store = .dir_store,
-    .family    = .fam,
-    .entity    = "DATE",
-    .lens      = .lens,
-    .extras    = ent_extras(.fam, "DATE"),   # lexnlp adds DateScore; matcon has DateValue alone
-    .quiet     = .quiet
-  ) |>
-    dplyr::mutate(Combo = .fam, .before = 1L)) |>
+  purrr::imap(.combos, function(.combo, .engine) {
+    ent_load_label(
+      .db_path = .db_path, .lens = .lens, .label = "date", .combo = .combo,
+      .extras = c("DateValue", "DateScore"), .quiet = .quiet
+    ) |>
+      dplyr::mutate(Combo = .engine, .before = 1L)
+  }) |>
     purrr::list_rbind() |>
     dplyr::mutate(
       DateValue = suppressWarnings(anytime::anydate(as.character(.data$DateValue))),
       Parsed    = !is.na(.data$DateValue)
     )
-}
-
-
-#' Load the TERM spans, and collapse them to one stated term per document
-#'
-#' REPLACES dte_term(), WHICH READ THE TEXT. That function ran its own regex over the canonical text
-#' in R, which worked on 4,398 documents and could never work on 1.19 million: 04C writes no corpus
-#' text file, because the text is one parquet per document in the mirror. dateregex-v3 emits TERM
-#' from the same pass that produces DATE, so a term now arrives in the store with offsets, a parsed
-#' number, a unit and the name of the pattern that found it.
-#'
-#' MATCON ONLY, because it is the only family that emits a term at all. LexNLP has no such label.
-#'
-#' PRECEDENCE, NOT UNION. A document saying "term of three years" and "period of thirty days" has
-#' said one thing about its duration and one thing about its notice, and the first is the answer. The
-#' order is the registered TermKind vocabulary; within one kind the FIRST match wins, since the term
-#' clause precedes the schedules that restate parts of it.
-#'
-#' OpenEnded IS KEPT AND MARKED. "shall continue until terminated" carries a null TermYears, which is
-#' a stated term of unknown length rather than an absent one. Excluding it here would send the
-#' document to the farthest-future-date arm, which is the wrong answer for the one drafting form that
-#' says the contract will not end.
-#'
-#' @param .dir_store Directory holding the family databases.
-#' @param .lens Tibble from ent_doc_lens().
-#' @param .quiet Logical. Suppress the count message.
-#' @return Tibble: one row per document stating a term, with the kind, the number, the unit, the
-#'   years and the position. Documents stating none are absent.
-dte_load_terms <- function(.dir_store, .lens, .quiet = FALSE) {
-  if (FALSE) {
-    .dir_store <- .lP$Input$Store
-    .lens      <- tab_lens
-    .quiet     <- FALSE
-  }
-
-  raw_ <- ent_load_entity(
-    .dir_store = .dir_store,
-    .family    = "matcon",
-    .entity    = "TERM",
-    .lens      = .lens,
-    .extras    = ent_extras("matcon", "TERM"),   # TermN, TermUnit, TermYears
-    .quiet     = .quiet
-  ) |>
-    dplyr::mutate(
-      TermKind  = .data$LabelRaw,
-      TermYears = as.numeric(.data$TermYears),
-      TermN     = as.numeric(.data$TermN),
-      IsOpen    = .data$TermKind == "OpenEnded"
-    )
-
-  rank_ <- stats::setNames(seq_along(plot_levels("TermKind")), plot_levels("TermKind"))
-  bad_  <- setdiff(unique(raw_$TermKind), names(rank_))
-  if (length(bad_) > 0L) {
-    cli::cli_abort(c(
-      "dateregex emits {length(bad_)} TERM pattern{?s} the vocabulary does not name: \\
-       {paste(bad_, collapse = ', ')}.",
-      "i" = "Register {length(bad_)} name{?s} in TermKind, so the precedence order says what to do."
-    ))
-  }
-
-  out_ <- raw_ |>
-    dplyr::mutate(KindRank = unname(rank_[.data$TermKind])) |>
-    dplyr::arrange(.data$DocID, .data$KindRank, .data$Start) |>
-    dplyr::slice_head(n = 1L, by = DocID) |>
-    dplyr::select("DocID", "TermKind", "TermN", "TermUnit", "TermYears", "IsOpen",
-                  TermStart = "Start", TermStop = "Stop", TermSpan = "Span")
-
-  n_ <- raw_ |>
-    dplyr::summarise(NTermSpan = dplyr::n(), NTermKind = dplyr::n_distinct(.data$TermKind),
-                     .by = DocID)
-
-  out_ <- dplyr::left_join(out_, n_, by = dplyr::join_by(DocID))
-
-  if (!.quiet) {
-    cli::cli_alert_success(
-      "Stated term in {format(nrow(out_), big.mark = ',')} \\
-       {cli::qty(nrow(out_))}document{?s}, from {format(nrow(raw_), big.mark = ',')} \\
-       {cli::qty(nrow(raw_))}span{?s}. {format(sum(out_$IsOpen), big.mark = ',')} \\
-       {cli::qty(sum(out_$IsOpen))}{?is/are} open-ended."
-    )
-  }
-  out_
 }
 
 
@@ -415,6 +269,109 @@ dte_describe <- function(.dates, .keys, .path_text, .spec) {
 }
 
 
+# 4. The stated term ---------------------------------------------------------------------------------------------------
+
+#' Terms a contract states in words rather than as a date
+#'
+#' "for a period of five (5) years from the Effective Date" is a duration with no end date at all,
+#' and once the start is known it is arithmetic. It is also what the contract SAYS, against a maximum
+#' over dates it merely mentions, which is why it outranks the other two arms.
+#'
+#' TWO FAMILIES, DELIBERATELY. A period or term of N units, and an Nth anniversary. A contract has
+#' many ways of stating a term and this catches two of them; the rest is reported as absent rather
+#' than chased, because the point is to reduce noise and not to eliminate it.
+#'
+#' The FIRST match in the document is taken, since the term clause precedes the schedules that
+#' restate parts of it, and the number of matches is carried so a document stating several is
+#' visible rather than silently resolved.
+#'
+#' @param .path_text 04A's canonical text parquet.
+#' @param .quiet Logical. Suppress the count message.
+#' @return Tibble: DocID, TermYears, TermText, TermKind, NTermMatch. One row per document that states
+#'   a term; documents stating none are absent.
+dte_term <- function(.path_text, .quiet = FALSE) {
+  if (FALSE) {
+    .path_text <- .lP$Input$Text
+    .quiet     <- FALSE
+  }
+
+  num_ <- paste(names(.dte_number), collapse = "|")
+  ord_ <- paste(names(.dte_ordinal), collapse = "|")
+  unt_ <- paste(names(.dte_unit_years), collapse = "|")
+
+  # TERM OF AND PERIOD OF ARE SPLIT, and the split is the point. "term of three (3) years" is what a
+  # contract calls its own duration; "period of thirty (30) days" is a notice period, a cure period
+  # or a payment window, and pooling the two put 127 documents at 30 days and dragged the median of
+  # credit agreements to one year. Both families are extracted, both are reported, and the caller
+  # chooses which count as a duration.
+  rx_of_ <- function(.lead) {
+    paste0(.lead, "\\s+OF\\s+(?:APPROXIMATELY\\s+)?(", num_,
+           "|\\d{1,3})\\s*(?:\\(\\s*(\\d{1,3})\\s*\\))?\\s+(", unt_, ")S?\\b")
+  }
+  rx_term_   <- rx_of_("TERM")
+  rx_period_ <- rx_of_("PERIOD")
+  rx_anniv_  <- paste0("(", ord_, "|\\d{1,2})(?:ST|ND|RD|TH)?\\s+ANNIVERSARY")
+
+  body_ <- arrow::read_parquet(.path_text) |>
+    dplyr::transmute(DocID, Body = stringi::stri_trans_toupper(
+      stringi::stri_replace_all_regex(.data$TextRaw, "\\s+", " ")
+    ))
+
+  # Numbers arrive as a word or as digits; the parenthesised digit wins where the drafter supplied
+  # both, because it is their own disambiguation of their own sentence.
+  as_num_ <- function(.word, .digit, .map) {
+    dplyr::case_when(
+      !is.na(.digit) & nzchar(.digit)             ~ suppressWarnings(as.numeric(.digit)),
+      stringi::stri_detect_regex(.word, "^\\d+$") ~ suppressWarnings(as.numeric(.word)),
+      TRUE                                        ~ unname(.map[.word])
+    )
+  }
+
+  of_ <- function(.rx, .kind) {
+    body_ |>
+      dplyr::mutate(M = stringi::stri_match_first_regex(.data$Body, .rx)) |>
+      dplyr::mutate(
+        NMatch    = stringi::stri_count_regex(.data$Body, .rx),
+        TermN     = as_num_(.data$M[, 2], .data$M[, 3], .dte_number),
+        TermYears = .data$TermN * unname(.dte_unit_years[.data$M[, 4]]),
+        TermText  = .data$M[, 1],
+        TermKind  = .kind
+      ) |>
+      dplyr::filter(!is.na(.data$TermYears), .data$TermYears > 0) |>
+      dplyr::select(DocID, TermYears, TermText, TermKind, NTermMatch = NMatch)
+  }
+
+  term_   <- of_(.rx = rx_term_,   .kind = "term of")
+  period_ <- of_(.rx = rx_period_, .kind = "period of")
+
+  ann_ <- body_ |>
+    dplyr::mutate(M = stringi::stri_match_first_regex(.data$Body, rx_anniv_)) |>
+    dplyr::mutate(
+      NMatch    = stringi::stri_count_regex(.data$Body, rx_anniv_),
+      TermYears = as_num_(.data$M[, 2], NA_character_, .dte_ordinal),
+      TermText  = .data$M[, 1],
+      TermKind  = "anniversary"
+    ) |>
+    dplyr::filter(!is.na(.data$TermYears), .data$TermYears > 0) |>
+    dplyr::select(DocID, TermYears, TermText, TermKind, NTermMatch = NMatch)
+
+  # PRECEDENCE, not union. A document saying "term of three years" and "period of thirty days" has
+  # said one thing about its duration and one thing about its notice, and the first is the answer.
+  out_ <- dplyr::bind_rows(term_, ann_, period_) |>
+    dplyr::mutate(KindRank = match(.data$TermKind, c("term of", "anniversary", "period of"))) |>
+    dplyr::slice_min(order_by = .data$KindRank, n = 1L, by = DocID, with_ties = FALSE) |>
+    dplyr::select(-KindRank)
+
+  if (!.quiet) {
+    cli::cli_alert_success(
+      "Stated term found in {format(nrow(out_), big.mark = ',')} \\
+       document{cli::qty(nrow(out_))}{?s}."
+    )
+  }
+  out_
+}
+
+
 # 5. The duration ------------------------------------------------------------------------------------------------------
 
 #' One start, one end and a duration per document
@@ -429,7 +386,7 @@ dte_describe <- function(.dates, .keys, .path_text, .spec) {
 #' unfiltered set.
 #'
 #' @param .dates Tibble from dte_describe().
-#' @param .terms Tibble from dte_load_terms().
+#' @param .terms Tibble from dte_term().
 #' @param .keys Tibble from ent_anchor_keys().
 #' @param .spec List from dte_spec().
 #' @return Tibble: one row per document.
@@ -441,34 +398,11 @@ dte_duration <- function(.dates, .terms, .keys, .spec) {
     .spec  <- .lP$Params$Spec
   }
 
-  # THE FAMILY FILTER IS THE FIRST THING APPLIED, because every quantity below is computed over the
-  # spans it leaves. "pooled" is both families stacked, which is the published shape.
-  src_ <- if (identical(.spec$Family, "pooled")) {
-    .dates
-  } else {
-    dplyr::filter(.dates, .data$Combo == .spec$Family)
-  }
-
   # The year guard applies to every date this rule reads, start and end alike: a span whose year the
-  # parser inferred is no more trustworthy as a signing date than as an expiry. It is nearly a no-op
-  # under Family = "matcon", whose patterns require a year in the text, and is the point of the
-  # argument under "lexnlp", whose grammar does not.
-  if (isTRUE(.spec$RequireYear)) src_ <- dplyr::filter(src_, .data$HasYear)
+  # parser inferred is no more trustworthy as a signing date than as an expiry.
+  src_ <- if (isTRUE(.spec$RequireYear)) dplyr::filter(.dates, .data$HasYear) else .dates
 
-  # TWO DIALS ON THE TERM, and they are different questions. TermKinds asks which PATTERNS state a
-  # duration; TermFloor asks how long a stated period has to be before it is one. An open-ended term
-  # passes neither and is carried separately, because it is an outcome rather than a value.
-  open_ <- dplyr::filter(.terms, .data$IsOpen) |>
-    dplyr::select("DocID", OpenKind = "TermKind")
-
-  terms_ <- .terms |>
-    dplyr::filter(
-      .data$TermKind %in% .spec$TermKinds,
-      !.data$IsOpen,
-      !is.na(.data$TermYears),
-      .data$TermYears >= .spec$TermFloor
-    ) |>
-    dplyr::select("DocID", "TermYears", "TermKind")
+  terms_ <- dplyr::filter(.terms, .data$TermKind %in% .spec$TermKinds)
 
   past_ <- src_ |>
     dplyr::filter(!is.na(.data$GapDays), .data$GapDays <= 0L)
@@ -504,8 +438,8 @@ dte_duration <- function(.dates, .terms, .keys, .spec) {
     dplyr::left_join(signed_,  by = dplyr::join_by(DocID)) |>
     dplyr::left_join(end_any_, by = dplyr::join_by(DocID)) |>
     dplyr::left_join(end_cue_, by = dplyr::join_by(DocID)) |>
-    dplyr::left_join(terms_,   by = dplyr::join_by(DocID)) |>
-    dplyr::left_join(open_,    by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(dplyr::select(terms_, DocID, TermYears, TermKind),
+                     by = dplyr::join_by(DocID)) |>
     dplyr::mutate(
       dplyr::across(c(NSpans, NDates, NFuture, NCued),
                     \(.x) as.integer(dplyr::coalesce(.x, 0L))),
@@ -517,38 +451,26 @@ dte_duration <- function(.dates, .terms, .keys, .spec) {
       StartSource = dplyr::case_when(
         identical(.spec$Start, "filed") ~ "filed",
         !is.na(.data$DateSigned)        ~ "signed",
-        .default                        = "filed"
+        TRUE                            ~ "filed"
       ),
       UseTerm = identical(.spec$End, "term") & !is.na(.data$TermYears),
-      # AN OPEN-ENDED TERM OUTRANKS THE FARTHEST FUTURE DATE AND NOT A STATED ONE. A document saying
-      # both "five year term" and "shall continue until terminated" has stated a length, and the
-      # length is the answer; a document saying only the second has stated that it has no length,
-      # which is a different thing from having said nothing.
-      IsOpenEnd = !.data$UseTerm & identical(.spec$End, "term") & !is.na(.data$OpenKind),
-      UseCue  = !.data$UseTerm & !.data$IsOpenEnd & .spec$End %in% c("term", "cue") &
-                !is.na(.data$EndCue),
+      UseCue  = !.data$UseTerm & .spec$End %in% c("term", "cue") & !is.na(.data$EndCue),
       EndTerm = .data$DateStart + round(.data$TermYears * 365.25),
       DateEnd = dplyr::case_when(
-        .data$UseTerm   ~ .data$EndTerm,
-        .data$IsOpenEnd ~ lubridate::NA_Date_,
-        .data$UseCue    ~ .data$EndCue,
-        .default        = .data$EndAny
+        .data$UseTerm ~ .data$EndTerm,
+        .data$UseCue  ~ .data$EndCue,
+        TRUE          ~ .data$EndAny
       ),
       DurationSource = dplyr::case_when(
-        .data$UseTerm         ~ "term",
-        .data$IsOpenEnd       ~ "open",
-        .data$UseCue          ~ "cue",
-        !is.na(.data$DateEnd) ~ "maxdate",
-        .default              = "none"
+        .data$UseTerm            ~ "term",
+        .data$UseCue             ~ "cue",
+        !is.na(.data$DateEnd)    ~ "maxdate",
+        TRUE                     ~ "none"
       ),
       # A stated term that REPLACED a future date the document also carried, rather than filling a
       # gap. Defensible -- a term is what the contract says about itself -- but it is a large silent
       # substitution and this is what makes it countable.
       TermOverrode = .data$UseTerm & !is.na(.data$EndAny),
-      # And the reverse: a document with NO future date whose only statement about its end is the
-      # stated term. These are the documents the published maxdate definition gets most wrong,
-      # because for them it has nothing to take a maximum over.
-      TermFilledGap = .data$UseTerm & is.na(.data$EndAny),
       RawYears = as.numeric(.data$DateEnd - .data$DateStart) / 365.25,
       IsCapped = !is.na(.data$RawYears) & .data$RawYears > .spec$CapYears,
       IsNeg    = !is.na(.data$RawYears) & .data$RawYears < 0,
@@ -580,7 +502,6 @@ dte_row <- function(.dur, .spec) {
 
   tibble::tibble(
     Spec       = .spec$Label,
-    Family     = .spec$Family,
     Start      = .spec$Start,
     End        = .spec$End,
     Cap        = .spec$CapYears,
@@ -588,9 +509,7 @@ dte_row <- function(.dur, .spec) {
     PctTerm    = mean(.dur$DurationSource == "term"),
     PctCue     = mean(.dur$DurationSource == "cue"),
     PctMaxDate = mean(.dur$DurationSource == "maxdate"),
-    PctOpen    = mean(.dur$DurationSource == "open"),
     PctOverride = mean(.dur$TermOverrode, na.rm = TRUE),
-    PctFilledGap = mean(.dur$TermFilledGap, na.rm = TRUE),
     PctCapped  = mean(.dur$IsCapped, na.rm = TRUE),
     PctNeg     = mean(.dur$IsNeg, na.rm = TRUE),
     N          = length(d_),
@@ -621,7 +540,7 @@ dte_row <- function(.dur, .spec) {
 #' description.
 #'
 #' @param .desc Tibble from dte_describe().
-#' @param .terms Tibble from dte_load_terms().
+#' @param .terms Tibble from dte_term().
 #' @param .keys Tibble from ent_anchor_keys().
 #' @param .specs List of lists from dte_spec().
 #' @param .quiet Logical. Suppress the progress bar.
@@ -843,69 +762,43 @@ dte_report_cues <- function(.tab) {
 
 
 #' Terms stated in words
-#' @param .terms Tibble from dte_load_terms().
+#' @param .terms Tibble from dte_term().
 #' @param .n_docs Integer. Documents in the sample.
-#' @param .spec List from dte_spec(). Says which patterns this run admits.
 #' @return Invisibly the summary.
-dte_report_terms <- function(.terms, .n_docs, .spec) {
+dte_report_terms <- function(.terms, .n_docs) {
   if (FALSE) {
     .terms  <- tab_terms
     .n_docs <- nrow(tab_keys)
-    .spec   <- .lP$Params$Spec
   }
 
   cli::cli_h2("Terms stated in words")
   out_ <- .terms |>
     dplyr::summarise(
-      Docs       = dplyr::n(),
-      MedYears   = stats::median(.data$TermYears, na.rm = TRUE),
-      P90Years   = unname(stats::quantile(.data$TermYears, 0.9, na.rm = TRUE)),
-      PctSubYear = mean(.data$TermYears < 1, na.rm = TRUE),
-      MedSpans   = stats::median(.data$NTermSpan),
-      Admitted   = dplyr::first(.data$TermKind) %in% .spec$TermKinds,
+      Docs      = dplyr::n(),
+      MedYears  = stats::median(.data$TermYears),
+      P90Years  = unname(stats::quantile(.data$TermYears, 0.9)),
+      PctSubYear = mean(.data$TermYears < 1),
+      MedMatch  = stats::median(.data$NTermMatch),
       .by = TermKind
     ) |>
-    dplyr::mutate(PctOfSample = .data$Docs / .n_docs) |>
-    dplyr::arrange(plot_factor(.data$TermKind, .key = "TermKind"))
+    dplyr::mutate(PctOfSample = .data$Docs / .n_docs)
 
   out_ |>
     dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x))) |>
-    tbl_say(.title = "By the pattern the extractor matched")
-
-  # THE UNIT IS THE DEMOTION RULE, so it is reported as one rather than left inside a share. A
-  # pattern whose modal unit is DAY is measuring notice windows whatever its name.
-  .terms |>
-    dplyr::summarise(Docs = dplyr::n(), .by = c(TermKind, TermUnit)) |>
-    tidyr::pivot_wider(names_from = "TermUnit", values_from = "Docs", values_fill = 0L) |>
-    dplyr::arrange(plot_factor(.data$TermKind, .key = "TermKind")) |>
-    tbl_say(.title = "Which unit each pattern states its term in")
+    tbl_say(.title = "By the family that matched")
 
   .terms |>
-    dplyr::filter(!is.na(.data$TermYears)) |>
     dplyr::summarise(Docs = dplyr::n(), .by = TermYears) |>
     dplyr::arrange(dplyr::desc(.data$Docs)) |>
     tbl_say(.title = "The commonest stated terms, in years", .n = 12L)
 
-  n_open_ <- sum(.terms$IsOpen)
-  # QUOTED PHRASES GO THROUGH {.val}, NOT THROUGH AN ESCAPED QUOTE. cli strings already carry
-  # backslash continuations, so a nested \" is one backslash away from terminating the string -- which
-  # is exactly what it did. The styling helper says the same thing and cannot be escaped wrong.
   cli::cli_alert_info(
-    "ADMITTED says which patterns this specification counts as a DURATION. \\
-     {paste(.spec$TermKinds, collapse = ', ')} are admitted\\
-     {if (.spec$TermFloor > 0) paste0(' above ', .spec$TermFloor, ' years') else ''}; the rest are \\
-     extracted, reported and left alone. A {.val {'three-year TERM'}} is what a contract calls its \\
-     own duration and a {.val {'thirty day PERIOD'}} is a notice window, but the pattern is only a \\
-     proxy for that -- the unit table above says it directly."
+    "PCTSUBYEAR IS WHY THE FAMILIES ARE SPLIT. \"TERM OF three years\" is what a contract calls its \\
+     own duration; \"PERIOD OF thirty days\" is a notice period, a cure period or a payment window, \\
+     and a family whose terms are mostly under a year is measuring the second thing. Only the \\
+     families named in the specification count as a duration; the rest are extracted, reported and \\
+     left alone."
   )
-  if (n_open_ > 0L) {
-    cli::cli_alert_info(
-      "{format(n_open_, big.mark = ',')} {cli::qty(n_open_)}document{?s} state an OPEN-ENDED term, \\
-       {.val {'shall continue until terminated'}}. These carry no duration and are counted apart \\
-       from the documents that state nothing, because a contract saying it will not end has said \\
-       something."
-    )
-  }
   invisible(out_)
 }
 
@@ -1061,17 +954,14 @@ dte_report_class <- function(.dur) {
 #' @param .dates Tibble from dte_load().
 #' @param .desc Tibble from dte_describe().
 #' @param .cues Tibble from dte_cue_hits().
-#' @param .terms Tibble from dte_load_terms().
+#' @param .terms Tibble from dte_term().
 #' @param .nofut Tibble from dte_nofuture().
 #' @param .daymonth Tibble from dte_daymonth().
 #' @param .sweep Tibble from dte_sweep().
 #' @param .dur Tibble from dte_duration().
 #' @param .n_docs Integer. Documents in the sample.
-#' @param .spec List from dte_spec(). Passed to the terms block, which reports which patterns this
-#'   run admits.
 #' @return Invisibly NULL.
-dte_report_all <- function(.dates, .desc, .cues, .terms, .nofut, .daymonth, .sweep, .dur, .n_docs,
-                           .spec) {
+dte_report_all <- function(.dates, .desc, .cues, .terms, .nofut, .daymonth, .sweep, .dur, .n_docs) {
   if (FALSE) {
     .dates    <- tab_dates
     .desc     <- tab_desc
@@ -1082,7 +972,6 @@ dte_report_all <- function(.dates, .desc, .cues, .terms, .nofut, .daymonth, .swe
     .sweep    <- tab_sweep
     .dur      <- tab_dur
     .n_docs   <- nrow(tab_keys)
-    .spec     <- .lP$Params$Spec
   }
 
   dte_report_parse(.dates = .dates)
@@ -1090,7 +979,7 @@ dte_report_all <- function(.dates, .desc, .cues, .terms, .nofut, .daymonth, .swe
   dte_report_daymonth(.tab = .daymonth)
   dte_report_region(.dates = .desc)
   dte_report_cues(.tab = .cues)
-  dte_report_terms(.terms = .terms, .n_docs = .n_docs, .spec = .spec)
+  dte_report_terms(.terms = .terms, .n_docs = .n_docs)
   dte_report_nofuture(.tab = .nofut)
   dte_report_sweep(.tab = .sweep)
   dte_report_class(.dur = .dur)

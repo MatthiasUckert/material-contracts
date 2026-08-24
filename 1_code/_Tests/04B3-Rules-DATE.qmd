@@ -633,8 +633,7 @@ dte_report_all(
   .daymonth = tab_dm,
   .sweep    = tab_sweep,
   .dur      = tab_dur,
-  .n_docs   = nrow(tab_keys),
-  .spec     = .lP$Params$Spec   # so the terms block says which patterns this run admits
+  .n_docs   = nrow(tab_keys)
 )
 ```
 

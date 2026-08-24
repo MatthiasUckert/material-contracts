@@ -8,11 +8,10 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
-# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
-# messages would discard this document's entire output. comment = "" removes the "##" prefix from
-# console blocks. Figure geometry is declared once in _quarto.yml.
 knitr::opts_chunk$set(
   root.dir = here::here(),
   message  = TRUE,
@@ -20,415 +19,516 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-options(cli.num_colors = 1, cli.width = 120)
-
-.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
-  knitr::current_input()
-} else {
-  rstudioapi::getActiveDocumentContext()[["path"]]
-}
-.name_script <- fs::path_ext_remove(basename(.name_script))
-
-library <- function(...) suppressPackageStartupMessages(base::library(...))
+options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
 ```
 
 ```{r}
 #| label: load-libraries
 #| echo: false
-source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
-source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
-source("1_code/_Commons/_NER.R", encoding = "UTF-8")
 
-# ORDER IS LOAD-BEARING. _Store.R supersedes ner_db_init(), ner_db_append() and ner_db_clear(), so
-# it must come AFTER _NER.R or the flat-table versions win and the corpus store is built without the
-# per-label tables -- which would be discovered only after the run.
-source("1_code/_Commons/_Store.R", encoding = "UTF-8")
-source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
-source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
 
-# 03A supplies the console formatter; 04A the entity vocabularies, the store overview, the
-# description helpers and the relabelling clear. THE CORPUS IS EXTRACTED BY THE CODE THE SAMPLE WAS
-# EXTRACTED WITH, pointed at documents that carry no labels -- which is what makes the two stores
-# comparable at all.
-purrr::walk(
-  .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
-  .f = function(.s) {
-    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
-           encoding = "UTF-8")
-  }
+# ORDER IS LOAD-BEARING. _Plots.R rebuilds its level registry empty every time it is sourced, so any
+# library registering a vocabulary must follow it.
+source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
+
+# 03A owns clf_read_text(), which is how every document in this project is read off the mirror. The
+# corpus is read by the same function that read the labelled sample, not by a copy that agrees today.
+source(
+  file     = init_create_script_fun(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare"),
+  encoding = "UTF-8"
 )
+
+# 04A owns the plot vocabularies and the coverage reporting this document compares against.
+source(
+  file     = init_create_script_fun(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
+  encoding = "UTF-8"
+)
+
+.name_script <- "04C-EntityCorpus"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
-  .dir_here    = here::here(),
-  .name_script = .name_script
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
 ))
 
-cat("Function File: ")
+cat("Function File:  ")
 (.path_fun <- init_create_script_fun(
-  .dir_here    = here::here(),
+  .dir_here    = here::here(), # project root
   .name_script = .name_script  # resolves to 1_code/04C-EntityCorpus.R
 ))
+
 source(file = .path_fun, encoding = "UTF-8")
 ```
 
 # Purpose
 
-04A ran nine engines over 4,398 labelled contracts and produced the evidence for choosing between
-them. **This document runs the chosen ones over the whole Exhibit-10 corpus** -- around 1.46 million
-documents -- and writes their spans into a store with the same schema.
+This script runs the entity extractors over every Exhibit 10 attachment in the corpus and stores what
+they found, span by span, in the same shape 04A produced for the labelled sample.
 
-It resolves nothing, selects nothing, and reports no finding beyond what came back.
+## Why the same code and not similar code
 
-## Why this can run before the rules are settled
+04A established what each engine does on 4,398 documents whose classification is known. That is only
+evidence about the corpus if the corpus is extracted by the same code -- so `ner_extract()` and
+`ner_ingest()` are called here unmodified, and everything in this document is about *which* documents
+reach them and how their text gets off disk.
 
-Because extraction is rule-independent. Every candidate carries its offsets into the canonical text,
-every engine reads the whole document, and every window a rule might later impose is a `WHERE`
-clause over what is already stored.
+The two sets of stores then carry identical schemas, identical model tags and identical spec hashes,
+which is what makes "the sample says X" a statement about the corpus rather than about the sample.
 
-The asymmetry is the whole argument: **a rule decided in six weeks costs a query; a rule decided
-before extraction and then changed costs the pass.** So the pass runs now and 04B is argued in
-parallel.
+## Why spaCy is not here
 
-## The engine set, and why these
+On 04A's evidence, and it is worth stating plainly because it is the largest single decision in the
+04 family.
 
-Declared here rather than read from a policy artifact. Engine evidence lives in 04A, the choice is
-an argument, and an argument belongs where a reader can see it.
+The transformer runs at 2.13 documents a second against LexNLP's 4.47 and matcon's 26.68, so it would
+have cost **more than the other two combined** -- six and a half days against three and a half. What
+it buys is measurable: its ORG has a positional contrast of 0.97, meaning organisations spread evenly
+through the document, against LexNLP's 4.36, the strongest end-of-document concentration in the whole
+table. spaCy proposes eleven times as many organisations, uniformly distributed through the body.
 
-| Engine | Labels | Why |
-|:--|:--|:--|
-| `lexnlp` | ORG, GPE, DATE, MONEY | Settled for ORG: contrast 3.16-6.81 against 0.68-1.33 for spaCy |
-| `paper:gazetteer-v1` | GPE | The other place candidate, and the only one that reaches cities |
-| `paper:dateregex-v2` | DATE | The other date candidate; it reaches expiry cues in 415 documents against LexNLP's 113 |
-| `paper:moneyregex-v6` | MONEY | Keeps the currency symbol where the alternatives drop it |
-| `paper:redaction-v1` | REDACT | The only engine |
+For extracting the parties to a contract, LexNLP's ORG is not the compromise. It is the better
+instrument, and it is six days cheaper.
 
-Two labels carry two engines each, deliberately. DATE and GPE are **undecided**, and undecided
-means both candidates run: the choice needs role-level analysis that does not exist yet, and
-re-running a corpus pass to recover a discarded engine costs far more than storing it.
+**PERSON goes with it**, since only spaCy produces it. No 04B document uses PERSON and no variable in
+the paper depends on it.
 
-## What the corpus pass now carries that the last one did not
+## What is recomputed, and what is not
 
-Every engine in the plan resolves as well as finds. LexNLP writes the parsed date, the ISO code, the
-company legal form and the amount; `dateregex-v2` writes a parsed date for 99.6% of what it matches;
-`moneyregex-v6` writes an amount and an ISO currency. Those columns had nowhere to live in the flat
-store and were discarded at the seam for the whole life of the project.
+Nothing that has been done. Every document is recorded against every model and entity it was sent to,
+whatever the outcome, so a re-render asks what is missing and extracts only that. An interrupted pass
+costs at most the chunk in flight.
 
-**This is the reason not to defer.** LexNLP's geoentity pass costs around five seconds a document
-and roughly three and a half days at twenty workers over the corpus. A pass that finds the spans and
-throws the resolution away is a pass that has to be repeated, and this is not a repeatable pass.
+**Resumption is a property here, not a feature.** There is no state to remember between renders and
+nothing that could be wrong about itself: the ledger is written per chunk and a document with a row
+is never sent again.
 
-## What is absent, and what that costs
+## How results are reported
 
-**No spaCy, so no PERSON.** The transformer is the only usable person engine -- contrast 3.93
-against 1.55, 1.35 and 1.08 for the CNN models -- and it runs at `n_process = 1` because a single
-Metal device cannot be shared across workers. That is a different order of cost from everything
-above.
+Console tables throughout. The one substantive comparison is against 04A's coverage on the labelled
+sample, because a corpus rate far from the sample rate is either a finding about representativeness
+or a defect in this pass, and both are worth having before a rule is written against these spans.
 
-It is also **recoverable**. The ledger records a document against an engine, so adding the
-transformer later extracts only the transformer and touches nothing already written. Postponing it
-is a deferral, not a foreclosure.
+## Where things are written
 
-## Resumption is the ledger, not the output
-
-A pass killed at any point resumes by asking the store what is missing. There is no checkpoint file
-and no partial-progress state to reconcile: `ner_run()` records a document against an engine when
-its rows are written, so restarting is idempotent by construction.
-
-The corollary is that **adding an engine makes every document incomplete again** -- correctly -- and
-`ent_store_status()` is where that becomes visible rather than surprising.
+Two databases under `Output/`, one per family, each holding one table per entity plus the ledger, the
+manifest, the corpus index and the failure log. 04B reads them; nothing else does.
 
 # Configuration
 
 ```{r}
-#| label: configure-paths
+#| label: configure
+
 .lP <- list(
   Input = list(
-    # fs::path, not utils_file_path: the project helper creates what it names, and a corpus tree
-    # conjured into existence would report itself present while holding nothing.
-    DirCorpus   = fs::path("../pMatDisc/2_output/01-GetEDGAR/GetEDGAR/DocumentData/Parsed/Exhibit10/"),
-    MetaData    = fs::path("../pMatDisc/2_output/01-GetEDGAR/Output/FullMetaData.parquet"),
-    LandingPage = fs::path("../pMatDisc/2_output/01-GetEDGAR/Output/LandingPage.parquet")
+    # THE REGISTER IS THE CORPUS. 02B holds every document with its ladder step attached, so
+    # membership, population and deduplication all come from one place. The alternative -- walking a
+    # parsed tree -- makes a second, independent statement about what is in the corpus, one that can
+    # disagree with the register without either of them reporting it.
+    Register = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "02B-Register"),
+      "Output", "Documents.parquet"
+    )
   ),
-  Cache = list(
-    CorpusFiles = utils_file_path(.dir_main, "Cache", "CorpusFiles.parquet") # DocID to Path index
+  Output = list(
+    Store = utils_file_path(.dir_main, "Output"),
+    Stage = utils_file_path(.dir_main, "Stage")
   ),
-  Store = list(
-    NerDB    = utils_file_path(.dir_main, "Store", "CorpusCandidates.duckdb"),
-    Manifest = utils_file_path(.dir_main, "Store", "manifest.parquet"),
-    # Plain text, one line per chunk, appended. This is what makes a two-day pass watchable: tail it
-    # from another terminal, read it after RStudio has been closed, check it on a machine running
-    # headless. Console output is buffered by knitr and gone when the session ends; a file is not.
-    Progress = utils_file_path(.dir_main, "Store", "progress.log")
-  ),
-  Work = list(
-    Dir = utils_file_path(.dir_main, "Work")   # per-chunk text parquet, deleted as it is consumed
-  ),
-  Param = list(
-    ChunkSize  = 50000L,  # documents held in memory at once; not a unit of resumption
-    IndexRerun = FALSE,  # TRUE re-walks the tree; FALSE reuses the cached index
-    Device     = "auto",
-    # The switch that decides whether this render is a rehearsal or the release. An integer draws
-    # that many documents at random and writes to a separate store; NULL processes the corpus.
-    # SET AN INTEGER, READ THE THROUGHPUT, THEN SET NULL. Every rate this project has is from the
-    # 4,398-document sample, whose length distribution is not the corpus's.
-    Limit      = NULL
+  Params = list(
+    # 01B's parsed mirror. The register stores no path -- DocTypeMod, YQ and DocID determine one --
+    # so the mirror root is a parameter and utils_doc_path() rebuilds the rest.
+    DirMirror = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "01B-EdgarDocuments"),
+      "GetEDGAR"
+    ),
+
+    # "all" is every Exhibit 10 attachment, and it is close to free. Deduplication removes 18.7% of
+    # the copies, so an "all" pass reads 1,189,805 attachments against "descriptive"'s 1,136,095 --
+    # 4.7% more work for a store that never needs revisiting. Deduplicated "all" is in fact cheaper
+    # than an undeduplicated "descriptive" pass would have been, and every narrower question is then
+    # a filter on a store that already exists.
+    Population = "all",
+    DocType    = "Exhibit10",
+
+    # DOCUMENTS PER ENGINE INVOCATION. Each chunk is read, staged as one parquet and handed to the
+    # extractor, so this trades container startups against staging-file size: at 5,000 documents the
+    # pass makes about 240 invocations and stages roughly 165 MB a time.
+    ChunkSize = 5000L,
+
+    # TWO WORKER COUNTS, BECAUSE THEY ARE TWO RESOURCES. The daemons read parquet files off disk and
+    # finish before the container starts, so the two never contend -- but they are separate settings
+    # and one number standing for both would hide that.
+    #
+    # The read is the dominant cost of the pass and not the extractors: one arrow::read_parquet() per
+    # document, 1.19 million times. That is why the parallelism goes there, where it also cannot
+    # change a result, because a read is pure.
+    ReadWorkers   = 24L,
+    EngineWorkers = 24L,
+
+    # BATCH SIZE FROM 04A'S BENCHMARK, and the honest note is that it barely matters. Over 4 to 64 the
+    # spread was 6% for matcon and 18% for LexNLP, against a worker count that is worth multiples. The
+    # benchmark measured at five workers and these run at twenty-four, so the ranking is assumed to
+    # transfer -- which is acceptable for a parameter this flat and would not be for the worker count.
+    Batch = list(matcon = 16L, lexnlp = 8L),
+
+    # A HANG DETECTOR, NOT A BUDGET. At matcon's throughput a document taking two minutes is running
+    # orders of magnitude beyond the median. LexNLP's cap is the one that matters and its expensive
+    # work is the maxent company NER and the date grammar, not the geoentity pass -- a timeout there
+    # is not one lost document but documents lost SYSTEMATICALLY IN THE LONGEST AGREEMENTS.
+    Timeout = list(matcon = 120L, lexnlp = 240L),
+
+    # Chunks between progress lines. The first and last always report, so a run is never silent.
+    ReportEvery = 5L,
+
+    # Documents drawn for the offset check. See the Validation section for why it is a sample here
+    # and every span in 04A.
+    OffsetSample = 500L,
+
+    # NULL takes the whole outstanding queue. An integer caps it, which is how to rehearse the loop
+    # on a few thousand documents before committing to the full pass.
+    Limit  = NULL,
+    Reload = FALSE   # rebuild the corpus index from the register rather than reusing the store's
   )
 )
 
-fs::dir_exists(.lP$Input$DirCorpus)
-fs::file_exists(.lP$Input$MetaData)
-```
-
-# The plan
-
-```{r}
-#| label: declare-plan
-tab_plan <- tibble::tribble(
-  ~Combo,                  ~Labels,
-  "lexnlp",                c("ORG", "GPE", "DATE", "MONEY"),
-  "paper:gazetteer-v1",    "GPE",
-  "paper:dateregex-v2",    "DATE",
-  "paper:moneyregex-v6",   "MONEY",
-  "paper:redaction-v1",    "REDACT"
+# WHAT EACH FAMILY IS ASKED FOR: everything it can produce. Asking for less risks a re-run when a
+# rule wants an entity we skipped, and asking for all of it costs nothing extra -- both families read
+# each document exactly once regardless of how many entities are requested.
+.lP$Plan <- tibble::tribble(
+  ~Family,   ~Entities,
+  "matcon",  c("GPE", "DATE", "TERM", "MONEY", "REDACT"),
+  "lexnlp",  c("ORG", "GPE", "DATE", "MONEY")
 )
 
-lst_labels <- ent_plan_labels(.plan = tab_plan)   # named list, as ner_run() takes it
-
-tab_plan |>
-  dplyr::mutate(Labels = purrr::map_chr(.data$Labels, \(.x) paste(sort(.x), collapse = ", "))) |>
-  tbl_say(.title = "Engines and the labels each is asked for")
+fs::dir_create(c(.lP$Output$Store, .lP$Output$Stage))
 ```
 
-Labels are passed **per combination**, not as one vector, and the difference is not cosmetic: asking
-the gazetteer for DATE returns nothing, while asking LexNLP for GPE runs its geoentity pass, which
-costs more than its other three extractors combined.
+# Families
 
 ```{r}
-#| label: declare-knobs
-.KNOBS <- list(
-  # TWENTY WORKERS, NOT TWENTY-FOUR, and the reason is the machine rather than the extraction.
-  # Throughput rises 1.60x from eight workers to sixteen and only 1.15x from sixteen to twenty-four
-  # on a 28-core M3 Ultra: twenty performance cores and eight efficiency cores, and workers past the
-  # twentieth land on the latter at roughly a third the speed.
-  #
-  # BATCH SIZE EIGHT FOR LEXNLP IS MEASURED, NOT INHERITED. 04A's sweep puts it at 7.92 doc/s
-  # against 1.32 at a batch of 128 -- six times slower for identical output, because the pool hands
-  # out one task per batch and a large batch strands whichever worker draws a 500,000-character
-  # credit agreement while the rest finish early.
-  #
-  # The 240-second cap is per extractor per document and exists for the geoentity pass, which scans
-  # a dictionary over the whole text. At 60 the longest agreements time out, and they time out
-  # SYSTEMATICALLY in the longest documents -- the worst possible place for a missing-at-random
-  # assumption to fail. Four such timeouts appeared in the sample even at 240.
-  "lexnlp"              = list(n_process = 20L, batch_size = 8L,  timeout = 240L),
-  # The gazetteer's sweep is sub-second in every cell on 200 documents, so 32 nominally beats 8 by
-  # noise. Taken anyway: at corpus scale the difference is 0.6 hours against 0.9, and neither
-  # setting can be wrong when the engine runs at several hundred documents a second.
-  "paper:gazetteer-v1"  = list(n_process = 20L, batch_size = 32L, timeout = 120L),
-  # dateregex was single-process because the extractor had no Pool, not because regex resists
-  # parallelism. It has one now. The cap is non-zero because the greedy overlap resolution is
-  # quadratic in candidate count and a date table can yield tens of thousands in one document.
-  "paper:dateregex-v2"  = list(n_process = 20L, batch_size = 64L, timeout = 120L),
-  "paper:moneyregex-v6" = list(n_process = 20L, batch_size = 64L, timeout = 120L),
-  "paper:redaction-v1"  = list(n_process = 20L, batch_size = 64L, timeout = 120L)
+#| label: describe-families
+
+# The same description 04A ran, and it must agree with it: the model tags and spec hashes recorded
+# beside the corpus spans are what make the two sets of stores comparable.
+tab_describe <- ner_describe(
+  .spacy_models = character(),        # spaCy is not in this pass; see the Purpose
+  .lexnlp_image = "contracts-lexnlp"
 )
 
-ent_check_plan(
-  .plan  = tab_plan,
-  .knobs = .KNOBS
+ner_report_describe(.describe = tab_describe)
+
+# WHAT A FINISHED DOCUMENT LOOKS LIKE, per family. The ledger is keyed on (DocID, Model, Entity), so
+# the queue needs to know how many rows a completed document carries -- and that number comes from
+# here rather than from the ledger, which cannot say on an empty store and says the wrong thing on a
+# partial one.
+tab_pairs <- .lP$Plan |>
+  purrr::pmap(\(Family, Entities) dplyr::mutate(
+    cor_pairs(.describe = tab_describe, .family = Family, .entity = Entities),
+    Family = Family, .before = 1L
+  )) |>
+  purrr::list_rbind()
+
+tbl_say(.tab = tab_pairs, .title = "Model and entity pairs the corpus spans will carry")
+
+cli::cli_alert_info(
+  "A document is finished when it has one ledger row for each of these pairs: \\
+   {paste(paste0(names(table(tab_pairs$Family)), ' ', as.integer(table(tab_pairs$Family))),
+          collapse = ', ')}."
 )
 ```
 
-Checked before any work starts rather than discovered inside the extraction loop. `ner_run()`
-dispatches through a chain of branches, so an engine it does not cover would abort after the index
-is built and the first chunks have run -- hours into a corpus pass.
+**A stale spec hash stops this document before it spends anything.** `ner_ingest()` refuses to write
+where a model tag is unchanged and its hash has moved, because that means the rules were edited
+without the version being bumped and the rows already stored mean something else. Over a three-day
+pass that check is worth more than it is on a sample.
 
-# The corpus
+# Input
 
 ```{r}
-#| label: build-index
-tab_index <- ent_corpus_index(
-  .dir_corpus   = .lP$Input$DirCorpus,
-  .path_meta    = .lP$Input$MetaData,      # filer name, CIK, filing date, HashIndex
-  .path_landing = .lP$Input$LandingPage,   # registered addresses, joined via HashIndex
-  .path_cache   = .lP$Cache$CorpusFiles,
-  .rerun        = .lP$Param$IndexRerun,    # FALSE reuses the cached walk
-  .limit        = .lP$Param$Limit          # integer = rehearsal draw; NULL = the corpus
+#| label: connect-and-load
+
+con_matcon <- ner_db_connect(
+  .db_path   = ner_db_path(.dir = .lP$Output$Store, .family = "matcon"),
+  .read_only = FALSE
 )
+ner_db_init(.con = con_matcon)
+cor_db_init(.con = con_matcon)
+
+con_lexnlp <- ner_db_connect(
+  .db_path   = ner_db_path(.dir = .lP$Output$Store, .family = "lexnlp"),
+  .read_only = FALSE
+)
+ner_db_init(.con = con_lexnlp)
+cor_db_init(.con = con_lexnlp)
+
+# THE INDEX IS LOADED INTO EACH FAMILY DATABASE, so every store answers its own questions: what is
+# outstanding is an anti-join inside one file rather than a join across two, and a family can be
+# cleared or shipped alone. An index of 1.19 million rows costs a few hundred megabytes twice.
+n_corpus <- cor_corpus_load(
+  .con           = con_matcon,
+  .path_register = .lP$Input$Register,      # 02B's register: the gate, not a directory walk
+  .dir_mirror    = .lP$Params$DirMirror,    # 01B's parsed mirror, where the text lives
+  .population    = .lP$Params$Population,   # "all"
+  .doc_type      = .lP$Params$DocType,      # "Exhibit10"
+  .reload        = .lP$Params$Reload
+)
+
+invisible(cor_corpus_load(
+  .con           = con_lexnlp,
+  .path_register = .lP$Input$Register,
+  .dir_mirror    = .lP$Params$DirMirror,
+  .population    = .lP$Params$Population,
+  .doc_type      = .lP$Params$DocType,
+  .reload        = .lP$Params$Reload
+))
 ```
 
-The tree walk is cached because it is slow and does not change between renders. `IndexRerun = TRUE`
-is the only way to pick up documents added since -- worth remembering rather than assuming a render
-sees the current tree.
+**Attachments, not copies, and this is the decision that saves seventeen hours.** 01C left it open --
+classification wants one copy, entity extraction "may want each, because the registrant-side metadata
+differs even where the text does not". The resolution is that the metadata differing is an
+*anchoring* input, applied downstream of extraction: the text of two copies of one attachment is
+identical, extraction reads text, so extracting both produces identical spans at 23% more cost.
 
-The metadata join carries the EDGAR facts alongside each document so that 04D has an anchor without
-reaching back to the raw exports.
+One row per attachment here. Fanning back out to all 1,462,939 registrant copies is a join on
+`HashDocument` at release, exactly as 03F does.
 
-# The store
-
-Adding a label to an engine no longer forces a re-extraction. The ledger is keyed on the label as
-well as the combination, so a policy addition leaves the existing labels marked done and only the
-addition is missing -- which `ner_run()` then groups and dispatches on its own. There is nothing to
-clear and nothing to reconcile, which is why the mechanism that used to do both is gone.
-
-```{r}
-#| label: check-manifest
-ent_corpus_manifest_sync(
-  .path_manifest = .lP$Store$Manifest,
-  .manifest      = ent_corpus_manifest(
-    .index  = tab_index,
-    .run    = tab_plan$Combo,
-    .labels = lst_labels
-  )
-) |>
-  tbl_say(.title = "Store settings against this run")
-```
+**Which attachment answers for the population** is the subtler half. `PrimaryFiler` is chosen
+globally while `EstiSample` depends on a per-CIK Compustat match, so an attachment can have its
+primary outside a population and another copy inside it -- 4,432 of them for the estimation sample and
+none for the descriptive one, which is exactly where the mechanism predicts them. So the rule is to
+extract the primary of every attachment with *at least one* copy in the population. That also makes
+the store population-independent: a pass run for one population is reused verbatim by any other.
 
 # Extraction
 
 ```{r}
-#| label: store-status
-.dir_store <- fs::path_dir(.lP$Store$NerDB)   # the timing log lives beside the store
+#| label: extract-matcon
 
-ent_store_status(
-  .db_path  = .lP$Store$NerDB,
-  .n_corpus = ent_corpus_n(.index = tab_index, .what = "docs"),
-  .run      = tab_plan$Combo,
-  .dir      = .dir_store    # supplies the measured rate for the remaining-time estimate
-)
-
-tab_todo <- ent_pending(
-  .db_path = .lP$Store$NerDB,
-  .index   = tab_index,
-  .run     = tab_plan$Combo,
-  .labels  = lst_labels   # complete means every combination AND label, not every combination
+tab_pass_matcon <- cor_pass(
+  .con            = con_matcon,
+  .family         = "matcon",
+  .entity         = .lP$Plan$Entities[[which(.lP$Plan$Family == "matcon")]],
+  .describe       = tab_describe,                # supplies the model tags AND the pair count
+  .stage_path     = fs::path(.lP$Output$Stage, "matcon-chunk.parquet"),
+  .stage_dir      = fs::path(.lP$Output$Stage, "matcon"),
+  .chunk_size     = .lP$Params$ChunkSize,        # documents per engine invocation
+  .read_workers   = .lP$Params$ReadWorkers,      # daemons reading parquet off the mirror
+  .engine_workers = .lP$Params$EngineWorkers,    # processes inside the extractor
+  .batch_size     = .lP$Params$Batch$matcon,
+  .timeout        = .lP$Params$Timeout$matcon,
+  .limit          = .lP$Params$Limit,            # NULL takes the whole outstanding queue
+  .report_every   = .lP$Params$ReportEvery
 )
 ```
 
-The first thing a reader of a two-day pass needs. A second render finds every document extracted, so
-the loop has nothing to do and prints nothing -- which is indistinguishable from a loop that is
-broken. This says "finished" out loud.
+```{r}
+#| label: extract-lexnlp
+
+tab_pass_lexnlp <- cor_pass(
+  .con            = con_lexnlp,
+  .family         = "lexnlp",
+  .entity         = .lP$Plan$Entities[[which(.lP$Plan$Family == "lexnlp")]],
+  .describe       = tab_describe,
+  .stage_path     = fs::path(.lP$Output$Stage, "lexnlp-chunk.parquet"),
+  .stage_dir      = fs::path(.lP$Output$Stage, "lexnlp"),
+  .chunk_size     = .lP$Params$ChunkSize,
+  .read_workers   = .lP$Params$ReadWorkers,
+  .engine_workers = .lP$Params$EngineWorkers,
+  .batch_size     = .lP$Params$Batch$lexnlp,
+  .timeout        = .lP$Params$Timeout$lexnlp,
+  .limit          = .lP$Params$Limit,
+  .report_every   = .lP$Params$ReportEvery
+)
+```
 
 ```{r}
-#| label: extract-corpus
-chunks_ <- if (nrow(tab_todo) == 0L) {
-  list()
-} else {
-  split(tab_todo, ceiling(seq_len(nrow(tab_todo)) / .lP$Param$ChunkSize))
-}
+#| label: report-pass
 
-if (length(chunks_) == 0L) {
-  cli::cli_alert_success(
-    "Nothing to extract: every document in scope is already in the store. Raise Limit or set it \\
-     to NULL to take in more of the corpus."
-  )
-}
+tab_pass <- dplyr::bind_rows(tab_pass_matcon, tab_pass_lexnlp)
 
-prog_ <- ent_progress_new(
-  .n_chunks = length(chunks_),
-  .n_docs   = nrow(tab_todo),
-  .path_log = .lP$Store$Progress   # tail -f this to watch a long pass from anywhere
+cor_report_pass(.tab = tab_pass, .n_corpus = n_corpus)
+```
+
+**Cheapest family first**, so a pass interrupted in the expensive one still leaves the other complete.
+Measured on the corpus at twenty-four workers, matcon runs at roughly 150 documents a second and
+LexNLP at 20, so matcon is under two hours and LexNLP is the overnight job. Both are faster than
+04A's benchmark predicted -- that benchmark ran at five workers over 320 documents, so it amortised
+interpreter and container startup badly and understated the cheap family by nearly a factor of six.
+
+**Only the read is parallel.** The extractors are subprocesses already running their own workers;
+adding R-side concurrency around them would contend rather than help. The daemons read parquet files
+off the mirror and are finished before the container starts, so the two never compete for anything.
+
+**A failure is recorded rather than retried, and that is a correction.** The first version of this
+document logged failures and sent them again on every render, on the reasoning that a mount which
+hiccuped must not be blacklisted. The reasoning was right and the consequence was not: 736 documents
+in this corpus hold no text, so the queue never emptied, the failure log grew by 736 rows a render,
+and the status report advised re-rendering to continue -- advice that could not work.
+
+They now get a ledger row with status `error`, which excludes them, counts them honestly, and leaves
+them recoverable by hand. The evidence that they are permanent rather than transient is independent:
+**03F's classification pass over the same population failed on the same 736 documents.** Two passes,
+different engines, identical count.
+
+Two exclusions, two prospects. A **timeout** may complete under a longer cap. An **error** is a
+document with no text, and no cap changes that.
+
+# Validation
+
+```{r}
+#| label: validate-matcon
+
+lst_valid_matcon <- cor_report_validation(
+  .con       = con_matcon,
+  .family    = "matcon",
+  .describe  = tab_describe,
+  .entity    = .lP$Plan$Entities[[which(.lP$Plan$Family == "matcon")]],
+  .n_offsets = .lP$Params$OffsetSample
+)
+```
+
+```{r}
+#| label: validate-lexnlp
+
+lst_valid_lexnlp <- cor_report_validation(
+  .con       = con_lexnlp,
+  .family    = "lexnlp",
+  .describe  = tab_describe,
+  .entity    = .lP$Plan$Entities[[which(.lP$Plan$Family == "lexnlp")]],
+  .n_offsets = .lP$Params$OffsetSample
+)
+```
+
+**The offset check is a sample here and every span in 04A, and the reason is structural rather than
+cost.** 04A's spans all index one file, so verifying them is one read. The corpus text is 1.19 million
+separate parquets, so verifying every span means reading the corpus a second time.
+
+A systematic failure -- a byte rather than code-point slice, a truncation the extractor did not report
+-- shows in any sample at all. A failure confined to a handful of documents would not, and nothing
+here claims otherwise. The draw is seeded, so a re-render checks the same documents and a new failure
+is a new finding rather than a new sample.
+
+**An empty store is not a pass.** Both checks are satisfied by having nothing to check, which is
+exactly how 04A's first version reported two green ticks on a store that held nothing at all. Each
+reports the size of what it checked, and a store with no spans says so.
+
+# Results
+
+```{r}
+#| label: report-summary
+
+tab_summary <- dplyr::bind_rows(
+  cor_summary(.con = con_matcon, .family = "matcon", .n_corpus = n_corpus),
+  cor_summary(.con = con_lexnlp, .family = "lexnlp", .n_corpus = n_corpus)
 )
 
-tab_timing <- purrr::imap(chunks_, function(.chunk, .i) {
-  out_ <- ent_extract_corpus_chunk(
-    .chunk    = .chunk,
-    .db_path  = .lP$Store$NerDB,   # one store for the whole corpus
-    .run      = tab_plan$Combo,
-    .labels   = lst_labels,        # per combination, not one vector for every engine
-    .dir_work = .lP$Work$Dir,      # the chunk's text parquet, written and deleted
-    .knobs    = .KNOBS,
-    .device   = .lP$Param$Device
+# 04A's coverage on the labelled sample, read from its own stores rather than restated here.
+con_sample <- ner_attach(
+  .dir      = fs::path(
+    init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"), "Output"
+  ),
+  .families = c("matcon", "lexnlp")
+)
+
+tab_sample_cov <- purrr::map(c("matcon", "lexnlp"), \(.f) {
+  con_ <- ner_db_connect(
+    .db_path = ner_db_path(
+      .dir = fs::path(
+        init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
+        "Output"
+      ),
+      .family = .f
+    ),
+    .read_only = TRUE
   )
-  ent_write_timing(
-    .dir     = .dir_store,
-    .chunk   = .i,
-    .n_docs  = out_$nDocs,   # documents in the chunk
-    .n_new   = out_$nNew,    # of which this many actually had to be extracted
-    .seconds = out_$Seconds
-  )
-  ent_progress_step(.progress = prog_, .n_new = out_$nNew, .seconds = out_$Seconds)
-  out_
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+  n_ <- as.integer(DBI::dbGetQuery(con_, "SELECT COUNT(DISTINCT DocID) AS n FROM runs")$n[[1L]])
+  ent_coverage(.summary = ner_db_summary(.con = con_), .family = .f, .n_doc = n_)
 }) |>
   purrr::list_rbind()
+
+DBI::dbDisconnect(con_sample, shutdown = TRUE)
+
+cor_report_summary(.tab = tab_summary, .sample = tab_sample_cov)
 ```
 
-Chunked because 1.46 million documents do not fit in memory, and because a chunk boundary is a
-natural place to write progress. **The chunk is not the unit of resumption** -- the ledger is -- so a
-pass killed mid-chunk loses only the documents whose rows had not yet been written.
+**The comparison against the labelled sample is the point of running 04A first.** Every one of these
+engines was measured on 4,398 documents whose classification is known; if the corpus rate differs
+sharply from the sample rate, either the sample is not representative of the corpus for that entity
+or something in this pass is wrong. Both are findings worth having before a rule is written against
+these spans, and the two are told apart by reading spans rather than by reading the table.
 
-# Description
-
-```{r}
-#| label: summarise-store
-.ov <- ent_overview(.db_path = .lP$Store$NerDB)
-
-ent_report_store(.ov = .ov)
-```
-
-```{r}
-#| label: report-throughput
-ent_report_throughput(
-  .dir      = .dir_store,
-  .n_corpus = ent_corpus_n(.index = tab_index, .what = "docs"),
-  .n_cands  = sum(.ov$ledger$Candidates)   # what has been written, for the store-size projection
-)
-```
-
-**This is what the rehearsal is for.** 04A measures LexNLP at 7.92 documents per second on a
-200-document random draw at these settings, which projects to roughly 51 hours over 1.46 million --
-a little over two days, with the four regex engines adding comparatively little. But that draw comes
-from 4,398 hand-picked material contracts with a median around 33,000 characters, and the corpus
-carries every Exhibit 10 filed, including short amendments and very long credit agreements. Read the
-per-engine rate here against that projection before setting `Limit` to `NULL`.
-
-No cross-engine agreement is computed. On the sample that produced four million merged mentions from
-4,398 documents; at corpus scale it would be roughly 1.3 billion, and the question it answers --
-which engine adds what over another -- was already answered in 04A on documents that carry labels.
+**The manifest is printed with the results deliberately.** A reader of this page can say which version
+of which extractor produced the corpus without opening a store -- and when the gazetteer is next
+revised, the hash beside these rows is what says whether they predate it.
 
 # Deployment
 
 ```{r}
 #| label: deploy-summary
-tibble::tibble(
-  Artifact = c("Candidate store", "Run manifest", "Corpus index"),
-  Path     = c(.lP$Store$NerDB, .lP$Store$Manifest, .lP$Cache$CorpusFiles)
-) |>
-  dplyr::mutate(
-    Exists = fs::file_exists(.data$Path),
-    MB     = round(as.numeric(fs::file_size(.data$Path)) / 1024^2, 1),
-    Path   = fs::path_file(.data$Path)
-  ) |>
-  tbl_say(.title = "Written by 04C")
+
+cor_report_artifacts(
+  .dir      = .lP$Output$Store,
+  .families = c("matcon", "lexnlp")
+)
+```
+
+Two databases, and they are contracts rather than conveniences. 04B reads them; every offset in them
+indexes the mirror's parsed text, which nothing in this repository rewrites.
+
+# Overview
+
+```{r}
+#| label: overview
+
+tab_status <- dplyr::bind_rows(
+  cor_status(
+    .con    = con_matcon, .family = "matcon", .describe = tab_describe,
+    .entity = .lP$Plan$Entities[[which(.lP$Plan$Family == "matcon")]]
+  ),
+  cor_status(
+    .con    = con_lexnlp, .family = "lexnlp", .describe = tab_describe,
+    .entity = .lP$Plan$Entities[[which(.lP$Plan$Family == "lexnlp")]]
+  )
+)
+
+cor_report_status(.tab = tab_status)
+
+tbl_say(
+  .tab   = dplyr::select(tab_summary, "Family", "Model", "Entity", "NSpan", "NDoc",
+                         "Coverage", "SpansPerDoc"),
+  .title = "What the corpus pass produced"
+)
 ```
 
 ```{r}
-#| label: deploy-guard
-if (!is.null(.lP$Param$Limit)) {
-  cli::cli_alert_warning(
-    "THIS IS A REHEARSAL. Limit is {(.lP$Param$Limit)}, so the store holds a random draw and not \\
-     the corpus. Nothing downstream should read it."
-  )
-} else {
-  cli::cli_alert_success("Full corpus pass; the store is the deliverable.")
-}
+#| label: disconnect
+
+# LAST, AND DELIBERATELY SO. Every section above reads from an open connection, and a disconnect
+# written where the work happened would silently strand any section added below it. If a section is
+# added, it goes above this.
+DBI::dbDisconnect(con_matcon, shutdown = TRUE)
+DBI::dbDisconnect(con_lexnlp, shutdown = TRUE)
+
+cli::cli_alert_success("Both stores closed.")
 ```
 
-Stated rather than inferred. A rehearsal store and a release store have the same name and the same
-schema, and the only thing separating them is a parameter three hundred lines above.
+**No figures.** 04A carries the positional profiles and the agreement matrix, drawn on a sample where
+every engine ran including the ones excluded here. Repeating them on the corpus with two families
+would say less, and what the corpus adds -- scale -- is a table rather than a picture.
 
 # Next
 
-**04B** develops the rules on the labelled sample, where the EDGAR anchor makes a rule testable.
-Nothing here depends on that work and nothing there is blocked by this pass.
+**04B** turns these spans into variables: one document per entity, each proposing rules and measuring
+what they keep and discard against an unadjusted baseline. Nothing there re-extracts; every rule is a
+query against the offsets stored here.
 
-**04D** applies those rules to this store and resolves spans into published variables. Every window
-a rule imposes is a `WHERE` clause over offsets already written, which is why the order of these two
-documents does not matter.
-
-**Persons are not extracted here.** Adding `spacy:en_core_web_trf` later costs one transformer pass
-over the corpus and touches nothing already written -- the ledger sees the new combination as
-missing for every document and leaves the five above alone. Whether that is worth doing is a
-question for 04B, which is where the counterparty rule will show whether person spans carry a
-variable or not.
+Two things are open and neither blocks 04B. **The anchors** -- the filer's own name, filing date and
+registered addresses, against which an extracted entity can be scored -- are derived from the register
+rather than from any extraction, so they can be built wherever 04B wants them. And **the release**,
+which fans these attachment-level spans back out to all 1,462,939 registrant copies on
+`HashDocument`, carrying the population flags as columns so a reader subsets without the register.

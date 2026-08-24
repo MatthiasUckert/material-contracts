@@ -33,7 +33,7 @@
 
 if (FALSE) {
   .path_text <- .lP$Input$Text
-  .dir_store <- .lP$Input$Store
+  .db_path   <- .lP$Input$Store
 }
 
 
@@ -62,35 +62,26 @@ plot_register_levels(
 
 #' Load the redaction markers and split them by kind
 #'
-#' The kind comes from LabelRaw, which is what the extractor called the marker before anything
+#' The kind comes from LabelRaw, which is what the extractor called the marker before the store
 #' normalised it. Anything the extractor named with "bare" is a run of asterisks; everything else
 #' follows the bracketed convention.
 #'
-#' ONE FAMILY, AND NOT BY CHOICE. matcon's redaction-v2 is the only extractor in the project that
-#' emits a redaction marker at all -- LexNLP has no such label and spaCy is not in the corpus pass.
-#' So this document has no second opinion to report against, which is why every table below is a
-#' description rather than a comparison.
-#'
-#' @param .dir_store Directory holding the family databases.
+#' @param .db_path 04A's candidate store.
 #' @param .lens Tibble from ent_doc_lens().
-#' @param .family Character. The family that emits redaction markers.
+#' @param .combo Character. Engine token.
 #' @param .quiet Logical. Suppress the count message.
 #' @return Tibble: one row per marker, with Kind.
-red_load <- function(.dir_store, .lens, .family = "matcon", .quiet = FALSE) {
+red_load <- function(.db_path, .lens, .combo = "paper:redaction-v1", .quiet = FALSE) {
   if (FALSE) {
-    .dir_store <- .lP$Input$Store
-    .lens      <- tab_lens
-    .family    <- "matcon"
-    .quiet     <- FALSE
+    .db_path <- .lP$Input$Store
+    .lens    <- tab_lens
+    .combo   <- "paper:redaction-v1"
+    .quiet   <- FALSE
   }
 
-  ent_load_entity(
-    .dir_store = .dir_store,
-    .family    = .family,
-    .entity    = "REDACT",
-    .lens      = .lens,
-    .extras    = ent_extras(.family, "REDACT"),   # none; the kind is in the core LabelRaw
-    .quiet     = .quiet
+  ent_load_label(
+    .db_path = .db_path, .lens = .lens, .label = "redact", .combo = .combo,
+    .extras = character(), .quiet = .quiet
   ) |>
     dplyr::mutate(
       Kind = dplyr::if_else(
@@ -107,58 +98,13 @@ red_load <- function(.dir_store, .lens, .family = "matcon", .quiet = FALSE) {
 #' A count of markers is partly a count of words when contracts run from four thousand to seventeen
 #' thousand of them by class. This is the denominator that makes the count comparable.
 #'
-#' THE REGISTER ALREADY HOLDS IT, and reading it there rather than recounting is what lets this
-#' variable reach the corpus. 02B carries nWords for all 1,771,923 documents; counting \\S+ over the
-#' canonical text works on 4,398 and cannot work on 1.19 million, because 04C writes no corpus text
-#' file. The two are not identical -- one counts whitespace-separated runs in R and the other was
-#' computed upstream -- so the loader reports how far apart they are rather than assuming they agree,
-#' and the fallback recount is what a document missing from the register gets.
-#'
-#' @param .keys Tibble from ent_anchor_keys(), carrying nWords from the register.
-#' @param .path_text 04A's canonical text parquet, for the agreement check and the fallback.
-#' @param .quiet Logical. Suppress the agreement report.
+#' @param .path_text 04A's canonical text parquet.
 #' @return Tibble: DocID, NWords.
-red_words <- function(.keys, .path_text, .quiet = FALSE) {
-  if (FALSE) {
-    .keys      <- tab_keys
-    .path_text <- .lP$Input$Text
-    .quiet     <- FALSE
-  }
+red_words <- function(.path_text) {
+  if (FALSE) .path_text <- .lP$Input$Text
 
-  reg_ <- dplyr::transmute(.keys, DocID, RegWords = as.numeric(.data$nWords))
-
-  txt_ <- arrow::read_parquet(.path_text) |>
-    dplyr::transmute(DocID, TxtWords = stringi::stri_count_regex(.data$TextRaw, "\\S+"))
-
-  out_ <- dplyr::full_join(reg_, txt_, by = dplyr::join_by(DocID)) |>
-    dplyr::mutate(NWords = dplyr::coalesce(.data$RegWords, .data$TxtWords))
-
-  if (!.quiet) {
-    both_ <- dplyr::filter(out_, !is.na(.data$RegWords), !is.na(.data$TxtWords))
-    tibble::tibble(
-      Item = c("Documents in the sample",
-               "Word count from the register",
-               "Recounted from the canonical text",
-               "Both, and within one per cent",
-               "Both, and within ten per cent"),
-      N    = c(nrow(out_),
-               sum(!is.na(out_$RegWords)),
-               sum(!is.na(out_$TxtWords)),
-               sum(abs(both_$RegWords - both_$TxtWords) <= 0.01 * both_$TxtWords),
-               sum(abs(both_$RegWords - both_$TxtWords) <= 0.10 * both_$TxtWords))
-    ) |>
-      dplyr::mutate(Share = tbl_pct(.data$N / nrow(out_))) |>
-      tbl_say(.title = "The denominator, from two independent sources")
-
-    cli::cli_alert_info(
-      "TWO COUNTS OF ONE QUANTITY, and the point of printing both is that only the register's can \\
-       reach the corpus -- 04C writes no corpus text file, so a recount stops at the sample. Where \\
-       they disagree materially the ratio below is sensitive to which is used, and that is worth \\
-       knowing before anyone reads a per-thousand-words figure."
-    )
-  }
-
-  dplyr::select(out_, "DocID", "NWords")
+  arrow::read_parquet(.path_text) |>
+    dplyr::transmute(DocID, NWords = stringi::stri_count_regex(.data$TextRaw, "\\S+"))
 }
 
 
@@ -176,33 +122,28 @@ red_words <- function(.keys, .path_text, .quiet = FALSE) {
 #' anyone builds on it.
 #'
 #' @param .marks Tibble from red_load().
-#' @param .dir_store Directory holding the family databases.
+#' @param .db_path 04A's candidate store.
 #' @param .lens Tibble from ent_doc_lens().
-#' @param .labels Named character vector: entity name to the family that supplies it.
+#' @param .labels Named character vector: label table to engine token.
 #' @param .reach Integer. Furthest a labelled span may be and still be the marker's neighbour.
 #' @param .quiet Logical. Suppress the loader messages.
 #' @return .marks with NearLabel and NearDist added.
-red_neighbour <- function(.marks, .dir_store, .lens, .labels, .reach = 40L, .quiet = TRUE) {
+red_neighbour <- function(.marks, .db_path, .lens, .labels, .reach = 40L, .quiet = TRUE) {
   if (FALSE) {
-    .marks     <- tab_marks
-    .dir_store <- .lP$Input$Store
-    .lens      <- tab_lens
+    .marks   <- tab_marks
+    .db_path <- .lP$Input$Store
+    .lens    <- tab_lens
     .labels  <- .lP$Params$Neighbours
     .reach   <- 40L
     .quiet   <- TRUE
   }
 
-  others_ <- purrr::imap(.labels, function(.family, .entity) {
-    ent_load_entity(
-      .dir_store = .dir_store,
-      .family    = .family,
-      .entity    = .entity,
-      .lens      = .lens,
-      .extras    = character(),   # only the position matters here
-      .quiet     = .quiet
+  others_ <- purrr::imap(.labels, function(.combo, .label) {
+    ent_load_label(
+      .db_path = .db_path, .lens = .lens, .label = .label, .combo = .combo,
+      .extras = character(), .quiet = .quiet
     ) |>
-      dplyr::transmute(DocID, OStart = .data$Start, OStop = .data$Stop,
-                       NearLabel = tolower(.entity))
+      dplyr::transmute(DocID, OStart = .data$Start, OStop = .data$Stop, NearLabel = .label)
   }) |>
     purrr::list_rbind()
 

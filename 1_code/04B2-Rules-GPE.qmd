@@ -8,6 +8,8 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 # message = TRUE is required: cli writes through the message stream under knitr, so suppressing
@@ -21,38 +23,35 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-options(cli.num_colors = 1, cli.width = 120) # plain ASCII; ANSI codes paste as garbage
-
-.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
-  knitr::current_input()
-} else {
-  rstudioapi::getActiveDocumentContext()[["path"]]
-}
-.name_script <- fs::path_ext_remove(basename(.name_script))
-
-library <- function(...) suppressPackageStartupMessages(base::library(...))
+options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
 ```
 
 ```{r}
 #| label: load-libraries
 #| echo: false
-source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
-source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
-source("1_code/_Commons/_NER.R", encoding = "UTF-8")
-source("1_code/_Commons/_Store.R", encoding = "UTF-8")
-source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
-source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
-source("1_code/_Commons/_Entity.R", encoding = "UTF-8")
 
-# 03A owns the contract-type vocabulary; 04A owns the sample, the canonical text and the store. This
+source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
+
+# ORDER IS LOAD-BEARING. _Plots.R rebuilds its level registry empty every time it is sourced, so any
+# library that registers a vocabulary must follow it -- and both _Entity.R and this document's own
+# file do.
+source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
+
+# 03A owns the contract-type vocabulary; 04A owns the sample, the canonical text and the stores. This
 # document does NOT source 04B1: it reads 04B1's artifact, which is the point of writing one.
 purrr::walk(
   .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
-  .f = function(.s) {
-    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
-           encoding = "UTF-8")
-  }
+  .f = \(.s) source(
+    file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+    encoding = "UTF-8"
+  )
 )
+
+.name_script <- "04B2-Rules-GPE"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
@@ -60,118 +59,152 @@ cat("Main Directory: ")
   .name_script = .name_script  # this document's name; the output directory is derived from it
 ))
 
-cat("Function File: ")
+cat("Function File:  ")
 (.path_fun <- init_create_script_fun(
   .dir_here    = here::here(), # project root
   .name_script = .name_script  # resolves to 1_code/04B2-Rules-GPE.R
 ))
+
 source(file = .path_fun, encoding = "UTF-8")
 ```
 
 # Purpose
 
-04B1 found a contracting party in each contract and labelled every other organisation beside it.
-This document answers one question about each of them: **where is it**.
+04B1 found a contracting party in each contract and labelled every other organisation beside it. This
+document answers one question about each of them: **where is it.**
 
-That question exists because of a referee comment. The published paper reports 1.9 geoentities per
-contract and a figure of occurrence by continent, and referee 1 wrote that *it is unclear whether the
-countries mentioned are the locations of the contracting entities... it seems possible that mentioned
-countries may simply be mentioned in contract pertaining to some planned business activity.* Correct.
-The answer is not to find more places; it is to attach the ones already found to the organisation
-they belong to.
+## The question a referee asked
+
+The published paper reports 1.9 geoentities per contract and a figure of occurrence by continent.
+Referee 1: *"it is unclear whether the countries mentioned are the locations of the contracting
+entities... it seems possible that mentioned countries may simply be mentioned in contract pertaining
+to some planned business activity."* That is right. The answer is not to find more places, it is to
+attach the ones already found to the organisation they belong to.
+
+## Two producers at different tiers, not two opinions about one
+
+matcon's gazetteer carries **116,000** entries and reaches cities and counties. LexNLP carries **437**
+-- countries and first-level subdivisions -- and reaches no city at all.
+
+04A measured what that means. The two agree on only **44.5%** of GPE mentions, and where they do meet
+they agree on boundaries **97.6%** of the time. That is the signature of complements rather than
+substitutes: most of what each proposes, the other never sees, and where both see something they see
+it identically. Neither can be discarded without losing coverage, so both are resolved onto one
+hierarchy, marked, and stacked. **Never pooled inside a table.**
 
 ## The grain is one row per organisation
 
-Not one per document. A document-level variable is then a filter on that table rather than a separate
-computation, and *which party is this the address of* becomes a column rather than a question the
-release cannot answer. Every organisation is computed; filer and counterparty are a column, exactly
-as in 04B1. An organisation with nothing beside it gets a blank, and the count of what was near it
-says whether that means "nothing was there" or "something was and did not resolve".
+Not one per document. A document-level variable is then a filter on this table rather than a separate
+computation, and "which party is this the address of" stops being a question the release cannot
+answer. Every organisation is computed; filer and counterparty are a column, exactly as in 04B1.
 
-## One rule
+## One rule, and one cue
 
 **The place nearest an organisation is that organisation's place.** Search backwards, because a
-preamble names the company and then qualifies it -- `X, a Delaware corporation, with offices at 100
-Main Street, Springfield, Illinois`. Stop at the first organisation. Refuse beyond the reach.
+preamble names the company and then qualifies it -- "X, a Delaware corporation, with offices at 100
+Main Street, Springfield, Illinois". Stop at the first organisation. Refuse beyond the reach. That is
+the whole of it.
 
-## One cue, and only because proximity cannot reach it
-
-A governing-law clause names a jurisdiction nowhere near a party: 95% of the spans its cue catches
-are attached to no organisation at all. An earlier version also carried incorporation and location
-cues, which fired beside a party that proximity had already found -- and, because the cue outranked
-proximity, assigned a role to 14,227 spans attached to nothing. Those two families are gone. One
-signal per question.
-
-Where the clause fires and names no place -- `the laws of the State in which the Premises are
-located` -- that is recorded as **self-referential** rather than as nothing. It is a real contract
-term, not a coverage gap.
+**One cue, and only because proximity cannot reach it.** A governing-law clause sits nowhere near a
+party: 95% of the spans its cue catches are attached to no organisation at all. An earlier version
+also carried incorporation and location cues, which fired beside a party that proximity had already
+caught -- and, because the cue outranked proximity, assigned a role to 14,227 spans attached to
+nothing. Those two families are gone. One signal per question.
 
 ## Cities are an input, not an output
 
-A city resolves to its state and the **state** is released; no reported variable is a city. That is
-what lets the location variable be read against the incorporation variable, because they then live on
-the same tier.
+A city resolves to its state and the state is released; no reported variable is a city. That is the
+only way the location variable can be read against the incorporation variable, because they then live
+on the same tier. Cities stay in the span-level artifact, because they are what validates against
+EDGAR's registered address -- 45.0% at city level against 3.2% at state level, which is the
+separation this whole document rests on.
 
-Two thirds of city names exist in several states. An ambiguous city takes whichever of **its own
-candidate states** the contract itself names, nearest to the city -- which is what stops a
-`Springfield` beside a Delaware corporation from becoming Springfield, Delaware. It uses no new data
-and it is the same evidence the extractor already relies on, since a word-like city name is only
-emitted where a state anchor sits within forty characters.
+Noise is expected and is not eliminated. No place-name stoplist, no check that a city beside a party
+is the party's own rather than its lawyer's. Every table carries the unadjusted count -- every
+distinct place the contract names anywhere -- so a reader sees what the rule removed.
 
-Cities stay in the span-level artifact because they are what validates against EDGAR's registered
-address: **45.0% at city level against 3.2% at state level** on the previous render. That gap is the
-entire argument for resolving cities to states rather than reading state spans as locations.
+## What is recomputed, and what is not
 
-## Both engines, marked
+Everything, on every render. Both families' GPE tables fit in memory and the attachment is a fill
+down an ordered stack, so nothing here is cached and nothing needs to be.
 
-LexNLP resolves jurisdictions and reaches no cities; the gazetteer reaches cities and resolves nothing
-in the store. Every table is built **per engine and stacked**, so a combined view is a choice the
-reader makes rather than one this file makes.
+The stores are opened **read-only**, so no path through this document can write to an artifact it does
+not own. The one file read past a package boundary is the gazetteer's own lookup, and the Input
+section says why that is safe.
 
-## Noise is expected and is not eliminated
+## How results are reported
 
-No place-name stoplist. No check that a city beside a party is the party's own rather than its
-lawyer's. Every table carries the unadjusted count -- every distinct place named anywhere -- so a
-reader sees what the rule removed.
+Console tables throughout, four maps in `# Maps` and three figures in `# Overview`. Every table
+carrying a rule's count carries the unadjusted count beside it, and every table is per family.
 
-**Coverage per organisation will read lower than coverage per document, and that is arithmetic.** A
-document counts as covered when any party has a state; an organisation counts only when it does.
+## Where things are written
+
+Three artifacts: the place spans with their hierarchy, the release at organisation grain, and a
+document-level view of it. 04B3 reads none of them; the release is for the paper.
 
 # Configuration
 
 ```{r}
-#| label: configure-paths
+#| label: configure
+
 .lP <- list(
   Input = list(
     # 04A's canonical text. Every offset in this family indexes this file.
-    Text    = "2_output/04A-EntityExtract/sample_text.parquet",
-    # 04A's sample table: labels, folds and the registered addresses.
-    Anchors = "2_output/04A-EntityExtract/sample_anchors.parquet",
-    # 04A's candidate store, opened read-only.
-    Store   = "2_output/04A-EntityExtract/Store/EntityCandidates.duckdb",
-    # The gazetteer's own hierarchy, rebuilt by 1_code/_Scripts/rebuild-geo-lookup.R.
-    Lookup  = "contracts-engine/data/gazetteer/geo_lookup.parquet",
+    Text = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
+      "Output", "sample_text.parquet"
+    ),
+    # 04A's sample stores, ONE PER FAMILY. The directory is the argument; the family is the filename.
+    Store = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
+      "Output"
+    ),
+    # THE ANCHOR IS BUILT, NOT READ. 03A supplies the labels and folds, 02B the identity, and 01C the
+    # registered addresses -- which this document, unlike 04B1, actually needs: they are the only
+    # external check any of its variables has.
+    Prepared = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare"),
+      "prepared.parquet"
+    ),
+    Register = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "02B-Register"),
+      "Output", "Documents.parquet"
+    ),
+    Landing = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "01C-EdgarMetaData"),
+      "Output", "LandingPage.parquet"
+    ),
+    # THE GAZETTEER'S OWN LOOKUP, inside the matcon-extract package. Reading a package's data tree is
+    # crossing the CLI seam, and it is safe here for a specific reason rather than by convention:
+    # gazetteer.py's spec() folds a content hash of this exact file into gazetteer-v2's spec hash, so
+    # a lookup that changed moves the model's hash and ner_manifest_write() aborts on the next
+    # ingest. This document and the store cannot silently disagree about which lookup they used.
+    Lookup = here::here("contracts-extract", "src", "matcon_extract", "data", "geo_lookup.parquet"),
     # 04B1's organisations, with the position and the role every place attaches to.
-    Org     = "2_output/04B1-Rules-ORG/roles_org.parquet"
+    Org = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "04B1-Rules-ORG"),
+      "Output", "roles_org.parquet"
+    )
   ),
   Output = list(
-    Spans = utils_file_path(.dir_main, "roles_gpe.parquet"), # one row per place span
-    Org   = utils_file_path(.dir_main, "geo_org.parquet"),   # one row per organisation -- the release
-    Doc   = utils_file_path(.dir_main, "geo_doc.parquet")    # one row per document -- a view of it
+    Spans = utils_file_path(.dir_main, "Output", "roles_gpe.parquet"), # one row per place span
+    Org   = utils_file_path(.dir_main, "Output", "geo_org.parquet"),   # per organisation: the release
+    Doc   = utils_file_path(.dir_main, "Output", "geo_doc.parquet")    # per document: a view of it
   ),
   Params = list(
-    # BOTH ENGINES, marked and stacked. Never pooled inside a table.
-    Combos  = c(lexnlp = "lexnlp", gazetteer = "paper:gazetteer-v1"),
-    Extras  = c("GeoName", "GeoAlias", "GeoCategory", "Iso2", "Iso3"),
-    LawWin  = 120L,     # characters read before a span for the governing-law cue
-    Bins    = 50L,      # bins across relative position in the density figure
-    ReadN   = 10L,      # spans read back in context
-    ReadCtx = 200L,     # characters either side of a span
-    CheckN  = 500L,     # spans cut from the text and compared to what was stored
-    MapCombo = "gazetteer", # the engine the maps and the class table are drawn from
-    LabelN      = 12L,  # countries labelled with their count on a world map
-    LabelStates = 15L,  # states labelled on the US map
-    Seed    = 42L       # fixed, so the same documents are read on every render
+    # BOTH FAMILIES, marked and stacked. Never pooled inside a table. The extras differ per family
+    # and are declared once in _Entity.R, because the two gpe tables no longer share a schema: matcon
+    # emits GeoKey, IsWord, NParent and MatchKind; lexnlp emits GeoName, GeoAlias and GeoCategory.
+    Families = c("lexnlp", "matcon"),
+    LawWin   = 120L,     # characters read before a span for the governing-law cue
+    Bins     = 50L,      # bins across relative position in the density figure
+    ReadN    = 10L,      # spans read back in context
+    ReadCtx  = 200L,     # characters either side of a span
+    CheckN   = 500L,     # spans cut from the text and compared to what was stored
+    MapCombo = "matcon", # the family the maps and the class table are drawn from
+    LabelN      = 12L,   # countries labelled with their count on a world map
+    LabelStates = 15L,   # states labelled on the US map
+    Seed     = 42L       # fixed, so the same documents are read on every render
   )
 )
 
@@ -194,24 +227,36 @@ document counts as covered when any party has a state; an organisation counts on
   geo_spec(.reach = 200, .party_only = TRUE)  # parties only, against every organisation
 )
 
-fs::file_exists(unlist(.lP$Input))
+fs::dir_create(fs::path_dir(.lP$Output$Spans))
+
+tibble::tibble(
+  Input  = names(.lP$Input),
+  Path   = purrr::map_chr(.lP$Input, \(.p) fs::path_rel(.p, start = here::here())),
+  Exists = purrr::map_lgl(.lP$Input, \(.p) fs::file_exists(.p) || fs::dir_exists(.p))
+) |>
+  tbl_say(.title = "Every input resolves before anything is computed")
 ```
 
-The last path is 04B1's artifact. This document reads it rather than sourcing 04B1, which is the
-reason for splitting the family: a change to the date rule should not re-run the party sweep.
+Failing here rather than six chunks later is deliberate: a missing upstream artifact should stop the
+document where the path is declared. `Org` is 04B1's artifact, read rather than recomputed, which is
+the reason for splitting the family -- a change to the date rule should not re-run the party sweep.
 
-# Sample
+# Input
 
 ```{r}
 #| label: build-keys
+
 tab_keys <- ent_anchor_keys(
-  .path_anchors = .lP$Input$Anchors   # carries the registered addresses the validation needs
+  .path_prepared = .lP$Input$Prepared,   # 03A: DocID, ClassDetailed, AmendType, Fold
+  .path_register = .lP$Input$Register,   # 02B: CIK, CompanyName, DateFiled
+  .path_landing  = .lP$Input$Landing,    # 01C: the registered addresses this document validates on
+  .quiet         = FALSE
 )
 
 tab_lens <- ent_doc_lens(.path_text = .lP$Input$Text)
 
 tab_org <- arrow::read_parquet(.lP$Input$Org) |>
-  dplyr::select(DocID, Key, Name, Role, Start, Stop)
+  dplyr::select("DocID", "Key", "Name", "Role", "Start", "Stop")
 
 tibble::tibble(
   Item = c("Documents in the sample",
@@ -230,10 +275,16 @@ tibble::tibble(
   tbl_say(.title = "What this document is built on")
 ```
 
+**The address coverage is the second row and it is the ceiling on the only precision measure here.**
+Nothing upstream has ever reported it: 04B1 passed `NULL` for the landing page because ORG has no use
+for an address, so this is the first render in which that join runs at all. A low number is not a
+defect -- it is the denominator every figure in Validation is read against.
+
 ```{r}
 #| label: load-lookup
+
 tab_lookup <- geo_lookup(
-  .path_lookup = .lP$Input$Lookup   # one row per name and class, every column prefixed Lk
+  .path_lookup = .lP$Input$Lookup   # the two parent columns gazetteer-v2 does not emit
 )
 
 tab_cand <- geo_candidates(
@@ -241,41 +292,84 @@ tab_cand <- geo_candidates(
 )
 ```
 
+**The lookup does much less than it used to.** `gazetteer-v2` emits `GeoKey`, `NParent`, `IsWord`,
+`Iso2` and `Iso3` on every row it writes, so only the state and its county are recovered here. Under
+the flat store none of those arrived and all five were joined in.
+
 ```{r}
 #| label: load-spans
-tab_raw <- purrr::imap(
-  .x = .lP$Params$Combos,
-  .f = function(.combo, .engine) {
-    ent_load_label(
-      .db_path = .lP$Input$Store,     # opened read-only
-      .lens    = tab_lens,            # supplies document length
-      .label   = "gpe",
-      .combo   = .combo,
-      .extras  = .lP$Params$Extras,   # lexnlp's resolved columns; empty on gazetteer rows
-      .quiet   = FALSE
-    ) |>
-      geo_resolve(.lookup = tab_lookup, .engine = .engine) |>
-      dplyr::mutate(Combo = .engine, .before = 1L)
-  }
+
+tab_raw <- purrr::map(
+  .x = .lP$Params$Families,
+  .f = \(.fam) ent_load_entity(
+    .dir_store = .lP$Input$Store,               # the directory; the family is the filename
+    .family    = .fam,
+    .entity    = "GPE",
+    .lens      = tab_lens,                      # supplies document length
+    .extras    = ent_extras(.fam, "GPE"),       # declared per family in _Entity.R
+    .quiet     = FALSE
+  ) |>
+    geo_resolve(.lookup = tab_lookup, .family = .fam) |>
+    dplyr::mutate(Combo = .fam, .before = 1L)
 ) |>
   purrr::list_rbind()
 ```
 
+**The extras are asked for per family**, because the two `gpe` tables no longer share a schema. Under
+the flat store a caller named one list for both and the ingest padded whatever an extractor did not
+emit; here asking matcon for `GeoName` is an abort naming the columns it does have.
+
+**And two of them are renamed on read, because a shared column name is not a shared quantity.** Both
+families emit an `Iso2` and an `Iso3`, and the four columns mean four things. matcon's own
+documentation is explicit: its `Iso2` resolves *"all 50 states, 81% of populated places, 95% of
+counties, and NEVER a country"*, while its `Iso3` is *"every country, and USA for every US entity"*.
+LexNLP is the other way round -- `Iso3` on countries alone, `Iso2` on a country **or** a subdivision.
+
+Read under one pair of names the two disagree silently, and the first version of this document did
+exactly that. It rendered clean and produced the right answer by luck: `geo_country()` reads the
+country column first and matcon's happened to be one, while the subdivision-prefix recovery sat dead
+at 0.0% of matcon's rows and 4.2% of LexNLP's. They arrive as `SubIso` and `CountryIso3` now, and
+`geo_resolve()` is the one place their meaning is mapped onto the shared hierarchy.
+
 ```{r}
 #| label: resolve-cities
+
 tab_geo <- tab_raw |>
   geo_city_state(.cand = tab_cand) |>   # every state a city name exists in
-  geo_country()                          # ISO alpha-3, the only country key both engines produce
+  geo_country()                          # the country, from three sources in a stated order
 
 geo_report_resolve(.geo = tab_geo)
 ```
 
 ```{r}
 #| label: report-cities
+
 geo_report_city(.geo = tab_geo)
 ```
 
-# Attachment
+```{r}
+#| label: report-coverage
+
+tab_cover <- geo_coverage(.geo = tab_geo)
+
+geo_report_coverage(.tab = tab_cover, .country = tab_geo)
+```
+
+**This table exists because a claim about a column belongs in a render rather than in a paragraph.**
+04A's prose asserted that LexNLP emits no ISO codes, reasoning from the fact that the codes are
+dropped as **match aliases** -- which is true, and does not follow. `IN`, `NOR` and `AND` are English
+words appearing in nearly every contract, so admitting them as aliases would be ruinous; but the codes
+are a property of the entity that matched, not of the alias that matched it, and they arrive
+populated. That error survived one document because nothing printed the column.
+
+The country rollup is reported for the same reason. It is the one place a country is **inferred**
+rather than read: of the geo dictionary's 437 entities only the 253 countries carry an ISO-3166-3, so
+Ontario, Guangdong and Scotland have none. Their ISO-3166-2 is a subdivision code -- `CA-AB`, `CN-13`,
+`GB-ENG` -- whose prefix is exactly the country, and splitting on the hyphen recovers it. An earlier
+version claimed those rows "keep their ISO code, so they roll to a country" and they did not; they
+came out missing.
+
+# Construction
 
 ```{r}
 #| label: attach-base
@@ -299,7 +393,7 @@ geo_report_org(.orgtab = tab_org_geo)
 
 This is the release. Everything below is either a check on it or a view of it.
 
-# Governing law
+## Governing law
 
 ```{r}
 #| label: build-law
@@ -328,14 +422,7 @@ tab_doc <- geo_doc_table(
 geo_report_law(.doc = tab_doc)
 ```
 
-# Validation
-
-```{r}
-#| label: validate-address
-tab_validate <- geo_validate(.roles = tab_roles, .keys = tab_keys)
-
-geo_report_validate(.tab = tab_validate)
-```
+# Selection
 
 ```{r}
 #| label: sweep-specs
@@ -348,6 +435,29 @@ tab_sweep <- geo_sweep(
 )
 
 geo_report_sweep(.tab = tab_sweep)
+```
+
+**A wider reach always attaches more places; whether the extra ones are right is only visible in the
+address column.** That is why the sweep carries it rather than reporting size alone -- a specification
+can be judged only on the one quantity this document has an external check for.
+
+# Results
+
+```{r}
+#| label: report-class
+geo_report_class(
+  .doc   = tab_doc,
+  .combo = "matcon"     # named, not taken as whichever family came first
+)
+```
+
+# Validation
+
+```{r}
+#| label: validate-address
+tab_validate <- geo_validate(.roles = tab_roles, .keys = tab_keys)
+
+geo_report_validate(.tab = tab_validate)
 ```
 
 ```{r}
@@ -398,7 +508,7 @@ tibble::tibble(
   tbl_say(.title = "Every row is expected at 100%")
 ```
 
-# Reading
+# Robustness
 
 ```{r}
 #| label: read-state
@@ -484,7 +594,7 @@ ent_read_spans(
 # no address in the contract -- but the block that says whether the blank is honest.
 ent_read_spans(
   .tab       = tab_org_geo |>
-    dplyr::filter(!.data$HasGeo, .data$OrgRole == "counterparty", .data$Combo == "gazetteer") |>
+    dplyr::filter(!.data$HasGeo, .data$OrgRole == "counterparty", .data$Combo == "matcon") |>
     dplyr::left_join(dplyr::select(tab_org, DocID, Key, Stop), by = dplyr::join_by(DocID,
                                                                                    OrgKey == Key)),
   .path_text = .lP$Input$Text,
@@ -499,157 +609,6 @@ ent_read_spans(
     .title = "Counterparties with no place beside them"
   )
 ```
-
-# Results
-
-```{r}
-#| label: report-class
-geo_report_class(
-  .doc   = tab_doc,
-  .combo = "gazetteer"   # named, not taken as whichever engine came first
-)
-```
-
-# Maps
-
-Four views of the same count, all document-weighted: a contract either names a place or it does not,
-so one table-heavy filing cannot colour a country on its own. The fill is logarithmic, because the
-United States outweighs everywhere else by three orders of magnitude and a linear scale would paint
-one country and leave the rest indistinguishable from empty. The largest areas carry their count.
-
-**The first two tabs are the argument.** Unadjusted is every place the contracts name -- the
-published figure of 1.9 geoentities per contract, and what referee 1 could not interpret. Parties is
-the same count restricted to places this document attached to a filer or a counterparty. The
-difference between them is the rule.
-
-::: {.panel-tabset}
-
-## Unadjusted
-
-```{r}
-#| label: fig-map-unadjusted
-#| fig-height: !expr plot_height(6L)
-#| fig-cap: "Countries by the number of contracts naming a place in them, with no rule applied. Every
-#|   place span counts, wherever it sits and whatever it refers to -- a party's address, a planned
-#|   business activity, a court's seat. This is the map the published geoentity count would draw."
-geo_map_input(
-  .roles    = tab_roles,
-  .keys     = tab_keys,
-  .combo    = .lP$Params$MapCombo,
-  .scope    = "all",        # every span, attached or not
-  .level    = "country",
-  .by_class = FALSE
-) |>
-  plot_map_world(
-    .val     = "N",
-    .log     = TRUE,
-    .name    = "Contracts",
-    .label_n = .lP$Params$LabelN
-  )
-```
-
-## Parties
-
-```{r}
-#| label: fig-map-parties
-#| fig-height: !expr plot_height(6L)
-#| fig-cap: "The same count, restricted to places attached to a filer or a counterparty. A country
-#|   that fades between this tab and the last is one the contracts mention without any party being
-#|   there, which is exactly the distinction the referee asked for."
-geo_map_input(
-  .roles    = tab_roles,
-  .keys     = tab_keys,
-  .combo    = .lP$Params$MapCombo,
-  .scope    = "parties",    # attached to a filer or a counterparty
-  .level    = "country",
-  .by_class = FALSE
-) |>
-  plot_map_world(
-    .val     = "N",
-    .log     = TRUE,
-    .name    = "Contracts",
-    .label_n = .lP$Params$LabelN
-  )
-```
-
-## By contract type
-
-One full-width map per type, in a nested tabset. A three-by-four grid of world maps was three hundred
-pixels a panel: the titles clipped, the coastlines vanished and no country was distinguishable from
-its neighbour. A small multiple has to be small AND legible, and a world map is not.
-
-Each map is emitted through `knitr::knit_child()` rather than by writing headers with `cat()`. A
-header printed from an `asis` chunk is markdown, but the figures beside it are output blocks knitr
-wraps separately, so the two do not interleave and every map lands under the first tab. A child
-document produces one properly wrapped cell per class, which is what the tabset needs.
-
-::: {.panel-tabset}
-
-```{r}
-#| label: fig-map-class
-#| results: asis
-#| echo: false
-tab_map_class <- geo_map_input(
-  .roles    = tab_roles,
-  .keys     = tab_keys,
-  .combo    = .lP$Params$MapCombo,
-  .scope    = "parties",
-  .level    = "country",
-  .by_class = TRUE          # computed once, then split one class at a time
-)
-
-purrr::walk(plot_levels("ClassDetailed"), function(.cls) {
-  cat(
-    knitr::knit_child(
-      text  = c(
-        "### `r .cls`",
-        "",
-        "```{r}",
-        "#| echo: false",
-        paste0("#| fig-height: ", plot_height(6L)),
-        "tab_map_class |>",
-        "  dplyr::filter(.data$Class == .cls) |>",
-        "  plot_map_world(.val = \"N\", .log = TRUE, .name = \"Contracts\",",
-        "                 .label_n = .lP$Params$LabelN)",
-        "```",
-        ""
-      ),
-      envir = environment(),
-      quiet = TRUE
-    ),
-    sep = "\n"
-  )
-})
-```
-
-:::
-
-## US states
-
-```{r}
-#| label: fig-map-states
-#| fig-height: !expr plot_height(6L)
-#| fig-cap: "US states by the number of contracts placing a party there. This is the tier the rule
-#|   actually releases, and the one with enough mass to show structure -- a world map of US contracts
-#|   is one dark country and a scattering. Delaware is incorporation rather than location, which is
-#|   the distinction the registered-address check measures."
-geo_map_input(
-  .roles    = tab_roles,
-  .keys     = tab_keys,
-  .combo    = .lP$Params$MapCombo,
-  .scope    = "parties",
-  .level    = "state",      # the released tier
-  .by_class = FALSE
-) |>
-  plot_map_usa(
-    .val     = "N",
-    .log     = TRUE,
-    .name    = "Contracts",
-    .label_n = .lP$Params$LabelStates
-  )
-```
-
-:::
 
 # Deployment
 
@@ -679,11 +638,133 @@ what the registered-address check reads and what anyone re-deriving the resoluti
 
 # Overview
 
+## Maps
+
+Four views of the same count, all document-weighted: a contract either names a place or it does not,
+so one table-heavy filing cannot colour a country on its own. The fill is logarithmic, because the
+United States outweighs everywhere else by three orders of magnitude and a linear scale would paint
+one country and leave the rest indistinguishable from empty. The largest areas carry their count.
+
+**The first two tabs are the argument.** Unadjusted is every place the contracts name -- the
+published figure of 1.9 geoentities per contract, and what referee 1 could not interpret. Parties is
+the same count restricted to places this document attached to a filer or a counterparty. The
+difference between them is the rule.
+
+::: {.panel-tabset}
+
+### Unadjusted
+
+```{r}
+#| label: fig-map-unadjusted
+#| fig-height: !expr plot_height(6L)
+#| fig-cap: "Countries by the number of contracts naming a place in them, with no rule applied. Every
+#|   place span counts, wherever it sits and whatever it refers to -- a party's address, a planned
+#|   business activity, a court's seat. This is the map the published geoentity count would draw."
+geo_map_input(
+  .roles    = tab_roles,
+  .keys     = tab_keys,
+  .combo    = .lP$Params$MapCombo,
+  .scope    = "all",        # every span, attached or not
+  .level    = "country",
+  .by_class = FALSE
+) |>
+  plot_map_world(
+    .val     = "N",
+    .log     = TRUE,
+    .name    = "Contracts",
+    .label_n = .lP$Params$LabelN
+  )
+```
+
+### Parties
+
+```{r}
+#| label: fig-map-parties
+#| fig-height: !expr plot_height(6L)
+#| fig-cap: "The same count, restricted to places attached to a filer or a counterparty. A country
+#|   that fades between this tab and the last is one the contracts mention without any party being
+#|   there, which is exactly the distinction the referee asked for."
+geo_map_input(
+  .roles    = tab_roles,
+  .keys     = tab_keys,
+  .combo    = .lP$Params$MapCombo,
+  .scope    = "parties",    # attached to a filer or a counterparty
+  .level    = "country",
+  .by_class = FALSE
+) |>
+  plot_map_world(
+    .val     = "N",
+    .log     = TRUE,
+    .name    = "Contracts",
+    .label_n = .lP$Params$LabelN
+  )
+```
+
+### By contract type
+
+The twelve per-class world maps that stood here have been replaced by a table, for two reasons and
+both are evidence rather than taste.
+
+**The construct failed twice.** They were drawn one per class through `knitr::knit_child()` inside a
+nested tabset. In the 03 pass Quarto's tabset filter emptied `panel-tabset` divs built from
+R-generated HTML, and the project recorded that construct as abandoned. Here it failed differently: a
+plot recorded inside a child is replayed onto a device that has not registered the theme's font, and
+`grid` raises `invalid font type` at the first label drawn -- which is why the two unlabelled stages
+before it completed and the labelled draw did not.
+
+**And the figure was the weakest in the document.** The US map's own caption says a world map of US
+contracts is one dark country and a scattering; twelve of those is twelve dark countries. The
+question they were asked -- which contract types reach outside the United States -- is answered
+better by counting.
+
+```{r}
+#| label: report-class-countries
+
+tab_class_geo <- geo_class_countries(
+  .roles = tab_roles,
+  .keys  = tab_keys,                 # supplies the type and the denominator
+  .combo = .lP$Params$MapCombo,      # matcon, the family that reaches a city
+  .scope = "parties",                # attached to a filer or a counterparty
+  .n     = .lP$Params$LabelN         # countries shown as columns, most frequent first
+)
+
+geo_report_class_countries(.tab = tab_class_geo, .combo = .lP$Params$MapCombo)
+```
+
+### US states
+
+```{r}
+#| label: fig-map-states
+#| fig-height: !expr plot_height(6L)
+#| fig-cap: "US states by the number of contracts placing a party there. This is the tier the rule
+#|   actually releases, and the one with enough mass to show structure -- a world map of US contracts
+#|   is one dark country and a scattering. Delaware is incorporation rather than location, which is
+#|   the distinction the registered-address check measures."
+geo_map_input(
+  .roles    = tab_roles,
+  .keys     = tab_keys,
+  .combo    = .lP$Params$MapCombo,
+  .scope    = "parties",
+  .level    = "state",      # the released tier
+  .by_class = FALSE
+) |>
+  plot_map_usa(
+    .val     = "N",
+    .log     = TRUE,
+    .name    = "Contracts",
+    .label_n = .lP$Params$LabelStates
+  )
+```
+
+:::
+
+## The rule in three figures
+
 ```{r}
 #| label: fig-density
 #| fig-height: !expr plot_height(6L)
 #| fig-cap: "Share of place spans by relative position in the document, weighted by documents, per
-#|   engine. LexNLP's jurisdictions and the gazetteer's cities do not sit in the same part of a
+#|   engine. LexNLP's jurisdictions and matcon's cities do not sit in the same part of a
 #|   contract, which is the first sign that they are measuring different things."
 tab_geo |>
   dplyr::group_split(.data$Combo) |>
@@ -732,9 +813,9 @@ geo_report_all(
 Two things here are provisional and both are decided by a number rather than by argument. The reach
 is one figure for every level; the sweep carries a per-level row and the registered-address column is
 what would justify taking it. And the release is built from both engines side by side; the resolution
-table says the gazetteer matches LexNLP on states, beats it on countries and adds every city, so the
-gazetteer may end up carrying the release with LexNLP retained only for the subdivisions the
-hierarchy has no tier for.
+table says matcon matches LexNLP on states, beats it on countries and adds every city, so matcon may
+end up carrying the release with LexNLP retained only for the subdivisions the hierarchy has no tier
+for.
 
 04B3 takes dates, which are not anchored on a party and answer a different referee. Contract duration
 is currently the filing date to the farthest future date in the text, and Table 3 Panel B reports a

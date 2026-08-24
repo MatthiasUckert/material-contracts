@@ -14,19 +14,7 @@
 # organisations. There is nothing for a window to separate.
 #
 # CURRENCIES ARE NEVER POOLED. A maximum across currencies is not a quantity. Currency is populated
-# on 100% of both families' rows -- 42,937 of 42,937 -- so the split costs nothing.
-#
-# AMOUNT ARRIVES AS TEXT AND IS CAST HERE. moneyregex crosses the seam as a string precisely so a
-# contract value survives intact, and the store now keeps it that way: the schema is derived from the
-# parquet rather than declared, so Amount lands as VARCHAR. Casting where somebody does arithmetic is
-# the right place for it, and this is that place.
-#
-# ONE FAMILY IS BARELY USABLE AND THE DOCUMENT SAYS SO RATHER THAN QUIETLY DROPPING IT. Over the
-# corpus LexNLP reaches 0.170 coverage against matcon's 0.710, at 3.0 spans a document against 14.6.
-# 04A measured the sharper version on the sample: of 2,541 mentions the two families BOTH found,
-# ZERO share identical offsets. Not a disagreement -- a systematic convention difference, and one of
-# the two is including something the other is not. Both are loaded, marked and reported apart, and
-# the reading blocks are where the difference becomes visible rather than inferred.
+# on 100% of both money engines' rows -- 42,937 of 42,937 -- so the split costs nothing.
 #
 # THE REPETITION RATIO IS WHY SUM SURVIVES. A contract restating the same fifty million across five
 # clauses sums to two hundred and fifty million, and no filter can tell a restatement from a second
@@ -45,17 +33,11 @@
 
 if (FALSE) {
   .path_text <- .lP$Input$Text
-  .dir_store <- .lP$Input$Store
+  .db_path   <- .lP$Input$Store
 }
 
 
 # 1. Vocabulary --------------------------------------------------------------------------------------------------------
-
-plot_register_levels(
-  .key    = "MoneyEngine",
-  .levels = c("lexnlp", "matcon"),
-  .short  = c("lexnlp", "matcon")
-)
 
 plot_register_levels(
   .key    = "MoneyBlock",
@@ -108,44 +90,36 @@ mny_spec <- function(.filter = "par", .cue_win = 60L, .label = NULL) {
 
 # 3. Input ---------------------------------------------------------------------------------------------------------------
 
-#' Load the money spans from both families, with the par-value context
+#' Load the money spans from both engines, with the par-value context
 #'
 #' Amount and Currency arrive resolved from the store. The context is read here rather than in the
 #' filter, because it does not depend on any specification and reading the text twice would cost more
 #' than carrying sixty characters per span.
 #'
-#' AMOUNT IS CAST FROM TEXT. moneyregex writes it as a string so a contract value crosses the seam
-#' intact, and the store keeps the string because its schema is the parquet's. as.numeric() here is
-#' the first arithmetic anything does with it, which is where the cast belongs -- and a value that
-#' will not cast becomes NA and is counted by the parse report rather than silently dropped.
-#'
-#' @param .dir_store Directory holding the family databases.
+#' @param .db_path 04A's candidate store.
 #' @param .lens Tibble from ent_doc_lens().
 #' @param .path_text 04A's canonical text parquet.
-#' @param .families Character vector of family names.
+#' @param .combos Named character vector of engine tokens.
 #' @param .win Integer. Characters read before a span.
 #' @param .quiet Logical. Suppress the count messages.
 #' @return Tibble: one row per span, with Combo, Amount, Currency, Block and IsPar.
-mny_load <- function(.dir_store, .lens, .path_text, .families = c("lexnlp", "matcon"),
-                     .win = 60L, .quiet = FALSE) {
+mny_load <- function(.db_path, .lens, .path_text, .combos, .win = 60L, .quiet = FALSE) {
   if (FALSE) {
-    .dir_store <- .lP$Input$Store
+    .db_path   <- .lP$Input$Store
     .lens      <- tab_lens
     .path_text <- .lP$Input$Text
-    .families  <- .lP$Params$Families
+    .combos    <- .lP$Params$Combos
     .win       <- 60L
     .quiet     <- FALSE
   }
 
-  raw_ <- purrr::map(.families, \(.fam) ent_load_entity(
-    .dir_store = .dir_store,
-    .family    = .fam,
-    .entity    = "MONEY",
-    .lens      = .lens,
-    .extras    = ent_extras(.fam, "MONEY"),   # Amount and Currency, from both
-    .quiet     = .quiet
-  ) |>
-    dplyr::mutate(Combo = .fam, .before = 1L)) |>
+  raw_ <- purrr::imap(.combos, function(.combo, .engine) {
+    ent_load_label(
+      .db_path = .db_path, .lens = .lens, .label = "money", .combo = .combo,
+      .extras = c("Amount", "Currency"), .quiet = .quiet
+    ) |>
+      dplyr::mutate(Combo = .engine, .before = 1L)
+  }) |>
     purrr::list_rbind()
 
   txt_ <- arrow::read_parquet(.path_text)
@@ -157,8 +131,6 @@ mny_load <- function(.dir_store, .lens, .path_text, .families = c("lexnlp", "mat
 
   raw_ |>
     dplyr::mutate(
-      AmountRaw = as.character(.data$Amount),
-      Amount    = suppressWarnings(as.numeric(.data$AmountRaw)),
       Before = stringi::stri_trans_toupper(
         stringi::stri_replace_all_regex(
           stringi::stri_sub(src_, from = pmax(1L, .data$Start + 1L - .win), to = .data$Start),
@@ -170,7 +142,7 @@ mny_load <- function(.dir_store, .lens, .path_text, .families = c("lexnlp", "mat
       Block    = dplyr::case_when(
         is.na(.data$Currency)     ~ NA_character_,
         .data$Currency == "USD"   ~ "USD",
-        .default                  = "non-USD"
+        TRUE                      ~ "non-USD"
       ),
       IsZero   = !is.na(.data$Amount) & .data$Amount == 0
     )
@@ -378,13 +350,13 @@ mny_report_sweep <- function(.tab) {
 
 #' The released variables by contract type
 #' @param .agg Tibble from mny_aggregate().
-#' @param .combo Character. Which family the table covers.
+#' @param .combo Character. Which engine the table covers.
 #' @param .block Character. Which currency block.
 #' @return Invisibly the summary.
-mny_report_class <- function(.agg, .combo = "matcon", .block = "USD") {
+mny_report_class <- function(.agg, .combo = "moneyregex", .block = "USD") {
   if (FALSE) {
     .agg   <- tab_agg
-    .combo <- "matcon"
+    .combo <- "moneyregex"
     .block <- "USD"
   }
 
@@ -425,14 +397,14 @@ mny_report_class <- function(.agg, .combo = "matcon", .block = "USD") {
 #' @param .money Tibble from mny_load().
 #' @param .sweep Tibble from mny_sweep().
 #' @param .agg Tibble from mny_aggregate().
-#' @param .combo Character. Which family the class table covers.
+#' @param .combo Character. Which engine the class table covers.
 #' @return Invisibly NULL.
-mny_report_all <- function(.money, .sweep, .agg, .combo = "matcon") {
+mny_report_all <- function(.money, .sweep, .agg, .combo = "moneyregex") {
   if (FALSE) {
     .money <- tab_money
     .sweep <- tab_sweep
     .agg   <- tab_agg
-    .combo <- "matcon"
+    .combo <- "moneyregex"
   }
 
   mny_report_parse(.money = .money)
@@ -447,13 +419,13 @@ mny_report_all <- function(.money, .sweep, .agg, .combo = "matcon") {
 
 #' Distribution of the largest amount per contract, by type
 #' @param .agg Tibble from mny_aggregate().
-#' @param .combo Character. Which family.
+#' @param .combo Character. Which engine.
 #' @param .block Character. Which currency block.
 #' @return A ggplot object.
-mny_plot_max <- function(.agg, .combo = "matcon", .block = "USD") {
+mny_plot_max <- function(.agg, .combo = "moneyregex", .block = "USD") {
   if (FALSE) {
     .agg   <- tab_agg
-    .combo <- "matcon"
+    .combo <- "moneyregex"
     .block <- "USD"
   }
 
@@ -474,12 +446,12 @@ mny_plot_max <- function(.agg, .combo = "matcon", .block = "USD") {
 
 #' How much of a contract's money is the same figure repeated
 #' @param .agg Tibble from mny_aggregate().
-#' @param .combo Character. Which family.
+#' @param .combo Character. Which engine.
 #' @return A ggplot object.
-mny_plot_repeat <- function(.agg, .combo = "matcon") {
+mny_plot_repeat <- function(.agg, .combo = "moneyregex") {
   if (FALSE) {
     .agg   <- tab_agg
-    .combo <- "matcon"
+    .combo <- "moneyregex"
   }
 
   .agg |>

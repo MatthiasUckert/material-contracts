@@ -1,30 +1,18 @@
 # 04B1-Rules-ORG: the contracting party and its counterparties --------------------------------------------------------
 #
 # WHAT THIS FILE DOES
-# 04A ran three extractor families over 4,398 hand-classified contracts and ranked none of them,
-# because ranking needs labels and there are no entity labels. 04B writes the rules, ONE DOCUMENT PER
-# ENTITY. This is the first: organisations, because every other party quantity -- the jurisdiction,
-# the address, the signing date -- is measured from where an organisation was found.
+# 04A extracted nine engines over 4,398 hand-classified contracts and ranked none of them, because
+# ranking needs labels and there are no entity labels. 04B writes the rules, ONE DOCUMENT PER ENTITY.
+# This is the first: organisations, because every other party quantity -- the jurisdiction, the
+# address, the signing date -- is measured from where an organisation was found.
 #
-# Shared tooling lives in _Commons/_Entity.R: the name reduction, the anchor build, the store loader,
-# the span reader, the offset check and the table shapes. Everything here is a RULE, and rules belong
-# to one entity.
+# Shared tooling lives in _Commons/_Entity.R: the name reduction, the store loader, the span reader,
+# the offset check and the table shapes. Everything here is a RULE, and rules belong to one entity.
 #
 # ONE ENGINE, AND THAT IS THE BINDING CONSTRAINT
-# 04C ran two families over the corpus and neither is spaCy. For ORG that leaves lexnlp alone, so the
-# whole rule runs in R over a table that fits in memory and DuckDB is read once.
-#
-# 04A's own measurements are why spaCy is not the loss it looks like. On the labelled sample the
-# transformer alone emitted 915,716 ORG spans against lexnlp's 81,467 -- eleven times as many. But
-# volume is not the argument: the positional contrast is. lexnlp's ORG concentrates at the document
-# ends with a contrast of 4.36, the strongest of any producer and entity 04A measured, while spaCy's
-# is 0.97, uniform to within rounding. spaCy finds every organisation named anywhere; lexnlp finds
-# the ones named where parties are named. For this rule that is the better instrument.
-#
-# COUNTS IN SPANS, NOT MENTIONS. 04A's agreement tables count MENTIONS -- overlapping spans within a
-# document collapsed into one place in the text -- so its 80,584 and this file's 81,467 are the same
-# extraction in two units. Comparing one against the other is how a quantity gets measured against
-# itself and found to disagree.
+# 04C runs five engines over the corpus and none of them is spaCy. For ORG that leaves lexnlp alone,
+# which emits 81,467 spans against spaCy's 5.3 million, so the whole rule runs in R over a table that
+# fits in memory and DuckDB is read once.
 #
 # THE PARTY IS THE ANCHOR, NOT A REGION
 # An earlier design read a fixed head and asked whether the filer was inside it. Sweeping that head
@@ -53,20 +41,13 @@
 # carries the UNADJUSTED count -- every distinct organisation the contract names anywhere -- so the
 # reader sees what the rule removed rather than being asked to trust that it removed the right things.
 #
-# TWO COLUMN NAMES ARE THIS PROJECT'S AND NOT LEXNLP'S, and the translation happens once, in
-# ent_load_entity(). NameCore is lexnlp's Name -- renamed because Name means the resolved company for
-# ORG and the resolved place for GPE, and one column meaning two things is a defect waiting for a
-# reader. LegalForm is lexnlp's TypeAbbr -- renamed because it holds the string "NA" for a National
-# Association, which R prints identically to a missing value. Everything below uses the project's
-# names and never sees lexnlp's.
-#
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
 # cli/fs/here; pure ASCII; stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
 
 if (FALSE) {
   .path_text <- .lP$Input$Text
-  .dir_store <- .lP$Input$Store
+  .db_path   <- .lP$Input$Store
 }
 
 
@@ -127,8 +108,7 @@ plot_register_levels(
 #' @param .guard_deep_family Logical. Refuse a ONE-TOKEN family match past .deep. FALSE, because
 #'   reading the ten it would refuse found six to be the right corporate family -- Nielsen Holdings
 #'   to The Nielsen Company, NewAlliance Bancshares to NewAlliance Bank -- against four bad ones, and
-#'   refusing sends all ten to the fallback, which is right 64.6% of the time -- 71.2% before the
-#'   exact-within override, and the fall is that override working rather than a cost. Swept row.
+#'   refusing sends all ten to a fallback that is right 71% of the time. Kept as a swept row.
 #' @return A named list carrying the match specification.
 ent_rule <- function(.key = "core", .min_key = 2L, .min_contain = 5L, .tight = TRUE,
                      .frag_min = 10L, .frag_share = 0.6,

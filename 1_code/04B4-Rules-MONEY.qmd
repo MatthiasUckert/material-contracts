@@ -8,6 +8,8 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| label: setup
 #| include: false
 #| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
 knitr::opts_chunk$set(
@@ -17,36 +19,32 @@ knitr::opts_chunk$set(
   comment  = ""
 )
 
-options(cli.num_colors = 1, cli.width = 120) # plain ASCII; ANSI codes paste as garbage
-
-.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
-  knitr::current_input()
-} else {
-  rstudioapi::getActiveDocumentContext()[["path"]]
-}
-.name_script <- fs::path_ext_remove(basename(.name_script))
-
-library <- function(...) suppressPackageStartupMessages(base::library(...))
+options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
 ```
 
 ```{r}
 #| label: load-libraries
 #| echo: false
-source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
-source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
-source("1_code/_Commons/_NER.R", encoding = "UTF-8")
-source("1_code/_Commons/_Store.R", encoding = "UTF-8")
-source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
-source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
-source("1_code/_Commons/_Entity.R", encoding = "UTF-8")
+
+source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
+
+# ORDER IS LOAD-BEARING. _Plots.R rebuilds its level registry empty every time it is sourced, so any
+# library that registers a vocabulary must follow it.
+source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
 
 purrr::walk(
   .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
-  .f = function(.s) {
-    source(file = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
-           encoding = "UTF-8")
-  }
+  .f = \(.s) source(
+    file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+    encoding = "UTF-8"
+  )
 )
+
+.name_script <- "04B4-Rules-MONEY"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
@@ -54,66 +52,106 @@ cat("Main Directory: ")
   .name_script = .name_script  # this document's name; the output directory is derived from it
 ))
 
-cat("Function File: ")
+cat("Function File:  ")
 (.path_fun <- init_create_script_fun(
   .dir_here    = here::here(), # project root
   .name_script = .name_script  # resolves to 1_code/04B4-Rules-MONEY.R
 ))
+
 source(file = .path_fun, encoding = "UTF-8")
 ```
 
 # Purpose
 
-This is the least opinionated of the five rule documents, and it should be. There is no external fact
-to anchor an amount against -- nothing in EDGAR records what a contract was worth -- and no taxonomy
-that says which figure in a credit agreement is *the* amount. So this document does not invent one.
-It reports what the extractors found, filters the two things that demonstrably are not amounts, and
-puts the numbers beside the contract type so a reader can judge whether the ordering makes sense.
+This document turns parsed amounts into document-level money variables.
+
+## The least opinionated of the five, and it should be
+
+There is no external fact to anchor an amount against and no taxonomy that says what a contract's
+value is, so this document does not invent one. It reports what the extractors found, filters the two
+things that are demonstrably not amounts, and puts the numbers beside the contract type so a reader
+can see whether the ordering makes sense.
+
+## One family is barely usable, and the document says so
+
+Over the corpus LexNLP reaches **0.170** coverage against matcon's **0.710**, at 3.0 spans a document
+against 14.6. 04A measured the sharper version on the sample: of **2,541** mentions the two families
+*both* found, **zero** share identical offsets.
+
+Zero out of thousands is not a disagreement. It is a systematic convention difference -- one family
+is including something the other is not, on every single co-occurrence -- and the reading blocks
+below are where that becomes visible rather than inferred. Both families are loaded, marked and
+reported apart; the class tables are drawn from matcon and say so.
 
 ## Whole document, no region rule
 
 Money is genuinely distributed: no engine exceeds a positional contrast of 1.85 between the ends and
-the middle of a contract, against 22.6% and 25.2% in the two ends for organisations. There is nothing
-for a window to separate, so there is no window.
+the middle, against 22.6% and 25.2% in the two ends for organisations. There is nothing for a window
+to separate.
 
 ## Currencies are never pooled
 
-A maximum across currencies is not a quantity. `Currency` is populated on 100% of both money engines'
-rows -- 42,937 of 42,937 -- so USD and non-USD are reported side by side at no cost.
+A maximum across currencies is not a quantity. Currency is populated on 100% of both families' rows
+-- 42,937 of 42,937 -- so the split costs nothing.
 
-## Why the sum survives, with a caveat attached
+## The repetition ratio is why sum survives
 
 A contract restating the same fifty million across five clauses sums to two hundred and fifty
-million, and **no filter can tell a restatement from a second obligation**. Rather than drop the sum,
-this document reports **distinct amounts over total spans** beside it. That ratio says how much of a
-class's total is repetition, which is the caveat the sum needs.
-
-Maximum is the only unambiguous statistic -- the largest figure the contract names -- and it is
-reported first.
+million, and no filter can tell a restatement from a second obligation. So distinct amounts over
+total spans is reported beside the sum: it says how much of a class's total is repetition, which is
+the caveat the sum needs rather than an argument for dropping it.
 
 ## Two filters, both on things that are not amounts
 
-A **zero**, and a figure preceded by **par-value language**. The store's two commonest money spans
-are `$ 0` and `$ 0.00`, which is boilerplate about share denomination rather than anything a party
-owes. Both are swept and the unfiltered row stays in every table.
+A zero, and a figure sitting next to "par value" -- the store's two commonest money spans are `$ 0`
+and `$ 0.00`, which is boilerplate about share denomination rather than anything a party owes. Both
+are swept, and the unfiltered row stays in every table.
+
+## What is recomputed, and what is not
+
+Everything, on every render. The context is read once, outside the filter, because it depends on no
+specification.
+
+## How results are reported
+
+Console tables throughout, two figures in `# Overview`, every table per family and per currency.
+
+## Where things are written
+
+Two artifacts: the amount spans with their context flags, and one row per document, family and
+currency block.
 
 # Configuration
 
 ```{r}
-#| label: configure-paths
+#| label: configure
+
 .lP <- list(
   Input = list(
-    Text    = "2_output/04A-EntityExtract/sample_text.parquet",
-    Anchors = "2_output/04A-EntityExtract/sample_anchors.parquet",
-    Store   = "2_output/04A-EntityExtract/Store/EntityCandidates.duckdb"
+    Text = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
+      "Output", "sample_text.parquet"
+    ),
+    Store = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
+      "Output"
+    ),
+    Prepared = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare"),
+      "prepared.parquet"
+    ),
+    Register = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "02B-Register"),
+      "Output", "Documents.parquet"
+    )
   ),
   Output = list(
-    Spans = utils_file_path(.dir_main, "roles_money.parquet"), # one row per amount span
-    Doc   = utils_file_path(.dir_main, "money_doc.parquet")    # one row per document and engine
+    Spans = utils_file_path(.dir_main, "Output", "roles_money.parquet"), # per amount span
+    Doc   = utils_file_path(.dir_main, "Output", "money_doc.parquet")    # per document and family
   ),
   Params = list(
-    Combos     = c(lexnlp = "lexnlp", moneyregex = "paper:moneyregex-v6"),
-    ClassCombo = "moneyregex", # the engine the class tables are drawn from
+    Families   = c("lexnlp", "matcon"),
+    ClassCombo = "matcon",     # the family the class tables and figures are drawn from
     CueWin     = 60L,          # characters read before a span for the par-value cue
     ReadN      = 10L,
     ReadCtx    = 200L,
@@ -122,35 +160,52 @@ owes. Both are swept and the unfiltered row stays in every table.
   )
 )
 
+# The filter carried into the released artifacts.
 .lP$Params$Spec <- mny_spec(
-  .filter  = "par",  # drop zeros and par-value figures
-  .cue_win = 60L
+  .filter  = "par",              # drops a zero, and a figure preceded by par-value language
+  .cue_win = .lP$Params$CueWin
 )
 
+# Every filter, unfiltered first, so what the rule removes is visible rather than asserted.
 .lP$Params$Specs <- list(
-  mny_spec(.filter = "none"),  # the unfiltered reference, kept in every table
+  mny_spec(.filter = "none"),
   mny_spec(.filter = "zero"),
   mny_spec(.filter = "par")
 )
 
-fs::file_exists(unlist(.lP$Input))
+fs::dir_create(fs::path_dir(.lP$Output$Spans))
+
+tibble::tibble(
+  Input  = names(.lP$Input),
+  Path   = purrr::map_chr(.lP$Input, \(.p) fs::path_rel(.p, start = here::here())),
+  Exists = purrr::map_lgl(.lP$Input, \(.p) fs::file_exists(.p) || fs::dir_exists(.p))
+) |>
+  tbl_say(.title = "Every input resolves before anything is computed")
 ```
 
-# Sample
+# Input
 
 ```{r}
 #| label: build-keys
-tab_keys <- ent_anchor_keys(.path_anchors = .lP$Input$Anchors)
+
+tab_keys <- ent_anchor_keys(
+  .path_prepared = .lP$Input$Prepared,
+  .path_register = .lP$Input$Register,
+  .path_landing  = NULL,             # no address is used here
+  .quiet         = FALSE
+)
+
 tab_lens <- ent_doc_lens(.path_text = .lP$Input$Text)
 ```
 
 ```{r}
 #| label: load-money
+
 tab_money <- mny_load(
-  .db_path   = .lP$Input$Store,
+  .dir_store = .lP$Input$Store,      # the directory; the family is the filename
   .lens      = tab_lens,
-  .path_text = .lP$Input$Text,
-  .combos    = .lP$Params$Combos,
+  .path_text = .lP$Input$Text,       # for the par-value context, read once
+  .families  = .lP$Params$Families,
   .win       = .lP$Params$CueWin,
   .quiet     = FALSE
 )
@@ -158,7 +213,13 @@ tab_money <- mny_load(
 mny_report_parse(.money = tab_money)
 ```
 
-# The variables
+**`Amount` arrives as text and is cast here.** `moneyregex` writes it as a string so a contract value
+crosses the seam intact, and the store keeps the string because its schema is the parquet's rather
+than a declaration. `as.numeric()` in the loader is the first arithmetic anything does with it, which
+is where the cast belongs -- and a value that will not cast becomes `NA` and is counted by the parse
+report rather than silently dropped.
+
+# Construction
 
 ```{r}
 #| label: aggregate-base
@@ -171,6 +232,8 @@ tab_agg <- mny_aggregate(
 tab_doc <- mny_doc_table(.agg = tab_agg, .keys = tab_keys)
 ```
 
+# Selection
+
 ```{r}
 #| label: sweep-filters
 tab_sweep <- mny_sweep(
@@ -182,6 +245,8 @@ tab_sweep <- mny_sweep(
 
 mny_report_sweep(.tab = tab_sweep)
 ```
+
+# Results
 
 ```{r}
 #| label: report-class-usd
@@ -201,7 +266,55 @@ mny_report_class(
 )
 ```
 
-# Reading
+# Validation
+
+```{r}
+#| label: validate-offsets
+tab_check <- ent_verify_span(
+  .tab       = tab_money,
+  .path_text = .lP$Input$Text,
+  .col_start = "Start",
+  .col_stop  = "Stop",
+  .col_span  = "Span",
+  .n         = .lP$Params$CheckN,
+  .seed      = .lP$Params$Seed
+)
+
+tibble::tibble(
+  Check = c(
+    "Text cut at the stored offsets equals the stored span",
+    "Every parsed span carries a currency block",
+    "No aggregated maximum is smaller than its median",
+    "No aggregated sum is smaller than its maximum",
+    "Distinct amounts never exceed spans",
+    "Every document has a row per engine"
+  ),
+  N = c(
+    sum(tab_check$Exact),
+    sum(!is.na(tab_money$Block[tab_money$Parsed])),
+    sum(tab_agg$MoneyMax >= tab_agg$MoneyMed),
+    sum(tab_agg$MoneySum >= tab_agg$MoneyMax),
+    sum(tab_agg$NDistinct <= tab_agg$NSpans),
+    nrow(tab_doc)
+  ),
+  Of = c(
+    nrow(tab_check),
+    sum(tab_money$Parsed),
+    nrow(tab_agg),
+    nrow(tab_agg),
+    nrow(tab_agg),
+    nrow(tab_keys) * dplyr::n_distinct(tab_agg$Combo)
+  )
+) |>
+  dplyr::mutate(Share = tbl_pct(.data$N / .data$Of)) |>
+  tbl_say(.title = "Every row is expected at 100%")
+```
+
+The middle three are arithmetic identities rather than tests of the extraction, and that is the
+point: they fail only if an aggregation is wrong, which is the failure mode this document is most
+exposed to and least able to see any other way.
+
+# Robustness
 
 ```{r}
 #| label: read-largest
@@ -258,54 +371,6 @@ ent_read_spans(
     .title = "Non-USD amounts"
   )
 ```
-
-# Validation
-
-```{r}
-#| label: validate-offsets
-tab_check <- ent_verify_span(
-  .tab       = tab_money,
-  .path_text = .lP$Input$Text,
-  .col_start = "Start",
-  .col_stop  = "Stop",
-  .col_span  = "Span",
-  .n         = .lP$Params$CheckN,
-  .seed      = .lP$Params$Seed
-)
-
-tibble::tibble(
-  Check = c(
-    "Text cut at the stored offsets equals the stored span",
-    "Every parsed span carries a currency block",
-    "No aggregated maximum is smaller than its median",
-    "No aggregated sum is smaller than its maximum",
-    "Distinct amounts never exceed spans",
-    "Every document has a row per engine"
-  ),
-  N = c(
-    sum(tab_check$Exact),
-    sum(!is.na(tab_money$Block[tab_money$Parsed])),
-    sum(tab_agg$MoneyMax >= tab_agg$MoneyMed),
-    sum(tab_agg$MoneySum >= tab_agg$MoneyMax),
-    sum(tab_agg$NDistinct <= tab_agg$NSpans),
-    nrow(tab_doc)
-  ),
-  Of = c(
-    nrow(tab_check),
-    sum(tab_money$Parsed),
-    nrow(tab_agg),
-    nrow(tab_agg),
-    nrow(tab_agg),
-    nrow(tab_keys) * dplyr::n_distinct(tab_agg$Combo)
-  )
-) |>
-  dplyr::mutate(Share = tbl_pct(.data$N / .data$Of)) |>
-  tbl_say(.title = "Every row is expected at 100%")
-```
-
-The middle three are arithmetic identities rather than tests of the extraction, and that is the
-point: they fail only if an aggregation is wrong, which is the failure mode this document is most
-exposed to and least able to see any other way.
 
 # Deployment
 
