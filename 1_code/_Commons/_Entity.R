@@ -177,6 +177,187 @@ ent_doc_lens <- function(.path_text) {
 }
 
 
+#' The anchor columns, from a table already carrying CompanyName and DateFiled
+#'
+#' THE ANCHOR IS DEFINED ONCE, HERE. Two callers need it and they differ only in where their rows
+#' come from: ent_anchor_keys() takes the labelled spine, ent_corpus_keys() takes the register whole.
+#' When the scoring side of 04B learned that EDGAR stores states as two-letter codes and contracts
+#' write them out, a second copy of the anchor logic did not learn it, and the geographic contrast a
+#' reading session saw was built from cities alone while the measurement behind it was not. A
+#' definition with two implementations has one that is wrong or about to be.
+#'
+#' @param .tab Tibble carrying CompanyName and DateFiled.
+#' @return .tab with CompanyClean, DateFiled parsed, AnchorKey, AnchorTight, AnchorLen, AnchorTok.
+ent_anchor_cols <- function(.tab) {
+  if (FALSE) .tab <- reg_
+
+  .tab |>
+    dplyr::mutate(
+      CompanyClean = ent_strip_conformed(.x = .data$CompanyName),
+      DateFiled    = suppressWarnings(anytime::anydate(as.character(.data$DateFiled))),
+      AnchorKey    = ent_norm_key(.x = .data$CompanyClean, .min = 1L),
+      AnchorTight  = stringi::stri_replace_all_fixed(.data$AnchorKey, " ", ""),
+      AnchorLen    = nchar(.data$AnchorKey),
+      AnchorTok    = stringi::stri_count_fixed(.data$AnchorKey, " ") + 1L
+    )
+}
+
+
+#' Anchor keys at corpus scale, from the register and a classification release
+#'
+#' WHAT DIFFERS FROM ent_anchor_keys(), AND WHAT DOES NOT. The anchor -- the filer's own name and the
+#' filing date -- is identical and comes from ent_anchor_cols(). What differs is the row source and
+#' the class: 04B takes both from 03A's labelled spine of 4,398 documents, and at corpus scale there
+#' is no spine. The register carries every document, and 03F's release carries the class for every
+#' document it could label.
+#'
+#' THE ENGINE IS DECLARED, NOT RESOLVED HERE. 03F's release carries every engine's label side by side
+#' and deliberately no single Class column: which engine is authoritative is a decision, and a
+#' decision belongs in a configuration a reader can see rather than inside a function they would have
+#' to open.
+#'
+#' THE JOIN IS LEFT AND THE HOLE IS COUNTED. A document 03F could not label is a real category -- 736
+#' hold no text at all -- and an inner join would drop exactly the rows the coverage line reports.
+#'
+#' @param .path_register 02B's Documents.parquet.
+#' @param .path_release Release parquet from 03F. NA leaves Class and AmendType missing.
+#' @param .engine Character. Label prefix in the release, "Bert" or "Kw".
+#' @param .doc_ids Character. Restrict to these documents; NULL takes every register row.
+#' @param .quiet Logical. Suppress the coverage line.
+#' @return Tibble: the anchor columns, Class, ClassBroad, AmendType, NWords, nChars.
+ent_corpus_keys <- function(.path_register, .path_release = NA_character_, .engine = "Bert",
+                            .doc_ids = NULL, .quiet = FALSE) {
+  if (FALSE) {
+    .path_register <- .lP$Input$Register
+    .path_release  <- path_release
+    .engine        <- "Bert"
+    .doc_ids       <- tab_index$DocID
+    .quiet         <- FALSE
+  }
+
+  reg_ <- arrow::open_dataset(sources = .path_register) |>
+    dplyr::select("DocID", "HashDocument", "HashIndex", "CIK", "CompanyName", "DateFiled",
+                  "nWords", "nChars")
+  if (!is.null(.doc_ids)) reg_ <- dplyr::filter(reg_, .data$DocID %in% .doc_ids)
+
+  out_ <- reg_ |>
+    dplyr::collect() |>
+    ent_anchor_cols() |>
+    dplyr::mutate(NWords = as.integer(.data$nWords))
+
+  cls_ <- ent_corpus_class(
+    .path_release = .path_release, .engine = .engine, .doc_ids = out_$DocID
+  )
+  out_ <- dplyr::left_join(out_, cls_, by = dplyr::join_by(DocID))
+
+  if (!.quiet) {
+    cli::cli_alert_success(
+      "{format(nrow(out_), big.mark = ',')} {cli::qty(nrow(out_))}anchor{?s} built from the \\
+       register."
+    )
+    miss_ <- sum(is.na(out_$CompanyName))
+    if (miss_ > 0L) {
+      cli::cli_alert_danger(
+        "{format(miss_, big.mark = ',')} {cli::qty(miss_)}document{?s} carry no company name and \\
+         can only take a fallback party."
+      )
+    }
+    if ("Class" %in% names(out_)) {
+      cli::cli_alert_info(
+        "Class present for {tbl_pct(mean(!is.na(out_$Class)))} of documents."
+      )
+    }
+  }
+  out_
+}
+
+
+#' The corpus classification, read under one declared engine
+#'
+#' THE SCHEMA IS READ, NOT ASSUMED. Which label columns a release carries depends on which tasks 03F
+#' ran, and asking for one that is absent should name what is there -- the alternative is a silently
+#' missing column arriving downstream as NA and reading as an unlabelled corpus.
+#'
+#' @param .path_release Release parquet from 03F; NA returns an empty frame.
+#' @param .engine Character. Label prefix, "Bert" or "Kw".
+#' @param .doc_ids Character. Restrict to these documents.
+#' @return Tibble: DocID, Class, ClassBroad, AmendType, and HierConsistent where the release has it.
+ent_corpus_class <- function(.path_release, .engine = "Bert", .doc_ids) {
+  if (FALSE) {
+    .path_release <- path_release
+    .engine       <- "Bert"
+    .doc_ids      <- tab_index$DocID
+  }
+
+  empty_ <- tibble::tibble(
+    DocID = character(0), Class = character(0), ClassBroad = character(0),
+    AmendType = character(0)
+  )
+  if (is.na(.path_release)) return(empty_)
+
+  have_ <- names(arrow::open_dataset(sources = .path_release))
+  want_ <- c(
+    Class      = paste0(.engine, "ClassDetailed"),
+    ClassBroad = paste0(.engine, "ClassBroad"),
+    AmendType  = paste0(.engine, "AmendType")
+  )
+  got_ <- want_[want_ %in% have_]
+
+  if (length(got_) == 0L) {
+    cli::cli_abort(c(
+      "The release carries no {(.engine)} label columns.",
+      "i" = "It has: {paste(have_, collapse = ', ')}.",
+      "x" = "Name a prefix this file actually uses."
+    ))
+  }
+  if (length(got_) < length(want_)) {
+    cli::cli_alert_warning(
+      "The release has no {paste(setdiff(want_, got_), collapse = ', ')}; \\
+       {cli::qty(length(setdiff(want_, got_)))}{?that column is/those columns are} left missing."
+    )
+  }
+
+  arrow::open_dataset(sources = .path_release) |>
+    dplyr::select(dplyr::all_of(c("DocID", unname(got_), intersect("HierConsistent", have_)))) |>
+    dplyr::filter(.data$DocID %in% .doc_ids) |>
+    dplyr::collect() |>
+    dplyr::rename(dplyr::all_of(got_)) |>
+    dplyr::distinct(.data$DocID, .keep_all = TRUE)
+}
+
+
+#' The newest usable classification release
+#'
+#' THE FILE IS FOUND, NOT NAMED. 03F stamps the transformer length into the stem and appends _partial
+#' where a pass was still running, so a hard-coded name is wrong on the day either changes. A complete
+#' release wins; a partial one is used only where nothing else exists, and says so, because a silently
+#' partial class column makes every class contrast a statement about an unnamed subset.
+#'
+#' @param .dir_release 03F's release directory.
+#' @return Character path, or NA where none exists.
+ent_release_path <- function(.dir_release) {
+  if (FALSE) .dir_release <- .lP$Input$Release
+
+  if (!fs::dir_exists(.dir_release)) return(NA_character_)
+
+  files_ <- fs::dir_ls(.dir_release, glob = "*contract_labels*.parquet")
+  files_ <- files_[!stringi::stri_detect_fixed(fs::path_file(files_), "_manifest")]
+  if (length(files_) == 0L) return(NA_character_)
+
+  full_ <- files_[!stringi::stri_detect_fixed(fs::path_file(files_), "_partial")]
+  pick_ <- if (length(full_) > 0L) full_ else files_
+  pick_ <- pick_[order(fs::file_info(pick_)$modification_time, decreasing = TRUE)][[1L]]
+
+  if (length(full_) == 0L) {
+    cli::cli_alert_warning(
+      "Only a partial release exists ({.path {as.character(fs::path_file(pick_))}}); the class \\
+       column covers part of the corpus and every contrast on it inherits that."
+    )
+  }
+  as.character(pick_)
+}
+
+
 #' Per-document anchor facts, one row per contract
 #'
 #' THE ANCHORS ARE BUILT HERE AND NOT READ FROM AN ARTIFACT, and that is a change of design rather
@@ -253,14 +434,7 @@ ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL
 
   out_ <- out_ |>
     dplyr::rename(Class = "ClassDetailed") |>
-    dplyr::mutate(
-      CompanyClean = ent_strip_conformed(.x = .data$CompanyName),
-      DateFiled    = suppressWarnings(anytime::anydate(as.character(.data$DateFiled))),
-      AnchorKey    = ent_norm_key(.x = .data$CompanyClean, .min = 1L),
-      AnchorTight  = stringi::stri_replace_all_fixed(.data$AnchorKey, " ", ""),
-      AnchorLen    = nchar(.data$AnchorKey),
-      AnchorTok    = stringi::stri_count_fixed(.data$AnchorKey, " ") + 1L
-    )
+    ent_anchor_cols()
 
   if (!.quiet) {
     miss_ <- sum(is.na(out_$CompanyName))

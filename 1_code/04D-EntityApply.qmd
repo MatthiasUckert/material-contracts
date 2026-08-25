@@ -1,0 +1,539 @@
+---
+title: "04D -- Applying the entity rules to the corpus"
+subtitle: "One document-level variable per entity, over 1.19 million attachments"
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+
+knitr::opts_chunk$set(
+  root.dir  = here::here(),
+  message   = TRUE,
+  warning   = FALSE,
+  comment   = "",
+  fig.width = 7.5,
+  fig.align = "center",
+  dpi       = 200,
+  out.width = "100%"
+)
+
+options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
+
+.name_script <- "04D-EntityApply"
+.dir_main    <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script)
+
+source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
+
+source(here::here("1_code", "03A-ClassifyPrepare.R"), encoding = "UTF-8")
+source(here::here("1_code", "04C-EntityCorpus.R"),    encoding = "UTF-8")
+
+source(here::here("1_code", "04B1-Rules-ORG.R"),    encoding = "UTF-8")
+source(here::here("1_code", "04B2-Rules-GPE.R"),    encoding = "UTF-8")
+source(here::here("1_code", "04B3-Rules-DATE.R"),   encoding = "UTF-8")
+source(here::here("1_code", "04B4-Rules-MONEY.R"),  encoding = "UTF-8")
+source(here::here("1_code", "04B5-Rules-REDACT.R"), encoding = "UTF-8")
+
+source(init_create_script_fun(.dir_here = here::here(), .name_script = .name_script),
+       encoding = "UTF-8")
+```
+
+# Purpose
+
+04B built one rule per entity on a sample of 4,398 contracts and measured each against facts EDGAR
+recorded independently of the text: the filer's own name, its filing date, its registered address.
+04C ran the extractors over the whole corpus and produced 125 million spans. This document is the
+join of the two. It decides nothing, measures nothing new, and reads its entire policy from a list
+printed below.
+
+**An apply stage with decisions of its own is one whose output depends on which version of it last
+ran.** A released dataset cannot be defended on those terms, so everything that could vary is
+declared in `Configuration`, printed in the render, and hashed into the directory the intermediate
+results are cached in. Changing any dial produces a different directory rather than a file mixing two
+rules.
+
+**Not one rule is reimplemented here.** The five 04B libraries are sourced and their functions called
+on chunks of the corpus instead of on the sample. That is what makes the corpus variables comparable
+with the sample ones a referee can check: they are the same code on different inputs rather than two
+implementations that agree today. The family has already paid for the alternative twice, in a
+duration extractor that re-derived in R what the Python extractor already emitted, and in a word
+count that recomputed what the register stored.
+
+Three properties of the 04B chain had to be established before chunking was sound, and all three were
+measured rather than assumed. They are set out where the code depends on them: the definition of a
+chunk in `Input`, the chunk size in `Configuration`, and in `Apply` the reason the party chain is the
+one chain that is not chunked at all.
+
+# Configuration
+
+Every path this document reads, every rule it applies, and the two numbers that control what it
+costs. Nothing below this chunk introduces a parameter.
+
+**The class comes from 03F, and which engine supplies it is a decision.** 03F's release carries
+`BertClassDetailed`, `KwClassDetailed` and a runner-up for each, side by side, and deliberately no
+resolved `Class` column -- exactly as the entity stores carry one table per family rather than a
+merged one. `MONEY` and `REDACT` both need a class to contrast on, so one engine is named here.
+`Bert` is that engine because it is the deployed all-data refit, because its pooled out-of-fold
+macro-F1 is 0.882, and because 03E found the oracle routing ceiling equal to using it everywhere:
+there is no headroom for a rule that picks between engines per document.
+
+```{r}
+#| label: configure
+
+.lP <- list(
+  Input = list(
+    # 04C's stores: spans, plus the corpus table that resolves the population and holds every path.
+    Store = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "04C-EntityCorpus"), "Output"
+    ),
+    # 02B's register: the anchor, and nChars, which is the document length. See Input.
+    Register = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "02B-Register"),
+      "Output", "Documents.parquet"
+    ),
+    # 03F's release: the corpus classification. The file is found rather than named.
+    Release = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "03F-ClassifyApply"),
+      "release"
+    ),
+    # The gazetteer, read past the CLI seam. gazetteer-v2's spec hash covers a content hash of this
+    # file, so a direct read is still covered by the manifest that guards the extraction.
+    Lookup = here::here("contracts-extract", "src", "matcon_extract", "data", "geo_lookup.parquet")
+  ),
+  Output = list(
+    Doc = list(
+      Org    = utils_file_path(.dir_main, "Output", "party_org.parquet"),    # per document
+      Geo    = utils_file_path(.dir_main, "Output", "geo_doc.parquet"),      # per document
+      Date   = utils_file_path(.dir_main, "Output", "duration_doc.parquet"), # per document
+      Money  = utils_file_path(.dir_main, "Output", "money_doc.parquet"),    # per document, family
+      Redact = utils_file_path(.dir_main, "Output", "redact_doc.parquet")    # per document
+    ),
+    Roles  = utils_file_path(.dir_main, "Output", "roles_org.parquet"),  # per document per name
+    Chunks = utils_file_path(.dir_main, "Cache"),                 # per-chunk results, policy-keyed
+    Stage  = utils_file_path(.dir_main, "Stage", "chunk.parquet") # one chunk of text at a time
+  ),
+  Params = list(
+    # WHICH FAMILY ANSWERS FOR WHICH ENTITY. Each is 04A's or 04B's finding, and the alternative is
+    # printed beside it in the policy table below rather than left implicit.
+    Family = list(
+      ORG    = "lexnlp",                 # 04A: positional contrast 4.36, the strongest of any pair
+      GPE    = "matcon",                 # 04B2: 4,525 distinct cities against lexnlp's none
+      DATE   = "matcon",                 # 04B3: requires a written year, which the guard needs
+      MONEY  = c("lexnlp", "matcon"),    # 04B4: zero exact agreement, so neither replaces the other
+      REDACT = "matcon"                  # 04A: the only family emitting a marker at all
+    ),
+    Extras = list(
+      ORG = c("NameCore", "LegalForm", "Description"),
+      GPE = ent_extras("matcon", "GPE")  # declared per family in _Entity.R, not typed here
+    ),
+    ClassEngine = "Bert",  # 03F label prefix; Kw is the alternative, BertClassDetailed2 the runner-up
+    # THE CUE WINDOWS ARE OFF, AND THIS IS THE ONE DIAL THAT COSTS SOMETHING.
+    # Three rules read the characters preceding a span to test for a cue phrase, and it is the only
+    # reason this stage touches contract text at all. Every other operation runs on offsets and the
+    # register. Measured cost of switching it off, per entity, in the policy table below.
+    Cues        = FALSE,
+    LawWin      = 120L,    # characters read before a place span for the governing-law cue
+    # EIGHT THOUSAND IS EVIDENCE. dte_describe() and geo_context() build one vector element per span,
+    # each holding a whole document, then cut a window out of each. Time growth over document growth
+    # was 0.94 from 2,000 to 8,000 and 4.72 from 8,000 to 32,000, so the cost stops being linear
+    # between them. _Tests/04D-Preflight.R is the sweep.
+    ChunkSize = 8000L,
+    Workers   = 12L,       # daemons for the staged text read; 04C's corpus pass used 24
+    Seed      = 42L
+  )
+)
+
+# The rules themselves, each constructed by the 04B function that defined it, with every argument
+# named at the value 04B released. A dial not named here is a decision nobody reviewed.
+.lP$Params$Rule <- ent_rule(
+  .key               = "core",  # the resolved name lexnlp fills on every span
+  .min_key           = 2L,      # shortest key admitted for equality
+  .min_contain       = 5L,      # shortest key admitted for containment or family
+  .tight             = TRUE,    # also compare with spaces removed
+  .frag_min          = 10L,     # shortest fragment admitted as a reverse match
+  .frag_share        = 0.6,     # and it must cover this much of the recorded name
+  .fam_tokens        = 2L,      # leading tokens two keys must share to be one corporate family
+  .fam_share         = 0.5,     # and those tokens must be this much of the shorter key
+  .fam_df            = 0.005,   # or ONE token, if it opens a name in at most this share of documents
+  .deep              = 5000L,   # a match past this offset is flagged, not rejected
+  .exact_within      = 500,     # prefer an exact match this close behind a contaminated one
+  .guard_deep_family = FALSE    # off: reading found most of what it would refuse to be correct
+)
+
+.lP$Params$Spec <- list(
+  Org = ent_window_spec(
+    .kind           = "fixed",  # constant characters either side of the party
+    .par            = 2000,     # half-width; 04B1's P90 neighbour gap is 1,343 characters
+    .tail_share     = 0.10,     # tail as a share of the document, clamped past the window
+    .tail_floor     = 0,        # no absolute minimum
+    .drop_fragments = FALSE     # swept and not adopted
+  ),
+  Geo = geo_spec(
+    .reach      = 200,          # furthest an organisation may be and still claim a place
+    .reach_city = NULL,         # one number for every level
+    .party_only = FALSE         # every organisation gets its geography; the role is a column
+  ),
+  Date = dte_spec(
+    .start        = "latest",   # the reference date the duration is measured from
+    .end          = "term",     # the stated term where there is one, a cue date otherwise
+    .family       = "matcon",
+    .cap_years    = 30,         # dropped, not winsorised
+    .require_year = FALSE,      # near-vacuous under matcon, which requires one anyway
+    .term_kinds   = c("UnitTerm", "ContinueFor", "PeriodOf", "Anniversary"),
+    .term_floor   = 0
+  ),
+  Money = mny_spec(
+    # THE PAR FILTER NEEDS A CUE AND THE ZERO FILTER DOES NOT. Par-value boilerplate is recognised
+    # from the words beside the amount; a zero is recognised from the amount. With cues off the
+    # filter drops to zero rather than claiming a par filter that never ran.
+    .filter  = if (.lP$Params$Cues) "par" else "zero",
+    .cue_win = 60L,             # characters either side of an amount, for the class cue
+    .label   = NULL
+  )
+)
+
+fs::dir_create(fs::path_dir(unlist(.lP$Output$Doc)))
+fs::dir_create(fs::path_dir(.lP$Output$Stage))
+```
+
+The policy is fingerprinted and the fingerprint names the cache directory. A pass costs about nine
+hours, which is exactly the cost that tempts a document into skipping its own work; instead each
+chunk is written as it completes and a chunk already present is reused. **A cache keyed on the chunk
+number alone would serve chunk seven from the last render whatever changed in between**, and a corpus
+scored half under one rule and half under another is a file no downstream check would catch.
+
+```{r}
+#| label: policy
+
+hash_policy <- apl_policy_hash(.params = .lP$Params)
+.lP$Output$Chunks <- fs::path(.lP$Output$Chunks, hash_policy)
+
+apl_report_policy(.params = .lP$Params, .hash = hash_policy)
+```
+
+# Input
+
+Three things are read before anything is applied: which documents the corpus holds, what the anchor
+for each of them is, and where the class came from.
+
+**A chunk is the keys and the lengths cut together, and `apl_chunk_frame()` is the only place that
+is decided.** `ent_apply()` runs from the key side so that a document in which the family found
+nothing still gets a row -- which is right, and which means the output is one row per *key*. Handed
+the corpus keys with an eight-thousand-document lens it builds 1.19 million rows to describe eight
+thousand documents, and does it again for every chunk. The preflight probe found this by timing it,
+and the answer is not to be careful but to have one function that cannot get it wrong.
+
+**The document length is the register's `nChars`, not a recount.** `ent_doc_lens()` reads every
+document to compute the character length of its text; the register stores that number for all 1.77
+million rows. The two were compared on 31,981 corpus documents and agreed **exactly on every one**,
+maximum relative difference 0.000. Recomputing it would be an hour of reading to reproduce a stored
+column, and it is the same mistake as the word count 04B5 removed.
+
+```{r}
+#| label: load-index
+
+tab_index <- apl_corpus_index(
+  .dir_store = .lP$Input$Store,       # 04C's stores; the corpus table is identical in each
+  .family    = "matcon"               # any family; matcon is named because it is always present
+)
+
+path_release <- ent_release_path(.dir_release = .lP$Input$Release)
+
+tab_keys <- ent_corpus_keys(
+  .path_register = .lP$Input$Register,      # the anchor, and nChars
+  .path_release  = path_release,            # 03F's corpus classification
+  .engine        = .lP$Params$ClassEngine,  # which engine's label is Class
+  .doc_ids       = tab_index$DocID,         # only what 04C extracted
+  .quiet         = FALSE
+)
+```
+
+The gazetteer is loaded once here rather than inside the chunk loop. Reading it per chunk is a fixed
+cost charged 149 times, and at two thousand documents it was most of the geography chain's elapsed
+time -- which would have read as a chain that scales beautifully rather than as a constant dwarfing
+the work.
+
+```{r}
+#| label: load-gazetteer
+
+geo_once <- list(
+  Lookup = geo_lookup(.path_lookup = .lP$Input$Lookup),      # the two parent columns v2 omits
+  Cand   = geo_candidates(.path_lookup = .lP$Input$Lookup)   # every state a city name exists in
+)
+
+chunks_ <- apl_chunks(.index = tab_index, .size = .lP$Params$ChunkSize)
+
+cli::cli_alert_info(
+  "{format(nrow(tab_index), big.mark = ',')} {cli::qty(nrow(tab_index))} attachment{?s} in \\
+   {length(chunks_)} {cli::qty(length(chunks_))} chunk{?s} of \\
+   {format(.lP$Params$ChunkSize, big.mark = ',')}."
+)
+```
+
+# Apply
+
+## The party stage, which is not chunked
+
+`ent_rule()`'s `.fam_df` admits a **single** shared leading token as evidence of a corporate family
+when that token opens the name of at most half a per cent of documents: `ENERGY` against `CHENIERE
+CREOLE TRAIL PIPELINE` is one family, `NATIONAL` opens hundreds and shares nothing. `ent_apply()`
+derives that share from the spans it is given.
+
+**Chunk it and the rule becomes a property of the partition.** Measured over 31,981 corpus documents:
+176 leading tokens fell on opposite sides of the threshold at 2,546 documents per chunk, 1,077 at
+509, and 2,512 at 255. Each one is a family match admitted in one chunk and refused in another, on
+identical text.
+
+The obvious repair is to compute the share over the corpus and pass it in, which needs an argument
+`ent_apply()` does not have. **The better repair is not to partition this chain.** It is the one
+chain that reads no text, and the preflight measured it getting *faster* as the set grows -- 110,
+then 289, then 518 documents per second, sublinear at both steps, because its fixed costs amortise.
+So it runs once, over everything, through 04B1's function called exactly as 04B1 calls it. The
+denominator is the corpus because the input is the corpus, and nothing upstream changes.
+
+The spans are read chunk by chunk so no single DuckDB result has to be materialised, then bound: the
+read is partitioned, the rule is not.
+
+```{r}
+#| label: run-party
+
+if (fs::file_exists(.lP$Output$Roles) && fs::file_exists(.lP$Output$Doc$Org)) {
+  res_org <- list(
+    Counts = arrow::read_parquet(.lP$Output$Doc$Org),
+    Roles  = arrow::read_parquet(.lP$Output$Roles)
+  )
+  cli::cli_alert_info("Party stage read from its artifacts; delete them to recompute.")
+} else {
+  res_org <- apl_org_whole(
+    .dir_store = .lP$Input$Store,        # 04C's spans
+    .family    = .lP$Params$Family$ORG,  # lexnlp
+    .keys      = tab_keys,               # the corpus, cut once against the lengths
+    .chunks    = chunks_,                # the READ is chunked; the rule is not
+    .rule      = .lP$Params$Rule,        # the match
+    .spec      = .lP$Params$Spec$Org,    # the window carried into the artifacts
+    .extras    = .lP$Params$Extras$ORG,  # NameCore, LegalForm, Description
+    .quiet     = TRUE
+  )
+  fs::dir_create(fs::path_dir(.lP$Output$Roles))
+  arrow::write_parquet(res_org$Roles,  .lP$Output$Roles)
+  arrow::write_parquet(res_org$Counts, .lP$Output$Doc$Org)
+}
+
+apl_report_org(.org = res_org, .n_doc = nrow(tab_keys))
+```
+
+**The organisations are written before the chunk loop starts**, and not only so the stage can be
+resumed. `geo_attach()` needs them, so geography can be chunked only because they already exist as a
+file the loop reads a slice of. Writing them is what makes the dependency explicit rather than a
+variable that happens to be in scope.
+
+## The pass
+
+One loop, four chains inside it, and with cue windows off **no contract text is opened at all**.
+Every rule that survives runs on what 04C already stored: the span, its offsets, its parsed value,
+and the register beside it. The stage is written empty so the 04B loaders keep their one calling
+convention, and the windows they cut out of it come back empty.
+
+What that costs, and it is worth stating plainly rather than discovering in a table:
+
+| Entity | With cues | Without |
+|:--|:--|:--|
+| REDACT | markers over register words | unchanged |
+| ORG | offsets and the anchor | unchanged |
+| GPE | place, resolution, role, **governing law** | place, resolution, role |
+| MONEY | par-value boilerplate dropped | zeros dropped; 1.7% more matcon spans kept |
+| DATE | term, then cue, then fallback | term, then fallback; 464 of 2,580 fall a rung |
+
+Governing law is **dropped rather than reported as absent**. 04B2 measured 95% of the spans its cue
+catches attaching to no organisation at all, so proximity cannot reach the clause and the cue is the
+only thing that identifies it. A column asserting that every contract names no governing law would be
+false rather than missing, so the columns do not appear.
+
+That variable belongs in the extractor rather than here. A governing-law clause is a legal object
+that happens to contain a place name, in the way a term is one that happens to contain a date, and
+`dateregex-v3` already shows the shape: emit it as its own entity and record which pattern matched.
+The extractor has the text open, which is the one place reading context is free.
+
+```{r}
+#| label: run-pass
+
+par_ok <- if (isTRUE(.lP$Params$Cues)) cor_daemons_start(.workers = .lP$Params$Workers) else FALSE
+
+tab_pass <- apl_pass(
+  .chunks     = chunks_,                    # the partition, in DocID order so it is stable
+  .keys       = tab_keys,                   # cut to each chunk by apl_chunk_frame()
+  .dir_chunks = .lP$Output$Chunks,          # named for the policy hash
+  .stage      = .lP$Output$Stage,           # overwritten each chunk; never read after the chunk
+  .params     = .lP$Params,                 # every rule, unchanged from Configuration
+  .dir_store  = .lP$Input$Store,            # 04C's spans
+  .path_roles = .lP$Output$Roles,           # the party stage's organisations, read per chunk
+  .geo        = geo_once,                   # the gazetteer, loaded once above
+  .workers    = if (par_ok) .lP$Params$Workers else 1L
+)
+
+if (par_ok) mirai::daemons(0L)
+```
+
+# Results
+
+```{r}
+#| label: report-pass
+
+tab_all <- c(list(Org = res_org$Counts), apl_bind(.dir_chunks = .lP$Output$Chunks))
+
+apl_report_all(.pass = tab_pass, .tabs = tab_all, .n_index = nrow(tab_index))
+```
+
+**The bind reads from disk rather than from what the pass returned.** A resumed render therefore
+produces exactly what an uninterrupted one would: a pass that returned only the chunks it computed
+this time would hand a second render a file covering a tenth of the corpus, and nothing inside the
+file would say so.
+
+# Validation
+
+Three checks, each of which would reveal a different failure.
+
+```{r}
+#| label: check-keys
+
+# 1. EVERY ENTITY COVERS THE SAME DOCUMENTS. The five chains ran on one chunk frame, so a
+#    disagreement here is a chain dropping rows rather than a population difference.
+purrr::imap(tab_all, \(.t, .k) tibble::tibble(
+  Entity   = .k,
+  Docs     = dplyr::n_distinct(.t$DocID),
+  Distinct = dplyr::n_distinct(.t$DocID) == nrow(.t) |
+    .k == "Money"   # MONEY is one row per document AND family, by design
+)) |>
+  purrr::list_rbind() |>
+  tbl_say(.title = "Documents per entity, and whether rows are unique within it")
+```
+
+```{r}
+#| label: check-missing
+
+# 2. A DOCUMENT THAT COULD NOT BE READ IS NOT A DOCUMENT WITH NOTHING IN IT. 04C found 736
+#    attachments holding no text and 03F's classification pass failed on the same 736, which makes
+#    it a property of the corpus rather than of either engine. They must appear here as absent, not
+#    as zero: a contract with no redaction marker and a file that would not open are different
+#    facts, and averaging them together understates every rate in the paper.
+tibble::tibble(
+  Indexed   = nrow(tab_index),
+  Keyed     = nrow(tab_keys),
+  Staged    = sum(tab_pass$nStaged, na.rm = TRUE),
+  InOutput  = dplyr::n_distinct(tab_all$Redact$DocID)
+) |>
+  dplyr::mutate(Unread = .data$Indexed - .data$InOutput) |>
+  tbl_say(.title = "Attachments at each stage")
+```
+
+```{r}
+#| label: check-chunks
+
+# 3. THE PARTS MUST SUM TO THE WHOLE. A row whose components do not add to its total is
+#    unreadable, and this family has produced one before: nDone sat beside a Share that had
+#    subtracted the 736 errors when nDone had not.
+tab_pass |>
+  dplyr::summarise(
+    Chunks  = dplyr::n(),
+    nIndex  = sum(.data$nIndex),
+    nStaged = sum(.data$nStaged, na.rm = TRUE),
+    .by     = Status
+  ) |>
+  tbl_say(.title = "Chunks by status")
+```
+
+# Robustness
+
+The rules were built on 4,398 documents and are applied here to 1.19 million. The question a referee
+would ask is whether they survive the move, and 04A answered the same question one level down: every
+family's document-level *span* coverage on the corpus sat within 3.3 points of its rate on the
+labelled sample. The equivalent statement for the rules is the share of documents each variable
+resolves.
+
+```{r}
+#| label: robust-coverage
+
+purrr::imap(tab_all, \(.t, .k) tibble::tibble(
+  Entity = .k,
+  Docs   = dplyr::n_distinct(.t$DocID),
+  Share  = tbl_pct(dplyr::n_distinct(.t$DocID) / nrow(tab_index))
+)) |>
+  purrr::list_rbind() |>
+  tbl_say(.title = "Documents each variable reaches")
+
+cli::cli_alert_info(
+  "These are documents the chain produced a row for, not documents in which it found something. \\
+   The second is a property of each variable and is reported where that variable is described."
+)
+```
+
+# Deployment
+
+Five files, one per entity, each the corpus-scale counterpart of what 04B wrote for the sample and
+carrying the same name -- so a reader who has followed 04B3 knows what `duration_doc.parquet` holds
+without opening it.
+
+**The fan-out is not done here.** These are attachment-level: 1,189,805 rows, the primary of every
+attachment with at least one copy in the population. Expanding to all 1,462,939 registrant copies on
+`HashDocument` belongs to the release, because doing it here would multiply five files by 23% each
+and force every later reader to undo it before joining anything.
+
+```{r}
+#| label: write-artifacts
+
+apl_write(.tabs = tab_all, .paths = .lP$Output$Doc)
+```
+
+# Overview
+
+```{r}
+#| label: fig-chunk-cost
+#| fig-height: !expr plot_height(6L)
+#| fig-cap: "Elapsed seconds per chunk, in the order chunks were processed. A flat cloud is the
+#|   expectation, since every chunk holds the same number of documents. A rising one means the cost
+#|   depends on something accumulating across the pass rather than on the documents in each chunk,
+#|   which is the failure the eight-thousand chunk size was chosen to avoid."
+
+tab_pass |>
+  dplyr::filter(.data$Status == "done", !is.na(.data$Secs)) |>
+  dplyr::mutate(Order = dplyr::row_number()) |>
+  ggplot2::ggplot(ggplot2::aes(x = .data$Order, y = .data$Secs)) +
+  ggplot2::geom_point(alpha = 0.55, size = 1.2) +
+  ggplot2::labs(x = "Chunk, in processing order", y = "Seconds") +
+  plot_theme(.grid = "y")
+```
+
+```{r}
+#| label: fig-doc-reach
+#| fig-height: !expr plot_height(5L)
+#| fig-cap: "Share of the indexed attachments each variable produced a row for. Every chain ran on
+#|   one chunk frame, so these should agree: a short bar is a chain dropping documents, not a
+#|   variable finding nothing in them."
+
+purrr::imap(tab_all, \(.t, .k) tibble::tibble(
+  Entity = .k, Share = dplyr::n_distinct(.t$DocID) / nrow(tab_index)
+)) |>
+  purrr::list_rbind() |>
+  plot_bar_ranked(
+    .cat   = "Entity",
+    .val   = "Share",
+    .key   = NULL,
+    .short = FALSE,
+    .label = TRUE
+  ) +
+  plot_scale_x_pct()
+```
+
+# Next
+
+The release fans these five tables out from 1,189,805 attachments to all 1,462,939 registrant copies
+on `HashDocument`, joins them into one document-level table, and carries the population flags as
+columns so a reader subsets without the register. It is also where the styled tables and figure files
+this document deliberately does not write are produced, for every pair in the family at once.
