@@ -86,6 +86,17 @@ fs::dir_create(.dir_out)
   StateWin = 200L,
   WordWin  = 40L
 )
+# tempdir() IS PER-SESSION, NOT PER-RUN, and treating the two as the same cost a confusing abort.
+# A second run inside one R session finds the first run's DuckDB file, and ner_manifest_write() then
+# correctly refuses to ingest rows whose spec hash differs from what that file already holds under
+# the same model tag -- "the tag has not moved but the provenance has, so the stored rows mean
+# something else". The guard is right and the stale store is the fault.
+#
+# IT LAY DORMANT UNTIL A SPEC HASH FIRST MOVED. Four runs of this suite passed on a store that was
+# never cleared, because the hash was identical every time; the lexnlp rebuild moved it and the
+# ingest aborted. Phase F moves all four matcon hashes at once, so the same abort is waiting for
+# every one of these files.
+purrr::walk(c(.lT$Spans, .lT$Store), \(.d) if (fs::dir_exists(.d)) fs::dir_delete(.d))
 fs::dir_create(c(.lT$Spans, .lT$Store))
 
 cli::cli_h1("Test-MatCon-GPE")
@@ -114,7 +125,7 @@ chk <- function(.name, .ok, .note = "") {
     .ok   <- TRUE
     .note <- ""
   }
-  
+
   # LENGTH IS CHECKED, NOT ONLY TRUTH. all(logical(0)) is TRUE, which is how four checks in the
   # first version of this file passed on columns that did not exist.
   ok_ <- length(.ok) == 1L && isTRUE(.ok)
@@ -150,7 +161,7 @@ chk_on <- function(.name, .tab, .cols, .fun, .note = "") {
     .fun  <- \(.t) all(.t$NParent == 1L)
     .note <- ""
   }
-  
+
   if (nrow(.tab) == 0L) {
     return(chk(.name, FALSE, "no rows to test -- the subset this check reads is empty"))
   }
@@ -177,7 +188,7 @@ chk_none <- function(.name, .tab, .note = "") {
     .tab  <- dplyr::filter(tab_raw, .data$DocID == "doc02")
     .note <- ""
   }
-  
+
   chk(.name, nrow(.tab) == 0L,
       if (nrow(.tab) == 0L) .note else paste0(nrow(.tab), " row(s) emitted; ", .note))
 }
@@ -265,11 +276,11 @@ org_at <- function(.doc, .name, .role) {
     .name <- "Zeta Industries Inc."
     .role <- "filer"
   }
-  
+
   txt_   <- tab_docs$TextRaw[match(.doc, tab_docs$DocID)]
   start_ <- stringi::stri_locate_first_fixed(txt_, .name)[, "start"]
   if (is.na(start_)) cli::cli_abort("{(.name)} does not occur in {(.doc)}.")
-  
+
   tibble::tibble(
     DocID = .doc,
     Key   = ent_norm_key(.x = .name, .min = 1L),
@@ -395,7 +406,7 @@ geo_for <- function(.doc, .key = NULL) {
     .doc <- "doc01"
     .key <- "SHAKOPEE"
   }
-  
+
   out_ <- dplyr::filter(tab_geo, .data$DocID == .doc)
   if (is.null(.key)) out_ else dplyr::filter(out_, .data$GeoKey == .key)
 }

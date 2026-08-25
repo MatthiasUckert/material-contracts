@@ -68,6 +68,17 @@ fs::dir_create(.dir_out)
   Spans = fs::path(.dir_out, "spans"),
   Store = fs::path(.dir_out, "store")
 )
+# tempdir() IS PER-SESSION, NOT PER-RUN, and treating the two as the same cost a confusing abort.
+# A second run inside one R session finds the first run's DuckDB file, and ner_manifest_write() then
+# correctly refuses to ingest rows whose spec hash differs from what that file already holds under
+# the same model tag -- "the tag has not moved but the provenance has, so the stored rows mean
+# something else". The guard is right and the stale store is the fault.
+#
+# IT LAY DORMANT UNTIL A SPEC HASH FIRST MOVED. Four runs of this suite passed on a store that was
+# never cleared, because the hash was identical every time; the lexnlp rebuild moved it and the
+# ingest aborted. Phase F moves all four matcon hashes at once, so the same abort is waiting for
+# every one of these files.
+purrr::walk(c(.lT$Spans, .lT$Store), \(.d) if (fs::dir_exists(.d)) fs::dir_delete(.d))
 fs::dir_create(c(.lT$Spans, .lT$Store))
 
 # 04B4's released specification, argument for argument as 04D declares it with cues on.
