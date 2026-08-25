@@ -45,3 +45,16 @@ _rendered/
 1_code/_BackUp/
 1_code/_Migration/
 *.BACKUP
+
+
+# _Tests/ is scratch: quick probes, run once, moved on. Untracked for the same reason as
+# _BackUp/ -- present on disk, absent from a reviewer's clone.
+#
+# TWO EXCEPTIONS, AND BOTH EARN IT. Parse-Check.R is the mechanical gate run before any
+# delivery. 04D-Preflight.R is cited as evidence in 04D's published prose -- it is the sweep
+# the 8,000-document chunk size comes from -- so a reviewer must be able to open it.
+#
+# NOTE THE /* RATHER THAN /. Git cannot re-include a file whose parent directory is excluded.
+1_code/_Tests/*
+!1_code/_Tests/Parse-Check.R
+!1_code/_Tests/04D-Preflight.R
