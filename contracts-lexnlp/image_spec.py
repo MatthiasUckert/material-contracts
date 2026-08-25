@@ -48,6 +48,18 @@ SOURCES = (
     "extract_lexnlp.py",
     "company_types.csv",
     "app/geoentities.csv",
+    # THE LOCKFILE IS PART OF THE IMAGE'S IDENTITY, AND WAS NOT. Until 2026-08-25 the Dockerfile ran
+    # `pip install lexnlp==2.3.0 pyarrow tqdm` and never read this file, so the lockfile was
+    # decorative on both axes at once: it could not change the build, and changing it could not move
+    # the hash. It is installed now, so it belongs here -- otherwise editing a pin would change what
+    # the container emits under an unchanged identity, which is the exact failure a spec hash exists
+    # to make impossible.
+    #
+    # ADDING IT MOVES THE HASH BY DESIGN. That is not evidence the container behaves differently; a
+    # file-content fingerprint moves whenever the file set changes. Whether the OUTPUT moved is a
+    # different question, and _Tests/Test-LexNLP.R answers it: its span hash over a fixed fixture
+    # was 9341e671a38a before this change.
+    "requirements.lock.txt",
 )
 
 
