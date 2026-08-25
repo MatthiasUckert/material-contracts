@@ -120,7 +120,7 @@ geo_lookup <- function(.path_lookup) {
   if (!fs::file_exists(.path_lookup)) {
     cli::cli_abort(c(
       "No geo lookup at {.path {(.path_lookup)}}.",
-      "i" = "It ships inside matcon-extract; 1_code/_Scripts/rebuild-geo-lookup.R rebuilds it."
+      "i" = "It ships inside matcon-extract, which is where the rebuilder lives too."
     ))
   }
 

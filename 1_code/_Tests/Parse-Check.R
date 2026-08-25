@@ -31,8 +31,7 @@ options(cli.num_colors = 1, cli.width = 120)
 .dirs <- c(
   here::here("1_code"),
   here::here("1_code", "_Commons"),
-  here::here("1_code", "_Tests"),
-  here::here("1_code", "_Scripts")
+  here::here("1_code", "_Tests")
 )
 
 .files <- .dirs[fs::dir_exists(.dirs)] |>

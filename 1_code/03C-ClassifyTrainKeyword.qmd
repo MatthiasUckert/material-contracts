@@ -14,13 +14,13 @@ knitr::opts_knit$set(root.dir = here::here())
 # Figure geometry is NOT set here -- it is declared once in _quarto.yml.
 knitr::opts_chunk$set(
   root.dir = here::here(),
-  message  = TRUE,       # mandatory: cli writes through the message stream under knitr, so
-                         # message = FALSE would discard this document's entire output
-  warning  = FALSE,
-  comment  = ""          # drops the "##" prefix, so console blocks copy verbatim
+  message = TRUE, # mandatory: cli writes through the message stream under knitr, so
+  # message = FALSE would discard this document's entire output
+  warning = FALSE,
+  comment = "" # drops the "##" prefix, so console blocks copy verbatim
 )
 
-options(cli.num_colors = 1, cli.width = 120)   # plain ASCII; ANSI codes paste as garbage
+options(cli.num_colors = 1, cli.width = 120) # plain ASCII; ANSI codes paste as garbage
 
 .name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
   knitr::current_input()
@@ -128,8 +128,10 @@ invisible to the rule that turns them into labels.
 #| label: config-paths
 .dir_prep <- init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare")
 
-# The generated term lists are produced outside the repository, by 03C-CoWorkKeywords.R and
-# 03C-CoWorkCompile.R, and are read from the shared project folder rather than rebuilt here.
+# THE TERM LISTS ARE A SUPPLIED INPUT, not something this document rebuilds -- the same standing as
+# 03A's label spine. They were produced by a reading session over contrastive document bundles; the
+# method is described under "The generated arm" below, and the lists themselves are archived with
+# the data rather than regenerated from code.
 .dir_cowork <- fs::path(
   "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractData",
   "KeyWordsClaude"
@@ -171,7 +173,7 @@ invisible to the rule that turns them into labels.
     # Nine of twelve, five of seven -- the same three-quarters -- and both of two, since a binary
     # table that only ever names one class is not a table.
     TargetPrecision = c(ClassDetailed = 0.95, ClassBroad = 0.95, AmendType = 0.85),
-    MinClasses      = c(ClassDetailed = 9L,   ClassBroad = 5L,   AmendType = 2L),
+    MinClasses      = c(ClassDetailed = 9L, ClassBroad = 5L, AmendType = 2L),
     Tolerance       = 0.01, # precision band treated as indistinguishable; roughly two SEs here
     MinFolds        = 3L, # fold agreement required of a published term
     HoldoutFold     = 5L, # the fold the generated arm never read
@@ -448,7 +450,7 @@ sel_best <- kw_summarise_selection(.tab = perf_sel, .label_col = "ClassDetailed"
     .tolerance    = 0.01, # precision band treated as a tie
     .min_coverage = 0.25, # below this a configuration is not publishable
     .prefer       = NULL, # no axis here is chosen on grounds the table does not report
-    .fallback     = TRUE  # these floors are swept over an already-publishable mine
+    .fallback     = TRUE # these floors are swept over an already-publishable mine
   )
 
 sel_best |>
@@ -469,10 +471,10 @@ floors_task <- purrr::map(
   .x = c("ClassDetailed", "ClassBroad", "AmendType"),
   .f = function(.task) {
     kw_task_floors(
-      .perf_sel     = perf_sel,              # selection sweep, every task
-      .label_col    = .task,                 # task
-      .tolerance    = .lP$Param$Tolerance,   # differences too small to measure
-      .min_coverage = 0.25                   # below this, not publishable
+      .perf_sel     = perf_sel, # selection sweep, every task
+      .label_col    = .task, # task
+      .tolerance    = .lP$Param$Tolerance, # differences too small to measure
+      .min_coverage = 0.25 # below this, not publishable
     )
   }
 ) |>
@@ -596,10 +598,9 @@ kw_report_audit(.tab_pred = pred_final, .per_class = 2L, .wrong = TRUE)
 
 # The generated arm
 
-`03C-CoWorkKeywords.R` wrote contrastive document bundles, pairing documents of a category with
-documents drawn from the rest so that a term appearing in both can be recognised as worthless. A
-reading session proposed terms from those bundles, and `03C-CoWorkCompile.R` folded the responses into
-one term list per task.
+Contrastive document bundles were written, pairing documents of a category with documents drawn from
+the rest so that a term appearing in both can be recognised as worthless. A reading session proposed
+terms from those bundles, and the responses were folded into one term list per task.
 
 The bundles were drawn from folds one to four, so the session read those documents together with their
 labels. Only the held-out fold is absent from every bundle, and it is therefore the only honest
@@ -611,7 +612,12 @@ values optimistic for both arms alike; the precision and coverage reported below
 purrr::walk(
   .x = c(.lP$Input$TermsDetailed, .lP$Input$TermsBroad, .lP$Input$TermsAmend),
   .f = function(.p) {
-    if (!fs::file_exists(.p)) cli::cli_abort("Missing term list {(.p)}; run 03C-CoWorkCompile.R")
+    if (!fs::file_exists(.p)) {
+      cli::cli_abort(c(
+        "Missing term list {.path {(.p)}}.",
+        "i" = "The term lists are a supplied input, archived with the data. See Configuration."
+      ))
+    }
   }
 )
 
@@ -619,7 +625,7 @@ cfg_detailed <- cfg_mine |> dplyr::filter(LabelCol == "ClassDetailed", Source ==
 
 perf_generated <- kw_terms_evaluate(
   .path_data     = .lP$Input$Prepared,
-  .terms_file    = .lP$Input$TermsDetailed, # written by 03C-CoWorkCompile.R
+  .terms_file    = .lP$Input$TermsDetailed, # the supplied term list; see Configuration
   .label_col     = "ClassDetailed",
   .source        = "text",
   .nwords        = cfg_detailed$NWords, # same window as the mined arm
@@ -865,17 +871,17 @@ change to make as a side effect of asking whether it should be made.
 #| label: robust-tau-floor
 tab_tau_floor <- purrr::pmap(plan_pub, function(Task, NWords) {
   kw_tau_floor_probe(
-    .label_col        = Task,                                    # task to probe
-    .n_words          = NWords,                                  # every published window, not one
-    .idx_mine         = idx_mine,                                # every mining cell
-    .cfg_mine         = cfg_mine,                                # crowned cell names the held axes
-    .floors           = floors_task[[Task]],                     # this task's selection floors
-    .target_precision = .lP$Param$TargetPrecision[[Task]],       # this task's promise
-    .min_classes      = .lP$Param$MinClasses[[Task]],            # breadth it must reach
-    .taus_published   = .lP$Param$TausPublished,                 # the grid the tables were chosen from
-    .taus_extended    = .lP$Param$TausProbe,                     # the same grid, extended downward
-    .tolerance        = .lP$Param$Tolerance,                     # differences too small to measure
-    .source           = "text"                                   # the field the shipped arm reads
+    .label_col        = Task, # task to probe
+    .n_words          = NWords, # every published window, not one
+    .idx_mine         = idx_mine, # every mining cell
+    .cfg_mine         = cfg_mine, # crowned cell names the held axes
+    .floors           = floors_task[[Task]], # this task's selection floors
+    .target_precision = .lP$Param$TargetPrecision[[Task]], # this task's promise
+    .min_classes      = .lP$Param$MinClasses[[Task]], # breadth it must reach
+    .taus_published   = .lP$Param$TausPublished, # the grid the tables were chosen from
+    .taus_extended    = .lP$Param$TausProbe, # the same grid, extended downward
+    .tolerance        = .lP$Param$Tolerance, # differences too small to measure
+    .source           = "text" # the field the shipped arm reads
   )
 }) |>
   purrr::list_rbind()
@@ -934,17 +940,17 @@ read the filer's title instead of the contract. They were settled on the evidenc
 # a lexicon whatever categories it holds.
 pubs <- purrr::pmap(plan_pub, function(Task, NWords) {
   kw_publish_lexicon(
-    .label_col        = Task,                                  # task to publish
-    .n_words          = NWords,                                # truncation window
-    .idx_mine         = idx_mine,                              # every mining cell, folds and all-data
-    .cfg_mine         = cfg_mine,                              # crowned cell names the held axes
-    .floors           = floors_task[[Task]],                   # this task's selection floors
-    .target_precision = .lP$Param$TargetPrecision[[Task]],     # this task's promise
-    .min_classes      = .lP$Param$MinClasses[[Task]],          # breadth it must reach
-    .taus             = .lP$Param$TausPublished,               # thresholds to trace
-    .tolerance        = .lP$Param$Tolerance,                   # differences too small to measure
-    .min_folds        = .lP$Param$MinFolds,                    # fold agreement a term must show
-    .source           = "text"                                 # the field the shipped arm reads
+    .label_col        = Task, # task to publish
+    .n_words          = NWords, # truncation window
+    .idx_mine         = idx_mine, # every mining cell, folds and all-data
+    .cfg_mine         = cfg_mine, # crowned cell names the held axes
+    .floors           = floors_task[[Task]], # this task's selection floors
+    .target_precision = .lP$Param$TargetPrecision[[Task]], # this task's promise
+    .min_classes      = .lP$Param$MinClasses[[Task]], # breadth it must reach
+    .taus             = .lP$Param$TausPublished, # thresholds to trace
+    .tolerance        = .lP$Param$Tolerance, # differences too small to measure
+    .min_folds        = .lP$Param$MinFolds, # fold agreement a term must show
+    .source           = "text" # the field the shipped arm reads
   )
 }) |>
   purrr::set_names(paste0(plan_pub$Task, "_W", plan_pub$NWords))
@@ -953,8 +959,8 @@ pubs <- purrr::pmap(plan_pub, function(Task, NWords) {
 ```{r}
 #| label: deploy-report-catalogue
 catalogue <- kw_catalogue(
-  .pubs      = pubs,                   # every task crossed with every window
-  .tolerance = .lP$Param$Tolerance     # precision band treated as indistinguishable
+  .pubs      = pubs, # every task crossed with every window
+  .tolerance = .lP$Param$Tolerance # precision band treated as indistinguishable
 )
 kw_report_catalogue(.tab = catalogue)
 ```
@@ -990,8 +996,8 @@ kw_report_lexicon(
 #| label: deploy-save-tables
 purrr::walk(pubs, function(.p) {
   kw_save_lexicon(
-    .tab  = .p$Lexicon,                                            # this window's published table
-    .dir  = .lP$Output$Table,                                      # one directory, many tables
+    .tab  = .p$Lexicon, # this window's published table
+    .dir  = .lP$Output$Table, # one directory, many tables
     .stem = kw_table_stem(.label_col = .p$LabelCol, .n_words = .p$NWords)
   )
 })
@@ -1004,8 +1010,8 @@ purrr::walk(pubs, function(.p) {
 # file rather than rebuilding the choice, which is what keeps the row marked here and the table
 # applied there from disagreeing.
 arrow::write_parquet(
-  x    = catalogue,                                                 # one row per task and window
-  sink = fs::path(.lP$Output$Table, "catalogue.parquet")            # beside the tables it describes
+  x    = catalogue, # one row per task and window
+  sink = fs::path(.lP$Output$Table, "catalogue.parquet") # beside the tables it describes
 )
 ```
 
@@ -1040,10 +1046,10 @@ selection, and it is stated at the top of this section rather than hidden in a c
 # worse than no run at all, since it is a plausible number for the wrong system.
 tab_parity <- purrr::map(pubs, function(.p) {
   kw_parity_check(
-    .pub      = .p,                    # this task and window
-    .mine_dir = .p$Dirs[[1]],          # one fold is enough; the tokenisation is not fold-specific
-    .docs     = tab_prep,              # the text the mine does not carry
-    .python   = .lP$Engine$Python,     # the interpreter the miner ran under
+    .pub      = .p, # this task and window
+    .mine_dir = .p$Dirs[[1]], # one fold is enough; the tokenisation is not fold-specific
+    .docs     = tab_prep, # the text the mine does not carry
+    .python   = .lP$Engine$Python, # the interpreter the miner ran under
     .script   = .lP$Engine$ScriptApply # the applier
   )
 }) |>
@@ -1066,9 +1072,9 @@ side mean the mine's candidate filters dropped a term the published table still 
 #| label: deploy-publish-runs
 runs_published <- purrr::map(pubs, function(.p) {
   kw_publish_runs(
-    .pub       = .p,                  # this task and window
-    .runs_root = .lP$Output$Runs,     # the same root the sweep writes to
-    .seed      = .lP$Param$Seed       # stamped for parity with the other engines
+    .pub       = .p, # this task and window
+    .runs_root = .lP$Output$Runs, # the same root the sweep writes to
+    .seed      = .lP$Param$Seed # stamped for parity with the other engines
   )
 }) |>
   purrr::list_rbind()
@@ -1084,12 +1090,12 @@ all of them.
 #| label: deploy-report-runs
 runs_published |>
   dplyr::summarise(
-    Folds     = dplyr::n(),
-    Coverage  = mean(Coverage),
+    Folds = dplyr::n(),
+    Coverage = mean(Coverage),
     Precision = mean(SelPrecision),
-    MacroF1   = mean(F1_macro),
-    Terms     = round(mean(nTerms)),
-    Classes   = round(mean(nClassesHit)),
+    MacroF1 = mean(F1_macro),
+    Terms = round(mean(nTerms)),
+    Classes = round(mean(nClassesHit)),
     .by = ConfigName
   ) |>
   # Joined back for the labels. The configuration name is the key and is far too long to print, so
@@ -1156,10 +1162,10 @@ about the category rather than a gap to be closed by lowering the bar.
 #|   abstention: the share of each category's documents that no term reached. Reading down that column
 #|   shows where the vocabulary runs out."
 clf_plot_confusion(
-  .tab_pred  = pred_final,    # committed and abstained predictions at the operating point
-  .normalize = TRUE,          # each row sums to one, so the abstention share is directly readable
-  .limits    = c(0, 1),       # same fill scale as the transformer matrices
-  .label_min = 0.005          # a cell below half a percent is drawn but not labelled
+  .tab_pred  = pred_final, # committed and abstained predictions at the operating point
+  .normalize = TRUE, # each row sums to one, so the abstention share is directly readable
+  .limits    = c(0, 1), # same fill scale as the transformer matrices
+  .label_min = 0.005 # a cell below half a percent is drawn but not labelled
 )
 ```
 
@@ -1177,9 +1183,9 @@ a reader applying the table by hand should expect it to stay silent about.
 #| fig-cap: "Performance against the truncation window. The reference line marks the transformer's
 #|   reading window; anything right of it is signal no model in this study sees."
 kw_plot_window(
-  .tab        = perf_mines,        # every mining cell
-  .label_col  = "ClassDetailed",   # task to plot
-  .window_ref = 512L               # the transformer's context window, in words
+  .tab        = perf_mines, # every mining cell
+  .label_col  = "ClassDetailed", # task to plot
+  .window_ref = 512L # the transformer's context window, in words
 )
 ```
 
@@ -1189,8 +1195,8 @@ kw_plot_window(
 #| fig-cap: "Precision bought by declining to label. Point area is the number of categories the table
 #|   still reaches, which is the constraint that stops the curve being read as free."
 kw_plot_tau(
-  .curve            = curve_detailed,              # one point per evidence threshold
-  .target_precision = .lP$Param$TargetPrecision[["ClassDetailed"]]   # drawn as a reference line
+  .curve            = curve_detailed, # one point per evidence threshold
+  .target_precision = .lP$Param$TargetPrecision[["ClassDetailed"]] # drawn as a reference line
 )
 ```
 
@@ -1205,7 +1211,7 @@ kw_plot_tau(
 #|   category for which the mining found no publishable term at all."
 kw_plot_reach(
   .tab = kw_default_pub(.pubs = pubs, .catalogue = catalogue, .label_col = "ClassDetailed")$Lexicon,
-  .key = "ClassDetailed"     # panels follow the registered taxonomic order
+  .key = "ClassDetailed" # panels follow the registered taxonomic order
 )
 ```
 

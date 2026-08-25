@@ -49,8 +49,8 @@ project:
   #
   # A DOCUMENT MUST MATCH THIS LIST TO INHERIT THIS FILE. A .qmd that does not match is rendered
   # standalone by Quarto: no toc, no code folding, no stylesheet, no embedded resources, and no
-  # error saying so. Underscore-prefixed subdirectories (_Commons, _Tests, _BackUp, _Migration,
-  # _Scripts) never match, which is why the layout probe sits here beside the runbooks rather than
+  # error saying so. Underscore-prefixed subdirectories (_Commons, _Tests, _BackUp, _Migration,) 
+  # never match, which is why the layout probe sits here beside the runbooks rather than
   # in _Tests/, where it was silently rendered unstyled.
   render:
     - "*.qmd"
