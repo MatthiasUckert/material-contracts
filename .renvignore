@@ -40,3 +40,13 @@ _contracts-extract/
 # The public site is a separate Quarto project with its own small set of R helpers. Include it here
 # only while it is absent; remove this line once 3_site/ is back and its dependencies matter.
 3_site/
+
+# Superseded code. Old scripts import packages the live pipeline no longer uses, and a lockfile
+# built from them pins dependencies nothing calls.
+#
+# THE ROOT ARCHIVE AND THE IN-REPO ONES ARE DIFFERENT DIRECTORIES. _BackUps/ is at the repository
+# root; _BackUp/ and _Migration/ are inside 1_code/ and were never matched by it. 116 superseded
+# files were therefore parsed at every session start.
+_BackUps/
+1_code/_BackUp/
+1_code/_Migration/

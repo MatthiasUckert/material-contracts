@@ -36,3 +36,12 @@ _2_output/
 # Superseded code and rendered output.
 _BackUps/
 _rendered/
+
+# In-repo archives. Present on disk as a working reference during the rewrite; moved to
+# ContractsBackUp/ at release. Tracked once, then untracked -- git history holds them.
+#
+# NOTE THE SINGULAR. _BackUps/ above is the repository-root archive; these two are inside
+# 1_code/ and were never matched by it.
+1_code/_BackUp/
+1_code/_Migration/
+*.BACKUP
