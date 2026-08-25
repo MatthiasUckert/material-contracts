@@ -3,14 +3,43 @@ name = "contracts-spacy"
 version = "0.1.0"
 description = "spaCy NER over contract text, emitting the shared candidate schema."
 requires-python = ">=3.10"
-
 # spaCy pulls torch through the transformer extra, so this environment is a gigabyte and
 # cannot be merged with anything light. That is the whole reason it is its own folder.
+#
+# THE MODEL IS THE IDENTITY, NOT THE PACKAGE, AND IT WAS UNDECLARED UNTIL 2026-08-25.
+# ner_describe() records the MODEL version -- 3.8.0 -- as the spaCy family's SpecHash, so a lock
+# pinning spacy 3.8.16 and leaving the model ambient pins the wrong thing: it describes an
+# environment that cannot reproduce the output. The four models were installed by hand into .venv,
+# invisible to uv, and `uv sync --frozen` would have removed them the way it removed pytest from
+# contracts-extract.
+#
+# ONLY THE TRANSFORMER IS DECLARED. 04A measured the three CNN models against it and they lost on
+# every entity: "running them again would spend minutes to reproduce a finding that is already
+# settled. They stay in the table so the exclusion is visible." A table is the right place for them;
+# six hundred megabytes of locked dependency that nothing executes is not. README.md carries the
+# one-line install for anyone reproducing 04A's benchmark.
 dependencies = [
     "spacy[transformers]>=3.7",
+    "en_core_web_trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.8.0/en_core_web_trf-3.8.0-py3-none-any.whl",
+    # HELD AT THE VERSION THAT RAN. uv resolved 0.0.10 while .venv carried 0.0.9, and this package
+    # is the tokenizer en_core_web_trf loads -- upstream of every span spaCy emits, not an
+    # incidental like a colouring library. 04A's benchmark and 04C's corpus pass both ran under
+    # 0.0.9, and there is no test suite in this folder to catch a change. Freezing means recording
+    # what produced the results; an upgrade is a separate decision with its own verification.
+    "curated-tokenizers==0.0.9",
     "pandas>=2.0",
     "pyarrow>=14.0",
     "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+# THE THREE COMPARISON MODELS, DECLARED AND NOT INSTALLED BY DEFAULT. Exactly the standing 04A gives
+# them: present in the benchmark table, absent from the pass. `uv sync --frozen --extra benchmark`
+# brings them back for anyone re-running that comparison.
+benchmark = [
+    "en_core_web_sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl",
+    "en_core_web_md @ https://github.com/explosion/spacy-models/releases/download/en_core_web_md-3.8.0/en_core_web_md-3.8.0-py3-none-any.whl",
+    "en_core_web_lg @ https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl",
 ]
 
 [tool.uv]
