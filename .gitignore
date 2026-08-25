@@ -58,3 +58,6 @@ _rendered/
 1_code/_Tests/*
 !1_code/_Tests/Parse-Check.R
 !1_code/_Tests/04D-Preflight.R
+# The four matcon tests earn their place the same way: they are the delivery gate for
+# contracts-extract, and they are what proves the Python freeze changed nothing.
+!1_code/_Tests/Test-MatCon-*.R
