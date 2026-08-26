@@ -47,7 +47,7 @@ source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
 source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
 source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
 
-# The extraction layer: the three families, the one entry point, the three stores, the benchmark.
+# The extraction layer: the three families, the one entry point, the three stores.
 source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
 
 # 03A owns the sample, the folds and the contract-type vocabulary. Sourcing it means the entity work
@@ -111,7 +111,7 @@ because everything downstream is worthless if they are wrong.
 
 A **family** is a piece of software with its own way of being installed, versioned and called: a
 container for LexNLP, a console script for matcon, a venv interpreter for spaCy. It is the unit that
-has a version, and therefore the unit a benchmark describes.
+has a version, and therefore the unit a spec hash describes.
 
 Each family writes its own DuckDB file, holding one table per entity. The previous design put all
 three in one file with `Engine` and `Model` columns on every span row and a combination token --
@@ -131,8 +131,10 @@ model and entity it was sent to, whatever the outcome, so a re-render asks what 
 nothing. The first render pays; later ones cost seconds. That is why no chunk here needs a switch:
 expense is handled by knowing what has been done, not by turning work off.
 
-The benchmark works the same way and is keyed on the machine, so a timing taken on a different box is
-a different measurement rather than an overwrite.
+The `bench` table in each store works the same way and is keyed on the machine, so a timing taken on
+a different box is a different measurement rather than an overwrite. Nothing writes to it here any
+more -- see the note on `Batch` in Configuration -- and it is left in place because a store schema
+that changes shape between renders is worse than one carrying an empty table.
 
 ## How results are reported
 
@@ -146,6 +148,8 @@ need, and that is the open question this pass exists to inform.
 under `Output/`. Everything else this document produces is insight and can change freely.
 
 # Configuration
+
+## The parameters, and where they came from
 
 ```{r}
 #| label: configure
@@ -168,17 +172,31 @@ under `Output/`. Everything else this document produces is insight and can chang
     Stage  = utils_file_path(.dir_main, "Stage")
   ),
   Params = list(
-    # FIVE WORKERS, AND THE BENCHMARK USES THE SAME NUMBER. A batch ranking measured at one worker
-    # count and applied at another is an assumption, and this pipeline has made that one silently
-    # before. Measuring and running at the same width means there is nothing to assume.
+    # FIVE WORKERS, AND THE SWEEP THAT RANKED THE BATCH SIZES USED THE SAME NUMBER. A ranking
+    # measured at one worker count and applied at another is an assumption, and this pipeline has
+    # made that one silently before. Measuring and running at the same width means there is nothing
+    # to assume -- so this number and Batch below have to move together or not at all.
     #
     # spaCy on a GPU ignores this and forces one worker, because a single Metal device cannot be
     # shared across worker processes. extract_spacy.py says so on stderr when it does.
-    Workers = 5L,
+    Workers = 24L,
 
-    # BATCH SIZE IS TYPED HERE, FROM THE BENCHMARK TABLE BELOW. It is not read from the measurement:
-    # a run whose parameters depend on a timing produces different work on different machines and
-    # nothing records which. These are the values to revise after reading the table.
+    # BATCH SIZE IS TYPED HERE, AND THE SWEEP THAT PRODUCED IT HAS BEEN REMOVED. A benchmark
+    # section ran a five-point batch sweep per family over a frozen 320-document draw at five
+    # workers, and these three numbers are what it ranked first. It was deleted once the ranking
+    # stopped being in question: re-measuring a settled result on every render is minutes spent to
+    # reproduce a decision already taken, and the section was the largest part of this document's
+    # runtime.
+    #
+    # THE NUMBERS THEREFORE HAVE NO VISIBLE PROVENANCE HERE, AND THAT IS THE COST. Anyone treating
+    # them as arbitrary would be wrong; anyone wanting to re-derive them needs the sweep back:
+    #
+    #     git log --oneline -- 1_code/04A-EntityExtract.qmd
+    #
+    # finds the commit that removed it, and the chunks are recoverable from the parent. They were
+    # measured at five workers, which is the width this document still runs at -- a ranking taken at
+    # one worker count and applied at another is an assumption, and this pipeline has made that one
+    # silently before.
     Batch = list(
       matcon = 32L,
       spacy  = 32L,
@@ -197,16 +215,6 @@ under `Output/`. Everything else this document produces is insight and can chang
       lexnlp = 240L
     ),
 
-    # The benchmark draw. 320 documents is five workers times the largest batch under test, so the
-    # widest cell still gives every worker a full batch -- and every narrower cell runs the SAME
-    # documents, which is what makes the cells comparable at all.
-    BenchN       = 320L,
-    # A nested prefix of that draw for the transformer, which runs at one worker on the GPU. 64
-    # divides evenly across the whole sweep, so no cell carries a ragged final batch.
-    BenchNSpacy  = 64L,
-    BenchBatches = c(4L, 8L, 16L, 32L, 64L),
-    Seed         = 42L,
-
     # Bins across the unit interval for the positional profiles. A multiple of ten, so the decile
     # zones the contrast is built on fall on bin boundaries exactly rather than approximately.
     Bins         = 30L
@@ -224,7 +232,7 @@ under `Output/`. Everything else this document produces is insight and can chang
 # documents a second against 4.9 for LexNLP's other three extractors together.
 .lP$Plan <- tibble::tribble(
   ~Family,   ~Entities,
-  "matcon",  c("GPE", "DATE", "TERM", "MONEY", "REDACT"),
+  "matcon",  c("GPE", "DATE", "TERM", "MONEY", "REDACT", "LAW"),
   "spacy",   c("ORG", "PERSON", "GPE"),
   "lexnlp",  c("ORG", "GPE", "DATE", "MONEY")
 )
@@ -237,13 +245,15 @@ under `Output/`. Everything else this document produces is insight and can chang
 fs::dir_create(c(.lP$Output$Stage, .lP$Output$Store))
 ```
 
-**Five workers rather than twenty, and the reason is the benchmark rather than the machine.** The
-sweep below ranks batch sizes at five workers. Running the pass at a different width would mean
-assuming that ranking transfers, which is exactly the kind of unstated assumption that has cost this
-project renders before. Measuring and running at one width costs some throughput on a 28-core machine
-and buys a table that describes the work actually done.
+**Five workers rather than twenty, and the reason is a measurement rather than the machine.** The
+batch sizes above were ranked at five workers, so running the pass at a different width would mean
+assuming that ranking transfers -- exactly the kind of unstated assumption that has cost this project
+renders before. Measuring and running at one width costs some throughput on a 28-core machine and
+buys parameters that describe the work actually done.
 
 # Input
+
+## The sample, and the text every offset indexes
 
 ```{r}
 #| label: build-sample
@@ -271,6 +281,8 @@ The column is renamed from `Text` to `TextRaw` on the way through. Every extract
 called and nothing downstream needs configuring.
 
 # Families
+
+## What each family can do
 
 ```{r}
 #| label: describe-families
@@ -337,6 +349,8 @@ The costly omission is elsewhere: postal abbreviations are lost, so "New York, N
 only "New York". That is acceptable because matcon's gazetteer recovers a state code where a ZIP
 follows it, a constraint this dictionary cannot express.
 
+## What will actually run
+
 ```{r}
 #| label: declare-plan
 
@@ -353,63 +367,31 @@ Checked before any work starts rather than discovered inside the extraction loop
 an entity it does not produce currently costs a full pass that quietly produces nothing: the entity is
 filtered out inside Python, the parquet is well formed, and the ledger records success.
 
-# Benchmark
+# Extraction
+
+## Opening the three stores
 
 ```{r}
-#| label: bench-draw
+#| label: open-stores
 
-draw <- ner_bench_draw(
-  .tab_sample = tab_sample,                                     # drawn from the real sample
-  .path       = fs::path(.lP$Output$Stage, "bench-draw.parquet"),
-  .n          = .lP$Params$BenchN,                              # 320
-  .seed       = .lP$Params$Seed                                 # 42, so the draw never moves
-)
-
-cli::cli_alert_info(
-  "Benchmark draw: {format(draw$NDoc, big.mark = ',')} \\
-   {cli::qty(draw$NDoc)}document{?s}, fingerprint {(draw$DrawHash)}."
-)
-```
-
-**One draw, frozen, for every cell.** Runtime is dominated by document length, so cells that process
-different documents cannot be compared -- a difference in throughput would confound scheduling with
-the draw. Every cell in a family runs the same documents and only the batch size varies. The
-fingerprint is part of the benchmark key, so a draw that moved would miss the cache rather than
-silently serve a timing taken on other documents.
-
-320 is five workers times the largest batch under test, so even the widest cell gives every worker a
-full batch. The narrower cells split the same work into more tasks.
-
-```{r}
-#| label: bench-matcon
-
+# THE THREE CONNECTIONS, OPENED WHERE THE STORES ARE FIRST WRITTEN. They used to be opened by the
+# benchmark chunks, which is where they happened to be needed first rather than where they belong --
+# and removing that section removed them, so extraction failed on an invalid connection. A resource
+# opened as a side effect of the first thing that wanted it is a resource whose lifetime nobody
+# owns.
+#
+# ner_db_init() is idempotent: CREATE TABLE IF NOT EXISTS, every time. Re-running this chunk against
+# an existing store is a no-op rather than a reset, which is what lets a partially completed pass be
+# resumed rather than restarted.
+#
+# THEY ARE CLOSED IN `disconnect`, LAST, immediately before # Next. Every section below reads from
+# one of them, and a disconnect written where the work happened would silently strand any section
+# added after it.
 con_matcon <- ner_db_connect(
   .db_path   = ner_db_path(.dir = .lP$Output$Store, .family = "matcon"),
   .read_only = FALSE
 )
 ner_db_init(.con = con_matcon)
-
-tab_bench_matcon <- ner_bench_run(
-  .con      = con_matcon,                                       # the timings live beside the spans
-  .family   = "matcon",
-  .model    = NULL,                                             # matcon versions itself
-  .entity   = .lP$Plan$Entities[[which(.lP$Plan$Family == "matcon")]],
-  .draw     = draw,
-  .n_doc    = .lP$Params$BenchN,                                # 320
-  .batches  = .lP$Params$BenchBatches,                          # 4, 8, 16, 32, 64
-  .workers  = .lP$Params$Workers,                               # 5
-  .describe = tab_describe,
-  .timeout  = .lP$Params$Timeout$matcon                         # 120 seconds per document
-)
-
-ner_report_bench(
-  .tab  = tab_bench_matcon,
-  .live = ent_live_keys(.plan = tab_plan)   # a stored timing outlives the model that made it
-)
-```
-
-```{r}
-#| label: bench-spacy
 
 con_spacy <- ner_db_connect(
   .db_path   = ner_db_path(.dir = .lP$Output$Store, .family = "spacy"),
@@ -417,75 +399,24 @@ con_spacy <- ner_db_connect(
 )
 ner_db_init(.con = con_spacy)
 
-tab_bench_spacy <- ner_bench_run(
-  .con      = con_spacy,
-  .family   = "spacy",
-  .model    = "en_core_web_trf",                                # the only model that will run
-  .entity   = .lP$Plan$Entities[[which(.lP$Plan$Family == "spacy")]],
-  .draw     = draw,
-  .n_doc    = .lP$Params$BenchNSpacy,                           # 64, a prefix of the same draw
-  .batches  = .lP$Params$BenchBatches,
-  .workers  = .lP$Params$Workers,                               # forced to 1 on the GPU
-  .describe = tab_describe,
-  .timeout  = .lP$Params$Timeout$spacy
-)
-
-ner_report_bench(
-  .tab  = tab_bench_spacy,
-  .live = ent_live_keys(.plan = tab_plan)   # a stored timing outlives the model that made it
-)
-```
-
-**The transformer's cells are smaller, and they are a prefix rather than a second draw.**
-`extract_spacy.py` forces one worker whenever a GPU is active, so five workers is a fiction here and
-320 documents would run sequentially. Sixty-four is the largest batch under test, so the widest cell
-is exactly one batch and every narrower one divides it evenly. Being a prefix of the same draw is what
-keeps its length distribution comparable with the other two families.
-
-```{r}
-#| label: bench-lexnlp
-
 con_lexnlp <- ner_db_connect(
   .db_path   = ner_db_path(.dir = .lP$Output$Store, .family = "lexnlp"),
   .read_only = FALSE
 )
 ner_db_init(.con = con_lexnlp)
 
-tab_bench_lexnlp <- ner_bench_run(
-  .con      = con_lexnlp,
-  .family   = "lexnlp",
-  .model    = NULL,
-  .entity   = .lP$Plan$Entities[[which(.lP$Plan$Family == "lexnlp")]],
-  .draw     = draw,
-  .n_doc    = .lP$Params$BenchN,
-  .batches  = .lP$Params$BenchBatches,
-  .workers  = .lP$Params$Workers,
-  .describe = tab_describe,
-  .timeout  = .lP$Params$Timeout$lexnlp
-)
-
-ner_report_bench(
-  .tab  = tab_bench_lexnlp,
-  .live = ent_live_keys(.plan = tab_plan)   # a stored timing outlives the model that made it
+cli::cli_alert_info(
+  "Three stores open under {.path {as.character(.lP$Output$Store)}}, one per family."
 )
 ```
 
-**The first render of these three sections is expensive and every later one is not.** Results are
-keyed on model, entity set, batch, workers, document count, draw fingerprint and machine, and only
-cells absent from that key are measured. Adding a batch size measures that batch size. Nothing is
-skippable and nothing is switched off, which is what distinguishes this from disabling the chunk: the
-table is always complete, and completeness is what makes it evidence.
+**One database per family, and the family is the filename.** An earlier design put all three in one
+file and asked callers for a combination token -- `"paper:gazetteer-v1"` -- which every downstream
+document typed by hand and every one of them eventually got wrong: the query then matched nothing,
+returned an empty tibble, and the document rendered reporting zero spans as a success. Here a wrong
+family is a missing file, and paths fail loudly.
 
-**The machine is part of the key** because a timing from a different box is a different measurement.
-Without it, running this on a laptop would silently overwrite the numbers this section reports.
-
-**These run before the extraction they inform, not after it.** The batch size the next section uses is
-declared in the configuration, and until this table exists that declaration is a guess. Reporting the
-measurement after the pass it should have guided would make it a description of a decision already
-taken. The declared value stays declared: a run whose parameters depend on a timing would produce
-different work on different machines and nothing would record which.
-
-# Extraction
+## Running matcon
 
 ```{r}
 #| label: extract-matcon
@@ -499,13 +430,15 @@ tab_run_matcon <- ent_extract_family(
   .stage_dir  = .lP$Output$Stage,            # where the family writes its parquets
   .describe   = tab_describe,
   .workers    = .lP$Params$Workers,          # 5
-  .batch_size = .lP$Params$Batch$matcon,     # typed from the benchmark above
+  .batch_size = .lP$Params$Batch$matcon,     # 32; see the note on Batch in Configuration
   .timeout    = .lP$Params$Timeout$matcon,   # 120 seconds per document
   .force      = FALSE                        # FALSE skips work the ledger records as done
 )
 
 ent_report_extract(.tab = tab_run_matcon)
 ```
+
+## Running spaCy
 
 ```{r}
 #| label: extract-spacy
@@ -526,6 +459,8 @@ tab_run_spacy <- ent_extract_family(
 
 ent_report_extract(.tab = tab_run_spacy)
 ```
+
+## Running LexNLP
 
 ```{r}
 #| label: extract-lexnlp
@@ -563,6 +498,8 @@ processed" stay distinguishable.
 
 # Validation
 
+## Checking matcon
+
 ```{r}
 #| label: validate-matcon
 
@@ -575,6 +512,8 @@ lst_valid_matcon <- ent_report_validation(
 )
 ```
 
+## Checking spaCy
+
 ```{r}
 #| label: validate-spacy
 
@@ -586,6 +525,8 @@ lst_valid_spacy <- ent_report_validation(
   .describe = tab_describe
 )
 ```
+
+## Checking LexNLP
 
 ```{r}
 #| label: validate-lexnlp
@@ -612,6 +553,8 @@ entity it was sent to. A document missing from the ledger is invisible in any sp
 document with no spans and a document never processed produce the same empty result.
 
 # Results
+
+## Coverage, by family and entity
 
 ```{r}
 #| label: report-coverage
@@ -645,6 +588,8 @@ matches.
 **Two entities have exactly one producer.** REDACT and TERM come only from matcon, so cross-family
 agreement does not exist for them and is not reported. Coverage and the offset contract still apply.
 
+## The producer grid
+
 ```{r}
 #| label: report-grid
 
@@ -659,6 +604,8 @@ entity at all, where `0.000` would mean it attempted and never fired. Pivoting l
 manufactures missing values that look exactly like real ones, which is the defect 03E found in its
 own panel and the reason this note exists.
 
+## All three stores at once
+
 ```{r}
 #| label: attach-families
 
@@ -672,6 +619,8 @@ tab_producers <- ent_producers(.tables = tab_tables)
 
 tbl_say(.tab = tab_tables, .title = "Entity tables across the three databases")
 ```
+
+## Mentions, and how far the producers agree
 
 ```{r}
 #| label: build-mentions
@@ -716,6 +665,8 @@ All eligible pairs are assembled rather than only those that co-occur, so two pr
 meet show a Jaccard of zero instead of vanishing from the table. A missing row and a zero are
 different findings.
 
+## Where in the document each entity falls
+
 ```{r}
 #| label: report-positions
 
@@ -745,6 +696,8 @@ so counting them as middle would blunt the very contrast being measured.
 
 # Deployment
 
+## The artifacts
+
 ```{r}
 #| label: deploy-summary
 
@@ -759,7 +712,80 @@ Four artifacts, and all of them are contracts rather than conveniences. `sample_
 text every offset in every store indexes; the three databases are what 04B reads. Everything else this
 document produces is insight and can change freely.
 
+## What each table holds
+
+```{r}
+#| label: deploy-shapes
+
+# WHAT IS ACTUALLY IN THE FILES. The table above says the three databases exist and how large they
+# are, which is a different question from what a reader of 04B needs to know: which columns each
+# table carries, how many rows are spans rather than sentinels, and what a found span looks like.
+ent_report_shapes(
+  .con    = con_all,      # the read-only connection already reaching all three stores
+  .tables = tab_tables,   # Family and Table, views excluded
+  .n      = 10L,          # enough to see the shape of the values, not only their names
+  .trunc  = 30L           # of a cue column, FOR DISPLAY; 160 characters are stored
+)
+```
+
+**The standing this section exists to serve: no rule may open a document again.** Every variable 04B
+and 04D produce has to be answerable from these columns plus the register, and the way to establish
+whether that holds is to read the columns rather than to assume them. A rule that turns out to need
+something absent here is a rule that needs the EXTRACTOR changed, not a window widened -- and the
+cost of discovering that at corpus scale rather than here is hours.
+
+`NSentinel` is the column to read first. A pass that ran and found nothing writes one all-null row
+per document, which is deliberate -- absent and zero are different facts and the ledger has to keep
+them apart. But a table of 4,398 rows where every `Start` is null reads identically to a healthy one
+until that column is looked at.
+
+**`DocID` is omitted from the column lists and the example rows, and from nothing else.** It heads
+all thirteen tables and carries a 42-character hash, so printing it takes a third of the width of
+every row to say the same thing thirteen times. `NCol` still counts it and the dictionary still
+describes it.
+
+**`NUsed` beside `NCol` is what a narrow table looks like.** A module writes one parquet for every
+label it owns, so the file carries the union of those labels' extras -- and the ingest used to take
+that width wholesale, which is how `lexnlp.date` came to hold `Name`, `TypeAbbr` and `Iso2` as
+thirteen permanently null columns. It now takes the schema each entity declares, so the two numbers
+agree and the table is its own documentation.
+
+## What every column means
+
+```{r}
+#| label: deploy-dictionary
+
+# WHAT THE COLUMNS MEAN, AND THEN WHETHER THE ANSWER IS STILL TRUE. --describe carries a spec hash
+# and a label list and no prose, so this is the only place a reader meeting SubIso or NParent or
+# RepeatRatio can find out what they are. It can only be written by hand, which is exactly why the
+# check below exists.
+tab_dict <- ent_dictionary()
+
+tbl_say(.tab = tab_dict, .title = "What every column means")
+
+ent_check_dictionary(
+  .con    = con_all,
+  .tables = tab_tables,
+  .dict   = tab_dict
+)
+```
+
+**A dictionary that is not checked is the file most likely to be trusted and least likely to be
+true.** It falls out of date the day a column is added, and nothing about a stale entry looks stale.
+So it is set against the columns that actually exist and fails both ways: a column in a store with
+no entry, and an entry naming a column that has gone. The second direction matters as much as the
+first -- an entry describing a variable nobody emits any more is a reader being told to look for
+something they will not find.
+
+**Three entries are worth reading even by someone who knows the schema.** `Start` and `Stop` are
+code-point offsets, so R must slice with `stringi::stri_sub` and never `substr()`. `SubIso` and
+`Iso2` are the same quantity under two names and two different quantities under one, depending on
+which family emitted the row. And `Status` distinguishes a document that matched nothing from one
+whose extraction crashed -- both produce no spans, and only that column tells them apart.
+
 # Overview
+
+## What ran, and what it covered
 
 ```{r}
 #| label: overview
@@ -770,14 +796,9 @@ tbl_say(
 )
 
 ent_report_grid(.grid = tab_grid)
-
-tbl_say(
-  .tab   = dplyr::bind_rows(tab_bench_matcon, tab_bench_spacy, tab_bench_lexnlp) |>
-    dplyr::transmute(.data$Model, .data$Batch, .data$NDoc, DocPerS = round(.data$DocPerS, 2)) |>
-    dplyr::arrange(.data$Model, .data$Batch),
-  .title = "Throughput"
-)
 ```
+
+## Position across the document
 
 ```{r}
 #| label: fig-positions
@@ -790,6 +811,8 @@ ent_plot_positions(
 )
 ```
 
+## How many producers found each mention
+
 ```{r}
 #| label: fig-consensus
 #| fig-height: !expr plot_height(length(unique(tab_consensus$Entity)))
@@ -797,6 +820,8 @@ ent_plot_positions(
 
 ent_plot_consensus(.consensus = tab_consensus)
 ```
+
+## Pairwise agreement
 
 ```{r}
 #| label: fig-agreement
@@ -809,6 +834,8 @@ ent_plot_agreement(
   .min_producers = 2L              # with the diagonal, two producers is a readable triangle
 )
 ```
+
+## Closing the connections
 
 ```{r}
 #| label: disconnect

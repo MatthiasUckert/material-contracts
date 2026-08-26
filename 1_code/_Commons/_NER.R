@@ -1242,9 +1242,21 @@ ner_manifest_write <- function(.con, .model, .entity, .spec_hash) {
 
 #' Move one staged parquet's spans into this family's entity tables
 #'
-#' THE TABLE IS CREATED FROM THE PARQUET'S OWN SCHEMA, on first sight, and appended to thereafter.
-#' Everything the extractor emits is kept: LexNLP's ORG pass produces six extras and the previous
-#' store kept three, which is how a column somebody wants in six weeks gets discarded at the seam.
+#' THE TABLE IS CREATED FROM THE ENTITY'S DECLARED SCHEMA, on first sight, and appended to
+#' thereafter. It used to be created from the PARQUET's schema, which is a different and wider
+#' thing: a module writes one file for every label it owns, so lexnlp's four labels give a
+#' 24-column file in which a DATE row fills five columns and leaves thirteen null -- and every one
+#' of those thirteen became a column of lexnlp.date. A reader then had to know which columns
+#' belonged to which label before they could read anything.
+#'
+#' ent_stored_cols() IS THE DECLARATION, and it is derived from .ent_extras and .ent_rename rather
+#' than being a second copy of them. The table therefore holds exactly what ent_load_entity() will
+#' select from it, which is the property that makes the schema its own documentation.
+#'
+#' SOURCE ORDER. This calls into _Entity.R, which is sourced after this file everywhere in the
+#' project. R resolves at call time so the order is satisfied, but the dependency is real and is
+#' named here rather than left to be discovered: _NER.R owns the store, _Entity.R owns what each
+#' entity means, and the schema is where the two meet.
 #'
 #' Three columns do not survive: `Engine`, because the file is the family; `Label`, because the table
 #' is the entity; and `Model`, except for spaCy, where models are real and the column separates them.
@@ -1284,22 +1296,53 @@ ner_manifest_write <- function(.con, .model, .entity, .spec_hash) {
     ))
   }
 
-  drop_ <- if (.family == "spacy") c("Engine", "Label") else c("Engine", "Label", "Model")
-  keep_ <- setdiff(cols_, drop_)
-  sel_  <- paste(keep_, collapse = ", ")
-
+  # NO exists() GUARD HERE, AND THERE WAS ONE. It aborted with "_Entity.R must be sourced after
+  # _NER.R", which is a plausible cause and was not the actual one: the file had simply not been
+  # copied over. R's own error names the missing function exactly and guesses nothing, and a
+  # diagnostic that names the wrong cause is worse than none -- the same lesson the preflight probe
+  # recorded when it reported a missing corpus store that was present.
   out_ <- tibble::tibble(Entity = character(0), NSpan = integer(0), NDoc = integer(0))
 
   for (ent_ in .entity) {
     tbl_   <- tolower(ent_)
     where_ <- glue::glue("Label = '{ent_}' AND Start IS NOT NULL")
 
+    # PER ENTITY, NOT PER FILE. This is the whole change: the selection is computed inside the loop
+    # from what this entity declares, where it used to be computed once from the parquet and reused
+    # for every label the file carried.
+    want_ <- ent_stored_cols(.family = .family, .entity = ent_)
+    gone_ <- setdiff(want_, cols_)
+    if (length(gone_) > 0L) {
+      cli::cli_abort(c(
+        "{fs::path_file(.path)} carries no {paste(gone_, collapse = ', ')} for {(ent_)}.",
+        "i" = "Declared by ent_stored_cols(); present in the file: \\
+               {paste(cols_, collapse = ', ')}."
+      ))
+    }
+    sel_ <- paste0("\"", want_, "\"", collapse = ", ")
+
     # WHERE FALSE gives the schema and no rows, so a first ingest creates the table and a later one
-    # is a no-op. The column list is the parquet's, minus the three that the file name already says.
+    # is a no-op.
     DBI::dbExecute(.con, glue::glue(
       "CREATE TABLE IF NOT EXISTS {tbl_} AS
          SELECT {sel_} FROM read_parquet('{path_}') WHERE FALSE"
     ))
+
+    # A TABLE THAT ALREADY EXISTS UNDER A DIFFERENT SCHEMA IS NOT SILENTLY APPENDED TO. Narrowing
+    # the declaration leaves every store built under the old one holding columns this ingest will
+    # not fill, and an INSERT would either fail on arity or, worse, succeed against a table whose
+    # extra columns are quietly null forever. Same shape as the manifest guard: a store half in one
+    # schema and half in another is a file no downstream check would catch.
+    hold_ <- DBI::dbListFields(.con, tbl_)
+    if (!identical(hold_, want_)) {
+      cli::cli_abort(c(
+        "{(tbl_)} exists with a different schema than {(.family)}/{(ent_)} now declares.",
+        "*" = "holds:    {paste(hold_, collapse = ', ')}",
+        "*" = "declares: {paste(want_, collapse = ', ')}",
+        "i" = "Delete this family's database and re-ingest; the staged parquets are unchanged, so
+               nothing is re-extracted."
+      ))
+    }
 
     scope_ <- if (.family == "spacy") glue::glue(" AND Model = '{.model}'") else ""
     DBI::dbExecute(.con, glue::glue(
@@ -1321,6 +1364,217 @@ ner_manifest_write <- function(.con, .model, .entity, .spec_hash) {
 
   out_
 }
+
+# 3a. The schema of an entity table --------------------------------------------------------------------------------
+#
+# MOVED HERE FROM _Entity.R, AND THE REASON IS 04A AND 04C. Both source this file and never
+# _Entity.R -- they extract and ingest, and never turn a span into a variable -- so once
+# .ner_spans_write() began declaring each table's schema, it was calling into a file two of the
+# eight documents in the family do not load. It worked interactively, where both had been sourced by
+# hand, and would have failed on a clean render.
+#
+# THE DECLARATIONS ARE SCHEMA, AND SCHEMA BELONGS WITH THE STORE. That is the principled version of
+# the same point: this file owns the tables, so it owns what a table holds. _Entity.R reads from
+# here and nothing here reads from _Entity.R, which is the one-way dependency the two files had
+# before and briefly lost.
+
+#' The columns a family calls something else
+#'
+#' RENAMED ON READ, AND ONLY ON READ. The stores keep each family's own column names, which is what
+#' makes a column traceable to the documentation of the engine that produced it. But two of LexNLP's
+#' names cannot survive contact with R:
+#'
+#'   TypeAbbr holds the string "NA" for a National Association -- every national bank in the corpus
+#'   -- and R prints that identically to a missing value. A column whose most common value is
+#'   indistinguishable from absence in every table it appears in is a defect waiting for a reader.
+#'
+#'   Name means the resolved company for ORG and the resolved place for GPE. One column called Name
+#'   meaning two different things is the kind of thing that is obvious while writing and invisible
+#'   six weeks later.
+#'
+#' So the rename happens here, in one function, next to the schema it serves -- rather than in the
+#' ingest, where it would have made the store disagree with LexNLP's own documentation.
+.ent_rename <- list(
+  lexnlp = c(
+    NameCore       = "Name",
+    LegalForm      = "TypeAbbr",     # LexNLP's company_type_abbr: CORP, INC, LLC -- and NA
+    LegalFormFull  = "TypeFull",
+    LegalFormLabel = "TypeLabel",
+    GeoName        = "NameEn",
+    GeoAlias       = "Alias",
+    GeoCategory    = "EntityCategory",
+    # ENTITY IS LEXNLP'S WORD FOR A GEOGRAPHIC ENTITY, and unqualified it reads as an entity in this
+    # project's sense -- an ORG, a DATE, a span. Both columns are 0 of 2,522 on ORG rows and 2,177
+    # of 2,177 on GPE, so the prefix says what the count says.
+    GeoEntityId       = "EntityId",
+    GeoEntityPriority = "EntityPriority",
+    DateScore      = "Score"
+  ),
+  matcon = c(
+    # Iso2 is a SUBDIVISION code here and never a country; Iso3 is a country code and carries USA on
+    # every US entity, so neither name means what the identical name means in the LexNLP store.
+    SubIso      = "Iso2",
+    CountryIso3 = "Iso3"
+  )
+)
+
+#' What each family emits for one entity, under this project's names
+#'
+#' DECLARED IN ONE PLACE BECAUSE THE FAMILIES NO LONGER SHARE A SCHEMA. Under the flat store every
+#' GPE row carried the union of both producers' columns and a caller named one extras list for both.
+#' One database per family ended that: matcon's gpe table has GeoKey, IsWord, NParent and MatchKind
+#' and no GeoName; LexNLP's has GeoName, GeoAlias and GeoCategory and none of the others. A single
+#' list would have asked each family for the other's columns.
+#'
+#' 04A's numbers say why the two are worth keeping apart rather than reconciling here: they agree on
+#' only 44.5% of GPE mentions while agreeing on boundaries 97.6% of the time where they meet, which
+#' is complements at different tiers rather than rivals at one.
+.ent_extras <- list(
+  lexnlp = list(
+    # THE LEGAL-FORM TAXONOMY IS FREE, AND IT WAS BEING DISCARDED. LegalFormFull and
+    # LegalFormLabel move exactly with LegalForm -- 2,053 of 2,522 organisations carry all three or
+    # none -- so the coarser classification, whether a counterparty is a Corporation or a
+    # Partnership, is available wherever the abbreviation is and costs no coverage at all. It was
+    # emitted by the extractor and dropped at the seam, which is how a column somebody wants in six
+    # weeks disappears without anyone deciding it should.
+    ORG   = c("NameCore", "LegalForm", "LegalFormFull", "LegalFormLabel", "Description"),
+    # GeoEntityId and GeoEntityPriority are GEOGRAPHIC and belong nowhere else: 2,177 of 2,177 on
+    # GPE rows and 0 of 2,522 on ORG. Priority is what LexNLP ranks by where several entities could
+    # match one string, so it is the evidence for a resolution this project did not make.
+    GPE   = c("GeoName", "GeoAlias", "GeoCategory", "Iso2", "Iso3",
+              "GeoEntityId", "GeoEntityPriority"),
+    DATE  = c("DateValue", "DateScore"),
+    MONEY = c("Amount", "Currency")
+    #
+    # NameAbbr IS DELIBERATELY ABSENT, AND THAT IS A MEASUREMENT RATHER THAN AN OVERSIGHT. LexNLP
+    # declares it and fills it on 6 of 2,522 ORG spans -- 0.2%. Storing it would put back a column
+    # null on 99.8% of the rows of the only entity it could belong to, which is exactly the shape
+    # this declaration exists to remove. The dictionary records the count so the exclusion can be
+    # revisited on evidence rather than rediscovered.
+  ),
+  matcon = list(
+    # THE TWO ISO COLUMNS ARE RENAMED because matcon and LexNLP use the same two names for four
+    # different quantities. matcon's own docstring is explicit: Iso2 resolves "all 50 states, 81% of
+    # populated places, 95% of counties, and NEVER a country", while Iso3 is "every country, and USA
+    # for every US entity". LexNLP's Iso2 is a country code OR a subdivision code and its Iso3 is a
+    # country code on countries alone.
+    #
+    # Mapping both families onto Iso2/Iso3 was a defect that rendered clean: geo_country() reads Iso3
+    # first, matcon's Iso3 happens to be a country code, and the answer came out right by luck while
+    # the ISO-3166-2 prefix recovery sat dead at 0.0% of matcon's rows. A shared column NAME is not a
+    # shared QUANTITY, and the only place that can be settled is the read.
+    GPE    = c("GeoKey", "IsWord", "NParent", "SubIso", "CountryIso3", "MatchKind"),
+    DATE   = c("DateValue"),
+    TERM   = c("TermN", "TermUnit", "TermYears"),
+    MONEY  = c("Amount", "Currency"),
+    REDACT = character(),
+    # LAW CARRIES NONE, AND THAT IS THE DESIGN. lawregex locates a governing-law clause and says
+    # which cue opened it; the jurisdiction is the GPE span sitting INSIDE that clause, resolved
+    # once by the gazetteer rather than twice. Two extractors resolving Delaware would leave two
+    # answers to reconcile.
+    #
+    # DECLARED EXPLICITLY BECAUSE ent_extras() ABORTS ON AN UNKNOWN ENTITY, which is right: an
+    # entity that silently returned no extras would produce a table with the right rows and the
+    # wrong columns, and nothing downstream would say so. Every new label is registered here.
+    LAW    = character()
+  ),
+  spacy = list(
+    ORG    = character(),
+    PERSON = character(),
+    GPE    = character()
+  )
+)
+
+#: The context columns every matcon extractor emits, APPENDED rather than declared per entity.
+#:
+#: THE SAME ARRANGEMENT AS _io.Emitter, WHICH IS THE POINT. Python puts these two on the emitter
+#: rather than in each module's EXTRAS so that no module can forget them and the column order is
+#: uniform: CORE, the module's own extras, CueBefore, CueAfter. Declaring them per entity here would
+#: reintroduce exactly the drift that arrangement removes -- five entries that must agree, and
+#: nothing to notice when one does not.
+.ent_cues <- c("CueBefore", "CueAfter")
+
+#: Which families emit them. All three, and the third needed H5 fixed first.
+#:
+#: THE BLOCK WAS AN IDENTITY PROBLEM, NOT A SCHEDULING ONE. ner_describe() used to set the spaCy
+#: family's SpecHash from the MODEL version -- 3.8.0 -- so editing extract_spacy.py would have added
+#: two columns while the identity stayed exactly where it was. ner_manifest_write() would have seen
+#: nothing changed and admitted the new rows beside the old, leaving the store holding two
+#: generations under one tag with nothing able to tell them apart.
+#:
+#: ner_spacy_spec() now hashes the script AND the model together, so all three families report the
+#: same KIND of thing and an edit to any of them moves it. The version is still reported, in Note,
+#: where it is metadata rather than identity.
+.ent_cue_families <- c("matcon", "lexnlp", "spacy")
+
+#' The extras one family emits for one entity
+#'
+#' @param .family Family name.
+#' @param .entity Entity name.
+#' @return Character vector, possibly empty.
+ent_extras <- function(.family, .entity) {
+  if (FALSE) {
+    .family <- "matcon"
+    .entity <- "GPE"
+  }
+  fam_ <- .ent_extras[[.family]]
+  if (is.null(fam_)) cli::cli_abort("No extras declared for family {(.family)}.")
+  out_ <- fam_[[toupper(.entity)]]
+  if (is.null(out_)) {
+    cli::cli_abort(c(
+      "{(.family)} declares no {(.entity)} extras.",
+      "i" = "It declares: {paste(names(fam_), collapse = ', ')}."
+    ))
+  }
+  # THE CUE COLUMNS ARE APPENDED, NOT DECLARED. Every matcon entity carries them and none of the
+  # entries above names them, so an entity added tomorrow gets them without anyone remembering to.
+  # Order matters and matches the emitter: the module's own extras first, then CueBefore, CueAfter.
+  if (.family %in% .ent_cue_families) out_ <- c(out_, .ent_cues)
+  out_
+}
+
+#' The columns one entity's table holds in the store
+#'
+#' THE STORE'S SCHEMA, DECLARED ONCE AND ENFORCED AT BOTH ENDS. A module writes ONE parquet for
+#' every label it owns, so the file carries the union of those labels' extras -- lexnlp's four
+#' labels give a 24-column file in which a DATE row fills five of them and leaves thirteen null.
+#' The ingest used to take that file's schema wholesale, so lexnlp.date held Name, TypeAbbr and
+#' Iso2 and a reader had to know which columns belonged to which label before they could read
+#' anything.
+#'
+#' THE PARQUET IS TRANSPORT; THE TABLE IS SCHEMA. They do not have to match. A wide staging file
+#' costs nothing -- parquet stores an all-null column as metadata -- and narrowing at the ingest
+#' means the table holds exactly what ent_load_entity() will select from it. "What is used where"
+#' stops being a question a reader has to answer, because the schema IS the answer.
+#'
+#' NO NEW DECLARATION. .ent_extras already says what each family emits for each entity and
+#' .ent_rename already maps this project's names onto the store's, so the stored column list is
+#' derivable from what is here rather than being a second copy that can drift from it. This
+#' function is what ent_load_entity() computed inline; lifting it out is what lets the WRITE use
+#' the same expression as the READ.
+#'
+#' MODEL IS IN THE LIST FOR SPACY AND ONLY SPACY, and it is in the TABLE even though
+#' ent_load_entity() does not return it: spaCy is the one family where several models compete for
+#' one entity, so the column is what a read filters on.
+#'
+#' @param .family Family name.
+#' @param .entity Entity name.
+#' @return Character vector of stored column names, in table order.
+ent_stored_cols <- function(.family, .entity) {
+  if (FALSE) {
+    .family <- "lexnlp"
+    .entity <- "DATE"
+  }
+
+  ren_  <- .ent_rename[[.family]]
+  want_ <- ent_extras(.family, .entity)
+  stor_ <- if (is.null(ren_)) want_ else dplyr::coalesce(unname(ren_[want_]), want_)
+
+  c("DocID", "Start", "Stop", "Span", "LabelRaw",
+    if (identical(.family, "spacy")) "Model" else NULL,
+    stor_)
+}
+
 
 #' Ingest everything one extraction produced
 #'

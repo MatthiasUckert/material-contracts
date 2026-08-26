@@ -25,7 +25,17 @@
 # gazetteer, never both -- so naming the module would add a distinction no panel can show. spaCy is
 # the one family where several models can compete for the same entity, so its models stay separate.
 
-.ent_entities <- c("ORG", "PERSON", "GPE", "DATE", "MONEY", "REDACT", "TERM")
+# THE ORDER IS THE ORDER EVERY FIGURE USES, so it is a decision rather than a list. Parties first,
+# then where and when, then how much, then what was withheld -- which is the order a reader of a
+# contract meets them, and LAW sits beside GPE because a governing-law clause IS a place claim.
+#
+# AN UNREGISTERED LEVEL FAILS AT plot_factor() RATHER THAN SORTING ITSELF. Adding LAW to the plan
+# without adding it here stopped fig-positions with "1 value not registered under Entity" -- which
+# is the guard working: an unregistered level would otherwise sort alphabetically and take whatever
+# colour its position happened to give it, DIFFERENTLY IN EVERY FIGURE that happened to contain a
+# different subset of entities. A new entity therefore lands in two places, and the second one
+# announces itself.
+.ent_entities <- c("ORG", "PERSON", "GPE", "LAW", "DATE", "TERM", "MONEY", "REDACT")
 
 .ent_producers <- c(
   "spacy:sm", "spacy:md", "spacy:lg", "spacy:trf",
@@ -1408,6 +1418,435 @@ ent_plot_agreement <- function(.pairwise, .accuracy = 0.01, .min_producers = 2L)
 #' @param .families Family names.
 #' @param .path_sample The canonical text.
 #' @return Tibble: Artifact, Exists, MB.
+#' What every table in every store actually holds -- shapes and example rows
+#'
+#' WHY THIS IS A SECTION AND NOT A CONVENIENCE. The next piece of work goes rule by rule and asks
+#' what each one needs from the store, on the standing that no rule may open a document again. That
+#' question cannot be answered from prose: it needs the columns, their types, and enough rows to see
+#' what the values look like. ent_report_artifacts() says the files exist and how large they are;
+#' this says what is inside them.
+#'
+#' READ-ONLY, THROUGH THE CONNECTION THAT IS ALREADY OPEN. The attached connection reaches all three
+#' databases at once, so a second set of handles would only add a way for two sections to disagree
+#' about which file they were describing.
+#'
+#' THE CUE COLUMNS ARE TRUNCATED FOR DISPLAY AND ONLY FOR DISPLAY. CueBefore and CueAfter store 160
+#' characters each; ten rows of two such columns is three thousand characters per table, and the
+#' thing this section exists to show -- what the columns ARE -- would be buried under the values.
+#' The stored value is untouched and is in the parquet.
+#'
+#' VIEWS ARE EXCLUDED. dbListTables() returns views alongside tables, and ner_attach() creates one
+#' per entity so the three stores can be queried as if they were one. Counting a view as a table
+#' would report the same rows twice under two names.
+#'
+#' TABLE IS ALREADY QUALIFIED, and assuming otherwise cost a run. ner_attached_tables() returns
+#' Table as paste0(Family, ".", Tbl) -- there is no bare-name column -- so prefixing it with Family
+#' again produced "lexnlp.lexnlp.date" and a catalog error. The Family column is for grouping and
+#' reporting, never for building a query.
+#'
+#' @param .con Attached DuckDB connection from ner_attach().
+#' @param .tables Tibble from ner_attached_tables(): Family, Entity, Table (qualified), NSpan.
+#' @param .n Rows to show per table.
+#' @param .trunc Characters of a cue column to show. The stored width is 160.
+#' @return Invisibly, the shape summary.
+ent_report_shapes <- function(.con, .tables, .n = 10L, .trunc = 30L) {
+  if (FALSE) {
+    .con    <- con_all
+    .tables <- tab_tables
+    .n      <- 10L
+    .trunc  <- 30L
+  }
+
+  # ONE ROW PER TABLE: how much is in it, and over how many documents. NDoc is what separates "few
+  # spans because the entity is rare" from "few spans because the pass covered few documents".
+  shape_one <- function(.family, .table) {
+    if (FALSE) {
+      .family <- "matcon"
+      .table  <- "matcon.gpe"
+    }
+
+    cols_ <- names(DBI::dbGetQuery(.con, glue::glue("SELECT * FROM {(.table)} LIMIT 0")))
+
+    n_ <- DBI::dbGetQuery(.con, glue::glue(
+      "SELECT COUNT(*) AS NRow,
+              COUNT(DISTINCT DocID) AS NDoc,
+              SUM(CASE WHEN Start IS NULL THEN 1 ELSE 0 END) AS NSentinel
+         FROM {(.table)}"
+    ))
+
+    # WHICH COLUMNS THIS TABLE ACTUALLY USES, MEASURED OVER THE WHOLE TABLE. A module writes ONE
+    # parquet for every label it owns and each row fills only its own extras, so lexnlp.date carries
+    # Name and TypeAbbr and Iso2 -- entirely null, because those belong to the ORG and GPE rows in
+    # the same file. matcon.date does the same on a smaller scale with TermN and TermUnit.
+    #
+    # COUNTED, NOT SAMPLED. Deciding from the ten displayed rows would drop a column that is null in
+    # the first ten and populated in the eleventh, which is exactly the column a reader most needs
+    # to see.
+    live_ <- DBI::dbGetQuery(.con, glue::glue(
+      "SELECT {paste0('COUNT(\"', cols_, '\") AS \"', cols_, '\"', collapse = ', ')}
+         FROM {(.table)}"
+    ))
+    used_ <- cols_[as.numeric(live_[1L, ]) > 0]
+
+    # DocID IS OMITTED FROM THE DISPLAY AND FROM NOTHING ELSE. It is the first column of all
+    # thirteen tables and carries a 42-character hash, so it takes a third of the width of every
+    # printed row to say the same thing thirteen times. NCol still counts it and the dictionary
+    # still describes it; only these two lists leave it out, and the section prose says so.
+    show_ <- setdiff(used_, "DocID")
+
+    tibble::tibble(
+      Family    = .family,
+      Table     = .table,
+      NRow      = as.integer(n_$NRow[[1L]]),
+      NDoc      = as.integer(n_$NDoc[[1L]]),
+      NSentinel = as.integer(dplyr::coalesce(n_$NSentinel[[1L]], 0L)),
+      NCol      = length(cols_),
+      NUsed     = length(used_),
+      Columns   = paste(show_, collapse = ", "),
+      AllNull   = paste(setdiff(cols_, used_), collapse = ", ")
+    )
+  }
+
+  # A SENTINEL IS NOT A SPAN, and the count is here rather than in a footnote because a table of
+  # 4,398 rows where every Start is NULL means the pass ran and found nothing -- which reads
+  # identically to a healthy table until the column is looked at.
+  tab_shape <- purrr::map2(.tables$Family, .tables$Table, shape_one) |>
+    purrr::list_rbind() |>
+    dplyr::arrange(.data$Family, .data$Table)
+
+  cli::cli_h2("How much is in each table")
+  tbl_say(
+    .tab   = dplyr::select(tab_shape, "Family", "Table", "NRow", "NDoc", "NSentinel",
+                           "NCol", "NUsed"),
+    .title = "What each table holds"
+  )
+
+  # ONE LINE PER TABLE RATHER THAN A TIBBLE COLUMN. A column of comma-separated names is wider than
+  # any console and the printer splits it away from the Table it belongs to, which is how the first
+  # version of this section rendered: two blocks, neither readable beside the other.
+  cli::cli_h2("Columns actually used, per table")
+  cli::cli_alert_info(
+    "DocID is omitted below: it heads every one of the {nrow(tab_shape)} tables and says the same \\
+     thing in each. NCol still counts it."
+  )
+
+  # GROUPED BY FAMILY, because a reader comparing two producers of one entity is comparing across
+  # families and a flat list of thirteen makes them hunt. The families differ more from each other
+  # than the tables within one differ among themselves.
+  purrr::walk(unique(tab_shape$Family), \(.f) {
+    cli::cli_h3("{(.f)}")
+    tab_shape |>
+      dplyr::filter(.data$Family == .f) |>
+      purrr::pwalk(\(Family, Table, NRow, NDoc, NSentinel, NCol, NUsed, Columns, AllNull) {
+        cli::cli_text("")
+        cli::cli_text("{.strong {(Table)}}  ({(NUsed)} of {(NCol)} columns carry a value)")
+        cli::cli_text("  {(Columns)}")
+        if (nzchar(AllNull)) {
+          cli::cli_text("  {.emph always null here:} {(AllNull)}")
+        }
+      })
+  })
+
+  # EXAMPLE ROWS, SENTINELS EXCLUDED. A sentinel row is all-null past DocID and shows nothing about
+  # what a found span looks like, which is the whole point of printing rows at all.
+  cli::cli_h2("Example rows")
+  cli::cli_alert_info(
+    "{(.n)} row{?s} per table, DocID omitted and the cue columns cut to {(.trunc)} characters for \\
+     display. The stored width is 160."
+  )
+
+  fam_seen_ <- character(0)
+  purrr::walk2(.tables$Family, .tables$Table, \(.f, .t) {
+    if (!.f %in% fam_seen_) {
+      cli::cli_h3("{(.f)}")
+      fam_seen_ <<- c(fam_seen_, .f)
+    }
+    # ONLY THE COLUMNS THIS TABLE USES. Selecting * would print fourteen all-null columns beside
+    # the five that carry the answer, and the reader would be reading the module's schema rather
+    # than the entity's.
+    keep_ <- stringi::stri_split_fixed(
+      tab_shape$Columns[tab_shape$Table == .t][[1L]], ", "
+    )[[1L]]
+    keep_ <- keep_[nzchar(keep_)]
+
+    ex_ <- DBI::dbGetQuery(.con, glue::glue(
+      "SELECT {paste0('\"', keep_, '\"', collapse = ', ')} FROM {(.t)}
+         WHERE Start IS NOT NULL ORDER BY DocID, Start LIMIT {(.n)}"
+    )) |>
+      tibble::as_tibble() |>
+      dplyr::mutate(dplyr::across(
+        dplyr::any_of(c("CueBefore", "CueAfter")),
+        \(.x) paste0(stringi::stri_sub(.x, to = .trunc),
+                     dplyr::if_else(stringi::stri_length(.x) > .trunc, "...", ""))
+      ))
+
+    cli::cli_text("")
+    if (nrow(ex_) == 0L) {
+      cli::cli_alert_warning("{(.t)}: no span rows -- the pass ran and found nothing.")
+    } else {
+      cli::cli_alert_info("{(.t)}")
+      print(ex_, n = Inf, width = Inf)
+    }
+  })
+
+  invisible(tab_shape)
+}
+
+
+#' What every column in every store means
+#'
+#' DECLARED HERE AND NOWHERE ELSE. --describe carries a spec hash and a label list and no prose, so
+#' a reader meeting NParent or RepeatRatio or EntityPriority for the first time has the column name
+#' and nothing else. This is the only place that gap can be closed.
+#'
+#' IT DESCRIBES THE STORED SCHEMA, AND THE FIRST VERSION DESCRIBED THE OTHER ONE. There are two,
+#' and running the check found the difference: the store holds LexNLP's own column names, and
+#' ent_load_entity() renames several of them on the way out. So a dictionary written against what R
+#' returns had eleven undocumented columns and ten entries for columns no store holds -- both
+#' directions failing at once, on a file that read as correct.
+#'
+#' The stored name is therefore the key, and InR carries what a reader of R code will see instead.
+#' Both encounters are real: one in the parquet, one after a load.
+#'
+#' AND A HAND-WRITTEN DICTIONARY GOES STALE THE DAY A COLUMN IS ADDED, which is why it is not the
+#' last word. ent_check_dictionary() sets it against the columns that actually exist and fails both
+#' ways. Without that, the file most likely to be trusted would be the one least likely to be true.
+#'
+#' @return Tibble: Column, InR, Where, Meaning.
+ent_dictionary <- function() {
+  if (FALSE) {
+    # no arguments
+  }
+
+  tibble::tribble(
+    ~Column, ~InR, ~Where, ~Meaning,
+
+    # -- the shared span schema ------------------------------------------------------------------
+    "DocID", "", "every table",
+    "The attachment this row belongs to. Joins to the register and to 03A's sample.",
+    "Start", "", "entity tables",
+    "Offset of the span's first character. ZERO-BASED, HALF-OPEN, over CODE POINTS -- so
+     text[Start:Stop] is the span exactly, and R must slice with stringi::stri_sub rather than
+     substr(), which indexes bytes.",
+    "Stop", "", "entity tables",
+    "Offset one past the span's last character.",
+    "Span", "", "entity tables",
+    "The matched text, exactly as it appears in the document.",
+    "LabelRaw", "", "entity tables",
+    "What the producer itself called the match: a pattern name for matcon, a native label for
+     spaCy, an annotation class for LexNLP. This is what carries a rule's own vocabulary.
+     THE ENTITY ITSELF IS THE TABLE and is not a column -- Label and Engine are dropped at ingest
+     because the table names the first and the store names the second.",
+    "Model", "", "spacy tables",
+    "Which spaCy model produced the row. Stored only where a family has several models competing
+     for one entity, which spaCy is and the other two are not.",
+
+    # -- the context columns ---------------------------------------------------------------------
+    "CueBefore", "", "entity tables",
+    "The 160 characters immediately BEFORE the span, raw. Stored so that no rule has to open a
+     document again: the end-date cue, the par-value filter and the governing-law window all read
+     this instead of the text. Empty rather than absent for a span at the head of a document.",
+    "CueAfter", "", "entity tables",
+    "The 160 characters immediately AFTER. Load-bearing for money, where the classifying words
+     follow the figure as often as they precede it -- 'aggregate principal amount', 'per annum'.",
+
+    # -- matcon extras ---------------------------------------------------------------------------
+    "DateValue", "", "matcon.date, lexnlp.date",
+    "The parsed calendar date, ISO-8601. matcon emits one only where the text wrote a year;
+     LexNLP's grammar will supply one, and if it comes from the clock the same document yields a
+     different answer on a different day.",
+    "TermN", "", "matcon.date, matcon.term",
+    "The number in a stated term: the 5 in 'a period of five (5) years'. Null on every DATE row,
+     because dateregex writes one parquet for both its labels and each row fills only its own.",
+    "TermUnit", "", "matcon.date, matcon.term",
+    "Its unit -- day, month, year. KEPT SEPARATELY FROM TermYears because thirty days and one
+     month are within a week of each other in years and are not the same thing in a contract.",
+    "TermYears", "", "matcon.date, matcon.term",
+    "The term expressed in years. Null where the term is open-ended, which is a stated term of
+     unknown length rather than an absent one.",
+    "GeoKey", "", "matcon.gpe",
+    "The uppercased place name, so the join to the gazetteer is on a stored column rather than on
+     a function of one.",
+    "IsWord", "", "matcon.gpe",
+    "Whether the name is an ordinary English word. Decides which admission tier the gate applied:
+     a word-like name needs a state anchor within 40 characters, a distinctive one within 200.",
+    "NParent", "", "matcon.gpe",
+    "How many distinct parents the name has. SPRINGFIELD is 33. A resolver needs to know a name is
+     ambiguous BEFORE it picks one, and this is the cheapest way to say so.",
+    "MatchKind", "", "matcon.gpe",
+    "Which tier admitted the span: an anchor class, a distinctive name, or a word-like one.",
+
+    # -- the two ISO columns, and the reason they are renamed ------------------------------------
+    "Iso2", "SubIso (matcon), Iso2 (lexnlp)", "matcon.gpe, lexnlp.gpe",
+    "TWO DIFFERENT QUANTITIES UNDER ONE STORED NAME, which is why matcon's is renamed on read.
+     matcon's Iso2 is an ISO-3166-2 SUBDIVISION code -- 'US-MN' -- resolving all 50 states and
+     never a country. LexNLP's is a COUNTRY code. Mapping both onto one name was a defect that
+     rendered clean: geo_country() reads Iso3 first, matcon's happens to be a country code, and the
+     answer came out right by luck while the subdivision recovery sat dead at 0.0% of matcon rows.",
+    "Iso3", "CountryIso3 (matcon), Iso3 (lexnlp)", "matcon.gpe, lexnlp.gpe",
+    "ISO-3166-1 alpha-3. matcon's is USA for every US entity and a real code for every country;
+     LexNLP's is countries only. Renamed for the same reason as Iso2.",
+
+    # -- lexnlp extras, under their STORED names -------------------------------------------------
+    "Name", "NameCore", "lexnlp tables",
+    "The company name with its legal form removed. THIS IS WHAT A UNIQUE COUNTERPARTY IS COUNTED
+     BY -- ent_rule(.key = 'core') keys on ent_norm_key() of this column. Renamed on read because
+     'Name' says nothing about which of several names it is.",
+    "TypeFull", "LegalFormFull", "lexnlp.org",
+    "The legal form written out: 'Corporation', 'Limited Liability Company'. Filled on exactly the
+     rows TypeAbbr is -- 2,053 of 2,522 organisations carry all three type columns or none -- so the
+     coarser reading costs no coverage against the abbreviation.",
+    "TypeAbbr", "LegalForm", "lexnlp tables",
+    "The CANONICAL type, not the text as written: company_types.csv maps CO, Corp, Corporation,
+     Inc and Incorporated all onto CORP, and INC is not a value the table can produce. RENAMED
+     BECAUSE 'NA' IS ITS ABBREVIATION FOR NATIONAL ASSOCIATION and R prints that identically to
+     missing.",
+    "TypeLabel", "LegalFormLabel", "lexnlp.org",
+    "The family the form belongs to -- Corporation, Partnership, Limited Liability Company. A
+     COARSER TAXONOMY THAN TypeAbbr AND A DIFFERENT QUESTION: TypeAbbr separates LLC from LLP,
+     this separates a company from a partnership. It was emitted and discarded at the seam until
+     the store's schema was declared per entity.",
+    "Description", "", "lexnlp.org",
+    "Whatever descriptor LexNLP attached to the organisation.",
+    "NameAbbr", "", "emitted, NOT stored",
+    "An abbreviated company name. THE ONE COLUMN THE EXTRACTOR EMITS THAT NO TABLE KEEPS, and the
+     reason is a measurement: LexNLP fills it on 6 of 2,522 ORG spans, 0.2%. Storing it would put
+     back a column null on 99.8% of the rows of the only entity it could belong to. Recorded here
+     rather than dropped, so the exclusion can be revisited on evidence rather than rediscovered.",
+    "NameEn", "GeoName", "lexnlp tables",
+    "The resolved place name, in English.",
+    "Alias", "GeoAlias", "lexnlp tables",
+    "The alias that matched, where it differs from the resolved name.",
+    "EntityCategory", "GeoCategory", "lexnlp tables",
+    "LexNLP's own category for the geographic entity.",
+    "EntityId", "GeoEntityId", "lexnlp.gpe",
+    "LexNLP's internal identifier for the resolved GEOGRAPHIC entity. Renamed on read because
+     'Entity' unqualified reads as an entity in this project's sense. 2,177 of 2,177 on GPE rows
+     and 0 of 2,522 on ORG, which is what places it.",
+    "EntityPriority", "GeoEntityPriority", "lexnlp.gpe",
+    "LexNLP's own ranking where several geographic entities could match one string -- the evidence
+     for a resolution this project did not make and cannot otherwise inspect.",
+    "Score", "DateScore", "lexnlp tables",
+    "LexNLP's confidence in the parse. Emitted on date rows.",
+    "Amount", "", "matcon.money, lexnlp tables",
+    "The parsed figure. Null where the amount was redacted -- a denomination whose number was
+     withheld, which is not the same as a document naming no money.",
+    "Currency", "", "matcon.money, lexnlp tables",
+    "ISO code where one was written or implied. Present even where Amount is null.",
+
+    # -- the ledger and the manifest -------------------------------------------------------------
+    "Entity", "", "runs, manifest",
+    "Which entity the row concerns.",
+    "Status", "", "runs",
+    "hit, nohit, timeout or error. THE FOUR ARE DIFFERENT FACTS: a document that matched nothing
+     and one whose extraction crashed both produce no spans, and only this column tells them
+     apart.",
+    "RunAt", "", "runs",
+    "When the document was processed.",
+    "SpecHash", "", "manifest",
+    "A twelve-character fingerprint of what produced these rows -- the pattern spec for matcon,
+     the image sources for lexnlp, the script and model together for spaCy. THE LEDGER CATCHES A
+     DECLARED VERSION BUMP; THIS CATCHES AN UNDECLARED CHANGE, which is the failure no key can
+     see.",
+    "WrittenAt", "", "manifest",
+    "When that provenance was recorded."
+  ) |>
+    # The tribble strings are wrapped for the file's line limit, so the newlines and their leading
+    # spaces are an artefact of writing rather than part of the meaning.
+    dplyr::mutate(Meaning = stringi::stri_replace_all_regex(.data$Meaning, "\\s+", " "))
+}
+
+
+#' Does the dictionary describe the columns that actually exist?
+#'
+#' A DICTIONARY THAT IS NOT CHECKED IS THE FILE MOST LIKELY TO BE TRUSTED AND LEAST LIKELY TO BE
+#' TRUE. It is written by hand, it cannot be derived, and it falls out of date the day a column is
+#' added -- so it fails BOTH ways here: a column in a store with no entry, and an entry naming a
+#' column that has gone.
+#'
+#' The second direction matters as much as the first. A stale entry describing a column nobody
+#' emits any more is not harmless: it is a reader being told about a variable they will look for
+#' and not find.
+#'
+#' IT COMPARES AGAINST THE STORED NAMES, and the first version compared against the names R returns
+#' after ent_load_entity() renames them -- which failed in both directions at once and was how the
+#' two schemas were discovered at all. This is the check earning its place on its first run.
+#'
+#' @param .con Attached DuckDB connection.
+#' @param .tables Tibble from ner_attached_tables().
+#' @param .dict Tibble from ent_dictionary().
+#' @return Invisibly, the columns found across every table.
+ent_check_dictionary <- function(.con, .tables, .dict) {
+  if (FALSE) {
+    .con    <- con_all
+    .tables <- tab_tables
+    .dict   <- tab_dict
+  }
+
+  have_ <- purrr::map2(.tables$Family, .tables$Table, \(.f, .t) {
+    tibble::tibble(
+      Family = .f,
+      Table  = .t,
+      Column = names(DBI::dbGetQuery(.con, glue::glue("SELECT * FROM {(.t)} LIMIT 0")))
+    )
+  }) |>
+    purrr::list_rbind()
+
+  # THE LEDGER AND THE MANIFEST ARE IN THE DICTIONARY AND NOT IN .tables, and the reason is upstream:
+  # ner_attached_tables() filters runs, manifest, bench, corpus and failures out of its query
+  # explicitly, because they are one per store rather than one per entity and would otherwise appear
+  # three times as if they were entity tables. A reader of the store meets them immediately -- Status
+  # and SpecHash are exactly the columns they would ask about -- so those names are exempted here
+  # rather than dropped from the dictionary.
+  ledger_ <- c("Entity", "Status", "RunAt", "SpecHash", "WrittenAt")
+
+  # EMITTED AND NOT STORED IS A THIRD STATE, and it needs its own exemption for the same reason the
+  # ledger does: the dictionary describes it deliberately, so the check must not read it as stale.
+  # A column here is one the extractor produces and no entity declares -- a decision, recorded --
+  # where a stale entry is a decision nobody made.
+  unkept_ <- .dict$Column[.dict$Where == "emitted, NOT stored"]
+
+  undoc_ <- setdiff(unique(have_$Column), c(.dict$Column, ledger_))
+  stale_ <- setdiff(.dict$Column, c(unique(have_$Column), ledger_, unkept_))
+
+  cli::cli_h2("The dictionary against the stores")
+  tbl_say(
+    .tab = tibble::tibble(
+      Check = c("Every column in every store is documented",
+                "Every documented column still exists"),
+      N     = c(length(undoc_), length(stale_)),
+      Detail = c(
+        if (length(undoc_) == 0L) "" else paste(undoc_, collapse = ", "),
+        if (length(stale_) == 0L) "" else paste(stale_, collapse = ", ")
+      )
+    ),
+    .title = "The dictionary against the stores"
+  )
+
+  if (length(undoc_) > 0L) {
+    cli::cli_alert_danger(
+      "{length(undoc_)} {cli::qty(length(undoc_))}column{?s} in the stores {?is/are} undocumented: \\
+       {paste(undoc_, collapse = ', ')}."
+    )
+  }
+  if (length(stale_) > 0L) {
+    cli::cli_alert_warning(
+      "{length(stale_)} dictionary {cli::qty(length(stale_))}entr{?y/ies} name{?s/} a column no \\
+       store holds: {paste(stale_, collapse = ', ')}."
+    )
+  }
+  if (length(undoc_) == 0L && length(stale_) == 0L) {
+    cli::cli_alert_success(
+      "The dictionary covers {dplyr::n_distinct(have_$Column)} distinct \\
+       {cli::qty(dplyr::n_distinct(have_$Column))}column{?s} across {nrow(.tables)} table{?s}, \\
+       and describes nothing that is not there."
+    )
+  }
+
+  invisible(have_)
+}
+
+
 ent_report_artifacts <- function(.dir, .families, .path_sample) {
   if (FALSE) {
     .dir         <- .lP$Output$Store

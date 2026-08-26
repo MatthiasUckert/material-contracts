@@ -463,130 +463,16 @@ ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL
 }
 
 
-#' The columns a family calls something else
-#'
-#' RENAMED ON READ, AND ONLY ON READ. The stores keep each family's own column names, which is what
-#' makes a column traceable to the documentation of the engine that produced it. But two of LexNLP's
-#' names cannot survive contact with R:
-#'
-#'   TypeAbbr holds the string "NA" for a National Association -- every national bank in the corpus
-#'   -- and R prints that identically to a missing value. A column whose most common value is
-#'   indistinguishable from absence in every table it appears in is a defect waiting for a reader.
-#'
-#'   Name means the resolved company for ORG and the resolved place for GPE. One column called Name
-#'   meaning two different things is the kind of thing that is obvious while writing and invisible
-#'   six weeks later.
-#'
-#' So the rename happens here, in one function, next to the schema it serves -- rather than in the
-#' ingest, where it would have made the store disagree with LexNLP's own documentation.
-.ent_rename <- list(
-  lexnlp = c(
-    NameCore       = "Name",
-    LegalForm      = "TypeAbbr",     # LexNLP's company_type_abbr: CORP, INC, LLC -- and NA
-    LegalFormFull  = "TypeFull",
-    LegalFormLabel = "TypeLabel",
-    GeoName        = "NameEn",
-    GeoAlias       = "Alias",
-    GeoCategory    = "EntityCategory",
-    DateScore      = "Score"
-  ),
-  matcon = c(
-    # Iso2 is a SUBDIVISION code here and never a country; Iso3 is a country code and carries USA on
-    # every US entity, so neither name means what the identical name means in the LexNLP store.
-    SubIso      = "Iso2",
-    CountryIso3 = "Iso3"
-  )
-)
+# WHERE THE SCHEMA DECLARATIONS WENT
+# .ent_rename, .ent_extras, ent_extras() and ent_stored_cols() are in _NER.R, which is sourced
+# before this file everywhere. They describe what a STORE TABLE holds, and _NER.R owns the store --
+# but the deciding argument is smaller and harder: 04A and 04C source _NER.R and never this file, so
+# a declaration living here could not be reached by the two documents that write the tables.
+#
+# The functions keep their ent_ prefix rather than being renamed ner_. They are read far more often
+# by 04B and 04D than by the ingest, every call site in the family already names them, and a rename
+# would be churn across eight documents for a prefix that agrees with a filename.
 
-#' What each family emits for one entity, under this project's names
-#'
-#' DECLARED IN ONE PLACE BECAUSE THE FAMILIES NO LONGER SHARE A SCHEMA. Under the flat store every
-#' GPE row carried the union of both producers' columns and a caller named one extras list for both.
-#' One database per family ended that: matcon's gpe table has GeoKey, IsWord, NParent and MatchKind
-#' and no GeoName; LexNLP's has GeoName, GeoAlias and GeoCategory and none of the others. A single
-#' list would have asked each family for the other's columns.
-#'
-#' 04A's numbers say why the two are worth keeping apart rather than reconciling here: they agree on
-#' only 44.5% of GPE mentions while agreeing on boundaries 97.6% of the time where they meet, which
-#' is complements at different tiers rather than rivals at one.
-.ent_extras <- list(
-  lexnlp = list(
-    ORG   = c("NameCore", "LegalForm", "Description"),
-    GPE   = c("GeoName", "GeoAlias", "GeoCategory", "Iso2", "Iso3"),
-    DATE  = c("DateValue", "DateScore"),
-    MONEY = c("Amount", "Currency")
-  ),
-  matcon = list(
-    # THE TWO ISO COLUMNS ARE RENAMED because matcon and LexNLP use the same two names for four
-    # different quantities. matcon's own docstring is explicit: Iso2 resolves "all 50 states, 81% of
-    # populated places, 95% of counties, and NEVER a country", while Iso3 is "every country, and USA
-    # for every US entity". LexNLP's Iso2 is a country code OR a subdivision code and its Iso3 is a
-    # country code on countries alone.
-    #
-    # Mapping both families onto Iso2/Iso3 was a defect that rendered clean: geo_country() reads Iso3
-    # first, matcon's Iso3 happens to be a country code, and the answer came out right by luck while
-    # the ISO-3166-2 prefix recovery sat dead at 0.0% of matcon's rows. A shared column NAME is not a
-    # shared QUANTITY, and the only place that can be settled is the read.
-    GPE    = c("GeoKey", "IsWord", "NParent", "SubIso", "CountryIso3", "MatchKind"),
-    DATE   = c("DateValue"),
-    TERM   = c("TermN", "TermUnit", "TermYears"),
-    MONEY  = c("Amount", "Currency"),
-    REDACT = character()
-  ),
-  spacy = list(
-    ORG    = character(),
-    PERSON = character(),
-    GPE    = character()
-  )
-)
-
-#: The context columns every matcon extractor emits, APPENDED rather than declared per entity.
-#:
-#: THE SAME ARRANGEMENT AS _io.Emitter, WHICH IS THE POINT. Python puts these two on the emitter
-#: rather than in each module's EXTRAS so that no module can forget them and the column order is
-#: uniform: CORE, the module's own extras, CueBefore, CueAfter. Declaring them per entity here would
-#: reintroduce exactly the drift that arrangement removes -- five entries that must agree, and
-#: nothing to notice when one does not.
-.ent_cues <- c("CueBefore", "CueAfter")
-
-#: Which families emit them. All three, and the third needed H5 fixed first.
-#:
-#: THE BLOCK WAS AN IDENTITY PROBLEM, NOT A SCHEDULING ONE. ner_describe() used to set the spaCy
-#: family's SpecHash from the MODEL version -- 3.8.0 -- so editing extract_spacy.py would have added
-#: two columns while the identity stayed exactly where it was. ner_manifest_write() would have seen
-#: nothing changed and admitted the new rows beside the old, leaving the store holding two
-#: generations under one tag with nothing able to tell them apart.
-#:
-#: ner_spacy_spec() now hashes the script AND the model together, so all three families report the
-#: same KIND of thing and an edit to any of them moves it. The version is still reported, in Note,
-#: where it is metadata rather than identity.
-.ent_cue_families <- c("matcon", "lexnlp", "spacy")
-
-#' The extras one family emits for one entity
-#'
-#' @param .family Family name.
-#' @param .entity Entity name.
-#' @return Character vector, possibly empty.
-ent_extras <- function(.family, .entity) {
-  if (FALSE) {
-    .family <- "matcon"
-    .entity <- "GPE"
-  }
-  fam_ <- .ent_extras[[.family]]
-  if (is.null(fam_)) cli::cli_abort("No extras declared for family {(.family)}.")
-  out_ <- fam_[[toupper(.entity)]]
-  if (is.null(out_)) {
-    cli::cli_abort(c(
-      "{(.family)} declares no {(.entity)} extras.",
-      "i" = "It declares: {paste(names(fam_), collapse = ', ')}."
-    ))
-  }
-  # THE CUE COLUMNS ARE APPENDED, NOT DECLARED. Every matcon entity carries them and none of the
-  # entries above names them, so an entity added tomorrow gets them without anyone remembering to.
-  # Order matters and matches the emitter: the module's own extras first, then CueBefore, CueAfter.
-  if (.family %in% .ent_cue_families) out_ <- c(out_, .ent_cues)
-  out_
-}
 
 #' Load one entity table out of one family's store
 #'
