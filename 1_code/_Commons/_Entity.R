@@ -531,7 +531,12 @@ ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL
     DATE   = c("DateValue"),
     TERM   = c("TermN", "TermUnit", "TermYears"),
     MONEY  = c("Amount", "Currency"),
-    REDACT = character()
+    REDACT = character(0),
+    # LAW CARRIES NONE, AND THAT IS THE DESIGN. lawregex locates a governing-law clause and says
+    # which cue opened it; the jurisdiction is the GPE span sitting INSIDE that clause, resolved
+    # once by the gazetteer rather than twice. Declared explicitly because ent_extras() aborts on
+    # an unknown entity -- which is right, and means every new label must be registered here.
+    LAW    = character(0)
   ),
   spacy = list(
     ORG    = character(),
