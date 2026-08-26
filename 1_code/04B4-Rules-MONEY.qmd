@@ -1,5 +1,5 @@
 ---
-title: "Entity Rules -- Amounts (04B4)"
+title: "Entity Rules -- What a Contract Says It Is Worth (04B4)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -12,6 +12,10 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
 knitr::opts_chunk$set(
   root.dir = here::here(),
   message  = TRUE,
@@ -36,6 +40,7 @@ source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
 source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
 source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
 
+# 03A owns the contract-type vocabulary and the label spine; 04A owns the sample and the stores.
 purrr::walk(
   .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
   .f = \(.s) source(
@@ -63,75 +68,134 @@ source(file = .path_fun, encoding = "UTF-8")
 
 # Purpose
 
-This document turns parsed amounts into document-level money variables.
+This document turns parsed amounts into contract-level money variables.
 
 ## The least opinionated of the five, and it should be
 
 There is no external fact to anchor an amount against and no taxonomy that says what a contract's
-value is, so this document does not invent one. It reports what the extractors found, filters the two
-things that are demonstrably not amounts, and puts the numbers beside the contract type so a reader
-can see whether the ordering makes sense.
+value is, so this document does not invent one. It reports what the extractor found, removes the two
+things that are demonstrably not amounts anybody owes, and puts the numbers beside the contract type
+so a reader can see whether the ordering makes sense.
 
-## One family is barely usable, and the document says so
+## What comes out
 
-Over the corpus LexNLP reaches **0.170** coverage against matcon's **0.710**, at 3.0 spans a document
-against 14.6. 04A measured the sharper version on the sample: of **2,541** mentions the two families
-*both* found, **zero** share identical offsets.
+**One file: `contracts_money.parquet`, one row per contract.** A contract's value belongs to the
+contract and to no party in it. That is not the two-file problem 04B1 removed -- the counts in that
+second file were *derived* from the first and could contradict it, while an amount is an independent
+measurement nothing else computes.
 
-Zero out of thousands is not a disagreement. It is a systematic convention difference -- one family
-is including something the other is not, on every single co-occurrence -- and the reading blocks
-below are where that becomes visible rather than inferred. Both families are loaded, marked and
-reported apart; the class tables are drawn from matcon and say so.
+| Level | Columns |
+|:--|:--|
+| Kept | `NAmounts`, `NAmountsUSD`, `NAmountsOther`, `MoneyMaxUSD`, `MoneySumUSD`, `NDistinctUSD` |
+| Kept, other currencies | `MoneyMaxOther`, `MoneySumOther`, `NDistinctOther` |
+| Unfiltered | `NAmountsRaw`, `NaiveMaxUSD`, `NaiveSumUSD`, `NaiveMaxOther`, `NaiveSumOther` |
+| Removed | `NDroppedZero`, `NDroppedPar` |
+| Withheld by the contract | `NWithheldUSD`, `NWithheldOther` |
 
-## Whole document, no region rule
+## The rule is two filters and no number
 
-Money is genuinely distributed: no engine exceeds a positional contrast of 1.85 between the ends and
-the middle, against 22.6% and 25.2% in the two ends for organisations. There is nothing for a window
-to separate.
+**A zero is not an amount.** The store's two commonest money spans are `$ 0` and `$ 0.00`, which is
+boilerplate about share denomination rather than anything a party owes.
+
+**A figure beside par-value language is not an amount either.** `"par value $0.0001 per share"`,
+`"stated value of $0.01"`, `"shares of $0.01 par value per share"` -- share denomination again, and
+the commonest way a contract names a number that means nothing about its worth.
+
+Neither is a judgement about whether a figure *matters*. Both are figures that are not amounts, and
+the unfiltered count stays in the released file so a reader who disagrees can put them back.
+
+## A withheld figure is a measurement, not a parse failure
+
+`moneyregex` has three patterns for an amount the filer removed -- `symbol_redact` for `$[***]`,
+`$**`, `$TBD` and `$____`; `symbol_redact_open` for an unclosed `$[ ***`; and `symbol_bare` for a
+currency symbol immediately before `per`, as in *"a minimum market price of $ per share"*. All three
+emit a **currency and a null amount**, deliberately, and the module says why:
+
+> the amounts a filer withholds are systematically the material ones. Returning zero, or dropping the
+> row, would erase exactly the observation that matters.
+
+**This document was erasing it.** `Parsed` required both an amount and a currency and the aggregation
+began by filtering on it, so every withheld figure was gone before the first `summarise` and the parse
+table counted it as a failure to cast. It is not a failure. It is a contract naming a price and
+refusing to say what it is.
+
+**And it is sharper than anything 04B5 can offer.** `NRedactSymbol` counts `[***]` wherever it falls
+-- in a schedule, a definition, a party's name. A `symbol_redact` span is `[***]` *standing where a
+dollar figure belongs*, which is the measure referee 2's question about redaction intensity actually
+points at.
+
+They enter no arithmetic: a withheld figure carries no number, so a sum or a maximum including it
+would have to invent one. They are counted as an event.
+
+## One engine, and the measurement is decisive
+
+**LexNLP's money grammar accepts one phrasing in six.** Measured on a fixture and confirmed on the
+sample: of `$9,752,233.001`, `$2,500,000`, `US$5,000,000`, `5,000,000 dollars`, `USD 5,000,000` and
+`Five Million Dollars`, only the last matches. At scale that is a coverage of **0.163** against
+matcon's **0.712** on the corpus pass, and **0.260** against **0.830** on the sample.
+
+**And it settles a claim that was in the prose.** An earlier version kept both families on *"of 2,541
+mentions the two both found, zero share identical offsets, so neither replaces the other"*. That
+sentence is true and its reading was wrong: zero agreement between a producer finding five phrasings
+in six and one finding one is not two engines disagreeing, it is one engine largely **absent**.
+
+## The par cue is a column now, and this was the last text read in the family
+
+`mny_load()` used to open 04A's canonical text and cut sixty characters before every amount. Every
+matcon span carries `CueBefore` and `CueAfter` -- 160 raw characters either side, stored at extraction
+where the document and the offsets were already in one scope -- so the test is a column read.
+
+**With 04B2 and 04B3 already moved, no rule in the 04B family opens a document.** 04D's `Cues` dial
+existed to switch those three reads off at corpus scale, and switching them off is what made the
+governing-law columns vanish from the release. There is nothing left for it to gate.
+
+**And the window reads both sides, which it could not before.** The old roxygen promised *"characters
+either side of an amount"* and the code cut a window *ending* at the span, so par language written
+after the figure was structurally invisible: `"shares of $0.01 par value per share"` passed the filter
+every time. `Test-MatCon-MONEY.R` pinned both halves of that, and its `doc08` check is written to
+**flip** when a rule reads `CueAfter` -- which is how this change proves itself rather than being
+asserted.
 
 ## Currencies are never pooled
 
-A maximum across currencies is not a quantity. Currency is populated on 100% of both families' rows
--- 42,937 of 42,937 -- so the split costs nothing.
+A maximum across currencies is not a quantity. Currency is populated on 100% of matcon's rows, so the
+split costs no coverage at all, and USD and non-USD sit in columns of one row rather than in two
+tables nobody joins.
 
 ## The repetition ratio is why sum survives
 
-A contract restating the same fifty million across five clauses sums to two hundred and fifty
-million, and no filter can tell a restatement from a second obligation. So distinct amounts over
-total spans is reported beside the sum: it says how much of a class's total is repetition, which is
-the caveat the sum needs rather than an argument for dropping it.
+A contract restating the same fifty million across five clauses sums to two hundred and fifty million,
+and no filter can tell a restatement from a second obligation. So distinct amounts over total spans is
+reported beside the sum: it says how much of a total is repetition, which is the caveat the sum needs
+rather than an argument for dropping it.
 
-## Two filters, both on things that are not amounts
+**`MoneyMaxUSD` is the one unambiguous figure** -- the largest amount the contract names -- and it is
+the column a reader wanting one number should take.
 
-A zero, and a figure sitting next to "par value" -- the store's two commonest money spans are `$ 0`
-and `$ 0.00`, which is boilerplate about share denomination rather than anything a party owes. Both
-are swept, and the unfiltered row stays in every table.
+## Every table carries the unfiltered count
 
-## What is recomputed, and what is not
-
-Everything, on every render. The context is read once, outside the filter, because it depends on no
-specification.
+**Naive** is every parsed amount, both filters off: what a reader gets by summing what the extractor
+emitted. It sits beside the rule in every table and in the released file, because the difference
+between the two *is* what the filters did.
 
 ## How results are reported
 
-Console tables throughout, two figures in `# Overview`, every table per family and per currency.
+Console tables throughout, four figures in `# Overview`, and one reading block: whole contracts as the
+file holds them, drawn so that some are contracts where a filter bit.
 
 ## Where things are written
 
-Two artifacts: the amount spans with their context flags, and one row per document, family and
-currency block.
+**One file**, one row per contract.
 
 # Configuration
+
+## The parameters, and where they came from
 
 ```{r}
 #| label: configure
 
 .lP <- list(
   Input = list(
-    Text = fs::path(
-      init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
-      "Output", "sample_text.parquet"
-    ),
     Store = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
       "Output"
@@ -146,300 +210,320 @@ currency block.
     )
   ),
   Output = list(
-    Spans = utils_file_path(.dir_main, "Output", "roles_money.parquet"), # per amount span
-    Doc   = utils_file_path(.dir_main, "Output", "money_doc.parquet")    # per document and family
+    Contracts = utils_file_path(.dir_main, "Output", "contracts_money.parquet")
   ),
   Params = list(
-    Families   = c("lexnlp", "matcon"),
-    ClassCombo = "matcon",     # the family the class tables and figures are drawn from
-    CueWin     = 60L,          # characters read before a span for the par-value cue
-    ReadN      = 10L,
-    ReadCtx    = 200L,
-    CheckN     = 500L,
-    Seed       = 42L
+    Family   = "matcon",  # the only family that finds more than one phrasing in six
+    ReadDocs = 8L,        # contracts read whole from the released file
+    Seed     = 42L        # fixed, so the same contracts are read on every render
   )
 )
 
-# The filter carried into the released artifacts.
+# TWO DIALS, AND THE SECOND IS THE ONE A READER COULD DISAGREE WITH. The window is a real parameter
+# again: it used to sit in the specification while IsPar was computed once at load time, so a sweep
+# over specifications changed the label and nothing else.
 .lP$Params$Spec <- mny_spec(
-  .filter  = "par",              # drops a zero, and a figure preceded by par-value language
-  .cue_win = .lP$Params$CueWin
+  .filter  = "par",  # drops a zero, and a figure with par-value language beside it
+  .cue_win = 60L     # characters read EITHER SIDE, out of the 160 the store holds
 )
 
-# Every filter, unfiltered first, so what the rule removes is visible rather than asserted.
+# THE UNFILTERED ROW IS FIRST, so what the rule removes is visible rather than asserted. The last two
+# rows sweep the window, which the old specification could not: with IsPar computed at load time,
+# every swept width named a number and changed none.
 .lP$Params$Specs <- list(
   mny_spec(.filter = "none"),
   mny_spec(.filter = "zero"),
-  mny_spec(.filter = "par")
+  mny_spec(.filter = "par",  .cue_win = 30L, .label = "drop zero and par / 30"),
+  mny_spec(.filter = "par",  .cue_win = 60L, .label = "drop zero and par / 60"),
+  mny_spec(.filter = "par",  .cue_win = 120L, .label = "drop zero and par / 120")
 )
 
-fs::dir_create(fs::path_dir(.lP$Output$Spans))
+fs::dir_create(fs::path_dir(.lP$Output$Contracts))
 
-tibble::tibble(
+tab_inputs <- tibble::tibble(
   Input  = names(.lP$Input),
   Path   = purrr::map_chr(.lP$Input, \(.p) fs::path_rel(.p, start = here::here())),
   Exists = purrr::map_lgl(.lP$Input, \(.p) fs::file_exists(.p) || fs::dir_exists(.p))
-) |>
-  tbl_say(.title = "Every input resolves before anything is computed")
+)
+
+tbl_say(.tab = tab_inputs, .title = "Every input resolves before anything is computed")
+
+# A TABLE OF FALSE IS A REPORT, NOT A GATE, and the difference has cost a render before.
+if (any(!tab_inputs$Exists)) {
+  cli::cli_abort(c(
+    "{sum(!tab_inputs$Exists)} input{?s} {?does/do} not resolve.",
+    "x" = "{paste(tab_inputs$Input[!tab_inputs$Exists], collapse = ', ')}.",
+    "i" = "Every path here is required."
+  ))
+}
 ```
 
 # Input
+
+## The anchor, from EDGAR
 
 ```{r}
 #| label: build-keys
 
 tab_keys <- ent_anchor_keys(
-  .path_prepared = .lP$Input$Prepared,
-  .path_register = .lP$Input$Register,
-  .path_landing  = NULL,             # no address is used here
+  .path_prepared = .lP$Input$Prepared,  # 03A: DocID, ClassDetailed, AmendType, Fold
+  .path_register = .lP$Input$Register,  # 02B: CIK, CompanyName, DateFiled
+  .path_landing  = NULL,                # the addresses are 04B2's; not read here
   .quiet         = FALSE
 )
 
-tab_lens <- ent_doc_lens(.path_text = .lP$Input$Text)
+tab_lens <- tab_keys |>
+  dplyr::transmute(DocID, DocLen = as.integer(.data$nChars)) |>
+  dplyr::filter(!is.na(.data$DocLen), .data$DocLen > 0L)
 ```
 
+## The amounts
+
 ```{r}
-#| label: load-money
+#| label: load-spans
 
 tab_money <- mny_load(
-  .dir_store = .lP$Input$Store,      # the directory; the family is the filename
+  .dir_store = .lP$Input$Store,
   .lens      = tab_lens,
-  .path_text = .lP$Input$Text,       # for the par-value context, read once
-  .families  = .lP$Params$Families,
-  .win       = .lP$Params$CueWin,
+  .family    = .lP$Params$Family,   # matcon: five phrasings in six against LexNLP's one
   .quiet     = FALSE
 )
 
-mny_report_parse(.money = tab_money)
+tab_parse <- mny_table_parse(.money = tab_money)
+
+mny_report_parse(.tab = tab_parse)
 ```
 
-**`Amount` arrives as text and is cast here.** `moneyregex` writes it as a string so a contract value
-crosses the seam intact, and the store keeps the string because its schema is the parquet's rather
-than a declaration. `as.numeric()` in the loader is the first arithmetic anything does with it, which
-is where the cast belongs -- and a value that will not cast becomes `NA` and is counted by the parse
-report rather than silently dropped.
+**No filter runs at load.** Both depend on a specification, so applying either here would put them
+beyond the reach of the sweep -- which is exactly what the old version did with the par cue, leaving a
+dial that appeared in every swept label and changed nothing.
 
 # Construction
 
+## Applying the rule
+
 ```{r}
-#| label: aggregate-base
-tab_agg <- mny_aggregate(
+#| label: apply-rule
+
+res_base <- mny_apply(
   .money = tab_money,
-  .keys  = tab_keys,
-  .spec  = .lP$Params$Spec   # the filter carried into the artifacts
+  .keys  = tab_keys,             # runs from the key side, so a contract naming nothing survives
+  .spec  = .lP$Params$Spec
 )
 
-tab_doc <- mny_doc_table(.agg = tab_agg, .keys = tab_keys)
+tab_marked  <- res_base$Marked   # every span, with the par cue read from both sides
+tab_agg     <- res_base$Agg      # one row per contract and currency block
+tab_release <- res_base$Release  # the file
+```
+
+## Where the par-value language sat
+
+```{r}
+#| label: report-par-side
+
+tab_side <- mny_par_side(.marked = tab_marked)
+
+mny_report_par_side(.tab = tab_side)
+```
+
+**`after` is what the previous rule could not see.** It cut a window ending at the span, so the phrase
+written after the figure passed the filter every time. Reading the second side can only mark more and
+never unmark, so this is a gain with no cost column.
+
+## What the two filters removed
+
+```{r}
+#| label: report-dropped
+
+tab_drop <- mny_table_dropped(.release = tab_release)
+
+mny_report_dropped(.tab = tab_drop)
 ```
 
 # Selection
 
+## What each filter and window would have kept
+
 ```{r}
 #| label: sweep-filters
+
 tab_sweep <- mny_sweep(
   .money = tab_money,
   .keys  = tab_keys,
-  .specs = .lP$Params$Specs,
+  .specs = .lP$Params$Specs,   # the unfiltered one first, then the window
   .quiet = FALSE
 )
 
 mny_report_sweep(.tab = tab_sweep)
 ```
 
+**A window that changes no number is a finding rather than an artefact.** Under the old code the three
+window rows were guaranteed identical, because `IsPar` was computed before any specification was
+consulted. If they are identical now it is because the par language sits close to the figure, which is
+worth knowing.
+
 # Results
 
-```{r}
-#| label: report-class-usd
-mny_report_class(
-  .agg   = tab_agg,
-  .combo = .lP$Params$ClassCombo,
-  .block = "USD"
-)
-```
+## The rule against the unfiltered count
 
 ```{r}
-#| label: report-class-other
-mny_report_class(
-  .agg   = tab_agg,
-  .combo = .lP$Params$ClassCombo,
-  .block = "non-USD"
-)
+#| label: table-naive
+
+tab_naive <- mny_table_naive(.release = tab_release)
+
+mny_report_naive(.tab = tab_naive)
 ```
+
+**Both `MedMax` columns are over the same contracts** -- the ones that kept a USD amount -- so
+`MedMaxRule` can never exceed `MedMaxNaive`. Computing each over its own non-missing rows compares a
+set including the contracts whose every figure was boilerplate with one excluding them, and reports
+the filters as having *raised* contract value. `PctAllPar` is that excluded population: contracts that
+named a USD figure and kept none of it.
+
+## What each contract type is worth
+
+```{r}
+#| label: table-class
+
+tab_class <- mny_table_class(.release = tab_release)
+
+mny_report_class(.tab = tab_class)
+```
+
+**The ordering is the only external check this document has.** There is no ground truth for what a
+contract is worth, but a credit agreement should out-value an employment agreement and a reader can
+say whether it does.
 
 # Validation
 
-```{r}
-#| label: validate-offsets
-tab_check <- ent_verify_span(
-  .tab       = tab_money,
-  .path_text = .lP$Input$Text,
-  .col_start = "Start",
-  .col_stop  = "Stop",
-  .col_span  = "Span",
-  .n         = .lP$Params$CheckN,
-  .seed      = .lP$Params$Seed
-)
+## Three identities the amounts cannot violate
 
+```{r}
+#| label: validate-amounts
+
+# THE FILTERS ARE SUBTRACTIVE, so the kept count can never exceed the parsed count and the two drop
+# counts must account for the whole difference. A maximum over a subset can never exceed a maximum
+# over the whole, either.
 tibble::tibble(
-  Check = c(
-    "Text cut at the stored offsets equals the stored span",
-    "Every parsed span carries a currency block",
-    "No aggregated maximum is smaller than its median",
-    "No aggregated sum is smaller than its maximum",
-    "Distinct amounts never exceed spans",
-    "Every document has a row per engine"
-  ),
-  N = c(
-    sum(tab_check$Exact),
-    sum(!is.na(tab_money$Block[tab_money$Parsed])),
-    sum(tab_agg$MoneyMax >= tab_agg$MoneyMed),
-    sum(tab_agg$MoneySum >= tab_agg$MoneyMax),
-    sum(tab_agg$NDistinct <= tab_agg$NSpans),
-    nrow(tab_doc)
-  ),
-  Of = c(
-    nrow(tab_check),
-    sum(tab_money$Parsed),
-    nrow(tab_agg),
-    nrow(tab_agg),
-    nrow(tab_agg),
-    nrow(tab_keys) * dplyr::n_distinct(tab_agg$Combo)
-  )
+  Item = c("Documents in the sample",
+           "Rows in the released file",
+           "Where kept exceeds parsed",
+           "Where the drops do not account for the difference",
+           "Where the kept maximum exceeds the unfiltered one"),
+  N    = c(nrow(tab_keys),
+           nrow(tab_release),
+           sum(tab_release$NAmounts > tab_release$NAmountsRaw),
+           sum(tab_release$NAmountsRaw - tab_release$NAmounts !=
+                 tab_release$NDroppedZero + tab_release$NDroppedPar),
+           sum(dplyr::coalesce(tab_release$MoneyMaxUSD, 0) >
+                 dplyr::coalesce(tab_release$NaiveMaxUSD, 0)))
 ) |>
-  dplyr::mutate(Share = tbl_pct(.data$N / .data$Of)) |>
-  tbl_say(.title = "Every row is expected at 100%")
-```
+  tbl_say(.title = "Three identities the amounts cannot violate")
 
-The middle three are arithmetic identities rather than tests of the extraction, and that is the
-point: they fail only if an aggregation is wrong, which is the failure mode this document is most
-exposed to and least able to see any other way.
-
-# Robustness
-
-```{r}
-#| label: read-largest
-# The largest figure in each of a few contracts, read to see whether it is an obligation, a cap, a
-# share count that survived the parser or an authorised-capital line.
-ent_read_spans(
-  .tab       = tab_money |>
-    dplyr::filter(.data$Parsed, !.data$IsZero, !.data$IsPar, .data$Block == "USD",
-                  .data$Combo == .lP$Params$ClassCombo) |>
-    dplyr::slice_max(.data$Amount, n = 400L, with_ties = FALSE),
-  .path_text = .lP$Input$Text,
-  .col_start = "Start",
-  .col_stop  = "Stop",
-  .n         = .lP$Params$ReadN,
-  .ctx       = .lP$Params$ReadCtx,
-  .seed      = .lP$Params$Seed
-) |>
-  ent_report_read(
-    .cols  = c("Combo", "Amount", "Currency"),
-    .title = "The largest amounts in the sample"
-  )
-```
-
-```{r}
-#| label: read-par
-ent_read_spans(
-  .tab       = dplyr::filter(tab_money, .data$IsPar),
-  .path_text = .lP$Input$Text,
-  .col_start = "Start",
-  .col_stop  = "Stop",
-  .n         = 8L,
-  .ctx       = .lP$Params$ReadCtx,
-  .seed      = .lP$Params$Seed
-) |>
-  ent_report_read(
-    .cols  = c("Combo", "Amount", "Currency"),
-    .title = "Figures preceded by par-value language -- what the filter removes"
-  )
-```
-
-```{r}
-#| label: read-nonusd
-ent_read_spans(
-  .tab       = dplyr::filter(tab_money, .data$Parsed, .data$Block == "non-USD"),
-  .path_text = .lP$Input$Text,
-  .col_start = "Start",
-  .col_stop  = "Stop",
-  .n         = 8L,
-  .ctx       = .lP$Params$ReadCtx,
-  .seed      = .lP$Params$Seed
-) |>
-  ent_report_read(
-    .cols  = c("Combo", "Amount", "Currency"),
-    .title = "Non-USD amounts"
-  )
+cli::cli_alert_info(
+  "The first two rows must be equal and the last three must all be ZERO. A filter that added amounts \\
+   is not a filter; a difference the two drop counts cannot explain means a third thing is being \\
+   removed silently; and a subset with a larger maximum than its superset is arithmetically \\
+   impossible."
+)
 ```
 
 # Deployment
 
-```{r}
-#| label: write-artifacts
-arrow::write_parquet(dplyr::select(tab_money, -dplyr::any_of("Before")), .lP$Output$Spans)
-arrow::write_parquet(tab_doc, .lP$Output$Doc)
+## The release
 
-tibble::tibble(
-  Artifact = c("Amount spans with currency, zero and par-value flags",
-               "Money variables per document and engine, USD and non-USD side by side"),
-  Path     = c(.lP$Output$Spans, .lP$Output$Doc)
-) |>
-  dplyr::mutate(
-    Exists = fs::file_exists(.data$Path),
-    MB     = round(as.numeric(fs::file_size(.data$Path)) / 1024^2, 1),
-    Path   = fs::path_file(.data$Path)
-  ) |>
-  tbl_say(.title = "Written by 04B4")
+```{r}
+#| label: write-artifact
+
+arrow::write_parquet(tab_release, .lP$Output$Contracts)
+
+mny_report_release(.tab = tab_release)
 ```
 
-The span file keeps the flags rather than the filtered set, so a consumer wanting the unfiltered
-count has it and one wanting the filter can apply the same two columns this document did.
+## The released file, read
+
+```{r}
+#| label: read-release
+
+tab_sample <- mny_release_sample(
+  .tab  = tab_release,
+  .n    = .lP$Params$ReadDocs,   # some drawn from contracts where a filter bit
+  .seed = .lP$Params$Seed
+)
+
+mny_report_release_sample(.tab = tab_sample)
+```
+
+## What every column means
+
+```{r}
+#| label: report-dictionary
+
+tab_dict <- mny_dictionary(.tab = tab_release)
+
+mny_report_dictionary(.tab = tab_dict)
+```
+
+**The naive columns are what make the rest arguable.** Keeping only what the rule kept would leave a
+reader unable to check what it removed; publishing both means the filters are a choice the file
+supports rather than one it hides.
 
 # Overview
 
+## The rule in one table
+
+```{r}
+#| label: report-headline
+
+mny_report_headline(.release = tab_release, .side = tab_side)
+```
+
+## What the filters removed
+
+```{r}
+#| label: fig-naive
+#| fig-cap: "Mean amounts per contract by type, before and after the two filters. The gap between
+#|   each pair is the boilerplate: zeros and par values, which are figures rather than amounts."
+#| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_naive$Class))
+
+mny_plot_naive(.tab = tab_naive)
+```
+
+## The largest amount, by type
+
 ```{r}
 #| label: fig-max
-#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")))
-#| fig-cap: "Median of the largest USD amount named in a contract, by type. The sanity test is the
-#|   ordering rather than the level: credit agreements and mergers should sit at the top and
-#|   compensation agreements at the bottom."
-mny_plot_max(
-  .agg   = tab_agg,
-  .combo = .lP$Params$ClassCombo,
-  .block = "USD"
-)
+#| fig-cap: "The largest USD amount each contract names, by type, on a log scale. This is the
+#|   ordering check: there is no ground truth for a contract's value, but the ranking should be one a
+#|   reader recognises."
+#| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_release$Class))
+
+mny_plot_max(.release = tab_release)
 ```
+
+## Which side the phrase was written on
+
+```{r}
+#| label: fig-par-side
+#| fig-cap: "Which side of the figure the par-value phrase was written on. Everything but the first
+#|   bar was invisible to the rule this replaces, which read only the characters before the amount."
+#| fig-height: 2.4
+
+mny_plot_par_side(.tab = tab_side)
+```
+
+## How much of a total is repetition
 
 ```{r}
 #| label: fig-repeat
-#| fig-height: !expr plot_height(6L)
-#| fig-cap: "Cumulative distribution of distinct amounts over total amount spans, for contracts
-#|   naming at least three, by currency block. A contract near one names a different figure every
-#|   time; one near zero repeats the same figure, and its sum is that figure counted again."
-mny_plot_repeat(
-  .agg   = tab_agg,
-  .combo = .lP$Params$ClassCombo
-)
-```
+#| fig-cap: "Distinct amounts over amounts kept, per contract. A low ratio is a contract restating one
+#|   figure many times, and it is the caveat the sum needs."
+#| fig-height: 3.4
 
-```{r}
-#| label: report-everything
-mny_report_all(
-  .money = tab_money,
-  .sweep = tab_sweep,
-  .agg   = tab_agg,
-  .combo = .lP$Params$ClassCombo
-)
+mny_plot_repeat(.release = tab_release)
 ```
 
 # Next
 
-Two things are deliberately not attempted, and both would need a judgement this document has no
-evidence for.
-
-**No contract value.** Naming the largest figure "the contract value" would be a claim about which
-obligation matters, and nothing in the data supports it. The maximum is released as the maximum.
-
-**No scale correction.** A figure written "in thousands" in a table header is parsed at face value,
-and no engine reads the header. That is a known understatement in an unknown share of documents; the
-read blocks are where it would first become visible.
+04B5 counts what was withheld: the redaction markers a contract carries, and what they sit beside. It
+is the last of the five, and like this one it opens no document.

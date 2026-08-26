@@ -37,16 +37,23 @@ if (FALSE) {
 # 0. Vocabulary of the shared artifacts --------------------------------------------------------------------------------
 # A level set belongs HERE and not in an entity's own file when it describes an artifact one document
 # writes and another reads. 04B1 writes roles_org.parquet with a Role column; 04B2 reads it and never
-# sources 04B1, which is the whole point of splitting the family -- so registering OrgRole in 04B1
+# sources 04B1, which is the whole point of splitting the family -- so registering PartyRole in 04B1
 # leaves 04B2 with a column it cannot order, and it fails at the first plot_factor() rather than at
 # load. Anything private to one entity stays in that entity's file.
+#
+# FIVE LEVELS, AND TWO OF THEM ARE NEW. REGISTRANT replaced FILER, because the party this pipeline
+# identifies is the SEC registrant and calling it the filer invited the reading that EDGAR names both
+# sides of a contract. NONE is the sentinel a document with no organisation carries, so that a count
+# over the released file has the whole sample as its denominator. FRAGMENT is gone: 04B1 merges a
+# split name into its parent before roles are assigned, so there is no longer a party for a fifth
+# level to describe.
 #
 # Sourced after _Plots.R, which rebuilds the registry empty each time it loads.
 
 plot_register_levels(
-  .key    = "OrgRole",
-  .levels = c("filer", "counterparty", "fragment", "signatory", "other"),
-  .short  = c("filer", "counter", "frag", "signer", "other")
+  .key    = "PartyRole",
+  .levels = c("registrant", "counterparty", "signatory", "other", "none"),
+  .short  = c("registrant", "counter", "signer", "other", "none")
 )
 
 

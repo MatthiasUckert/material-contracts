@@ -1,8 +1,7 @@
-# 04B3-Rules-DATE: signing, end and duration -------------------------------------------------------------------------
+# 04B3-Rules-DATE: when a contract starts, ends and how long it runs -----------------------------------------------------
 #
 # WHAT THIS FILE DOES
-# Turns parsed dates and stated terms into a contract duration. Function prefix is `dte_`, so nothing
-# here collides with the `ent_`, `geo_`, `mny_`, `red_` or `plot_` layers.
+# Turns parsed dates and stated terms into a contract duration. Function prefix is `dte_`.
 #
 # THE NUMBER THAT MADE THIS DOCUMENT NECESSARY
 # Table 3 Panel B reports contract duration with a mean of 2.38 years, a median of 0.40 and a
@@ -11,256 +10,210 @@
 # the cap is not applied to what is tabulated, or something is in the wrong unit. Referee 1 saw the
 # symptom and asked whether there were "errors in identifying dates affecting the right tail".
 #
-# The published definition is the first row of the sweep rather than a thing this document replaces
-# sight unseen, and SdOverCap appears in every row: it cannot exceed one half.
+# THE PUBLISHED DEFINITION IS THE NAIVE BASELINE, and it is a row in the sweep rather than something
+# this document replaces sight unseen: take the farthest future date the contract mentions and call
+# the distance to it the duration. Every table below reports it beside the rule, because the
+# difference between the two IS what the rule did.
 #
-# THE STATED TERM NOW COMES FROM THE STORE, AND THAT IS THE ONE STRUCTURAL CHANGE
-# An earlier version of this file carried dte_term(), which re-implemented stated-term extraction in
-# R with its own regex over the canonical text. It worked and it could never leave the sample: 04C
-# writes no corpus text file -- the text is 1.19 million separate parquets in the mirror -- so any
-# variable built on it stopped at 4,398 documents. dateregex-v3 emits TERM as a second label from the
-# same pass that produces DATE, so the terms arrive in the store with offsets like everything else.
+# THE RULE IS ONE START AND A FOUR-RUNG END
+#   START. The latest date at or before the filing. An amendment citing a 1998 original still signs
+#     itself later, and the latest pre-filing date finds that wherever it sits. Where no date
+#     precedes the filing, the filing date is used and StartSource records it.
+#   END, in order:
+#     1. A STATED TERM -- "for a period of five (5) years". A duration with no end date at all, and
+#        once the start is known it is arithmetic. This is what the contract SAYS.
+#     2. AN OPEN-ENDED TERM -- "shall continue until terminated", "in perpetuity". The duration is
+#        left MISSING, because a perpetual agreement has no duration and saying so is a finding.
+#     3. A DATED TERMINATION -- the farthest future date with a termination cue beside it.
+#     4. THE FARTHEST FUTURE DATE, whatever it is. The naive definition, kept as the last rung and
+#        marked, because it is a guess rather than a reading.
+# DurationSource distinguishes all four, so a reader can keep only what the contract actually said.
 #
-# THE EXTRACTOR STATES, THE RULE DECIDES. The engine emits every stated period it can find and
-# records WHICH PATTERN found it in LabelRaw. This file chooses which of those patterns count as a
-# contract duration. That was already the shape of the old .term_kinds argument; it is now a filter
-# on provenance the extractor supplies rather than on a distinction re-derived here.
+# THE LONGEST STATED PERIOD IS THE TERM, AND THAT REPLACED TWO DIALS
+# A contract states several periods and only one of them is its duration:
 #
-# AND THE UNIT REPLACES THE PATTERN AS THE DEMOTION RULE. The old code split "term of" from "period
-# of" and demoted the second, because pooling them "put 127 documents at thirty days". The pattern
-# was a proxy: thirty DAYS is a notice window and five YEARS is a term, and the engine emits TermN
-# and TermUnit as columns, so the rule says that directly instead of inferring it from the drafter's
-# choice of noun. Both dials are swept.
+#   3.1  Buyer shall cure any breach within a period of thirty (30) days.
+#   5.2  Seller warrants the Products for a period of twelve (12) months.
+#   9.1  This Agreement shall continue for a period of five (5) years.
 #
-# NO CLUSTERING, AND THAT IS A CORRECTION
-# An earlier version collapsed each document to one row per calendar date, keeping the earliest
-# occurrence. It bought nothing -- the duration is a max() and a min() over VALUES, which do not care
-# how many times a value appears -- and it created a bug: the termination cue was then tested at the
-# earliest occurrence, so "shall expire on December 31, 2020" was invisible whenever that date had
-# already appeared in the preamble, which in a contract is the normal case. Everything below runs at
-# SPAN level and deduplicates only where a count is reported.
+# All three are real contract terms; only 9.1 is how long the contract lasts. All three match the
+# SAME PATTERN, because the drafter wrote "period of N units" three times -- so no filter on pattern
+# names can separate them, and taking the first by position releases the CURE PERIOD as the duration.
 #
-# NO REGION RULE, EITHER
-# Dates are not bimodal the way organisations are. Measured over the sample: the head is 72.8%
-# pre-filing and the TAIL is 73.0% -- identical -- against a deep U for organisations with 22.6% and
-# 25.2% in the two ends. Region separates the head from the middle and separates nothing else, and
-# excluding the tail from the end search cost 2.5 points of coverage and left the standard deviation
-# unchanged. So the end rule reads the whole document, and the head restriction on the START is a
-# swept row rather than a rule.
+# TAKING THE LONGEST NEEDS NO THRESHOLD AND CANNOT DELETE A CONTRACT'S ONLY TERM. A minimum length
+# would work on the example, but it has to be defended -- why one year and not six months -- and it
+# deletes the stated term of a genuine three-month agreement, sending it to the guess rung. The
+# longest is a SELECTION rather than a FILTER: a contract stating one period keeps it whatever its
+# length, and a contract stating several gets the one that outlasts the others.
 #
-# THE THREE THINGS A CONTRACT CAN SAY ABOUT WHEN IT ENDS, AND A FOURTH THAT IS NOT SILENCE
-#   1. A STATED TERM -- "for a period of five (5) years from the Effective Date". A duration with no
-#      end date at all, and once the start is known it is arithmetic. This is what the contract SAYS,
-#      rather than a maximum over dates it happens to mention, so it outranks the other two.
-#   2. A DATED TERMINATION -- a future date with a termination cue beside it.
-#   3. NOTHING, in which case the farthest future date is taken and recorded as such. That is the
-#      published definition, and it picks up a patent expiry and a perpetuity boilerplate along with
-#      the contract's own end.
-#   4. AN OPEN-ENDED TERM -- "shall continue until terminated". The engine emits this as a span with
-#      TermYears null, which is a stated term of UNKNOWN length rather than an absent one. It gets
-#      its own DurationSource and a missing duration, because a perpetual agreement has no duration
-#      and saying so is a finding. Under the old code it fell through to the farthest future date,
-#      which is exactly the wrong answer for the one form that says it will not end.
-# DurationSource distinguishes all four, because they are not the same evidence.
+# WHAT IT COSTS, STATED RATHER THAN DISCOVERED. It is wrong exactly where a contract states a longer
+# NON-DURATION period than its own duration: a one-year agreement with a ten-year confidentiality
+# survival clause, a two-year agreement with a six-year licence carve-out. Survival clauses are the
+# real exposure, because they are common and deliberately long. The trade is accepted because a cure
+# period is far commoner than a survival clause outlasting the term, and the comparison against
+# position-first is reported rather than asserted -- with the disagreements read back in context,
+# which is the only thing that can tell a duration from a survival clause.
+#
+# ONE ENGINE, AND IT SETTLES THE RIGHT-TAIL QUESTION BY CONSTRUCTION
+# matcon's patterns require a year IN THE TEXT -- four digits in nine of them, two in SlashShort --
+# so there is no partial match to complete and no clock to complete it from. LexNLP's grammar has no
+# such constraint, and dateregex.py measured the consequence on this sample: of its spans carrying no
+# written year, 76% resolve to the FUTURE at a median of 11.6 years out, and 80.8% of all dates more
+# than fifteen years out are year-less. Running matcon alone is therefore not a preference between
+# two producers; it is the guard against the exact failure the referee asked about.
+#
+# AND IT RETIRES A DIAL. RequireYear existed to drop spans whose year the parser invented, which is a
+# LexNLP failure mode. Under matcon every emitted date carries a year the contract wrote, so the
+# guard has nothing to guard and it is gone rather than left switched off.
+#
+# THE CUE IS A COLUMN NOW, AND THIS WAS THE LAST TEXT READ IN THE FAMILY
+# dte_describe() used to open 04A's canonical text and cut 120 characters before every date to test
+# for a termination cue. Every matcon span now carries CueBefore -- 160 raw characters, stored at
+# extraction where the text and the offsets are already in one scope -- so the test is a column read.
+#
+# THAT MATTERS BEYOND THIS FILE. It was the last of three rules that opened a document, and with it
+# gone no rule in the 04B family touches contract text at all. 04D's Cues dial existed to switch
+# those reads off at corpus scale, and switching them off is what made the governing-law columns
+# vanish from the release; there is nothing left for it to gate.
 #
 # THE CAP DROPS, IT DOES NOT WINSORISE. A duration of exactly thirty years that is not one is worse
-# than a missing value.
+# than a missing value, and DurationDropped says which of the two reasons applied.
 #
-# WHICH FAMILY SUPPLIES THE DATES IS THE RIGHT-TAIL TEST, not a preference. matcon's patterns require
-# a year in the text by construction -- four digits in nine of them, two in one -- so there is no
-# partial match to complete and no clock to complete it from. LexNLP's grammar has no such
-# constraint, and dateregex.py measures the consequence on this sample: of its spans carrying no
-# written year, 76% resolve to the FUTURE at a median of 11.6 years out, and 80.8% of all dates more
-# than fifteen years out are year-less. The duration is therefore computed per family and pooled, and
-# SdOverCap sits beside each -- which is the direct answer to the referee's question.
+# ONE FILE, ONE ROW PER CONTRACT
+# A duration belongs to a contract and to no party in it, so this writes its own file rather than
+# widening 04B2's. That is not the two-file problem ORG removed: the counts in that second file were
+# DERIVED from the first and could contradict it, while a duration is an independent measurement that
+# nothing else computes.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
 # cli/fs/here; pure ASCII; stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
 
 if (FALSE) {
-  .path_text <- .lP$Input$Text
   .dir_store <- .lP$Input$Store
 }
 
 
-# 1. Vocabulary --------------------------------------------------------------------------------------------------------
-
-plot_register_levels(
-  .key    = "DateRegion",
-  .levels = c("head", "middle", "tail"),
-  .short  = c("head", "middle", "tail")
-)
+# 1. Vocabulary ----------------------------------------------------------------------------------------------------------
 
 plot_register_levels(
   .key    = "DurationSource",
-  .levels = c("term", "cue", "maxdate", "open", "none"),
-  .short  = c("term", "cue", "maxdate", "open", "none")
-)
-
-# THE ENGINE'S OWN PROVENANCE, ordered by how strong a claim each pattern makes about a DURATION.
-# UnitTerm and ContinueFor say a term outright; PeriodOf and Anniversary say one above a floor;
-# UnitPeriod is a notice, cure or payment window; OpenEnded is unbounded. The order is the precedence
-# a document stating several is resolved by.
-plot_register_levels(
-  .key    = "TermKind",
-  .levels = c("UnitTerm", "ContinueFor", "PeriodOf", "Anniversary", "UnitPeriod", "OpenEnded"),
-  .short  = c("unit term", "continue", "period of", "anniv", "unit period", "open")
+  .levels = c("term", "open", "cue", "maxdate", "none"),
+  .short  = c("term", "open", "cue", "maxdate", "none")
 )
 
 plot_register_levels(
-  .key    = "DateEngine",
-  .levels = c("lexnlp", "matcon", "pooled"),
-  .short  = c("lexnlp", "matcon", "pooled")
+  .key    = "StartSource",
+  .levels = c("signed", "filed"),
+  .short  = c("signed", "filed")
+)
+
+plot_register_levels(
+  .key    = "DurationDropped",
+  .levels = c("kept", "negative", "capped", "no end"),
+  .short  = c("kept", "negative", "capped", "no end")
 )
 
 plot_register_levels(
-  .key    = "DateSide",
-  .levels = c("before filing", "after filing", "same day"),
-  .short  = c("before", "after", "same")
-)
-
-plot_register_levels(
-  .key    = "NoFuture",
-  .levels = c("has future date", "term stated", "all before filing", "no dates"),
-  .short  = c("future", "term", "all past", "none")
+  .key    = "TermKind",
+  .levels = c("UnitTerm", "ContinueFor", "PeriodOf", "UnitPeriod", "Anniversary", "OpenEnded"),
+  .short  = c("unit term", "continue", "period of", "unit period", "anniv", "open")
 )
 
 
-# THE THREE VOCABULARIES THAT USED TO LIVE HERE ARE GONE. .dte_number, .dte_ordinal and
-# .dte_unit_years existed to turn "five (5) years" into 5 and "years" into 1.0, inside an R regex
-# that read the canonical text. dateregex-v3 does that in the extractor and emits TermN, TermUnit and
-# TermYears as columns, so the arithmetic happens once, in the language that owns the pattern, and
-# the corpus gets the same answer as the sample. What remains here is the cue list, which is a RULE:
-# it decides which future dates count as a termination and nothing upstream can decide that.
-
-
-# 2. Cues and terms ----------------------------------------------------------------------------------------------------
-# TWO SMALL VOCABULARIES AND A HIT RATE FOR EVERY ENTRY. Neither list is defended by argument: the
-# report prints how often each term fires and on what share of future dates, and a term that fires
-# everywhere without marking a termination is dropped from the list rather than explained.
+# 2. The one cue list ----------------------------------------------------------------------------------------------------
+# TEN TERMS AND A HIT RATE FOR EVERY ONE. The list is not defended by argument: the report prints how
+# often each term fires and on what share of future dates, and a term firing everywhere without
+# marking a termination is a term to drop rather than to explain.
 #
 # THROUGH and UNTIL are the entries under suspicion -- both are common enough to appear beside any
-# date at all -- and the per-term table is where that gets settled.
+# date at all -- and the per-term table is where that gets settled rather than asserted.
 
 .dte_end_cue <- c("EXPIR", "TERMINAT", "MATURIT", "UNTIL", "THROUGH", "SHALL END", "ENDS ON",
                   "ENDING", "TERM SHALL", "TERM OF THIS")
 
 
-# 3. Input -------------------------------------------------------------------------------------------------------------
+# 3. Input ---------------------------------------------------------------------------------------------------------------
 
 #' Build one duration specification
 #'
-#' @param .start Character. "latest" takes the latest date at or before the filing, wherever it sits;
-#'   "head" restricts that to the head of the document; "filed" is the published definition and the
-#'   reference row. LATEST rather than HEAD by default because an amendment citing a 1998 original
-#'   still signs itself later, and the latest pre-filing date finds that whether or not it sits in a
-#'   preamble.
-#' @param .end Character. "term" is the full cascade -- stated term, then dated termination, then the
-#'   farthest future date. "cue" drops the term arm; "any" is the published definition.
-#' @param .family Character. Which family's DATE spans the rule reads: "matcon", "lexnlp" or
-#'   "pooled". NOT A PREFERENCE BUT THE RIGHT-TAIL TEST. matcon's patterns require a year in the text
-#'   by construction; LexNLP's grammar does not, and 76% of its year-less spans resolve to the future
-#'   at a median of 11.6 years out. Sweeping this is how the referee's question about the right tail
-#'   gets an answer rather than an assurance. TERM spans always come from matcon, which is the only
-#'   family that emits them.
-#' @param .head_floor Integer. Head width in characters, used only when .start is "head".
-#' @param .head_share Numeric. Head share of document length, taken as max() with the floor.
-#' @param .tail_share Numeric. Tail share, reported in the region table and used by no rule.
-#' @param .cue_win Integer. Characters read before a date for the termination cue.
-#' @param .cap_years Numeric. Durations beyond this are DROPPED, not winsorised: a duration of
-#'   exactly the cap that is not one is worse than a missing value. Inf is the uncapped reference.
-#' @param .require_year Logical. Use only DATE spans whose text carries a four-digit year. Largely
-#'   the same axis as .family -- matcon enforces it upstream -- and kept separate because it applies
-#'   to LexNLP's spans, where the constraint does not exist.
-#' @param .term_kinds Character vector of LabelRaw values admitted as a stated term. These are the
-#'   ENGINE'S OWN pattern names, so the rule filters on provenance the extractor supplied rather than
-#'   on a distinction re-derived in R. UnitPeriod is excluded by default because a "thirty (30) day
-#'   period" is a notice, a cure or a payment window; OpenEnded is excluded here and handled as its
-#'   own outcome rather than as a term of no length.
-#' @param .term_floor Numeric. Shortest stated term admitted as a DURATION, in years. THE UNIT
-#'   REPLACES THE PATTERN as the demotion rule: the old code demoted "period of" because pooling it
-#'   with "term of" put 127 documents at thirty days, but the pattern was a proxy for what the number
-#'   and the unit say directly. Zero admits everything and is a swept row.
+#' TWO DIALS AND A CAP, DOWN FROM NINE. What went: the family and its pooled arm, because one engine
+#' is a decision rather than a parameter; RequireYear, because it guards a LexNLP failure mode that
+#' matcon cannot have; the head restriction on the start, because region separates the head from the
+#' middle and nothing else; the cue window, because the cue is a stored column; and TermKinds and
+#' TermFloor, both replaced by taking the longest stated period.
+#'
+#' @param .start Character, "latest" or "filed". LATEST is the latest date at or before the filing.
+#'   FILED uses the filing date for every contract, which is the published definition's start.
+#' @param .end Character, "term", "cue" or "any". TERM walks the full cascade. CUE skips the stated
+#'   term. ANY takes the farthest future date for every contract -- THE NAIVE BASELINE, and the
+#'   definition Table 3 was built with.
+#' @param .cap_years Numeric. Durations above this are DROPPED rather than winsorised, because a
+#'   duration of exactly the cap that is not one is worse than a missing value. Inf disables it.
 #' @param .label Character or NULL. Overrides the generated label.
 #' @return A named list carrying the specification.
-dte_spec <- function(.start = "latest", .end = "term", .family = "matcon",
-                     .head_floor = 3000L, .head_share = 0.10, .tail_share = 0.20,
-                     .cue_win = 120L, .cap_years = 30, .require_year = FALSE,
-                     .term_kinds = c("UnitTerm", "ContinueFor", "PeriodOf", "Anniversary"),
-                     .term_floor = 0, .label = NULL) {
+dte_spec <- function(.start = "latest", .end = "term", .cap_years = 30, .label = NULL) {
   if (FALSE) {
-    .start        <- "latest"
-    .end          <- "term"
-    .family       <- "matcon"
-    .head_floor   <- 3000L
-    .head_share   <- 0.10
-    .tail_share   <- 0.20
-    .cue_win      <- 120L
-    .cap_years    <- 30
-    .require_year <- FALSE
-    .term_kinds   <- c("UnitTerm", "ContinueFor", "PeriodOf", "Anniversary")
-    .term_floor   <- 0
-    .label        <- NULL
+    .start     <- "latest"
+    .end       <- "term"
+    .cap_years <- 30
+    .label     <- NULL
   }
 
-  if (!.start %in% c("latest", "head", "filed")) {
-    cli::cli_abort("{.arg .start} must be latest, head or filed.")
-  }
+  if (!.start %in% c("latest", "filed")) cli::cli_abort("{.arg .start} must be latest or filed.")
   if (!.end %in% c("term", "cue", "any")) cli::cli_abort("{.arg .end} must be term, cue or any.")
-  if (!.family %in% c("matcon", "lexnlp", "pooled")) {
-    cli::cli_abort("{.arg .family} must be matcon, lexnlp or pooled.")
-  }
 
-  lab_ <- if (!is.null(.label)) {
-    .label
-  } else {
-    paste0(.family, " / ", .start, " / ", .end, " / ",
-           if (is.infinite(.cap_years)) "uncapped" else paste0(.cap_years, "y"),
-           if (.require_year) " / year" else "",
-           if (.term_floor > 0) paste0(" / >", .term_floor, "y") else "")
-  }
-
-  list(Start = .start, End = .end, Family = .family,
-       HeadFloor = as.integer(.head_floor), HeadShare = .head_share,
-       TailShare = .tail_share, CueWin = as.integer(.cue_win), CapYears = .cap_years,
-       RequireYear = isTRUE(.require_year), TermKinds = .term_kinds, TermFloor = .term_floor,
-       Label = lab_)
+  list(
+    Start    = .start,
+    End      = .end,
+    CapYears = .cap_years,
+    Label    = if (!is.null(.label)) {
+      .label
+    } else {
+      paste0(.start, " / ", .end, " / ",
+             if (is.infinite(.cap_years)) "uncapped" else paste0(.cap_years, "y"))
+    }
+  )
 }
 
 
-#' Load the DATE spans from both families and keep the ones that parsed
+#' Load the DATE spans, and keep the ones that parsed
 #'
-#' Both families parse nearly everything they emit -- 99.2% and 99.6% -- so the unparsed remainder is
-#' a rounding error rather than a population. That is worth saying because the same is not true of
-#' spaCy, which the corpus pass does not run and which emits no date at all.
+#' matcon parses 99.6% of what it emits, so the unparsed remainder is a rounding error rather than a
+#' population. That is worth saying because the same is not true of every producer: spaCy emits no
+#' date at all, and LexNLP's grammar supplies a year from the clock where the text wrote none.
 #'
-#' NO CLUSTERING. Every span survives, because the cue has to be tested where the drafter wrote it
-#' and a collapsed row can only be tested once.
+#' NO CLUSTERING, AND THAT IS A CORRECTION. An earlier version collapsed each document to one row per
+#' calendar date, keeping the earliest occurrence. It bought nothing -- the duration is a max() and a
+#' min() over VALUES, which do not care how often a value appears -- and it created a defect: the
+#' termination cue was then tested at the EARLIEST occurrence, so "shall expire on December 31, 2020"
+#' was invisible whenever that date had already appeared in the preamble, which in a contract is the
+#' normal case.
+#'
+#' CueBefore ARRIVES WITH THE SPAN and is not selected away, which is what lets dte_describe() test
+#' the cue without opening a document.
 #'
 #' @param .dir_store Directory holding the family databases.
-#' @param .lens Tibble from ent_doc_lens().
-#' @param .families Character vector of family names.
-#' @param .quiet Logical. Suppress the count messages.
-#' @return Tibble: one row per span, with Combo and DateValue.
-dte_load <- function(.dir_store, .lens, .families = c("lexnlp", "matcon"), .quiet = FALSE) {
+#' @param .lens Tibble: DocID and DocLen.
+#' @param .family Character. The family supplying dates.
+#' @param .quiet Logical. Suppress the count message.
+#' @return Tibble: one row per span, with DateValue and CueBefore.
+dte_load <- function(.dir_store, .lens, .family = "matcon", .quiet = FALSE) {
   if (FALSE) {
     .dir_store <- .lP$Input$Store
     .lens      <- tab_lens
-    .families  <- .lP$Params$Families
+    .family    <- "matcon"
     .quiet     <- FALSE
   }
 
-  purrr::map(.families, \(.fam) ent_load_entity(
+  ent_load_entity(
     .dir_store = .dir_store,
-    .family    = .fam,
+    .family    = .family,
     .entity    = "DATE",
     .lens      = .lens,
-    .extras    = ent_extras(.fam, "DATE"),   # lexnlp adds DateScore; matcon has DateValue alone
+    .extras    = ent_extras(.family, "DATE"),   # DateValue, and the two cue columns
     .quiet     = .quiet
   ) |>
-    dplyr::mutate(Combo = .fam, .before = 1L)) |>
-    purrr::list_rbind() |>
     dplyr::mutate(
       DateValue = suppressWarnings(anytime::anydate(as.character(.data$DateValue))),
       Parsed    = !is.na(.data$DateValue)
@@ -268,31 +221,31 @@ dte_load <- function(.dir_store, .lens, .families = c("lexnlp", "matcon"), .quie
 }
 
 
-#' Load the TERM spans, and collapse them to one stated term per document
+#' Load the TERM spans, and take the longest one per contract
 #'
-#' REPLACES dte_term(), WHICH READ THE TEXT. That function ran its own regex over the canonical text
-#' in R, which worked on 4,398 documents and could never work on 1.19 million: 04C writes no corpus
-#' text file, because the text is one parquet per document in the mirror. dateregex-v3 emits TERM
-#' from the same pass that produces DATE, so a term now arrives in the store with offsets, a parsed
-#' number, a unit and the name of the pattern that found it.
+#' THE EXTRACTOR STATES, THE RULE DECIDES. dateregex emits every stated period it can find and
+#' records which pattern found it. This file chooses which of them is the contract's duration.
 #'
-#' MATCON ONLY, because it is the only family that emits a term at all. LexNLP has no such label.
+#' THE LONGEST WINS, AND THAT IS THE WHOLE RULE. A contract states a cure period, a warranty period
+#' and a term, all three written "period of N units" and all three matching the same pattern; the
+#' longest of them is the one the contract lasts for. Precedence by pattern cannot separate them
+#' because the drafter used the same words, and precedence by position releases the cure period.
 #'
-#' PRECEDENCE, NOT UNION. A document saying "term of three years" and "period of thirty days" has
-#' said one thing about its duration and one thing about its notice, and the first is the answer. The
-#' order is the registered TermKind vocabulary; within one kind the FIRST match wins, since the term
-#' clause precedes the schedules that restate parts of it.
+#' NO FLOOR, AND THAT IS DELIBERATE. A minimum length would also work on that example, and it has two
+#' costs the longest does not: a number to defend, and the deletion of a genuine three-month
+#' agreement's only stated term. A selection cannot delete anything.
 #'
-#' OpenEnded IS KEPT AND MARKED. "shall continue until terminated" carries a null TermYears, which is
-#' a stated term of unknown length rather than an absent one. Excluding it here would send the
-#' document to the farthest-future-date arm, which is the wrong answer for the one drafting form that
-#' says the contract will not end.
+#' OPEN-ENDED IS CARRIED SEPARATELY. "shall continue until terminated" has a null TermYears, so it
+#' can never be the longest and would vanish; it is a stated term of UNKNOWN length rather than an
+#' absent one, and dte_duration() gives it its own rung.
+#'
+#' NTerms IS REPORTED because the risk lives entirely in contracts stating more than one period. A
+#' contract stating one is unambiguous whatever rule picks it.
 #'
 #' @param .dir_store Directory holding the family databases.
-#' @param .lens Tibble from ent_doc_lens().
+#' @param .lens Tibble: DocID and DocLen.
 #' @param .quiet Logical. Suppress the count message.
-#' @return Tibble: one row per document stating a term, with the kind, the number, the unit, the
-#'   years and the position. Documents stating none are absent.
+#' @return Tibble: one row per document stating a term, with the longest and the first by position.
 dte_load_terms <- function(.dir_store, .lens, .quiet = FALSE) {
   if (FALSE) {
     .dir_store <- .lP$Input$Store
@@ -302,10 +255,10 @@ dte_load_terms <- function(.dir_store, .lens, .quiet = FALSE) {
 
   raw_ <- ent_load_entity(
     .dir_store = .dir_store,
-    .family    = "matcon",
+    .family    = "matcon",                      # the only family emitting a term at all
     .entity    = "TERM",
     .lens      = .lens,
-    .extras    = ent_extras("matcon", "TERM"),   # TermN, TermUnit, TermYears
+    .extras    = ent_extras("matcon", "TERM"),  # TermN, TermUnit, TermYears
     .quiet     = .quiet
   ) |>
     dplyr::mutate(
@@ -315,66 +268,102 @@ dte_load_terms <- function(.dir_store, .lens, .quiet = FALSE) {
       IsOpen    = .data$TermKind == "OpenEnded"
     )
 
-  rank_ <- stats::setNames(seq_along(plot_levels("TermKind")), plot_levels("TermKind"))
-  bad_  <- setdiff(unique(raw_$TermKind), names(rank_))
+  bad_ <- setdiff(unique(raw_$TermKind), plot_levels("TermKind"))
   if (length(bad_) > 0L) {
     cli::cli_abort(c(
       "dateregex emits {length(bad_)} TERM pattern{?s} the vocabulary does not name: \\
        {paste(bad_, collapse = ', ')}.",
-      "i" = "Register {length(bad_)} name{?s} in TermKind, so the precedence order says what to do."
+      "i" = "Register {length(bad_)} name{?s} in TermKind so every table can order them."
     ))
   }
 
-  out_ <- raw_ |>
-    dplyr::mutate(KindRank = unname(rank_[.data$TermKind])) |>
-    dplyr::arrange(.data$DocID, .data$KindRank, .data$Start) |>
+  open_ <- raw_ |>
+    dplyr::filter(.data$IsOpen) |>
+    dplyr::summarise(OpenKind = dplyr::first(.data$TermKind), .by = DocID)
+
+  closed_ <- dplyr::filter(raw_, !.data$IsOpen, !is.na(.data$TermYears))
+
+  # THE LONGEST, and the FIRST BY POSITION beside it. The second is not used by the rule; it is what
+  # the comparison in Selection is measured against, and computing it here means the two answers come
+  # from one pass over one table rather than from two that could diverge.
+  long_ <- closed_ |>
+    dplyr::arrange(.data$DocID, dplyr::desc(.data$TermYears), .data$Start) |>
     dplyr::slice_head(n = 1L, by = DocID) |>
-    dplyr::select("DocID", "TermKind", "TermN", "TermUnit", "TermYears", "IsOpen",
-                  TermStart = "Start", TermStop = "Stop", TermSpan = "Span")
+    dplyr::select("DocID", "TermKind", "TermN", "TermUnit", "TermYears",
+                  TermStart = "Start", TermSpan = "Span")
 
-  n_ <- raw_ |>
-    dplyr::summarise(NTermSpan = dplyr::n(), NTermKind = dplyr::n_distinct(.data$TermKind),
-                     .by = DocID)
+  first_ <- closed_ |>
+    dplyr::arrange(.data$DocID, .data$Start) |>
+    dplyr::slice_head(n = 1L, by = DocID) |>
+    dplyr::select("DocID", FirstYears = "TermYears", FirstKind = "TermKind")
 
-  out_ <- dplyr::left_join(out_, n_, by = dplyr::join_by(DocID))
+  seen_ <- closed_ |>
+    dplyr::summarise(
+      NTerms   = dplyr::n(),
+      MaxYears = max(.data$TermYears),
+      MinYears = min(.data$TermYears),
+      .by = DocID
+    )
+
+  out_ <- long_ |>
+    dplyr::left_join(first_, by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(seen_,  by = dplyr::join_by(DocID)) |>
+    dplyr::full_join(open_,  by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(
+      NTerms   = as.integer(dplyr::coalesce(.data$NTerms, 0L)),
+      IsOpen   = !is.na(.data$OpenKind),
+      Disagree = !is.na(.data$TermYears) & !is.na(.data$FirstYears) &
+                 .data$TermYears != .data$FirstYears
+    )
 
   if (!.quiet) {
     cli::cli_alert_success(
       "Stated term in {format(nrow(out_), big.mark = ',')} \\
        {cli::qty(nrow(out_))}document{?s}, from {format(nrow(raw_), big.mark = ',')} \\
        {cli::qty(nrow(raw_))}span{?s}. {format(sum(out_$IsOpen), big.mark = ',')} \\
-       {cli::qty(sum(out_$IsOpen))}{?is/are} open-ended."
+       {cli::qty(sum(out_$IsOpen))}{?is/are} open-ended, and \\
+       {format(sum(out_$Disagree), big.mark = ',')} \\
+       {cli::qty(sum(out_$Disagree))}state{?s} a longer period than the first one written."
     )
   }
   out_
 }
 
 
-#' Region, gap to the filing date, and the termination cue -- per span
+# 4. Description ---------------------------------------------------------------------------------------------------------
+
+#' The gap to the filing date, and the termination cue -- per span
 #'
-#' The cue is read in the characters BEFORE the span, because a clause states the event and then the
-#' date: "shall expire on December 31, 2020". At span level rather than after a collapse, so a date
-#' written twice is tested twice and the one beside the clause counts.
+#' THE CUE IS A COLUMN READ, AND IT USED TO BE A TEXT READ. This function opened 04A's canonical text
+#' and cut 120 characters before every date; CueBefore carries 160 raw characters stored at
+#' extraction, where the document and the offsets were already in one scope. The window is narrowed
+#' here rather than at extraction so that refining the cue list never means re-extracting.
 #'
-#' Region is carried for the report and for the swept head restriction on the start. No end rule
-#' reads it: the head is 72.8% pre-filing and the tail 73.0%, so region separates the head from the
-#' middle and nothing else.
+#' AT SPAN LEVEL RATHER THAN AFTER A COLLAPSE, because a clause states the event and then the date --
+#' "shall expire on December 31, 2020" -- and a date written twice must be tested at the occurrence
+#' beside the clause rather than at the first one in the document.
+#'
+#' NORMALISED HERE, NOT IN PYTHON. The column is stored raw so that normalisation stays in R where
+#' the matching lives, which makes the comparison exact by construction rather than a test of whether
+#' Python's upper() and stringi's agree.
 #'
 #' @param .dates Tibble from dte_load(), parsed rows only.
 #' @param .keys Tibble from ent_anchor_keys(). Supplies DateFiled.
-#' @param .path_text 04A's canonical text parquet.
-#' @param .spec List from dte_spec().
-#' @return .dates with Region, GapDays, Side, Before and HasEndCue added.
-dte_describe <- function(.dates, .keys, .path_text, .spec) {
+#' @param .win Integer. Characters of the stored cue window this rule reads.
+#' @return .dates with GapDays, Side, Before and HasEndCue added.
+dte_describe <- function(.dates, .keys, .win = 120L) {
   if (FALSE) {
-    .dates     <- tab_parsed
-    .keys      <- tab_keys
-    .path_text <- .lP$Input$Text
-    .spec      <- .lP$Params$Spec
+    .dates <- tab_parsed
+    .keys  <- tab_keys
+    .win   <- 120L
   }
 
-  txt_ <- arrow::read_parquet(.path_text)
-  src_ <- txt_$TextRaw[match(.dates$DocID, txt_$DocID)]
+  if (!"CueBefore" %in% names(.dates)) {
+    cli::cli_abort(c(
+      "The DATE spans carry no CueBefore, so the termination cue cannot be tested.",
+      "i" = "matcon stores it at extraction; a store written before that change has to be rebuilt."
+    ))
+  }
 
   hit_ <- function(.txt, .terms) {
     Reduce(`|`, lapply(.terms, function(.t) stringi::stri_detect_fixed(.txt, .t)))
@@ -383,50 +372,47 @@ dte_describe <- function(.dates, .keys, .path_text, .spec) {
   .dates |>
     dplyr::left_join(dplyr::select(.keys, DocID, DateFiled), by = dplyr::join_by(DocID)) |>
     dplyr::mutate(
-      HeadEnd   = pmax(.spec$HeadFloor, .spec$HeadShare * .data$DocLen),
-      TailStart = .data$DocLen - .spec$TailShare * .data$DocLen,
-      Region    = dplyr::case_when(
-        .data$Start <  .data$HeadEnd   ~ "head",
-        .data$Start >= .data$TailStart ~ "tail",
-        TRUE                           ~ "middle"
-      ),
       GapDays = as.integer(.data$DateValue - .data$DateFiled),
       Side    = dplyr::case_when(
         is.na(.data$GapDays) ~ NA_character_,
         .data$GapDays < 0L   ~ "before filing",
         .data$GapDays > 0L   ~ "after filing",
-        TRUE                 ~ "same day"
+        .default             = "same day"
       ),
+      # The last .win characters of the stored window, uppercased and collapsed. stri_sub with a
+      # negative from() counts back from the end, which is what makes this the characters NEAREST
+      # the span rather than the start of the stored window.
       Before = stringi::stri_trans_toupper(
         stringi::stri_replace_all_regex(
-          stringi::stri_sub(src_, from = pmax(1L, .data$Start + 1L - .spec$CueWin),
-                            to = .data$Start),
-          "\\s+", " "
+          stringi::stri_sub(dplyr::coalesce(.data$CueBefore, ""), from = -.win), "\\s+", " "
         )
       ),
-      HasEndCue = hit_(.data$Before, .dte_end_cue),
-      # A SPAN WITH NO FOUR-DIGIT YEAR HAD ITS YEAR INFERRED, and the parser infers the present one.
-      # That is where the tail comes from: "Section 3-1" parsed to 2026-03-01, "Exhibit 10-15" to
-      # 2026-10-15, "10-35 Second" to 2035-10-01. All of them are section and exhibit references, and
-      # none is a date the contract wrote. The guard is upstream of these rules in the extractor;
-      # this column is what makes the damage countable and optionally removable.
-      HasYear = stringi::stri_detect_regex(.data$Span, "\\d{4}")
+      HasEndCue = hit_(.data$Before, .dte_end_cue)
     )
 }
 
 
-# 5. The duration ------------------------------------------------------------------------------------------------------
+# 5. The duration --------------------------------------------------------------------------------------------------------
 
 #' One start, one end and a duration per document
 #'
-#' THE START is the latest date at or before the filing -- optionally restricted to the head, which
-#' is a swept row. An amendment citing a 1998 original still signs itself later, and the latest
-#' pre-filing date finds that wherever it sits.
+#' RUNS FROM THE KEY SIDE, so a document in which matcon found no date at all still carries a row and
+#' enters every average as a missing value rather than disappearing from the denominator.
 #'
-#' THE END cascades: a stated term added to the start, then the farthest future date carrying a
-#' termination cue, then the farthest future date. DurationSource says which, because they are three
-#' different kinds of evidence and pooling them would hide that the third is a maximum over an
-#' unfiltered set.
+#' THE FOUR RUNGS ARE FOUR KINDS OF EVIDENCE, not four attempts at one thing. A stated term is what
+#' the contract SAYS about itself. An open-ended clause says it will not end, which is a finding
+#' rather than a gap. A cued date is a reading of the words beside a date. The farthest future date
+#' is a maximum over dates the contract mentions for reasons it never states, and it is the naive
+#' definition kept as the last rung so that coverage does not fall to nothing.
+#'
+#' AN OPEN-ENDED TERM OUTRANKS THE FARTHEST FUTURE DATE AND NOT A STATED ONE. A document saying both
+#' "five year term" and "shall continue until terminated" has stated a length, and the length is the
+#' answer; a document saying only the second has stated that it HAS no length, which is a different
+#' thing from having said nothing.
+#'
+#' THE NAIVE DURATION IS COMPUTED FOR EVERY DOCUMENT whatever the specification asks for, because it
+#' is the comparison every table is read against and deriving it later from the released columns is
+#' impossible: the farthest future date is not among them.
 #'
 #' @param .dates Tibble from dte_describe().
 #' @param .terms Tibble from dte_load_terms().
@@ -441,40 +427,10 @@ dte_duration <- function(.dates, .terms, .keys, .spec) {
     .spec  <- .lP$Params$Spec
   }
 
-  # THE FAMILY FILTER IS THE FIRST THING APPLIED, because every quantity below is computed over the
-  # spans it leaves. "pooled" is both families stacked, which is the published shape.
-  src_ <- if (identical(.spec$Family, "pooled")) {
-    .dates
-  } else {
-    dplyr::filter(.dates, .data$Combo == .spec$Family)
-  }
+  src_ <- dplyr::filter(.dates, .data$Parsed)
 
-  # The year guard applies to every date this rule reads, start and end alike: a span whose year the
-  # parser inferred is no more trustworthy as a signing date than as an expiry. It is nearly a no-op
-  # under Family = "matcon", whose patterns require a year in the text, and is the point of the
-  # argument under "lexnlp", whose grammar does not.
-  if (isTRUE(.spec$RequireYear)) src_ <- dplyr::filter(src_, .data$HasYear)
-
-  # TWO DIALS ON THE TERM, and they are different questions. TermKinds asks which PATTERNS state a
-  # duration; TermFloor asks how long a stated period has to be before it is one. An open-ended term
-  # passes neither and is carried separately, because it is an outcome rather than a value.
-  open_ <- dplyr::filter(.terms, .data$IsOpen) |>
-    dplyr::select("DocID", OpenKind = "TermKind")
-
-  terms_ <- .terms |>
-    dplyr::filter(
-      .data$TermKind %in% .spec$TermKinds,
-      !.data$IsOpen,
-      !is.na(.data$TermYears),
-      .data$TermYears >= .spec$TermFloor
-    ) |>
-    dplyr::select("DocID", "TermYears", "TermKind")
-
-  past_ <- src_ |>
-    dplyr::filter(!is.na(.data$GapDays), .data$GapDays <= 0L)
-  if (identical(.spec$Start, "head")) past_ <- dplyr::filter(past_, .data$Region == "head")
-
-  signed_ <- past_ |>
+  signed_ <- src_ |>
+    dplyr::filter(!is.na(.data$GapDays), .data$GapDays <= 0L) |>
     dplyr::slice_max(order_by = .data$GapDays, n = 1L, by = DocID, with_ties = FALSE) |>
     dplyr::select(DocID, DateSigned = DateValue)
 
@@ -491,10 +447,9 @@ dte_duration <- function(.dates, .terms, .keys, .spec) {
 
   seen_ <- src_ |>
     dplyr::summarise(
-      NSpans   = dplyr::n(),
-      NDates   = dplyr::n_distinct(.data$DateValue),
-      NFuture  = dplyr::n_distinct(.data$DateValue[.data$GapDays > 0L]),
-      NCued    = dplyr::n_distinct(.data$DateValue[.data$HasEndCue & .data$GapDays > 0L]),
+      NDates  = dplyr::n_distinct(.data$DateValue),
+      NFuture = dplyr::n_distinct(.data$DateValue[.data$GapDays > 0L]),
+      NCued   = dplyr::n_distinct(.data$DateValue[.data$HasEndCue & .data$GapDays > 0L]),
       .by = DocID
     )
 
@@ -504,11 +459,16 @@ dte_duration <- function(.dates, .terms, .keys, .spec) {
     dplyr::left_join(signed_,  by = dplyr::join_by(DocID)) |>
     dplyr::left_join(end_any_, by = dplyr::join_by(DocID)) |>
     dplyr::left_join(end_cue_, by = dplyr::join_by(DocID)) |>
-    dplyr::left_join(terms_,   by = dplyr::join_by(DocID)) |>
-    dplyr::left_join(open_,    by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(
+      dplyr::select(.terms, DocID, TermKind, TermYears, TermN, TermUnit, NTerms, IsOpen,
+                    OpenKind, FirstYears, Disagree),
+      by = dplyr::join_by(DocID)
+    ) |>
     dplyr::mutate(
-      dplyr::across(c(NSpans, NDates, NFuture, NCued),
+      dplyr::across(c(NDates, NFuture, NCued, NTerms),
                     \(.x) as.integer(dplyr::coalesce(.x, 0L))),
+      IsOpen    = dplyr::coalesce(.data$IsOpen, FALSE),
+      Disagree  = dplyr::coalesce(.data$Disagree, FALSE),
       DateStart = if (identical(.spec$Start, "filed")) {
         .data$DateFiled
       } else {
@@ -519,16 +479,12 @@ dte_duration <- function(.dates, .terms, .keys, .spec) {
         !is.na(.data$DateSigned)        ~ "signed",
         .default                        = "filed"
       ),
-      UseTerm = identical(.spec$End, "term") & !is.na(.data$TermYears),
-      # AN OPEN-ENDED TERM OUTRANKS THE FARTHEST FUTURE DATE AND NOT A STATED ONE. A document saying
-      # both "five year term" and "shall continue until terminated" has stated a length, and the
-      # length is the answer; a document saying only the second has stated that it has no length,
-      # which is a different thing from having said nothing.
-      IsOpenEnd = !.data$UseTerm & identical(.spec$End, "term") & !is.na(.data$OpenKind),
-      UseCue  = !.data$UseTerm & !.data$IsOpenEnd & .spec$End %in% c("term", "cue") &
-                !is.na(.data$EndCue),
-      EndTerm = .data$DateStart + round(.data$TermYears * 365.25),
-      DateEnd = dplyr::case_when(
+      UseTerm   = identical(.spec$End, "term") & !is.na(.data$TermYears),
+      IsOpenEnd = !.data$UseTerm & identical(.spec$End, "term") & .data$IsOpen,
+      UseCue    = !.data$UseTerm & !.data$IsOpenEnd & .spec$End %in% c("term", "cue") &
+                  !is.na(.data$EndCue),
+      EndTerm   = .data$DateStart + round(.data$TermYears * 365.25),
+      DateEnd   = dplyr::case_when(
         .data$UseTerm   ~ .data$EndTerm,
         .data$IsOpenEnd ~ lubridate::NA_Date_,
         .data$UseCue    ~ .data$EndCue,
@@ -544,28 +500,98 @@ dte_duration <- function(.dates, .terms, .keys, .spec) {
       # A stated term that REPLACED a future date the document also carried, rather than filling a
       # gap. Defensible -- a term is what the contract says about itself -- but it is a large silent
       # substitution and this is what makes it countable.
-      TermOverrode = .data$UseTerm & !is.na(.data$EndAny),
-      # And the reverse: a document with NO future date whose only statement about its end is the
-      # stated term. These are the documents the published maxdate definition gets most wrong,
-      # because for them it has nothing to take a maximum over.
+      TermOverrode  = .data$UseTerm & !is.na(.data$EndAny),
       TermFilledGap = .data$UseTerm & is.na(.data$EndAny),
-      RawYears = as.numeric(.data$DateEnd - .data$DateStart) / 365.25,
-      IsCapped = !is.na(.data$RawYears) & .data$RawYears > .spec$CapYears,
-      IsNeg    = !is.na(.data$RawYears) & .data$RawYears < 0,
-      # DROPPED, not winsorised. A duration of exactly the cap that is not one is worse than missing.
+      RawYears      = as.numeric(.data$DateEnd - .data$DateStart) / 365.25,
+      NaiveYears    = as.numeric(.data$EndAny - .data$DateStart) / 365.25,
+      IsNeg         = !is.na(.data$RawYears) & .data$RawYears < 0,
+      IsCapped      = !is.na(.data$RawYears) & .data$RawYears > .spec$CapYears,
+      # DROPPED, not winsorised, and the reason is recorded. A duration of exactly the cap that is
+      # not one is worse than a missing value, and a missing value nobody can explain is worse again.
       DurationYears = dplyr::if_else(
         !is.na(.data$RawYears) & !.data$IsNeg & !.data$IsCapped, .data$RawYears, NA_real_
       ),
-      DurationDays = as.integer(round(.data$DurationYears * 365.25))
+      DurationDropped = dplyr::case_when(
+        !is.na(.data$DurationYears) ~ "kept",
+        .data$IsNeg                 ~ "negative",
+        .data$IsCapped              ~ "capped",
+        .default                    = "no end"
+      )
     )
 }
 
 
+#' The release: one row per contract
+#'
+#' A DURATION BELONGS TO A CONTRACT AND TO NO PARTY IN IT, so this is its own file rather than four
+#' more columns on 04B2's. That is not the two-file problem ORG removed: the counts in that second
+#' file were DERIVED from the first and could contradict it, while a duration is an independent
+#' measurement that nothing else computes. Joining is one key.
+#'
+#' NaiveYears IS RELEASED, and it is the definition this document argues against. Without it the
+#' comparison every table makes cannot be reproduced from the file -- the farthest future date is not
+#' among the released columns, so a reader could not recompute it. Publishing the baseline beside the
+#' rule is the same discipline that keeps the excluded parties in 04B1's file.
+#'
+#' EVERY DOCUMENT GETS A ROW, including the ones matcon found no date in. They carry a missing
+#' duration and DurationSource "none", so a mean over the file divides by the sample rather than by
+#' the documents that worked.
+#'
+#' @param .dur Tibble from dte_duration().
+#' @return Tibble: one row per contract, sixteen columns.
+dte_release <- function(.dur) {
+  if (FALSE) .dur <- tab_dur
+
+  .dur |>
+    dplyr::transmute(
+      .data$DocID, .data$Class, .data$AmendType,
+      DateFiled       = .data$DateFiled,
+      DateStart       = .data$DateStart,
+      StartSource     = .data$StartSource,
+      DateEnd         = .data$DateEnd,
+      DurationSource  = .data$DurationSource,
+      DurationYears   = .data$DurationYears,
+      DurationDropped = .data$DurationDropped,
+      NaiveYears      = .data$NaiveYears,
+      TermYears       = .data$TermYears,
+      TermKind        = .data$TermKind,
+      NTerms          = .data$NTerms,
+      NDates          = .data$NDates,
+      NFuture         = .data$NFuture
+    ) |>
+    dplyr::arrange(.data$DocID)
+}
+
+
+#' Apply one specification end to end
+#'
+#' @param .dates Tibble from dte_describe().
+#' @param .terms Tibble from dte_load_terms().
+#' @param .keys Tibble from ent_anchor_keys().
+#' @param .spec List from dte_spec().
+#' @return A list: Spec, Duration, Release.
+dte_apply <- function(.dates, .terms, .keys, .spec) {
+  if (FALSE) {
+    .dates <- tab_desc
+    .terms <- tab_terms
+    .keys  <- tab_keys
+    .spec  <- .lP$Params$Spec
+  }
+
+  dur_ <- dte_duration(.dates = .dates, .terms = .terms, .keys = .keys, .spec = .spec)
+  list(Spec = .spec, Duration = dur_, Release = dte_release(.dur = dur_))
+}
+
+
+# 6. Evidence ------------------------------------------------------------------------------------------------------------
+
 #' Reduce one specification to a comparable row
 #'
-#' SdOverCap IS THE DIAGNOSTIC. On non-negative support under a correctly applied cap the standard
-#' deviation cannot exceed half the cap. Table 3 Panel B reports 40.78 against a stated cap of 30, a
-#' ratio of 1.36, which no distribution on [0, 30] can produce.
+#' SdOverCap IS THE DIAGNOSTIC THIS DOCUMENT WAS BUILT AROUND. On non-negative support under a
+#' correctly applied cap the standard deviation cannot exceed half the cap. Table 3 Panel B reports
+#' 40.78 against a stated cap of 30, a ratio of 1.36, which no distribution on [0, 30] can produce --
+#' so the cap was not applied to what was tabulated, or something was in the wrong unit. Every row
+#' below carries the ratio, and it cannot exceed one half.
 #'
 #' @param .dur Tibble from dte_duration().
 #' @param .spec List from dte_spec().
@@ -576,552 +602,722 @@ dte_row <- function(.dur, .spec) {
     .spec <- .lP$Params$Spec
   }
 
-  d_ <- .dur$DurationYears[!is.na(.dur$DurationYears)]
+  kept_ <- .dur$DurationYears[!is.na(.dur$DurationYears)]
 
   tibble::tibble(
-    Spec       = .spec$Label,
-    Family     = .spec$Family,
-    Start      = .spec$Start,
-    End        = .spec$End,
-    Cap        = .spec$CapYears,
-    PctWithEnd = mean(!is.na(.dur$DateEnd)),
-    PctTerm    = mean(.dur$DurationSource == "term"),
-    PctCue     = mean(.dur$DurationSource == "cue"),
-    PctMaxDate = mean(.dur$DurationSource == "maxdate"),
-    PctOpen    = mean(.dur$DurationSource == "open"),
-    PctOverride = mean(.dur$TermOverrode, na.rm = TRUE),
-    PctFilledGap = mean(.dur$TermFilledGap, na.rm = TRUE),
-    PctCapped  = mean(.dur$IsCapped, na.rm = TRUE),
-    PctNeg     = mean(.dur$IsNeg, na.rm = TRUE),
-    N          = length(d_),
-    Mean       = if (length(d_) == 0L) NA_real_ else mean(d_),
-    Median     = if (length(d_) == 0L) NA_real_ else stats::median(d_),
-    P25        = if (length(d_) == 0L) NA_real_ else unname(stats::quantile(d_, 0.25)),
-    P75        = if (length(d_) == 0L) NA_real_ else unname(stats::quantile(d_, 0.75)),
-    Sd         = if (length(d_) < 2L) NA_real_ else stats::sd(d_),
-    SdOverCap  = if (length(d_) < 2L || is.infinite(.spec$CapYears)) {
+    Spec      = .spec$Label,
+    Start     = .spec$Start,
+    End       = .spec$End,
+    Cap       = .spec$CapYears,
+    Docs      = nrow(.dur),
+    PctKept   = mean(!is.na(.dur$DurationYears)),
+    PctTerm   = mean(.dur$DurationSource == "term"),
+    PctMax    = mean(.dur$DurationSource == "maxdate"),
+    Mean      = .dte_stat_or_na(.x = kept_, .f = mean),
+    Median    = .dte_stat_or_na(.x = kept_, .f = stats::median),
+    Sd        = .dte_stat_or_na(.x = kept_, .f = stats::sd),
+    SdOverCap = if (is.infinite(.spec$CapYears) || length(kept_) < 2L) {
       NA_real_
     } else {
-      stats::sd(d_) / .spec$CapYears
+      stats::sd(kept_) / .spec$CapYears
     }
   )
 }
 
 
-#' Sweep the specifications over ONE description
+#' Every specification, over one set of dates and terms
 #'
-#' THE DESCRIPTION IS COMPUTED ONCE, and that is the whole of the performance story. An earlier
-#' version called it per specification: eight reads of the canonical text and eight passes of the cue
-#' search over 102,005 spans, to produce eight IDENTICAL tables, because no specification differs in
-#' any field the description reads. Six minutes became the cost of computing the same thing eight
-#' times.
+#' THE NAIVE BASELINE IS A ROW HERE, not a separate computation: "filed / any / uncapped" is the
+#' published definition exactly, and "latest / any" is the same maximum measured from this document's
+#' start. The rule is the row that walks the full cascade.
 #'
-#' The fields that would break that are asserted rather than assumed, so a specification varying the
-#' cue window or the region bounds fails loudly here instead of silently reusing the wrong
-#' description.
-#'
-#' @param .desc Tibble from dte_describe().
+#' @param .dates Tibble from dte_describe().
 #' @param .terms Tibble from dte_load_terms().
 #' @param .keys Tibble from ent_anchor_keys().
-#' @param .specs List of lists from dte_spec().
+#' @param .specs List of specifications.
 #' @param .quiet Logical. Suppress the progress bar.
 #' @return Tibble: one row per specification.
-dte_sweep <- function(.desc, .terms, .keys, .specs, .quiet = FALSE) {
+dte_sweep <- function(.dates, .terms, .keys, .specs, .quiet = FALSE) {
   if (FALSE) {
-    .desc  <- tab_desc
+    .dates <- tab_desc
     .terms <- tab_terms
     .keys  <- tab_keys
     .specs <- .lP$Params$Specs
     .quiet <- FALSE
   }
 
-  fixed_ <- c("HeadFloor", "HeadShare", "TailShare", "CueWin")
-  seen_  <- unique(purrr::map_chr(.specs, function(.s) paste(unlist(.s[fixed_]), collapse = "|")))
-  if (length(seen_) > 1L) {
-    cli::cli_abort(
-      "Specifications differ in {.field {fixed_}}, which the shared description already fixed. \
-       Recompute dte_describe() per specification, or hold those fields constant."
-    )
-  }
-
   purrr::map(.specs, function(.s) {
-    dte_row(
-      .dur  = dte_duration(.dates = .desc, .terms = .terms, .keys = .keys, .spec = .s),
-      .spec = .s
-    )
+    dte_row(.dur = dte_duration(.dates = .dates, .terms = .terms, .keys = .keys, .spec = .s),
+            .spec = .s)
   }, .progress = !.quiet) |>
     purrr::list_rbind()
 }
 
 
-# 6. Description -------------------------------------------------------------------------------------------------------
-
-#' How often each cue term fires, and on what
+#' A statistic, or missing where there is nothing to compute it over
 #'
-#' THE LIST IS NOT DEFENDED BY ARGUMENT. A term that appears beside a large share of ALL dates
-#' without marking a termination is a word the language uses for other things -- THROUGH and UNTIL
-#' are the two under suspicion -- and this table is where that is settled. PctFuture is the
-#' discriminating column: a real termination cue sits beside a future date far more often than
-#' chance.
+#' @param .x Numeric vector, possibly empty.
+#' @param .f Function taking a numeric vector.
+#' @return The statistic, or NA_real_ where .x is too short.
+.dte_stat_or_na <- function(.x, .f) {
+  if (FALSE) {
+    .x <- numeric(0)
+    .f <- mean
+  }
+  if (length(.x) < 2L) NA_real_ else .f(.x)
+}
+
+
+#' How often each termination cue fires, and on what
+#'
+#' THE CUE LIST IS NOT DEFENDED BY ARGUMENT. A term firing beside a large share of ALL future dates
+#' is not marking terminations, it is marking dates -- and THROUGH and UNTIL are the two entries under
+#' suspicion, because both are common enough to sit beside anything. PctOfCued against PctOfFuture is
+#' what separates a cue from a common word: a useful term is high on the first and low on the second.
 #'
 #' @param .dates Tibble from dte_describe().
 #' @return Tibble: one row per cue term.
 dte_cue_hits <- function(.dates) {
   if (FALSE) .dates <- tab_desc
 
-  base_ <- mean(.dates$GapDays > 0L, na.rm = TRUE)
+  fut_  <- dplyr::filter(.dates, .data$Parsed, !is.na(.data$GapDays), .data$GapDays > 0L)
+  cued_ <- sum(fut_$HasEndCue)
 
   purrr::map(.dte_end_cue, function(.t) {
-    hit_ <- stringi::stri_detect_fixed(.dates$Before, .t)
+    hit_ <- stringi::stri_detect_fixed(fut_$Before, .t)
     tibble::tibble(
-      Cue       = .t,
-      Spans     = sum(hit_),
-      PctOfAll  = mean(hit_),
-      PctFuture = mean(.dates$GapDays[hit_] > 0L, na.rm = TRUE),
-      Lift      = mean(.dates$GapDays[hit_] > 0L, na.rm = TRUE) / base_
+      Cue         = .t,
+      Spans       = sum(hit_),
+      Docs        = dplyr::n_distinct(fut_$DocID[hit_]),
+      PctOfFuture = .dte_share_or_na(.x = hit_),
+      PctOfCued   = if (cued_ == 0L) NA_real_ else sum(hit_) / cued_
     )
   }) |>
     purrr::list_rbind() |>
-    dplyr::arrange(dplyr::desc(.data$Lift))
+    dplyr::arrange(dplyr::desc(.data$Spans))
 }
 
 
-#' Why a document has no future date
+#' A share, or missing where there is nothing to take a share of
 #'
-#' NOT A COVERAGE GAP UNTIL IT IS NAMED. A contract stating "for a period of five years" has said
-#' exactly when it ends and named no date to say it with, so counting it as missing would report a
-#' drafting convention as an extraction failure.
+#' @param .x Logical vector, possibly empty.
+#' @return The mean, or NA_real_ where .x is empty.
+.dte_share_or_na <- function(.x) {
+  if (FALSE) .x <- logical(0)
+  if (length(.x) == 0L) NA_real_ else mean(.x)
+}
+
+
+#' The longest stated term against the first one written
+#'
+#' THE ONE TRADE THIS DOCUMENT MAKES, MEASURED. Taking the longest releases the contract's duration
+#' where a cure period was written first; it releases a survival clause where one outlasts the term.
+#' Neither can be settled by a count, so this reports how often the two rules disagree and by how
+#' much, and the reading block beside it is what says which answer was right.
+#'
+#' @param .terms Tibble from dte_load_terms().
+#' @return Tibble: one row per outcome.
+dte_term_compare <- function(.terms) {
+  if (FALSE) .terms <- tab_terms
+
+  src_ <- dplyr::filter(.terms, !is.na(.data$TermYears), !is.na(.data$FirstYears))
+
+  tibble::tibble(
+    Item = c("Documents stating a closed term",
+             "Stating exactly one",
+             "Stating more than one",
+             "Where the longest is not the first written",
+             "Of those, the first was under a year",
+             "Of those, the longest is over five years"),
+    N    = c(nrow(src_),
+             sum(src_$NTerms == 1L),
+             sum(src_$NTerms > 1L),
+             sum(src_$Disagree),
+             sum(src_$Disagree & src_$FirstYears < 1),
+             sum(src_$Disagree & src_$TermYears > 5))
+  ) |>
+    dplyr::mutate(Share = .data$N / pmax(nrow(src_), 1L))
+}
+
+
+# 7. Tables --------------------------------------------------------------------------------------------------------------
+
+#' Which rung each contract's end came from, by contract type
+#' @param .dur Tibble from dte_duration().
+#' @return Tibble: one row per type, and one for the sample.
+dte_table_source <- function(.dur) {
+  if (FALSE) .dur <- tab_dur
+
+  cols_ <- function(.d) {
+    dplyr::summarise(
+      .d,
+      Docs    = dplyr::n(),
+      PctTerm = mean(.data$DurationSource == "term"),
+      PctOpen = mean(.data$DurationSource == "open"),
+      PctCue  = mean(.data$DurationSource == "cue"),
+      PctMax  = mean(.data$DurationSource == "maxdate"),
+      PctNone = mean(.data$DurationSource == "none"),
+      .by = dplyr::any_of("Class")
+    )
+  }
+
+  dplyr::bind_rows(
+    dplyr::arrange(cols_(.dur), dplyr::desc(.data$Docs)),
+    dplyr::mutate(cols_(dplyr::select(.dur, -"Class")), Class = "All", .before = 1L)
+  )
+}
+
+
+#' The rule against the naive duration, by contract type
+#'
+#' THE TABLE THIS DOCUMENT EXISTS TO PRODUCE. NAIVE is the farthest future date the contract mentions,
+#' which is the definition Table 3 was built with; RULE is the four-rung cascade. A reader who
+#' disagrees with the cascade can read the first column and ignore the second, and both are
+#' reproducible from the released file.
 #'
 #' @param .dur Tibble from dte_duration().
-#' @return .dur's documents with a NoFuture bucket.
-dte_nofuture <- function(.dur) {
+#' @return Tibble: one row per type, and one for the sample.
+dte_table_naive <- function(.dur) {
+  if (FALSE) .dur <- tab_dur
+
+  cols_ <- function(.d) {
+    dplyr::summarise(
+      .d,
+      Docs      = dplyr::n(),
+      MeanNaive = .dte_stat_or_na(.x = .data$NaiveYears[!is.na(.data$NaiveYears)], .f = mean),
+      MeanRule  = .dte_stat_or_na(.x = .data$DurationYears[!is.na(.data$DurationYears)],
+                                  .f = mean),
+      MedNaive  = .dte_stat_or_na(.x = .data$NaiveYears[!is.na(.data$NaiveYears)],
+                                  .f = stats::median),
+      MedRule   = .dte_stat_or_na(.x = .data$DurationYears[!is.na(.data$DurationYears)],
+                                  .f = stats::median),
+      SdNaive   = .dte_stat_or_na(.x = .data$NaiveYears[!is.na(.data$NaiveYears)], .f = stats::sd),
+      SdRule    = .dte_stat_or_na(.x = .data$DurationYears[!is.na(.data$DurationYears)],
+                                  .f = stats::sd),
+      PctSaid   = mean(.data$DurationSource %in% c("term", "open")),
+      .by = dplyr::any_of("Class")
+    )
+  }
+
+  dplyr::bind_rows(
+    dplyr::arrange(cols_(.dur), dplyr::desc(.data$Docs)),
+    dplyr::mutate(cols_(dplyr::select(.dur, -"Class")), Class = "All", .before = 1L)
+  )
+}
+
+
+#' Why a duration is missing
+#' @param .dur Tibble from dte_duration().
+#' @return Tibble: one row per reason.
+dte_table_dropped <- function(.dur) {
   if (FALSE) .dur <- tab_dur
 
   .dur |>
-    dplyr::transmute(
-      DocID, Class,
-      NoFuture = dplyr::case_when(
-        .data$NFuture > 0L       ~ "has future date",
-        !is.na(.data$TermYears)  ~ "term stated",
-        .data$NDates > 0L        ~ "all before filing",
-        TRUE                     ~ "no dates"
-      )
-    )
+    dplyr::summarise(Docs = dplyr::n(), .by = DurationDropped) |>
+    dplyr::mutate(Share = .data$Docs / sum(.data$Docs)) |>
+    dplyr::arrange(plot_factor(.data$DurationDropped, .key = "DurationDropped"))
 }
 
 
-#' How ambiguous the numeric date formats are
-#'
-#' Only a numeric date whose two leading components are both twelve or under is ambiguous at all.
-#' Measured once so the footnote carries a number: a swapped month and day moves a date by at most
-#' thirty days against a duration reported in years.
-#'
-#' @param .dates Tibble from dte_load().
-#' @return Tibble: one row.
-dte_daymonth <- function(.dates) {
-  if (FALSE) .dates <- tab_dates
+#' What the stated terms look like
+#' @param .terms Tibble from dte_load_terms().
+#' @return Tibble: one row per pattern.
+dte_table_terms <- function(.terms) {
+  if (FALSE) .terms <- tab_terms
 
-  num_ <- .dates |>
-    dplyr::filter(
-      stringi::stri_detect_regex(.data$Span, "^\\s*\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4}\\s*$")
+  .terms |>
+    dplyr::filter(!is.na(.data$TermYears)) |>
+    dplyr::summarise(
+      Docs      = dplyr::n(),
+      MedYears  = stats::median(.data$TermYears),
+      PctUnder1 = mean(.data$TermYears < 1),
+      PctOver10 = mean(.data$TermYears > 10),
+      MedNTerms = stats::median(.data$NTerms),
+      .by = TermKind
     ) |>
-    dplyr::mutate(
-      A = as.integer(stringi::stri_extract_first_regex(.data$Span, "\\d{1,2}")),
-      B = as.integer(stringi::stri_match_first_regex(.data$Span, "\\d{1,2}[/.-](\\d{1,2})")[, 2])
-    )
+    dplyr::mutate(Share = .data$Docs / sum(.data$Docs)) |>
+    dplyr::arrange(plot_factor(.data$TermKind, .key = "TermKind"))
+}
 
-  tibble::tibble(
-    NumericSpans   = nrow(num_),
-    Ambiguous      = sum(num_$A <= 12L & num_$B <= 12L, na.rm = TRUE),
-    DayFirstOnly   = sum(num_$A > 12L, na.rm = TRUE),
-    MonthFirstOnly = sum(num_$A <= 12L & num_$B > 12L, na.rm = TRUE)
+
+#' Where the start came from
+#' @param .dur Tibble from dte_duration().
+#' @return Tibble: one row per source.
+dte_table_start <- function(.dur) {
+  if (FALSE) .dur <- tab_dur
+
+  .dur |>
+    dplyr::summarise(
+      Docs    = dplyr::n(),
+      MedGap  = stats::median(as.numeric(.data$DateFiled - .data$DateStart), na.rm = TRUE),
+      MeanDur = .dte_stat_or_na(.x = .data$DurationYears[!is.na(.data$DurationYears)], .f = mean),
+      .by = StartSource
+    ) |>
+    dplyr::mutate(Share = .data$Docs / sum(.data$Docs)) |>
+    dplyr::arrange(plot_factor(.data$StartSource, .key = "StartSource"))
+}
+
+
+#' A few whole contracts, exactly as the file holds them
+#' @param .tab Tibble from dte_release().
+#' @param .n Integer. Contracts drawn.
+#' @param .seed Integer. Sampling seed.
+#' @return Tibble: the drawn rows.
+dte_release_sample <- function(.tab, .n = 8L, .seed = 42L) {
+  if (FALSE) {
+    .tab  <- tab_release
+    .n    <- 8L
+    .seed <- 42L
+  }
+
+  # ONE DOCUMENT PER RUNG WHERE THE SAMPLE HOLDS ONE, drawn deliberately. A random draw of eight
+  # would show the commonest rung eight times and say nothing about the other three, and the rungs
+  # are what a reader of DurationSource needs to recognise.
+  pick_ <- purrr::map(plot_levels("DurationSource"), function(.s) {
+    pool_ <- .tab$DocID[.tab$DurationSource == .s]
+    if (length(pool_) == 0L) return(character(0))
+    withr::with_seed(.seed, sample(pool_, size = min(2L, length(pool_))))
+  }) |>
+    unlist(use.names = FALSE)
+
+  .tab |>
+    dplyr::filter(.data$DocID %in% pick_) |>
+    dplyr::arrange(plot_factor(.data$DurationSource, .key = "DurationSource"), .data$DocID) |>
+    dplyr::slice_head(n = .n)
+}
+
+
+#' The disagreements between the longest term and the first one written
+#'
+#' READ RATHER THAN COUNTED, because no count can tell a contract's duration from a survival clause.
+#' These are the documents where the rule and the alternative give different answers, which is the
+#' whole population the choice is made over.
+#'
+#' @param .terms Tibble from dte_load_terms().
+#' @param .n Integer. Documents drawn.
+#' @param .seed Integer. Sampling seed.
+#' @return Tibble: the drawn documents, with both candidate terms.
+dte_read_terms <- function(.terms, .n = 12L, .seed = 42L) {
+  if (FALSE) {
+    .terms <- tab_terms
+    .n     <- 12L
+    .seed  <- 42L
+  }
+
+  src_ <- dplyr::filter(.terms, .data$Disagree)
+  if (nrow(src_) == 0L) return(tibble::tibble())
+
+  src_ |>
+    (\(.d) withr::with_seed(.seed, dplyr::slice_sample(.d, n = min(.n, nrow(.d)))))() |>
+    dplyr::arrange(dplyr::desc(.data$TermYears)) |>
+    dplyr::select("DocID", "NTerms", Longest = "TermYears", LongestKind = "TermKind",
+                  First = "FirstYears", FirstKind = "FirstKind", Span = "TermSpan")
+}
+
+
+#' What every column of the released file means
+#'
+#' A TABLE RATHER THAN PROSE, AND CHECKED AGAINST THE FILE. A column added or renamed without a
+#' matching entry aborts the render rather than leaving the documentation quietly wrong.
+#'
+#' @param .tab Tibble from dte_release().
+#' @return Tibble: Column, Meaning.
+dte_dictionary <- function(.tab) {
+  if (FALSE) .tab <- tab_release
+
+  dict_ <- tibble::tribble(
+    ~Column,           ~Meaning,
+    "DocID",           "the contract; joins to every other 04 file",
+    "Class",           "contract type, from 03A's label spine",
+    "AmendType",       "original or amended, from the same spine",
+    "DateFiled",       "when EDGAR recorded the filing",
+    "DateStart",       "the signing date: the latest date at or before the filing",
+    "StartSource",     "signed, or filed where no date preceded the filing",
+    "DateEnd",         "the end, from whichever rung supplied it",
+    "DurationSource",  "term, open, cue, maxdate, or none -- WHICH RUNG",
+    "DurationYears",   "end minus start; missing where dropped or where nothing was found",
+    "DurationDropped", "kept, negative, capped, or no end -- why it is missing",
+    "NaiveYears",      "the farthest future date less the start; the published definition",
+    "TermYears",       "the longest stated period, where the contract stated one",
+    "TermKind",        "which pattern found that period",
+    "NTerms",          "how many closed periods the contract states at all",
+    "NDates",          "distinct dates found",
+    "NFuture",         "of those, dates after the filing"
+  )
+
+  undoc_  <- setdiff(names(.tab), dict_$Column)
+  unseen_ <- setdiff(dict_$Column, names(.tab))
+  say_    <- function(.x) if (length(.x) == 0L) "none" else paste(.x, collapse = ", ")
+
+  if (length(undoc_) > 0L || length(unseen_) > 0L) {
+    cli::cli_abort(c(
+      "The dictionary and the released file disagree.",
+      "x" = "In the file and undocumented: {say_(undoc_)}.",
+      "x" = "Documented and not in the file: {say_(unseen_)}.",
+      "i" = "A dictionary that can drift from its file documents nothing."
+    ))
+  }
+
+  dict_[match(names(.tab), dict_$Column), ]
+}
+
+
+# 8. Report --------------------------------------------------------------------------------------------------------------
+
+#' What the dates and the terms supply
+#' @param .dates Tibble from dte_load().
+#' @param .terms Tibble from dte_load_terms().
+#' @param .keys Tibble from ent_anchor_keys().
+#' @return Invisibly the summary.
+dte_report_input <- function(.dates, .terms, .keys) {
+  if (FALSE) {
+    .dates <- tab_dates
+    .terms <- tab_terms
+    .keys  <- tab_keys
+  }
+
+  cli::cli_h2("What the extractor supplied")
+
+  n_ <- nrow(.keys)
+  out_ <- tibble::tibble(
+    Item = c("Documents in the sample",
+             "With at least one date",
+             "With a date that parsed",
+             "With a stated closed term",
+             "With an open-ended term"),
+    N    = c(n_,
+             dplyr::n_distinct(.dates$DocID),
+             dplyr::n_distinct(.dates$DocID[.dates$Parsed]),
+             dplyr::n_distinct(.terms$DocID[!is.na(.terms$TermYears)]),
+             dplyr::n_distinct(.terms$DocID[.terms$IsOpen]))
   ) |>
+    dplyr::mutate(Share = tbl_pct(.data$N / n_))
+
+  tbl_say(.tab = out_, .title = "Documents reached, by what the extractor found in them")
+
+  cli::cli_alert_info(
+    "matcon parses almost everything it emits, so the gap between the second and third rows is a \\
+     rounding error rather than a population. The two term rows are the ceiling on the rungs that \\
+     read what the contract SAYS: everything above that share falls to a cue or to the farthest \\
+     future date."
+  )
+  invisible(out_)
+}
+
+
+#' What the stated terms look like
+#' @param .tab Tibble from dte_table_terms().
+#' @param .cmp Tibble from dte_term_compare().
+#' @return Invisibly .tab.
+dte_report_terms <- function(.tab, .cmp) {
+  if (FALSE) {
+    .tab <- tab_term_tab
+    .cmp <- tab_term_cmp
+  }
+
+  cli::cli_h2("The stated terms")
+  .tab |>
     dplyr::mutate(
-      PctAmbiguous  = .data$Ambiguous / pmax(.data$NumericSpans, 1L),
-      PctDayFirstUn = .data$DayFirstOnly / pmax(.data$DayFirstOnly + .data$MonthFirstOnly, 1L)
-    )
-}
-
-
-# 7. Report ------------------------------------------------------------------------------------------------------------
-
-#' What each engine found and how much of it parsed
-#' @param .dates Tibble from dte_load().
-#' @return Invisibly the summary.
-dte_report_parse <- function(.dates) {
-  if (FALSE) .dates <- tab_dates
-
-  cli::cli_h2("Dates found and dates parsed")
-  out_ <- .dates |>
-    dplyr::summarise(
-      Spans     = dplyr::n(),
-      Docs      = dplyr::n_distinct(.data$DocID),
-      PctParsed = mean(.data$Parsed),
-      .by = Combo
-    )
-
-  out_ |>
-    dplyr::mutate(PctParsed = tbl_pct(.data$PctParsed)) |>
-    tbl_say(.title = "Every date span, by engine")
-
-  cli::cli_alert_info(
-    "Both engines parse nearly everything they emit, so what follows is bounded by what a contract \\
-     WRITES as a date rather than by what an extractor can read. A document with no future date has \\
-     not defeated the parser; it has said something else, and the table further down says what."
-  )
-  invisible(out_)
-}
-
-
-#' How many spans had their year inferred rather than written
-#'
-#' THE TAIL IS THIS. A span with no four-digit year gets the present year from the parser, and the
-#' read block shows what that produces: "Section 3-1" as 2026-03-01, "Exhibit 10-15" as 2026-10-15,
-#' "10-35 Second" as 2035-10-01. None is a date the contract wrote. It is an extractor behaviour and
-#' cannot be fixed here, but it can be counted and it can be filtered.
-#'
-#' @param .dates Tibble from dte_describe().
-#' @return Invisibly the summary.
-dte_report_year <- function(.dates) {
-  if (FALSE) .dates <- tab_desc
-
-  cli::cli_h2("Spans carrying their own year")
-  out_ <- .dates |>
-    dplyr::summarise(
-      Spans      = dplyr::n(),
-      PctWithYear = mean(.data$HasYear),
-      PctFuture   = mean(.data$GapDays > 0L, na.rm = TRUE),
-      MedGap      = stats::median(.data$GapDays, na.rm = TRUE),
-      .by = c(Combo, HasYear)
+      dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct_safe(.x)),
+      Share = tbl_pct(.data$Share)
     ) |>
-    dplyr::arrange(.data$Combo, dplyr::desc(.data$HasYear))
+    tbl_say(.title = "One row per pattern, over the documents stating a closed term")
 
-  out_ |>
-    dplyr::select(-PctWithYear) |>
-    dplyr::mutate(PctFuture = tbl_pct(.data$PctFuture)) |>
-    tbl_say(.title = "By engine, split on whether the span wrote a four-digit year")
-
-  far_ <- .dates |>
-    dplyr::filter(.data$GapDays > 365L * 15L) |>
-    dplyr::summarise(Spans = dplyr::n(), PctNoYear = mean(!.data$HasYear))
-
-  far_ |>
-    dplyr::mutate(PctNoYear = tbl_pct(.data$PctNoYear)) |>
-    tbl_say(.title = "Among dates more than fifteen years out")
+  .cmp |>
+    dplyr::mutate(Share = tbl_pct(.data$Share)) |>
+    tbl_say(.title = "The longest stated period against the first one written")
 
   cli::cli_alert_info(
-    "A span with no four-digit year had its year INFERRED, and the parser infers the present one. \\
-     The second table is the diagnosis: if the far-future dates are disproportionately year-less, \\
-     the right tail is section numbers and exhibit references rather than contract terms. That is an \\
-     extractor behaviour, upstream of every rule here, and the swept year guard is what this \\
-     document can do about it."
+    "PctUnder1 IS THE NUMBER THE RULE EXISTS FOR. A period under a year is a cure window, a notice \\
+     period or a warranty, and contracts state several of them beside their actual duration -- all \\
+     written \"period of N units\" and all matching the same pattern, so no filter on pattern names \\
+     could separate them. Taking the LONGEST does, without a threshold and without deleting the only \\
+     stated term of a genuinely short agreement."
   )
-  invisible(out_)
+  cli::cli_alert_info(
+    "The second table is the trade. Where the two rules disagree the longest is right if it is the \\
+     contract's duration and wrong if it is a survival clause, and no count can tell those apart -- \\
+     which is what the reading block in Robustness is for."
+  )
+  invisible(.tab)
 }
 
 
-#' The cue list, term by term
+#' How often each termination cue fires
 #' @param .tab Tibble from dte_cue_hits().
 #' @return Invisibly .tab.
 dte_report_cues <- function(.tab) {
   if (FALSE) .tab <- tab_cues
 
-  cli::cli_h2("The cue list, term by term")
+  cli::cli_h2("The termination cues")
   .tab |>
-    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x)),
-                  Lift = round(.data$Lift, 2)) |>
-    tbl_say(.title = "Ordered by lift over the base rate of future dates", .n = 25L)
+    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct_safe(.x))) |>
+    tbl_say(.title = "One row per cue, over every future date")
 
   cli::cli_alert_info(
-    "LIFT is the share of future dates among the spans a term fires on, over the share among all \\
-     dates. A real termination cue sits beside a future date far more often than chance and scores \\
-     well above one; a term scoring near one is a word the language uses for other things and is \\
-     carrying no information. THROUGH and UNTIL are the two entries this table exists to judge."
+    "A USEFUL CUE IS HIGH ON PctOfCued AND LOW ON PctOfFuture. A term firing beside a large share of \\
+     ALL future dates is marking dates rather than terminations, and THROUGH and UNTIL are the two \\
+     entries under suspicion because both are common enough to sit beside anything. This table is \\
+     where that gets settled: a term high on both columns is carrying the cue rung on its own and \\
+     should be read before it is trusted."
   )
   invisible(.tab)
 }
 
 
-#' Terms stated in words
-#' @param .terms Tibble from dte_load_terms().
-#' @param .n_docs Integer. Documents in the sample.
-#' @param .spec List from dte_spec(). Says which patterns this run admits.
-#' @return Invisibly the summary.
-dte_report_terms <- function(.terms, .n_docs, .spec) {
-  if (FALSE) {
-    .terms  <- tab_terms
-    .n_docs <- nrow(tab_keys)
-    .spec   <- .lP$Params$Spec
-  }
-
-  cli::cli_h2("Terms stated in words")
-  out_ <- .terms |>
-    dplyr::summarise(
-      Docs       = dplyr::n(),
-      MedYears   = stats::median(.data$TermYears, na.rm = TRUE),
-      P90Years   = unname(stats::quantile(.data$TermYears, 0.9, na.rm = TRUE)),
-      PctSubYear = mean(.data$TermYears < 1, na.rm = TRUE),
-      MedSpans   = stats::median(.data$NTermSpan),
-      Admitted   = dplyr::first(.data$TermKind) %in% .spec$TermKinds,
-      .by = TermKind
-    ) |>
-    dplyr::mutate(PctOfSample = .data$Docs / .n_docs) |>
-    dplyr::arrange(plot_factor(.data$TermKind, .key = "TermKind"))
-
-  out_ |>
-    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x))) |>
-    tbl_say(.title = "By the pattern the extractor matched")
-
-  # THE UNIT IS THE DEMOTION RULE, so it is reported as one rather than left inside a share. A
-  # pattern whose modal unit is DAY is measuring notice windows whatever its name.
-  .terms |>
-    dplyr::summarise(Docs = dplyr::n(), .by = c(TermKind, TermUnit)) |>
-    tidyr::pivot_wider(names_from = "TermUnit", values_from = "Docs", values_fill = 0L) |>
-    dplyr::arrange(plot_factor(.data$TermKind, .key = "TermKind")) |>
-    tbl_say(.title = "Which unit each pattern states its term in")
-
-  .terms |>
-    dplyr::filter(!is.na(.data$TermYears)) |>
-    dplyr::summarise(Docs = dplyr::n(), .by = TermYears) |>
-    dplyr::arrange(dplyr::desc(.data$Docs)) |>
-    tbl_say(.title = "The commonest stated terms, in years", .n = 12L)
-
-  n_open_ <- sum(.terms$IsOpen)
-  # QUOTED PHRASES GO THROUGH {.val}, NOT THROUGH AN ESCAPED QUOTE. cli strings already carry
-  # backslash continuations, so a nested \" is one backslash away from terminating the string -- which
-  # is exactly what it did. The styling helper says the same thing and cannot be escaped wrong.
-  cli::cli_alert_info(
-    "ADMITTED says which patterns this specification counts as a DURATION. \\
-     {paste(.spec$TermKinds, collapse = ', ')} are admitted\\
-     {if (.spec$TermFloor > 0) paste0(' above ', .spec$TermFloor, ' years') else ''}; the rest are \\
-     extracted, reported and left alone. A {.val {'three-year TERM'}} is what a contract calls its \\
-     own duration and a {.val {'thirty day PERIOD'}} is a notice window, but the pattern is only a \\
-     proxy for that -- the unit table above says it directly."
-  )
-  if (n_open_ > 0L) {
-    cli::cli_alert_info(
-      "{format(n_open_, big.mark = ',')} {cli::qty(n_open_)}document{?s} state an OPEN-ENDED term, \\
-       {.val {'shall continue until terminated'}}. These carry no duration and are counted apart \\
-       from the documents that state nothing, because a contract saying it will not end has said \\
-       something."
-    )
-  }
-  invisible(out_)
-}
-
-
-#' Where dates sit and which side of the filing they fall on
-#' @param .dates Tibble from dte_describe().
-#' @return Invisibly the summary.
-dte_report_region <- function(.dates) {
-  if (FALSE) .dates <- tab_desc
-
-  cli::cli_h2("Region against the filing date")
-  out_ <- .dates |>
-    dplyr::filter(!is.na(.data$Side)) |>
-    dplyr::summarise(Dates = dplyr::n(), MedGap = stats::median(.data$GapDays),
-                     PctCue = mean(.data$HasEndCue), .by = c(Region, Side)) |>
-    dplyr::mutate(Share = .data$Dates / sum(.data$Dates), .by = Region) |>
-    dplyr::arrange(plot_factor(.data$Region, .key = "DateRegion"),
-                   plot_factor(.data$Side, .key = "DateSide"))
-
-  out_ |>
-    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x)),
-                  Share = tbl_pct(.data$Share)) |>
-    tbl_say(.title = "Reported, and read by no end rule")
-
-  cli::cli_alert_info(
-    "REPORTED AND NOT USED. The head is 72.8% pre-filing and the TAIL is 73.0% -- region separates \\
-     the head from the middle and separates nothing else, against a deep U for organisations. \\
-     Excluding the tail from the end search cost two and a half points of coverage and left the \\
-     standard deviation unchanged, so no end rule reads this table and the head restriction on the \\
-     START is a swept row rather than a rule."
-  )
-  invisible(out_)
-}
-
-
-#' Why a document has no future date
-#' @param .tab Tibble from dte_nofuture().
-#' @return Invisibly the summary.
-dte_report_nofuture <- function(.tab) {
-  if (FALSE) .tab <- tab_nofut
-
-  cli::cli_h2("Documents with no future date")
-  out_ <- .tab |>
-    dplyr::summarise(Docs = dplyr::n(), .by = c(Class, NoFuture)) |>
-    dplyr::mutate(Share = .data$Docs / sum(.data$Docs), .by = Class) |>
-    dplyr::select(-Docs) |>
-    tidyr::pivot_wider(names_from = NoFuture, values_from = Share, values_fill = 0) |>
-    dplyr::arrange(plot_factor(.data$Class, .key = "ClassDetailed"))
-
-  out_ |>
-    dplyr::mutate(dplyr::across(-Class, \(.x) tbl_pct(.x))) |>
-    tbl_say(.title = "One row per contract type")
-
-  all_ <- .tab |>
-    dplyr::summarise(Docs = dplyr::n(), .by = NoFuture) |>
-    dplyr::mutate(Share = tbl_pct(.data$Docs / sum(.data$Docs))) |>
-    dplyr::arrange(plot_factor(.data$NoFuture, .key = "NoFuture"))
-
-  tbl_say(.tab = all_, .title = "Over the sample")
-
-  cli::cli_alert_info(
-    "TERM STATED is not a gap. A contract writing \"for a period of five years\" has said exactly \\
-     when it ends and named no date to say it with, so counting it as missing would report a \\
-     drafting convention as an extraction failure. ALL BEFORE FILING is an amendment or a plan that \\
-     genuinely states no end, and NO DATES is the only bucket that is an extraction question."
-  )
-  invisible(out_)
-}
-
-
-#' The numeric-format exposure
-#' @param .tab Tibble from dte_daymonth().
+#' Which rung each contract's end came from
+#' @param .tab Tibble from dte_table_source().
 #' @return Invisibly .tab.
-dte_report_daymonth <- function(.tab) {
-  if (FALSE) .tab <- tab_dm
+dte_report_source <- function(.tab) {
+  if (FALSE) .tab <- tab_source
 
-  cli::cli_h2("Numeric date formats")
+  cli::cli_h2("Which rung supplied the end")
   .tab |>
-    dplyr::mutate(PctAmbiguous = tbl_pct(.data$PctAmbiguous),
-                  PctDayFirstUn = tbl_pct(.data$PctDayFirstUn)) |>
-    tbl_say(.title = "How much of the sample the convention could move")
+    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x))) |>
+    tbl_say(.title = "One row per contract type, and one for the sample")
 
   cli::cli_alert_info(
-    "Among the UNAMBIGUOUS numeric dates, PctDayFirstUn is the share written day first. Near zero \\
-     makes US convention the right assumption, and the residual exposure is the ambiguous share \\
-     times that rate times at most thirty days, against a duration reported in years."
+    "PctTerm AND PctOpen ARE WHAT THE CONTRACT SAID; PctCue is a reading of the words beside a date; \\
+     PctMax is a maximum over dates the contract mentions for reasons it never states. Their sum is \\
+     coverage and their split is quality, and a reader wanting only what was stated filters \\
+     DurationSource rather than recomputing anything."
   )
   invisible(.tab)
 }
 
 
-#' The specification sweep
+#' The rule against the naive duration
+#' @param .tab Tibble from dte_table_naive().
+#' @return Invisibly .tab.
+dte_report_naive <- function(.tab) {
+  if (FALSE) .tab <- tab_naive
+
+  cli::cli_h2("The rule against the naive duration")
+  .tab |>
+    dplyr::mutate(
+      dplyr::across(c(MeanNaive, MeanRule, MedNaive, MedRule, SdNaive, SdRule),
+                    \(.x) tbl_num(.x)),
+      PctSaid = tbl_pct(.data$PctSaid)
+    ) |>
+    tbl_say(.title = "Duration under both definitions, by contract type")
+
+  cli::cli_alert_info(
+    "NAIVE is the farthest future date the contract mentions, which is the definition Table 3 was \\
+     built with. RULE is the cascade. READ THE TWO STANDARD DEVIATIONS AGAINST EACH OTHER: that is \\
+     the referee's question, because a variable capped at 30 years cannot have a standard deviation \\
+     above 15 and the published one is 40.78. PctSaid is the share where the end came from something \\
+     the contract stated rather than from a maximum."
+  )
+  invisible(.tab)
+}
+
+
+#' Why a duration is missing, and where the start came from
+#' @param .drop Tibble from dte_table_dropped().
+#' @param .start Tibble from dte_table_start().
+#' @return Invisibly .drop.
+dte_report_missing <- function(.drop, .start) {
+  if (FALSE) {
+    .drop  <- tab_drop
+    .start <- tab_start
+  }
+
+  cli::cli_h2("What is missing, and why")
+  .drop |>
+    dplyr::mutate(Share = tbl_pct(.data$Share)) |>
+    tbl_say(.title = "One row per reason a duration is not reported")
+
+  .start |>
+    dplyr::mutate(Share = tbl_pct(.data$Share), MeanDur = tbl_num(.data$MeanDur)) |>
+    tbl_say(.title = "Where the start came from")
+
+  cli::cli_alert_info(
+    "THE CAP DROPS RATHER THAN WINSORISES, so CAPPED is a missing value and not a pile at thirty \\
+     years -- a duration of exactly the cap that is not one is worse than nothing. NEGATIVE is an end \\
+     before the start, which can only mean the two came from different readings of the document. \\
+     FILED is the fallback start: no date preceded the filing, so EDGAR's own date was used, and \\
+     that is a date the contract never wrote."
+  )
+  invisible(.drop)
+}
+
+
+#' Every specification, side by side
 #' @param .tab Tibble from dte_sweep().
 #' @return Invisibly .tab.
 dte_report_sweep <- function(.tab) {
   if (FALSE) .tab <- tab_sweep
 
-  cli::cli_h2("Duration, by specification")
+  cli::cli_h2("Every definition, side by side")
   .tab |>
-    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x)),
-                  dplyr::across(c(Mean, Median, P25, P75, Sd, SdOverCap), \(.x) round(.x, 2))) |>
-    tbl_say(.title = "Each row is one start, one end cascade, one cap and one year guard", .n = 30L)
+    dplyr::mutate(
+      dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x)),
+      dplyr::across(c(Mean, Median, Sd, SdOverCap), \(.x) tbl_num(.x))
+    ) |>
+    tbl_say(.title = "One row per definition, the first being the published one")
 
   cli::cli_alert_info(
-    "SdOverCap CANNOT EXCEED ONE HALF on non-negative support under a correctly applied cap. Table 3 \\
-     Panel B reports 40.78 against a stated cap of 30, a ratio of 1.36, which no distribution on \\
-     [0, 30] can produce. PctTerm, PctCue and PctMaxDate are the three kinds of evidence the end \\
-     rests on, and the third is the published definition -- a maximum over an unfiltered set."
+    "SdOverCap CANNOT EXCEED ONE HALF on non-negative support under a correctly applied cap, and \\
+     Table 3 reports a ratio of 1.36. Any row here above 0.5 means the cap did not reach what is \\
+     being summarised. The uncapped rows have no ratio because there is nothing to divide by, which \\
+     is itself the point: an uncapped maximum over dates a contract happens to mention has no bound \\
+     at all."
   )
   invisible(.tab)
 }
 
 
-#' The released duration by contract type
-#' @param .dur Tibble from dte_duration().
+#' What the released file holds
+#' @param .tab Tibble from dte_release().
 #' @return Invisibly the summary.
-dte_report_class <- function(.dur) {
-  if (FALSE) .dur <- tab_dur
+dte_report_release <- function(.tab) {
+  if (FALSE) .tab <- tab_release
 
-  cli::cli_h2("Duration by contract type")
+  cli::cli_h2("The released file")
 
-  f_ <- function(.d) {
+  out_ <- .tab |>
     dplyr::summarise(
-      .d,
       Docs      = dplyr::n(),
-      MeanDates = mean(.data$NDates),
-      PctEnd    = mean(!is.na(.data$DateEnd)),
-      PctTerm   = mean(.data$DurationSource == "term"),
-      PctCue    = mean(.data$DurationSource == "cue"),
-      N         = sum(!is.na(.data$DurationYears)),
-      MedYears  = stats::median(.data$DurationYears, na.rm = TRUE),
-      MeanYears = mean(.data$DurationYears, na.rm = TRUE),
-      SdYears   = stats::sd(.data$DurationYears, na.rm = TRUE)
-    )
-  }
+      MeanYears = .dte_stat_or_na(.x = .data$DurationYears[!is.na(.data$DurationYears)],
+                                  .f = mean),
+      .by = DurationSource
+    ) |>
+    dplyr::mutate(
+      Share     = tbl_pct(.data$Docs / sum(.data$Docs)),
+      MeanYears = tbl_num(.data$MeanYears)
+    ) |>
+    dplyr::arrange(plot_factor(.data$DurationSource, .key = "DurationSource"))
 
-  ent_bind_all(.tab = f_(dplyr::group_by(.dur, Class)), .fun = f_, .src = .dur) |>
-    dplyr::mutate(dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x)),
-                  dplyr::across(c(MeanDates, MedYears, MeanYears, SdYears), \(.x) round(.x, 2))) |>
-    tbl_say(.title = "One row per type, and one for the sample")
+  tbl_say(.tab = out_, .title = "One row per contract, by the rung that supplied its end")
 
   cli::cli_alert_info(
-    "PctTerm and PctCue together are the share resting on something the contract SAID; the remainder \\
-     rests on the farthest future date, which is a maximum over dates the contract merely mentions. \\
-     A class where both are low still has a duration, and it is the weakest kind."
+    "EVERY CONTRACT GETS A ROW, including the ones matcon found no date in -- those carry NONE and a \\
+     missing duration, so a mean over the file divides by the sample rather than by the documents \\
+     that worked. NaiveYears is released beside the rule so the comparison every table makes can be \\
+     reproduced from the file rather than only from this render."
   )
-  invisible(.dur)
+  invisible(out_)
 }
 
 
-#' Every DATE report in order
-#'
-#' @param .dates Tibble from dte_load().
-#' @param .desc Tibble from dte_describe().
-#' @param .cues Tibble from dte_cue_hits().
-#' @param .terms Tibble from dte_load_terms().
-#' @param .nofut Tibble from dte_nofuture().
-#' @param .daymonth Tibble from dte_daymonth().
-#' @param .sweep Tibble from dte_sweep().
-#' @param .dur Tibble from dte_duration().
-#' @param .n_docs Integer. Documents in the sample.
-#' @param .spec List from dte_spec(). Passed to the terms block, which reports which patterns this
-#'   run admits.
-#' @return Invisibly NULL.
-dte_report_all <- function(.dates, .desc, .cues, .terms, .nofut, .daymonth, .sweep, .dur, .n_docs,
-                           .spec) {
-  if (FALSE) {
-    .dates    <- tab_dates
-    .desc     <- tab_desc
-    .cues     <- tab_cues
-    .terms    <- tab_terms
-    .nofut    <- tab_nofut
-    .daymonth <- tab_dm
-    .sweep    <- tab_sweep
-    .dur      <- tab_dur
-    .n_docs   <- nrow(tab_keys)
-    .spec     <- .lP$Params$Spec
+#' A few whole contracts, printed as the file holds them
+#' @param .tab Tibble from dte_release_sample().
+#' @return Invisibly .tab.
+dte_report_release_sample <- function(.tab) {
+  if (FALSE) .tab <- tab_sample
+
+  cli::cli_h2("The released file, read")
+
+  .tab |>
+    dplyr::select("DocID", "Class", "DateStart", "StartSource", "DateEnd", "DurationSource",
+                  "DurationYears", "NaiveYears", "TermYears", "NTerms") |>
+    tbl_say(.title = "Two contracts from each rung, in released columns")
+
+  cli::cli_alert_info(
+    "READ DurationYears AGAINST NaiveYears ROW BY ROW. Where the rung is TERM they can differ by a \\
+     lot, and the difference is a stated duration replacing a maximum over unrelated dates. Where the \\
+     rung is MAXDATE they are equal by construction, and those are the contracts for which this rule \\
+     has nothing better than the published definition."
+  )
+  invisible(.tab)
+}
+
+
+#' The disagreements between the two term rules
+#' @param .tab Tibble from dte_read_terms().
+#' @return Invisibly .tab.
+dte_report_read_terms <- function(.tab) {
+  if (FALSE) .tab <- tab_read_terms
+
+  cli::cli_h2("Where the longest term is not the first one written")
+
+  if (nrow(.tab) == 0L) {
+    cli::cli_alert_info("No document states two closed terms of different lengths.")
+    return(invisible(.tab))
   }
 
-  dte_report_parse(.dates = .dates)
-  dte_report_year(.dates = .desc)
-  dte_report_daymonth(.tab = .daymonth)
-  dte_report_region(.dates = .desc)
-  dte_report_cues(.tab = .cues)
-  dte_report_terms(.terms = .terms, .n_docs = .n_docs, .spec = .spec)
-  dte_report_nofuture(.tab = .nofut)
-  dte_report_sweep(.tab = .sweep)
-  dte_report_class(.dur = .dur)
-  invisible(NULL)
+  tbl_say(.tab = .tab, .title = "The span the rule chose, beside the one position would have chosen")
+
+  cli::cli_alert_info(
+    "THIS IS THE ONE BLOCK A COUNT CANNOT REPLACE. Read the span: \"for a period of five (5) years\" \\
+     beside a first term of thirty days is the rule working, and a ten-year confidentiality period \\
+     beside a first term of one year is the rule taking a survival clause for a duration. If the \\
+     second shape dominates, the answer is a cue on the span rather than a different threshold."
+  )
+  invisible(.tab)
 }
 
 
-# 8. Figures -----------------------------------------------------------------------------------------------------------
+#' The column dictionary
+#' @param .tab Tibble from dte_dictionary().
+#' @return Invisibly .tab.
+dte_report_dictionary <- function(.tab) {
+  if (FALSE) .tab <- tab_dict
 
-#' Gap between a date and the filing, by region
-#' @param .dates Tibble from dte_describe().
-#' @return A ggplot object.
-dte_plot_gap <- function(.dates) {
-  if (FALSE) .dates <- tab_desc
+  cli::cli_h2("What every column means")
+  tbl_say(.tab = .tab, .title = "Sixteen columns, in the order the file carries them")
 
-  .dates |>
-    dplyr::filter(!is.na(.data$GapDays), abs(.data$GapDays) <= 3650) |>
-    dplyr::mutate(Years = .data$GapDays / 365.25) |>
-    ggplot2::ggplot(ggplot2::aes(x = .data$Years, colour = .data$Region)) +
-    ggplot2::stat_ecdf(linewidth = 0.7) +
-    ggplot2::geom_vline(xintercept = 0, linetype = "dashed", colour = .plot_ink, linewidth = 0.3) +
-    plot_scale_colour_cat(name = NULL) +
-    plot_scale_y_pct() +
-    ggplot2::labs(x = NULL, y = NULL) +
-    plot_theme(.grid = "y", .legend = "bottom")
+  cli::cli_alert_info(
+    "DurationSource IS THE COLUMN THAT MAKES THE REST USABLE. Filtering it to term and open keeps \\
+     only what the contract stated about itself; keeping maxdate as well reproduces the published \\
+     definition. The dictionary is compared with the file's own names, so a column added or renamed \\
+     without an entry aborts this chunk."
+  )
+  invisible(.tab)
 }
 
 
-#' What the end date rests on, by contract type
+#' The rule in one table
 #' @param .dur Tibble from dte_duration().
-#' @return A ggplot object.
+#' @param .release Tibble from dte_release().
+#' @return Invisibly the table.
+dte_report_headline <- function(.dur, .release) {
+  if (FALSE) {
+    .dur     <- tab_dur
+    .release <- tab_release
+  }
+
+  cli::cli_h2("The rule in one table")
+
+  kept_  <- .dur$DurationYears[!is.na(.dur$DurationYears)]
+  naive_ <- .dur$NaiveYears[!is.na(.dur$NaiveYears)]
+
+  out_ <- tibble::tribble(
+    ~Item,                                      ~Value,
+    "Contracts",                                format(nrow(.dur), big.mark = ","),
+    "End taken from a stated term",             tbl_pct(mean(.dur$DurationSource == "term")),
+    "End taken from an open-ended clause",      tbl_pct(mean(.dur$DurationSource == "open")),
+    "End taken from a cued date",               tbl_pct(mean(.dur$DurationSource == "cue")),
+    "End taken from the farthest future date",  tbl_pct(mean(.dur$DurationSource == "maxdate")),
+    "No end found at all",                      tbl_pct(mean(.dur$DurationSource == "none")),
+    "Duration reported",                        tbl_pct(mean(!is.na(.dur$DurationYears))),
+    "Median duration, this rule",               tbl_num(.dte_stat_or_na(.x = kept_,
+                                                                       .f = stats::median)),
+    "Median duration, naive",                   tbl_num(.dte_stat_or_na(.x = naive_,
+                                                                       .f = stats::median)),
+    "Standard deviation, this rule",            tbl_num(.dte_stat_or_na(.x = kept_, .f = stats::sd)),
+    "Standard deviation, naive",                tbl_num(.dte_stat_or_na(.x = naive_,
+                                                                       .f = stats::sd)),
+    "Rows in the released file",                format(nrow(.release), big.mark = ",")
+  )
+
+  tbl_say(.tab = out_, .title = "Everything this document decided")
+
+  cli::cli_alert_info(
+    "THE TWO STANDARD DEVIATIONS ARE THE ANSWER TO THE REFEREE. A duration capped at thirty years \\
+     cannot have one above fifteen, and the published figure is 40.78. The first five rows say where \\
+     every contract's end came from, and the first two of those are the only ones the contract \\
+     stated itself."
+  )
+  invisible(out_)
+}
+
+
+# 9. Figures -------------------------------------------------------------------------------------------------------------
+
+#' Which rung supplied the end, by contract type
+#' @param .dur Tibble from dte_duration().
+#' @return A ggplot.
 dte_plot_source <- function(.dur) {
   if (FALSE) .dur <- tab_dur
 
@@ -1131,30 +1327,67 @@ dte_plot_source <- function(.dur) {
       .cat      = "Class",
       .val      = "N",
       .fill     = "DurationSource",
-      .key      = "ClassDetailed",
       .key_fill = "DurationSource",
-      .short    = FALSE,
+      .short    = TRUE,
       .share    = TRUE
-    )
+    ) +
+    ggplot2::labs(x = "Share of contracts")
 }
 
 
-#' Median duration by contract type
+#' The rule against the naive duration, by contract type
+#' @param .tab Tibble from dte_table_naive().
+#' @return A ggplot.
+dte_plot_naive <- function(.tab) {
+  if (FALSE) .tab <- tab_naive
+
+  .tab |>
+    dplyr::filter(.data$Class != "All") |>
+    dplyr::select("Class", Naive = "MedNaive", Rule = "MedRule") |>
+    tidyr::pivot_longer(cols = c("Naive", "Rule"), names_to = "Measure", values_to = "Years") |>
+    ggplot2::ggplot(ggplot2::aes(x = .data$Years,
+                                 y = stats::reorder(.data$Class, .data$Years),
+                                 fill = .data$Measure)) +
+    ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.75), width = 0.7) +
+    plot_scale_fill_cat(name = NULL) +
+    plot_scale_x_count() +
+    ggplot2::labs(x = "Median duration in years", y = NULL) +
+    plot_theme(.grid = "x", .legend = "bottom")
+}
+
+
+#' The distribution of duration, by rung
 #' @param .dur Tibble from dte_duration().
-#' @return A ggplot object.
-dte_plot_class <- function(.dur) {
+#' @return A ggplot.
+dte_plot_spread <- function(.dur) {
   if (FALSE) .dur <- tab_dur
 
   .dur |>
-    dplyr::filter(!is.na(.data$DurationYears)) |>
-    dplyr::summarise(MedYears = stats::median(.data$DurationYears), .by = Class) |>
-    plot_bar_ranked(
-      .cat      = "Class",
-      .val      = "MedYears",
-      .key      = "ClassDetailed",
-      .short    = FALSE,
-      .label    = TRUE,
-      .accuracy = 0.1,
-      .pct      = FALSE
-    )
+    dplyr::filter(!is.na(.data$DurationYears), .data$DurationSource != "none") |>
+    ggplot2::ggplot(ggplot2::aes(
+      x = .data$DurationYears,
+      y = plot_factor(.data$DurationSource, .key = "DurationSource", .short = TRUE, .rev = TRUE)
+    )) +
+    ggplot2::geom_boxplot(outlier.size = 0.5, linewidth = 0.4, fill = plot_pal_seq(1L),
+                          colour = plot_pal_grey(1L)) +
+    plot_scale_x_count() +
+    ggplot2::labs(x = "Duration in years", y = NULL) +
+    plot_theme(.grid = "x")
+}
+
+
+#' How often each cue fires, against how often it marks a termination
+#' @param .tab Tibble from dte_cue_hits().
+#' @return A ggplot.
+dte_plot_cues <- function(.tab) {
+  if (FALSE) .tab <- tab_cues
+
+  plot_bar_ranked(
+    .tab      = .tab,
+    .cat      = "Cue",
+    .val      = "PctOfFuture",
+    .pct      = TRUE,
+    .accuracy = 1
+  ) +
+    ggplot2::labs(x = "Share of all future dates the cue sits beside")
 }

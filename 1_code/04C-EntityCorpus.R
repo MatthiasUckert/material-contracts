@@ -1,5 +1,21 @@
 # ======================================================================================================================
 # 04C-EntityCorpus.R -- library for 04C-EntityCorpus.qmd
+#
+# TWO THINGS IN THIS FILE ARE NEWER THAN THE REST, and both exist because the corpus pass is long
+# enough that a defect found halfway through has already cost a night.
+#
+# THE PREFLIGHT. cor_manifest_check() compares the spec hash every model would write against the one
+# the store already holds, before a single document is read. ner_manifest_write() makes the same
+# comparison and it makes it correctly, but it makes it at the first INGEST -- hours in. The case is
+# live rather than hypothetical: adding CueBefore and CueAfter moved every matcon spec hash and the
+# LexNLP image hash with them, so a store built before that cannot be added to and cannot be read by
+# the current ent_extras().
+#
+# THE QUEUE ORDER UNDER A CAP. A DocID begins with the accession number, which begins with the
+# filer's CIK, so ORDER BY DocID LIMIT n takes the oldest registrants rather than a slice of the
+# corpus. Harmless on a full pass and wrong on a rehearsal, which exists to estimate coverage and
+# throughput -- so a capped queue orders by a hash and an uncapped one still orders by DocID, where
+# stability across resumptions is what matters.
 # ======================================================================================================================
 #
 # The corpus pass. Same extractors, same stores, same offset contract as 04A -- over 1.19 million
@@ -207,6 +223,138 @@ cor_corpus_load <- function(.con, .path_register, .dir_mirror, .population = "al
 }
 
 
+#' What the store already holds, against what the extractors now are
+#'
+#' THE CHECK THAT HAS TO HAPPEN BEFORE THE PASS, NOT DURING IT. ner_manifest_write() refuses to ingest
+#' rows whose spec hash differs from what the store holds under the same model tag -- which is exactly
+#' right, because a moved hash under an unchanged tag means the stored rows were produced by rules
+#' that no longer exist. But it fires at the FIRST INGEST, which on a three-day pass is hours in and
+#' after the read has already been paid for.
+#'
+#' THE CASE THIS EXISTS FOR IS LIVE. Adding CueBefore and CueAfter to the matcon extractors moved
+#' every one of their spec hashes, and the LexNLP image hash with them. A corpus store built before
+#' that carries rows the current extractors cannot be ingested beside -- and, separately, rows whose
+#' schema ent_load_entity() will refuse to read, because ent_extras() now names two columns those
+#' tables do not have.
+#'
+#' FOUR STATES PER MODEL, and only the last is a problem:
+#'   absent   the store has never held this model; nothing to compare
+#'   ok       the stored hash equals the current one
+#'   nohash   the family reports no hash, so a change to it can never be detected
+#'   MOVED    the stored hash differs -- the store must be cleared before this model runs again
+#'
+#' @param .con Connection to one family's database.
+#' @param .describe Output of ner_describe().
+#' @param .family Family name.
+#' @param .entity Entities requested. The pair list comes from cor_pairs(), so the preflight and the
+#'   queue cannot disagree about what a finished document looks like; the spec hash is joined back
+#'   from .describe, because cor_pairs() carries only Model and Entity.
+#' @return Tibble: Model, Entity, Current, Stored, State.
+cor_manifest_check <- function(.con, .describe, .family, .entity) {
+  if (FALSE) {
+    .con      <- con_matcon
+    .describe <- tab_describe
+    .family   <- "matcon"
+    .entity   <- c("GPE", "DATE", "TERM", "MONEY", "REDACT", "LAW")
+  }
+
+  # cor_pairs() RETURNS Model AND Entity AND NOTHING ELSE -- it exists to say how many ledger rows a
+  # finished document carries, so it drops everything the queue does not need. The hash has to come
+  # back from .describe, which is where ner_describe() put it.
+  #
+  # THE PAIR LIST IS STILL cor_pairs()'S, not a second filter written here: it carries the Ready gate
+  # and the abort on a family that produces none of the requested entities, and a preflight computing
+  # its own pair list could disagree with the queue about what a finished document looks like.
+  want_ <- cor_pairs(.describe = .describe, .family = .family, .entity = .entity) |>
+    dplyr::left_join(
+      dplyr::distinct(dplyr::select(.describe, "Model", "Entity", "SpecHash")),
+      by = dplyr::join_by(Model, Entity)
+    )
+
+  have_ <- DBI::dbGetQuery(.con, "SELECT Model, Entity, SpecHash FROM manifest") |>
+    tibble::as_tibble() |>
+    dplyr::rename(Stored = "SpecHash")
+
+  want_ |>
+    dplyr::rename(Current = "SpecHash") |>
+    dplyr::left_join(have_, by = dplyr::join_by(Model, Entity)) |>
+    dplyr::mutate(
+      State = dplyr::case_when(
+        is.na(.data$Stored)                  ~ "absent",
+        is.na(.data$Current)                 ~ "nohash",
+        .data$Stored == .data$Current        ~ "ok",
+        .default                             = "MOVED"
+      )
+    ) |>
+    dplyr::select("Model", "Entity", "Stored", "Current", "State")
+}
+
+
+#' Report the preflight, and stop or clear
+#'
+#' A MOVED HASH IS A DECISION, NOT A WARNING. The stored rows and the rows this pass would write mean
+#' different things, so they cannot share a store: either the store is cleared for that model and the
+#' corpus is re-extracted, or the pass does not run. Continuing is the one option that is never right,
+#' and it is the one an alert rather than an abort would have allowed.
+#'
+#' .rebuild IS THE EXPLICIT CONSENT. Clearing a corpus store discards days of extraction, so it does
+#' not happen because a hash moved -- it happens because someone set a flag saying they meant it. The
+#' default is to stop and say what to set.
+#'
+#' @param .con Connection to one family's database.
+#' @param .tab Tibble from cor_manifest_check().
+#' @param .family Family name.
+#' @param .rebuild Logical. Clear every moved model rather than aborting.
+#' @return Invisibly .tab.
+cor_report_manifest <- function(.con, .tab, .family, .rebuild = FALSE) {
+  if (FALSE) {
+    .con     <- con_matcon
+    .tab     <- tab_pre_matcon
+    .family  <- "matcon"
+    .rebuild <- FALSE
+  }
+
+  cli::cli_h2(paste0("Preflight -- ", .family))
+
+  .tab |>
+    dplyr::mutate(
+      Stored  = dplyr::coalesce(.data$Stored, "-"),
+      Current = dplyr::coalesce(.data$Current, "-")
+    ) |>
+    tbl_say(.title = "What the store holds, against what the extractors are now")
+
+  moved_ <- dplyr::filter(.tab, .data$State == "MOVED")
+
+  if (nrow(moved_) == 0L) {
+    cli::cli_alert_success(
+      "Every model the store holds matches the extractor that would write it, so this pass adds to \\
+       what is there rather than contradicting it."
+    )
+    return(invisible(.tab))
+  }
+
+  mods_ <- unique(moved_$Model)
+
+  if (!isTRUE(.rebuild)) {
+    cli::cli_abort(c(
+      "{length(mods_)} {(.family)} model{?s} {?has/have} moved since the store was written.",
+      "x" = "{paste(mods_, collapse = ', ')}.",
+      "i" = "The stored rows were produced by rules that no longer exist, so they cannot be read
+             beside new ones and cannot be ingested beside them either.",
+      "i" = "Set Rebuild = TRUE to clear {?this model/these models} and re-extract the corpus for
+             {?it/them}. Nothing else in the store is touched."
+    ))
+  }
+
+  cli::cli_alert_warning(
+    "Rebuild is on. Clearing {length(mods_)} {cli::qty(length(mods_))}model{?s} and every span \\
+     {?it has/they have} written."
+  )
+  purrr::walk(mods_, \(.m) ner_db_clear(.con = .con, .model = .m))
+  invisible(.tab)
+}
+
+
 # 2. The queue -----------------------------------------------------------------------------------------------------------
 
 #' The (model, entity) pairs a family will stamp for the entities requested
@@ -230,7 +378,7 @@ cor_pairs <- function(.describe, .family, .entity) {
   if (FALSE) {
     .describe <- tab_describe
     .family   <- "matcon"
-    .entity   <- c("GPE", "DATE", "TERM", "MONEY", "REDACT")
+    .entity   <- c("GPE", "DATE", "TERM", "MONEY", "REDACT", "LAW")
   }
 
   out_ <- .describe |>
@@ -269,12 +417,24 @@ cor_pairs <- function(.describe, .family, .entity) {
 #' @param .entity Entities requested.
 #' @param .limit Cap for a rehearsal; NULL takes everything outstanding.
 #' @return Tibble: DocID, Path.
+#'
+#' A CAP IS A FIXED COHORT, NOT A ROLLING WINDOW, and that is the whole point of it. Applying LIMIT
+#' to the OUTSTANDING set takes the next n documents on every render, so a rehearsal never repeats
+#' and never finishes: two renders at 1,000 give 2,000 different documents, and no number in either
+#' can be compared with the other. Applying it to the CORPUS instead fixes the cohort -- the same n
+#' documents every time, of which this render extracts whichever are not already done. A second
+#' render is then a no-op, and a coverage figure means the same thing twice.
+#'
+#' THE COHORT IS DRAWN IN HASH ORDER AND THE FULL QUEUE IN DocID ORDER. A DocID begins with the
+#' accession number, which begins with the filer's CIK, so DocID order is CIK order -- the oldest
+#' registrants first. Harmless when every document is taken anyway, and it also gives a stable
+#' resumption; wrong for a rehearsal meant to estimate coverage and throughput for the corpus.
 cor_pending <- function(.con, .describe, .family, .entity, .limit = NULL) {
   if (FALSE) {
     .con      <- con_matcon
     .describe <- tab_describe
     .family   <- "matcon"
-    .entity   <- c("GPE", "DATE", "TERM", "MONEY", "REDACT")
+    .entity   <- c("GPE", "DATE", "TERM", "MONEY", "REDACT", "LAW")
     .limit    <- NULL
   }
 
@@ -283,17 +443,28 @@ cor_pending <- function(.con, .describe, .family, .entity, .limit = NULL) {
 
   mods_ <- paste0("'", unique(pairs_$Model), "'", collapse = ", ")
   ents_ <- paste0("'", unique(pairs_$Entity), "'", collapse = ", ")
-  lim_  <- if (is.null(.limit)) "" else glue::glue(" LIMIT {as.integer(.limit)}")
+  # THE COHORT IS CHOSEN BEFORE THE LEDGER IS CONSULTED, which is what makes it fixed. Choosing it
+  # after would make "the first thousand" mean "the first thousand still outstanding", and that is a
+  # different thousand on every render.
+  # BOTH BRANCHES ARE SUBQUERIES so the alias binds the same way in each. Writing the uncapped branch
+  # as a bare table with its filter inline put the alias after the WHERE clause -- "FROM corpus WHERE
+  # Extract c" -- which is not a syntax error anybody reads twice and is not valid SQL either.
+  from_ <- if (is.null(.limit)) {
+    "(SELECT * FROM corpus WHERE Extract)"
+  } else {
+    glue::glue("(SELECT * FROM corpus WHERE Extract \\
+                 ORDER BY md5(DocID) LIMIT {as.integer(.limit)})")
+  }
 
   DBI::dbGetQuery(.con, glue::glue(
     "SELECT c.DocID, c.Path
-       FROM corpus c
+       FROM {from_} c
        LEFT JOIN (
          SELECT DocID, COUNT(*) AS n FROM runs
           WHERE Model IN ({mods_}) AND Entity IN ({ents_}) GROUP BY DocID
        ) r ON r.DocID = c.DocID
-      WHERE c.Extract AND COALESCE(r.n, 0) < {want_}
-      ORDER BY c.DocID{lim_}"
+      WHERE COALESCE(r.n, 0) < {want_}
+      ORDER BY c.DocID"
   )) |>
     tibble::as_tibble()
 }
@@ -535,7 +706,7 @@ cor_pass <- function(.con, .family, .entity, .describe, .stage_path, .stage_dir,
   if (FALSE) {
     .con            <- con_matcon
     .family         <- "matcon"
-    .entity         <- c("GPE", "DATE", "TERM", "MONEY", "REDACT")
+    .entity         <- c("GPE", "DATE", "TERM", "MONEY", "REDACT", "LAW")
     .describe       <- tab_describe
     .stage_path     <- fs::path(.lP$Output$Stage, "chunk.parquet")
     .stage_dir      <- fs::path(.lP$Output$Stage, "matcon")

@@ -1,5 +1,5 @@
 ---
-title: "Entity Rules -- Redactions (04B5)"
+title: "Entity Rules -- What Was Withheld (04B5)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -12,6 +12,10 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
 knitr::opts_chunk$set(
   root.dir = here::here(),
   message  = TRUE,
@@ -36,6 +40,7 @@ source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
 source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
 source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
 
+# 03A owns the contract-type vocabulary and the label spine; 04A owns the sample and the stores.
 purrr::walk(
   .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
   .f = \(.s) source(
@@ -63,67 +68,105 @@ source(file = .path_fun, encoding = "UTF-8")
 
 # Purpose
 
-This document counts redaction markers and turns them into a per-document intensity.
+This document counts what each contract withheld, and asks what the markers replaced.
 
-## One producer, so every table is a description
+## Six kinds, one column each, and that is the whole rule
 
-matcon's `redaction-v2` is the only extractor in the project that emits a redaction marker at all --
-LexNLP has no such label and spaCy is not in the corpus pass. So there is no second opinion to report
-against, and nothing below is a comparison. That is a fact about the instrument rather than a choice.
+`redaction.py` assigns a class to every span, and this releases all six of them separately:
 
-## The variable is bimodal and should be reported as two things
+| Class | What it matches |
+|:--|:--|
+| `RedactExplicit` | a bracket naming confidential treatment -- CONFIDENTIAL, REDACT, CTR |
+| `RedactSymbol` | a bracket of whitespace and asterisks -- `[***]`, `[ * * * ]`, `[*]` |
+| `RedactBlank` | a bracket of whitespace and underscores -- `[___]`, `[__]` |
+| `OmitExplicit` | a bracket recording deletion -- INTENTIONALLY, OMITTED, DELETE |
+| `OmitSymbol` | a bracket of bullets or ellipses, or three dots |
+| `RedactBare` | an unbracketed run of three or more asterisks |
 
-Over the corpus, REDACT coverage is **0.193** at **43.4 spans per document**. A fifth of contracts
-carry a marker at all, and the ones that do carry many. Presence and intensity are two questions, and
-a mean over every document answers neither: it is the product of a rate and a conditional mean, and
-the interesting variation is in both.
+**The version this replaces threw five of them away.** It tested whether `LabelRaw` contained
+`"BARE"` and called everything else "bracketed", so the four published classes and the one addition
+arrived as a single bucket. Releasing them separately costs four columns and makes every question
+below a **filter** rather than a decision taken here.
 
-## The denominator comes from the register
+## The published method is brackets only, and that is not an inference
 
-Markers per thousand words needs a word count, and contracts run from four thousand to seventeen
-thousand words by class. An earlier version counted `\S+` over the canonical text, which works on
-4,398 documents and cannot work on 1.19 million -- 04C writes no corpus text file. 02B's register
-carries `nWords` for all 1,771,923, so the ratio can reach the corpus.
+`06-Redactions.R` extracted `\[.+?\]` from uppercased, whitespace-collapsed text and joined a curated
+indicator list. No unbracketed pattern could reach it.
 
-**The two counts are printed side by side rather than assumed equal.** One counts whitespace-separated
-runs in R and the other was computed upstream; where they disagree materially the ratio is sensitive
-to which is used, and a reader of a per-thousand-words figure should know that before reading it.
+So **`NBracketed`** -- the five bracketed classes summed -- is the quantity Table 3 was built on, and
+it is released as its own column. The published figure is reproducible from this file rather than only
+from the old code, which is the same discipline as `NaiveYears` in 04B3 and the naive columns in 04B4.
+
+## Redact is not Omit
+
+`[INTENTIONALLY OMITTED]` is a placeholder where a schedule was left out. `[***]` is confidential
+treatment. Both are gaps in a contract and only one is a redaction, so **`NWithheld`** carries the
+`Redact` classes and leaves the `Omit` ones out.
+
+## One filing carries 14,689 bare markers
+
+**24% of every redaction span in the sample, from a single document.** Nothing here removes it: it is
+a real count of a real document, and the by-class columns make it visible without a rule -- its
+markers are entirely `RedactBare`, so any measure built on the bracketed classes never sees it.
+
+**What it cost when the kinds were pooled** is why the class contrast is computed **four ways** --
+span-weighted and document-weighted, with bare markers and without. Employment: Compensation once
+showed a positional contrast of 13.29 against 1 to 5 everywhere else, and that was one filing. A
+finding surviving all four cells is a finding; one appearing only in the span-weighted pooled cell is
+a flood document.
+
+## The ratio is the comparable quantity
+
+Contracts run from roughly 4,200 to 17,400 words by class, so a count of markers is partly a count of
+words. Markers per thousand words is what makes a class or industry comparison mean anything, and it
+is what referee 2 asked for when they wanted redaction intensity by firm-quarter.
+
+## The denominator comes from the register, and this document opens nothing
+
+02B carries `nWords` for all 1,771,923 documents. Counting `\S+` over the canonical text works on
+4,398 and cannot work on 1.19 million, because 04C writes no corpus text file. The recount is
+available as an **agreement check** on the sample and is skipped entirely when no text path is given,
+which is what the corpus run does.
+
+**With 04B2, 04B3 and 04B4 already moved to stored cue columns, no rule in the 04B family needs a
+document.** 04D's `Cues` dial has nothing left to gate.
 
 ## What sat beside a marker is reported and not released
 
-A marker beside a currency symbol hid an amount; beside an organisation, a party name. The nearest
-labelled span within reach is the cheapest statement of that, and it is the same proximity instrument
-04B2 uses. On the earlier check **82%** of markers had no labelled entity within forty characters,
-and a variable missing four times in five is a diagnostic rather than a measure. What it can say is
-which labels sit near markers at all, which is the first thing to know before anyone builds on it.
-
-## What is recomputed, and what is not
-
-Everything, on every render.
+A marker beside a currency symbol hid an amount; beside an organisation, a party name. That is a
+proximity question of exactly the kind 04B2 answers, and it reads no text. It stays a diagnostic
+because 82% of markers had no labelled entity within forty characters, and a variable missing four
+times in five is not a measure.
 
 ## How results are reported
 
-Console tables throughout, two figures in `# Overview`. The two marker kinds are separate columns,
-never a total.
+Console tables throughout, four figures in `# Overview`, and two reading blocks: **real markers of
+every class**, which is what decides whether a class belongs in a headline variable, and the ten
+heaviest documents.
 
 ## Where things are written
 
-Two artifacts: the markers with their kind and nearest neighbour, and one row per document.
+**One file**, one row per contract.
 
 # Configuration
+
+## The parameters, and where they came from
 
 ```{r}
 #| label: configure
 
 .lP <- list(
   Input = list(
-    Text = fs::path(
-      init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
-      "Output", "sample_text.parquet"
-    ),
     Store = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
       "Output"
+    ),
+    # THE CANONICAL TEXT, FOR A CHECK AND NOT A SOURCE. red_words() takes NULL here and skips the
+    # recount entirely, which is what the corpus run does; on the sample it is worth knowing whether
+    # the register's count and a recount agree.
+    Text = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
+      "Output", "sample_text.parquet"
     ),
     Prepared = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare"),
@@ -135,265 +178,358 @@ Two artifacts: the markers with their kind and nearest neighbour, and one row pe
     )
   ),
   Output = list(
-    Spans = utils_file_path(.dir_main, "Output", "roles_redact.parquet"), # per marker
-    Doc   = utils_file_path(.dir_main, "Output", "redact_doc.parquet")    # per document
+    Contracts = utils_file_path(.dir_main, "Output", "contracts_redact.parquet")
   ),
   Params = list(
-    Family = "matcon",   # the only family that emits a redaction marker
-    # WHAT A MARKER MIGHT HAVE REPLACED, each read from the family the corpus pass carries for it.
-    # ORG is LexNLP's because matcon emits none; the other three are matcon's.
-    Neighbours = c(MONEY = "matcon", ORG = "lexnlp", DATE = "matcon", GPE = "matcon"),
-    Reach   = 40L,      # furthest a labelled span may be and still be the marker's neighbour
-    Bins    = 50L,
-    ReadN   = 10L,
-    ReadCtx = 200L,
-    CheckN  = 500L,
-    Seed    = 42L
+    Family    = "matcon",                    # the only family emitting a redaction marker at all
+    NearLabel = c("MONEY", "GPE", "DATE"),   # what a marker might have replaced
+    Reach     = 40L,                         # characters either side, for the neighbour check
+    ReadKinds = 4L,                          # spans shown per class
+    ContextWidth = 108L,                     # characters a context line may use; must not wrap
+    ReadHeavy = 10L,                         # heaviest documents listed
+    Seed      = 42L                          # fixed, so the same spans are read on every render
   )
 )
 
-fs::dir_create(fs::path_dir(.lP$Output$Spans))
+fs::dir_create(fs::path_dir(.lP$Output$Contracts))
 
-tibble::tibble(
+tab_inputs <- tibble::tibble(
   Input  = names(.lP$Input),
   Path   = purrr::map_chr(.lP$Input, \(.p) fs::path_rel(.p, start = here::here())),
   Exists = purrr::map_lgl(.lP$Input, \(.p) fs::file_exists(.p) || fs::dir_exists(.p))
-) |>
-  tbl_say(.title = "Every input resolves before anything is computed")
+)
+
+tbl_say(.tab = tab_inputs, .title = "Every input resolves before anything is computed")
+
+# A TABLE OF FALSE IS A REPORT, NOT A GATE, and the difference has cost a render before. TEXT IS THE
+# ONE EXCEPTION AND IT IS DECLARED RATHER THAN ASSUMED: it feeds an agreement check on the sample and
+# is deliberately absent on the corpus, where 04C writes no text file at all. Aborting on it would
+# make the corpus path fail on a file it is right not to have.
+.lP$Params$Optional <- "Text"
+
+need_ <- dplyr::filter(tab_inputs, !.data$Exists, !.data$Input %in% .lP$Params$Optional)
+
+if (nrow(need_) > 0L) {
+  cli::cli_abort(c(
+    "{nrow(need_)} required input{?s} {?does/do} not resolve.",
+    "x" = "{paste(need_$Input, collapse = ', ')}."
+  ))
+}
+
+# AND AN ABSENT OPTIONAL INPUT IS NULLED HERE rather than left as a path that does not exist, so the
+# functions below take one decision from one place: red_words() sees NULL and skips the recount,
+# exactly as it does on the corpus.
+gone_ <- dplyr::filter(tab_inputs, !.data$Exists, .data$Input %in% .lP$Params$Optional)
+
+if (nrow(gone_) > 0L) {
+  .lP$Input[gone_$Input] <- list(NULL)
+  cli::cli_alert_info(
+    "{nrow(gone_)} optional input{?s} absent: {paste(gone_$Input, collapse = ', ')}. The word-count \\
+     agreement check is skipped and the register's count is used, which is what the corpus run does \\
+     in every case."
+  )
+}
 ```
 
 # Input
+
+## The anchor, and the denominator
 
 ```{r}
 #| label: build-keys
 
 tab_keys <- ent_anchor_keys(
-  .path_prepared = .lP$Input$Prepared,
-  .path_register = .lP$Input$Register,   # carries nWords, which is the ratio's denominator
-  .path_landing  = NULL,
+  .path_prepared = .lP$Input$Prepared,  # 03A: DocID, ClassDetailed, AmendType, Fold
+  .path_register = .lP$Input$Register,  # 02B: CIK, CompanyName, DateFiled, nWords
+  .path_landing  = NULL,                # the addresses are 04B2's; not read here
   .quiet         = FALSE
 )
 
-tab_lens <- ent_doc_lens(.path_text = .lP$Input$Text)
+tab_lens <- tab_keys |>
+  dplyr::transmute(DocID, DocLen = as.integer(.data$nChars)) |>
+  dplyr::filter(!is.na(.data$DocLen), .data$DocLen > 0L)
+
+tab_words <- red_words(
+  .keys      = tab_keys,
+  .path_text = .lP$Input$Text,   # NULL on the corpus run, and then nothing is opened
+  .quiet     = FALSE
+)
 ```
 
+**The register's count is the one used either way.** The recount exists to say whether the two agree,
+because where they disagree materially every per-thousand-words figure below is sensitive to which was
+taken -- and only the register's can reach the corpus.
+
+## The markers
+
 ```{r}
-#| label: load-markers
+#| label: load-spans
 
 tab_marks <- red_load(
-  .dir_store = .lP$Input$Store,   # the directory; the family is the filename
+  .dir_store = .lP$Input$Store,
   .lens      = tab_lens,
   .family    = .lP$Params$Family,
   .quiet     = FALSE
 )
-
-tab_words <- red_words(
-  .keys      = tab_keys,          # the register's count, which is the one that reaches the corpus
-  .path_text = .lP$Input$Text,    # the recount, for the agreement check and the fallback
-  .quiet     = FALSE
-)
-
-tab_counts <- red_counts(
-  .marks = tab_marks,             # every marker, with its kind
-  .words = tab_words,             # the denominator
-  .keys  = tab_keys               # so a document with no marker at all still carries a row
-)
-
-red_report_found(.marks = tab_marks, .counts = tab_counts)
 ```
+
+**The class arrives as the extractor wrote it.** `redaction.py`'s `CLASSES` tuple and this document's
+vocabulary are two statements of one list, so a class emitted there and unregistered here aborts
+rather than ordering arbitrarily in every table and appearing in no column of the release.
 
 # Construction
 
-```{r}
-#| label: find-neighbours
-tab_near <- red_neighbour(
-  .marks   = tab_marks,
-  .dir_store = .lP$Input$Store,
-  .lens    = tab_lens,
-  .labels  = .lP$Params$Neighbours,   # money, org, date and gpe at the corpus engines
-  .reach   = .lP$Params$Reach,
-  .quiet   = TRUE
-)
+## Applying the rule
 
-red_report_neighbour(.marks = tab_near, .reach = .lP$Params$Reach)
+```{r}
+#| label: apply-rule
+
+tab_release <- red_release(
+  .marks = tab_marks,
+  .words = tab_words,
+  .keys  = tab_keys    # runs from the key side, so a contract with no marker still gets a row
+)
 ```
 
+## What each class contributes
+
 ```{r}
-#| label: report-cto
-# The base rate stands unchecked until the confidential-treatment match is joined here. 05-CheckItem101
-# already establishes which filings carry an order, and if that rate and this one disagree materially,
-# one of them is wrong -- which matters for the intensity figures referee 2 asked for.
-red_report_cto(.counts = tab_counts, .cto = NULL)
+#| label: report-kind
+
+tab_kind <- red_table_kind(.marks = tab_marks, .release = tab_release)
+
+red_report_kind(.tab = tab_kind)
+```
+
+## What sat beside a marker
+
+```{r}
+#| label: neighbour
+
+tab_near <- red_neighbour(
+  .marks     = tab_marks,
+  .dir_store = .lP$Input$Store,
+  .lens      = tab_lens,
+  .labels    = .lP$Params$NearLabel,   # MONEY, GPE, DATE -- what a marker might have replaced
+  .reach     = .lP$Params$Reach,
+  .quiet     = TRUE
+)
+
+tab_near |>
+  dplyr::summarise(Spans = dplyr::n(), Docs = dplyr::n_distinct(.data$DocID), .by = Near) |>
+  dplyr::mutate(Share = tbl_pct(.data$Spans / sum(.data$Spans))) |>
+  dplyr::arrange(plot_factor(.data$Near, .key = "RedactNear")) |>
+  tbl_say(.title = "The nearest labelled entity within forty characters")
+
+cli::cli_alert_info(
+  "REPORTED AND NOT RELEASED. Most markers have nothing labelled beside them at all, and a variable \\
+   missing four times in five is a diagnostic rather than a measure. It is a comparison of offsets \\
+   and reads no text, which is the same instrument 04B2 attaches a place with."
+)
 ```
 
 # Results
 
+## Redaction intensity by contract type
+
 ```{r}
-#| label: report-contrast
-tab_contrast <- red_contrast(.marks = tab_marks, .counts = tab_counts)
+#| label: table-class
+
+tab_class <- red_table_class(.release = tab_release)
+
+red_report_class(.tab = tab_class)
+```
+
+## The class contrast, four ways
+
+```{r}
+#| label: table-contrast
+
+tab_contrast <- red_contrast(.marks = tab_marks, .release = tab_release)
 
 red_report_contrast(.tab = tab_contrast)
 ```
 
-The prediction this table exists to test, stated before it runs: **Employment: Compensation collapses
-toward the other classes** once bare markers are excluded and documents are weighted equally. If it
-does not, the 13.29 was a real finding about where compensation exhibits redact, and it can go in the
-paper -- but not until the four cells agree.
-
 # Validation
 
+## Three identities the counts cannot violate
+
 ```{r}
-#| label: validate-offsets
-tab_check <- ent_verify_span(
-  .tab       = tab_marks,
-  .path_text = .lP$Input$Text,
-  .col_start = "Start",
-  .col_stop  = "Stop",
-  .col_span  = "Span",
-  .n         = .lP$Params$CheckN,
-  .seed      = .lP$Params$Seed
-)
+#| label: validate-counts
+
+# THE TOTALS ARE SUMS OF THE SIX CLASSES, so they cannot disagree with them, and the published
+# definition can never exceed the whole. A contract with no marker must carry zeros rather than
+# missing values, because withholding nothing is a measurement.
+six_ <- rowSums(dplyr::select(tab_release, "NRedactExplicit", "NRedactSymbol", "NRedactBlank",
+                              "NOmitExplicit", "NOmitSymbol", "NRedactBare"))
 
 tibble::tibble(
-  Check = c(
-    "Text cut at the stored offsets equals the stored span",
-    "Every marker carries one of the two kinds",
-    "Bracketed and bare sum to the total",
-    "Every document carries a word count",
-    "Documents carrying exactly one row",
-    "Every neighbour distance is within the reach"
-  ),
-  N = c(
-    sum(tab_check$Exact),
-    sum(tab_marks$Kind %in% c("bracketed", "bare")),
-    sum(tab_counts$NBracketed + tab_counts$NBare == tab_counts$NRedact),
-    sum(!is.na(tab_counts$NWords)),
-    dplyr::n_distinct(tab_counts$DocID),
-    sum(tab_near$NearDist <= .lP$Params$Reach, na.rm = TRUE)
-  ),
-  Of = c(
-    nrow(tab_check),
-    nrow(tab_marks),
-    nrow(tab_counts),
-    nrow(tab_counts),
-    nrow(tab_counts),
-    sum(!is.na(tab_near$NearDist))
-  )
+  Item = c("Documents in the sample",
+           "Rows in the released file",
+           "Where the six classes do not sum to NRedact",
+           "Where NBracketed exceeds NRedact",
+           "Markers loaded, against the released total"),
+  N    = c(nrow(tab_keys),
+           nrow(tab_release),
+           sum(six_ != tab_release$NRedact),
+           sum(tab_release$NBracketed > tab_release$NRedact),
+           nrow(tab_marks) - sum(tab_release$NRedact))
 ) |>
-  dplyr::mutate(Share = tbl_pct(.data$N / .data$Of)) |>
-  tbl_say(.title = "Every row is expected at 100%")
+  tbl_say(.title = "Three identities the counts cannot violate")
+
+cli::cli_alert_info(
+  "The first two rows must be equal and the last three must all be ZERO. A total that is not the sum \\
+   of its parts means a class is being counted twice or not at all; a published definition larger \\
+   than the whole is arithmetically impossible; and a difference in the last row means markers were \\
+   loaded that no document's row accounts for."
+)
 ```
 
 # Robustness
 
-```{r}
-#| label: read-bracketed
-ent_read_spans(
-  .tab       = dplyr::filter(tab_near, .data$Kind == "bracketed", .data$NearLabel != "nothing"),
-  .path_text = .lP$Input$Text,
-  .col_start = "Start",
-  .col_stop  = "Stop",
-  .n         = .lP$Params$ReadN,
-  .ctx       = .lP$Params$ReadCtx,
-  .seed      = .lP$Params$Seed
-) |>
-  ent_report_read(
-    .cols  = c("Kind", "NearLabel", "NearDist"),
-    .title = "Bracketed markers with something labelled beside them"
-  )
-```
+## What each class actually catches
 
 ```{r}
-#| label: read-bare
-ent_read_spans(
-  .tab       = dplyr::filter(tab_near, .data$Kind == "bare"),
-  .path_text = .lP$Input$Text,
-  .col_start = "Start",
-  .col_stop  = "Stop",
-  .n         = 8L,
-  .ctx       = .lP$Params$ReadCtx,
-  .seed      = .lP$Params$Seed
-) |>
-  ent_report_read(
-    .cols  = c("Kind", "NearLabel", "NearDist"),
-    .title = "Bare markers -- the kind that floods"
-  )
+#| label: read-kinds
+
+tab_read <- red_read_kinds(
+  .marks = tab_near,               # carries Near, so the block says what sat beside each span
+  .n     = .lP$Params$ReadKinds,
+  .seed  = .lP$Params$Seed
+)
+
+red_report_read_kinds(.tab = tab_read)
 ```
 
+**This is the block that decides which classes a headline variable should use.** Six classes are six
+claims about what a bracket means, and no count says whether `[INTENTIONALLY OMITTED]` belongs in a
+redaction measure -- only the span does. Read the `Omit` rows against the `Redact` ones.
+
+## What one marker of each class sits in
+
 ```{r}
-#| label: read-flood
-# The documents with the most markers, read rather than averaged. An average over a distribution with
-# one observation at 14,689 is a fiction, and this is what that observation looks like.
-tab_counts |>
-  dplyr::slice_max(.data$NRedact, n = 10L, with_ties = FALSE) |>
-  dplyr::select(DocID, Class, NWords, NBracketed, NBare, RedactRatio) |>
-  dplyr::mutate(RedactRatio = round(.data$RedactRatio, 2)) |>
-  tbl_say(.title = "The ten most heavily marked documents")
+#| label: read-context
+
+tab_context <- red_read_context(
+  .marks = tab_marks,
+  .width = .lP$Params$ContextWidth   # budgeted so the line never wraps
+)
+
+red_report_context(.tab = tab_context)
 ```
+
+**A span says what a class matches; the sentence says what the drafter was doing.** `[***]` is
+unambiguous once `$ [***] per share` is around it, and `[.]` is not a redaction at all until the text
+says whether something was withheld or a bullet was left in. The context is `CueBefore` and
+`CueAfter` -- cut at extraction from the offsets that produced the span -- so this opens no
+document either.
+
+## The documents carrying the most markers
+
+```{r}
+#| label: read-heavy
+
+tab_heavy <- red_read_heavy(.release = tab_release, .n = .lP$Params$ReadHeavy)
+
+red_report_heavy(.tab = tab_heavy)
+```
+
+**A mean over a distribution with one observation at 14,689 is a fiction**, and this is what that
+observation looks like beside the ones around it.
 
 # Deployment
 
-```{r}
-#| label: write-artifacts
-arrow::write_parquet(tab_near, .lP$Output$Spans)
-arrow::write_parquet(tab_counts, .lP$Output$Doc)
+## The release
 
-tibble::tibble(
-  Artifact = c("Markers with their kind and what sat beside them",
-               "Redaction counts and intensity, per document"),
-  Path     = c(.lP$Output$Spans, .lP$Output$Doc)
-) |>
-  dplyr::mutate(
-    Exists = fs::file_exists(.data$Path),
-    MB     = round(as.numeric(fs::file_size(.data$Path)) / 1024^2, 1),
-    Path   = fs::path_file(.data$Path)
-  ) |>
-  tbl_say(.title = "Written by 04B5")
+```{r}
+#| label: write-artifact
+
+arrow::write_parquet(tab_release, .lP$Output$Contracts)
+
+red_report_release(.tab = tab_release)
 ```
 
-The document table carries both kinds as separate columns and both ratios, so a consumer who
-disagrees about whether bare markers count can pool them without re-deriving anything.
+## What every column means
+
+```{r}
+#| label: report-dictionary
+
+tab_dict <- red_dictionary(.tab = tab_release)
+
+red_report_dictionary(.tab = tab_dict)
+```
+
+**Every candidate definition is a column rather than a decision taken here:**
+
+```r
+tab_release |>
+  dplyr::summarise(
+    Published = sum(.data$NBracketed),   # what Table 3 counted
+    Withheld  = sum(.data$NWithheld),    # redaction, not omission
+    Everything = sum(.data$NRedact),
+    .by = Class
+  )
+```
 
 # Overview
 
+## The rule in one table
+
+```{r}
+#| label: report-headline
+
+red_report_headline(.release = tab_release, .marks = tab_marks)
+```
+
+## Spans against documents, by class
+
+```{r}
+#| label: fig-kind
+#| fig-cap: "Each class as a share of all markers, and as a share of the contracts carrying one. A
+#|   class large on spans and small on documents is concentrated in few filings, which is what the
+#|   bare row is."
+#| fig-height: 3.4
+
+red_plot_kind(.tab = tab_kind)
+```
+
+## Markers per thousand words
+
 ```{r}
 #| label: fig-ratio
-#| fig-height: !expr plot_height(length(plot_levels("ClassDetailed")))
-#| fig-cap: "Mean bracketed markers per thousand words, by contract type, weighting every contract
-#|   equally. This is the document-weighted, bare-excluded cell of the four-way table, and the one a
-#|   redaction-intensity figure should be built from."
-red_plot_ratio(.counts = tab_counts)
+#| fig-cap: "Bracketed markers per thousand words, by contract type, over the contracts carrying one.
+#|   The ratio rather than the count, because contracts run from roughly 4,200 to 17,400 words by
+#|   class."
+#| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_release$Class))
+
+red_plot_ratio(.release = tab_release)
 ```
+
+## Where the markers sit
 
 ```{r}
 #| label: fig-density
-#| fig-height: !expr plot_height(6L)
-#| fig-cap: "Share of markers by relative position in the document, weighted by documents, by kind.
-#|   A kind that clusters at one end is following a drafting convention; one spread evenly is being
-#|   used for something other than withholding a term."
-red_plot_density(.marks = tab_marks, .bins = .lP$Params$Bins)
+#| fig-cap: "Position through the document, by class. Confidential treatment concentrates where the
+#|   commercial terms are; an omitted schedule sits where schedules sit, which is one reason the two
+#|   are separate columns."
+#| fig-height: 4.2
+
+red_plot_density(.marks = tab_marks)
 ```
 
+## The nearest labelled entity
+
 ```{r}
-#| label: report-everything
-red_report_all(
-  .marks    = tab_marks,
-  .near     = tab_near,
-  .counts   = tab_counts,
-  .contrast = tab_contrast,
-  .reach    = .lP$Params$Reach
-)
+#| label: fig-near
+#| fig-cap: "The nearest labelled entity within forty characters of each marker. Most markers have
+#|   nothing labelled beside them, which is why this is a diagnostic and not a released variable."
+#| fig-height: 2.6
+
+red_plot_near(.near = tab_near)
 ```
 
 # Next
 
-Two things this document points at rather than answers.
-
-**The base rate needs the confidential-treatment match.** 05-CheckItem101 already establishes which
-filings carry an order; joining it here turns an unchecked share into a cross-tab, and a marker with
-no order or an order with no marker is a finding either way.
-
-**The money-adjacent case is the one worth pursuing.** A marker beside a currency symbol hid an
-amount, and that is the single place where this label and 04B4 have something to say to each other -- 
-a contract whose largest amount is redacted has a maximum that means something different from one
-whose largest amount is stated.
+**04D** applies all five rules at corpus scale. Nothing there re-extracts and nothing there opens a
+document: every rule in this family now reads spans and stored cue columns, so the corpus pass is a
+query rather than a second reading of 1.19 million contracts.

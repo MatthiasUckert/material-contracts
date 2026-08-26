@@ -80,6 +80,17 @@ reach them and how their text gets off disk.
 The two sets of stores then carry identical schemas, identical model tags and identical spec hashes,
 which is what makes "the sample says X" a statement about the corpus rather than about the sample.
 
+## What each family is asked for
+
+The same plan 04A ran, minus spaCy: **matcon** for `GPE`, `DATE`, `TERM`, `MONEY`, `REDACT` and
+`LAW`, and **LexNLP** for `ORG`, `GPE`, `DATE`, `MONEY`. Asking a family for everything it can produce
+costs nothing extra -- both read each document exactly once regardless of how many entities are
+requested -- and asking for less risks a re-run when a rule wants an entity this pass skipped.
+
+`LAW` is the one addition since the store was first built. `lawregex` emits a governing-law clause as
+a span with offsets, which is what lets 04B2 withhold a jurisdiction from a party's address by
+containment rather than by reading text.
+
 ## Why spaCy is not here
 
 On 04A's evidence, and it is worth stating plainly because it is the largest single decision in the
@@ -120,6 +131,8 @@ manifest, the corpus index and the failure log. 04B reads them; nothing else doe
 
 # Configuration
 
+## The parameters, and where they came from
+
 ```{r}
 #| label: configure
 
@@ -157,7 +170,7 @@ manifest, the corpus index and the failure log. 04B reads them; nothing else doe
     # DOCUMENTS PER ENGINE INVOCATION. Each chunk is read, staged as one parquet and handed to the
     # extractor, so this trades container startups against staging-file size: at 5,000 documents the
     # pass makes about 240 invocations and stages roughly 165 MB a time.
-    ChunkSize = 5000L,
+    ChunkSize = 50000L,
 
     # TWO WORKER COUNTS, BECAUSE THEY ARE TWO RESOURCES. The daemons read parquet files off disk and
     # finish before the container starts, so the two never contend -- but they are separate settings
@@ -188,19 +201,30 @@ manifest, the corpus index and the failure log. 04B reads them; nothing else doe
     # and every span in 04A.
     OffsetSample = 500L,
 
-    # NULL takes the whole outstanding queue. An integer caps it, which is how to rehearse the loop
-    # on a few thousand documents before committing to the full pass.
-    Limit  = NULL,
-    Reload = FALSE   # rebuild the corpus index from the register rather than reusing the store's
+    # NULL takes the whole outstanding queue. An integer names a FIXED COHORT: the same n documents
+    # on every render, of which this one extracts whichever are not already done. A second render at
+    # the same number is therefore a no-op rather than another n documents, so a rehearsal can be
+    # repeated and its numbers compared. The cohort is drawn in hash order, so it is a slice of the
+    # corpus rather than its oldest registrants. See cor_pending().
+    Limit  = 100000,
+    Reload = FALSE,  # rebuild the corpus index from the register rather than reusing the store's
+
+    # CLEARING A CORPUS STORE DISCARDS DAYS OF EXTRACTION, so it happens on an explicit flag and
+    # never because a check found a reason. FALSE stops the pass and names the models whose rules
+    # have moved; TRUE clears exactly those and re-extracts them.
+    Rebuild = FALSE
   )
 )
 
-# WHAT EACH FAMILY IS ASKED FOR: everything it can produce. Asking for less risks a re-run when a
-# rule wants an entity we skipped, and asking for all of it costs nothing extra -- both families read
-# each document exactly once regardless of how many entities are requested.
+# THE SAME PLAN 04A RAN, MINUS spaCy. Everything each family can produce, because asking for less
+# risks a re-run when a rule wants an entity this pass skipped and asking for all of it costs nothing
+# extra -- both families read each document exactly once regardless of how many entities are named.
+#
+# LAW IS THE ONE ADDITION since the store was first built, and it is what lets 04B2 withhold a
+# jurisdiction from a party's address by containment rather than by reading text.
 .lP$Plan <- tibble::tribble(
   ~Family,   ~Entities,
-  "matcon",  c("GPE", "DATE", "TERM", "MONEY", "REDACT"),
+  "matcon",  c("GPE", "DATE", "TERM", "MONEY", "REDACT", "LAW"),
   "lexnlp",  c("ORG", "GPE", "DATE", "MONEY")
 )
 
@@ -208,6 +232,8 @@ fs::dir_create(c(.lP$Output$Store, .lP$Output$Stage))
 ```
 
 # Families
+
+## What each engine is, and what it would write
 
 ```{r}
 #| label: describe-families
@@ -241,12 +267,9 @@ cli::cli_alert_info(
 )
 ```
 
-**A stale spec hash stops this document before it spends anything.** `ner_ingest()` refuses to write
-where a model tag is unchanged and its hash has moved, because that means the rules were edited
-without the version being bumped and the rows already stored mean something else. Over a three-day
-pass that check is worth more than it is on a sample.
-
 # Input
+
+## Opening the two stores, and loading the corpus index
 
 ```{r}
 #| label: connect-and-load
@@ -287,6 +310,56 @@ invisible(cor_corpus_load(
 ))
 ```
 
+## Preflight: what the store holds against what the extractors are
+
+```{r}
+#| label: preflight
+
+tab_pre <- dplyr::bind_rows(
+  dplyr::mutate(cor_manifest_check(
+    .con      = con_matcon,
+    .describe = tab_describe,
+    .family   = "matcon",
+    .entity   = .lP$Plan$Entities[[which(.lP$Plan$Family == "matcon")]]
+  ), Family = "matcon", .before = 1L),
+  dplyr::mutate(cor_manifest_check(
+    .con      = con_lexnlp,
+    .describe = tab_describe,
+    .family   = "lexnlp",
+    .entity   = .lP$Plan$Entities[[which(.lP$Plan$Family == "lexnlp")]]
+  ), Family = "lexnlp", .before = 1L)
+)
+
+cor_report_manifest(
+  .con     = con_matcon,
+  .tab     = dplyr::filter(tab_pre, .data$Family == "matcon"),
+  .family  = "matcon",
+  .rebuild = .lP$Params$Rebuild   # TRUE clears a moved model; FALSE stops and names it
+)
+
+cor_report_manifest(
+  .con     = con_lexnlp,
+  .tab     = dplyr::filter(tab_pre, .data$Family == "lexnlp"),
+  .family  = "lexnlp",
+  .rebuild = .lP$Params$Rebuild
+)
+```
+
+**`ner_ingest()` makes this comparison already, and it makes it too late.** It refuses to write where
+a model tag is unchanged and its hash has moved -- because that means the rules were edited without
+the version being bumped, and the rows already stored mean something else. But it fires at the first
+ingest, which on a three-day pass is hours in and after the read has been paid for.
+
+**The case is live rather than hypothetical.** Adding `CueBefore` and `CueAfter` to the extractors
+moved every matcon spec hash and the LexNLP image hash with them. A store built before that carries
+rows this pass cannot be ingested beside -- and, separately, rows `ent_load_entity()` will refuse to
+read, because `ent_extras()` now names two columns those tables do not have.
+
+**`MOVED` is a decision rather than a warning.** Either the store is cleared for that model and the
+corpus re-extracted, or the pass does not run. Continuing is the one option that is never right, and
+an alert would have allowed exactly that. Clearing discards days of work, so it needs `Rebuild = TRUE`
+-- a flag someone set on purpose, not a consequence of a check.
+
 **Attachments, not copies, and this is the decision that saves seventeen hours.** 01C left it open --
 classification wants one copy, entity extraction "may want each, because the registrant-side metadata
 differs even where the text does not". The resolution is that the metadata differing is an
@@ -305,6 +378,8 @@ the store population-independent: a pass run for one population is reused verbat
 
 # Extraction
 
+## Running matcon
+
 ```{r}
 #| label: extract-matcon
 
@@ -320,10 +395,12 @@ tab_pass_matcon <- cor_pass(
   .engine_workers = .lP$Params$EngineWorkers,    # processes inside the extractor
   .batch_size     = .lP$Params$Batch$matcon,
   .timeout        = .lP$Params$Timeout$matcon,
-  .limit          = .lP$Params$Limit,            # NULL takes the whole outstanding queue
+  .limit          = .lP$Params$Limit,            # NULL takes everything; n is a fixed cohort
   .report_every   = .lP$Params$ReportEvery
 )
 ```
+
+## Running LexNLP
 
 ```{r}
 #| label: extract-lexnlp
@@ -345,6 +422,8 @@ tab_pass_lexnlp <- cor_pass(
 )
 ```
 
+## What the pass did
+
 ```{r}
 #| label: report-pass
 
@@ -352,6 +431,12 @@ tab_pass <- dplyr::bind_rows(tab_pass_matcon, tab_pass_lexnlp)
 
 cor_report_pass(.tab = tab_pass, .n_corpus = n_corpus)
 ```
+
+**A capped run is a fixed cohort, so re-rendering it does nothing.** `Limit` names the same *n*
+documents every time -- the first *n* of the corpus in hash order -- and this pass extracts whichever
+of them the ledger does not already hold. That makes a rehearsal repeatable: the second render reports
+an empty queue, and a coverage figure from one render can be compared with the next. Raising the
+number extends the cohort rather than replacing it, so the work already done is kept.
 
 **Cheapest family first**, so a pass interrupted in the expensive one still leaves the other complete.
 Measured on the corpus at twenty-four workers, matcon runs at roughly 150 documents a second and
@@ -379,6 +464,8 @@ document with no text, and no cap changes that.
 
 # Validation
 
+## Checking matcon
+
 ```{r}
 #| label: validate-matcon
 
@@ -390,6 +477,8 @@ lst_valid_matcon <- cor_report_validation(
   .n_offsets = .lP$Params$OffsetSample
 )
 ```
+
+## Checking LexNLP
 
 ```{r}
 #| label: validate-lexnlp
@@ -417,6 +506,8 @@ exactly how 04A's first version reported two green ticks on a store that held no
 reports the size of what it checked, and a store with no spans says so.
 
 # Results
+
+## Corpus coverage, against the labelled sample
 
 ```{r}
 #| label: report-summary
@@ -468,6 +559,8 @@ revised, the hash beside these rows is what says whether they predate it.
 
 # Deployment
 
+## The artifacts
+
 ```{r}
 #| label: deploy-summary
 
@@ -481,6 +574,8 @@ Two databases, and they are contracts rather than conveniences. 04B reads them; 
 indexes the mirror's parsed text, which nothing in this repository rewrites.
 
 # Overview
+
+## What is finished and what is outstanding
 
 ```{r}
 #| label: overview
@@ -504,6 +599,8 @@ tbl_say(
   .title = "What the corpus pass produced"
 )
 ```
+
+## Closing the stores
 
 ```{r}
 #| label: disconnect
