@@ -74,6 +74,11 @@ fs::dir_create(.dir_out)
 # DuckDB file, and ner_manifest_write() then correctly refuses to ingest rows whose spec hash
 # differs from what that file holds under the same model tag.
 purrr::walk(c(.lT$Spans, .lT$Store), \(.d) if (fs::dir_exists(.d)) fs::dir_delete(.d))
+# The context width matcon now stores either side of every span. It lives in
+# _io.DEFAULT_CUE and in every extractor's SPEC, so a change there moves the hash and
+# should fail the re-cut below rather than pass quietly.
+.lT$Cue <- 160L
+
 fs::dir_create(c(.lT$Spans, .lT$Store))
 
 cli::cli_h1("Test-MatCon-LAW")
@@ -370,9 +375,15 @@ chk("Every fixture document reached the ledger",
     paste0(dplyr::n_distinct(tab_ledger$DocID), " of ", nrow(tab_docs)))
 chk("Clauses were read back out of the store", nrow(tab_law) > 0L,
     paste0(nrow(tab_law), " clause(s)"))
-chk("LAW carries no extras, by design",
-    length(ent_extras("matcon", "LAW")) == 0L,
-    "the jurisdiction is the gazetteer's answer, resolved once rather than twice")
+# "NO EXTRAS" STOPPED BEING EXPRESSIBLE AS A LENGTH, and that is a fact about the design rather than
+# a broken assertion. ent_extras() now APPENDS CueBefore and CueAfter to every matcon entity -- the
+# same arrangement _io.Emitter uses, so that no module can forget them -- which means this module
+# declaring none of its own still returns two. The claim under test is about what lawregex DECLARES,
+# not about what arrives, so the universal columns are subtracted before the count is taken.
+chk("LAW declares no extras of its own, by design",
+    identical(setdiff(ent_extras("matcon", "LAW"), c("CueBefore", "CueAfter")), character(0)),
+    paste0("ent_extras() returns ", paste(ent_extras("matcon", "LAW"), collapse = ", "),
+           " -- the jurisdiction is the gazetteer's answer, resolved once rather than twice"))
 
 cut_ <- stringi::stri_sub(
   tab_docs$TextRaw[match(tab_law$DocID, tab_docs$DocID)],
@@ -381,6 +392,72 @@ cut_ <- stringi::stri_sub(
 chk("Every clause equals the text at its own offsets",
     nrow(tab_law) > 0L && all(cut_ == tab_law$Span),
     paste0(sum(cut_ != tab_law$Span), " mismatch(es) over ", nrow(tab_law), " clause(s)"))
+
+cli::cli_h2("The context columns")
+
+# WHY THIS IS CHECKED IN EVERY TEST AND NOT ONCE. CueBefore and CueAfter exist so that no rule has
+# to open a document again: dte_describe()'s end cue, mny_load()'s par filter and geo_law()'s
+# governing-law window all read the characters around a span, and all three now read a column
+# instead. The columns are cut in Python by _io.Emitter.cues(), which slices code points -- and the
+# whole arrangement rests on that agreeing with what R would have cut. So each test re-cuts the
+# window from its own fixture and compares.
+#
+# THE HEAD CASE IS THE ONE THAT WOULD FAIL SILENTLY. text[max(0, start - 160):start] is empty for a
+# span at offset 0; text[-160:0] is also empty, but text[-160:] is the LAST 160 characters -- a
+# plausible-looking value from entirely the wrong end of the document. Only a span near the head
+# distinguishes the two, and a fixture without one would never notice.
+
+#' Both cue columns, checked against the window re-cut from the fixture
+#'
+#' @param .tab Span table from ent_load_entity().
+#' @param .what What the table holds, for the check names.
+#' @return Invisibly NULL.
+cue_checks <- function(.tab, .what) {
+  if (FALSE) {
+    .tab  <- tab_raw
+    .what <- "GPE"
+  }
+
+  chk(paste0(.what, ": the cue columns are present"),
+      all(c("CueBefore", "CueAfter") %in% names(.tab)),
+      paste(setdiff(c("CueBefore", "CueAfter"), names(.tab)), collapse = ", "))
+
+  if (!all(c("CueBefore", "CueAfter") %in% names(.tab)) || nrow(.tab) == 0L) return(invisible(NULL))
+
+  txt_ <- tab_docs$TextRaw[match(.tab$DocID, tab_docs$DocID)]
+
+  # stri_sub IS 1-BASED AND INCLUSIVE; the offsets are 0-based and half-open. The character at
+  # 0-based index Start-1 is 1-based Start, which is why the before-window ends at Start and the
+  # after-window begins at Stop + 1 with no further adjustment.
+  want_b_ <- stringi::stri_sub(txt_, from = pmax(1L, .tab$Start - .lT$Cue + 1L), to = .tab$Start)
+  want_a_ <- stringi::stri_sub(txt_, from = .tab$Stop + 1L, to = .tab$Stop + .lT$Cue)
+
+  chk(paste0(.what, ": CueBefore is the ", .lT$Cue, " characters before the span"),
+      all(.tab$CueBefore == want_b_),
+      paste0(sum(.tab$CueBefore != want_b_), " mismatch(es) over ", nrow(.tab), " span(s)"))
+  chk(paste0(.what, ": CueAfter is the ", .lT$Cue, " characters after it"),
+      all(.tab$CueAfter == want_a_),
+      paste0(sum(.tab$CueAfter != want_a_), " mismatch(es) over ", nrow(.tab), " span(s)"))
+
+  chk(paste0(.what, ": neither column is null on any span"),
+      !any(is.na(.tab$CueBefore)) && !any(is.na(.tab$CueAfter)),
+      paste0(sum(is.na(.tab$CueBefore)), " null before, ", sum(is.na(.tab$CueAfter)), " null after"))
+
+  # THE HEAD CASE. A span whose Start is under the window width must carry exactly Start characters
+  # of context, not 160 taken from the tail.
+  head_ <- dplyr::filter(.tab, .data$Start < .lT$Cue)
+  chk(paste0(.what, ": a span near the head does not wrap to the tail"),
+      nrow(head_) > 0L && all(stringi::stri_length(head_$CueBefore) == head_$Start),
+      if (nrow(head_) == 0L) {
+        "no span starts within the window; the fixture cannot test this"
+      } else {
+        paste0(nrow(head_), " span(s) start within ", .lT$Cue, " characters of the document head")
+      })
+
+  invisible(NULL)
+}
+
+cue_checks(tab_law, "LAW")
 
 cli::cli_h2("The cues")
 

@@ -63,7 +63,26 @@ LABEL_MAP = {
     "PERCENT": "PERCENT",
     "QUANTITY": "AMOUNT",
 }
-COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
+COLUMNS = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model",
+           "CueBefore", "CueAfter"]
+
+#: Characters of context kept either side of every span.
+#:
+#: THE SAME NUMBER AS matcon AND lexnlp, AND THE THIRD COPY OF THIS LOGIC. matcon_extract._io cuts
+#: it for the six matcon labels, extract_lexnlp.py for its four, and this file for spaCy's three.
+#: Sharing would mean one of three packages depending on another; three small copies with the same
+#: property written down is the trade taken. What must not drift:
+#:
+#:   THE CLAMP AT ZERO. text[max(0, start - 160):start] is empty for a span at the head of a
+#:   document, but text[-160:] is the LAST 160 characters -- a plausible-looking value from
+#:   entirely the wrong end, and nothing about it looks wrong.
+#:
+#: AND HERE THE CUT IS FROM THE DOCUMENT, NOT THE WINDOW, which is the one thing this copy does
+#: differently. Long documents are split into overlapping windows and `doc` is a WINDOW; only
+#: `off + ent.start_char` is document-absolute. Slicing the window would give a span near a window
+#: edge less context than the document actually holds, and silently -- the value would look ordinary
+#: and simply be short.
+CUE = 160
 WINDOW_OVERLAP = 1_000   # chars shared by adjacent windows so boundary entities survive
 
 
@@ -280,6 +299,12 @@ def main():
     # Collect per doc: offsets shifted to document-absolute; overlap dupes dropped.
     # A None doc = timed-out window: record a marker for that doc (re-run later),
     # don't drop the doc silently.
+    # THE FULL DOCUMENT, BY ID, FOR THE CONTEXT COLUMNS. The windowing above means `doc` inside the
+    # loop is a window and its offsets are window-relative; only off + ent.start_char indexes the
+    # document. Cutting context from anything but the full text would quietly shorten it at every
+    # window boundary.
+    text_by_doc = dict(zip(docids, texts))
+
     rows_by_doc = {docid: [] for docid in docids}
     seen = {}
     timed_out = set()
@@ -297,8 +322,10 @@ def main():
             if key in doc_seen:                         # duplicate from the overlap region
                 continue
             doc_seen.add(key)
-            doc_rows.append((docid, off + ent.start_char, off + ent.end_char,
-                             ent.text, label, ent.label_, engine, model))
+            start, stop = off + ent.start_char, off + ent.end_char
+            full = text_by_doc[docid]
+            doc_rows.append((docid, start, stop, ent.text, label, ent.label_, engine, model,
+                             full[max(0, start - CUE):start], full[stop:stop + CUE]))
     pbar.close()
 
     rows = []
@@ -306,12 +333,15 @@ def main():
         doc_rows = rows_by_doc[docid]
         rows.extend(doc_rows)                           # real candidates, if any
         if docid in timed_out:                          # window(s) skipped -> marker (any rows or not)
-            rows.append((docid, None, None, None, None, "timeout:window", engine, model))
+            rows.append((docid, None, None, None, None, "timeout:window", engine, model,
+                         None, None))
         elif not doc_rows:                              # genuine no-hit -> sentinel
-            rows.append((docid, None, None, None, None, None, engine, model))
+            rows.append((docid, None, None, None, None, None, engine, model, None, None))
 
     out = pd.DataFrame(rows, columns=COLUMNS)
     out[["Start", "Stop"]] = out[["Start", "Stop"]].astype("Int64")   # real nulls, not NaN
+    # Text and only text, so a context that happens to be entirely digits is not inferred numeric.
+    out[["CueBefore", "CueAfter"]] = out[["CueBefore", "CueAfter"]].astype("string")
     n_cand = int(out["Start"].notna().sum())
     out.to_parquet(args.output, index=False)
     print(f"{len(df)} doc(s) -> {n_cand} candidate(s)  [spacy:{model}, device={device}, n_process={n_process}]")

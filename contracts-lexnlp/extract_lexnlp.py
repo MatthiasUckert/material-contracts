@@ -86,7 +86,28 @@ EXTRA = [
     "DateValue", "Score",                                    # DATE
     "Amount", "Currency",                                    # MONEY
 ]
-COLUMNS = CORE + EXTRA
+#: Characters of context kept either side of every span.
+#:
+#: THE SAME NUMBER AS matcon, AND THE LOGIC IS DELIBERATELY DUPLICATED. matcon_extract._io.Emitter
+#: cuts these columns for the five matcon extractors, and sharing that helper would mean packaging
+#: the whole matcon_extract distribution into a Python 3.8 container that currently copies two
+#: files. Six lines with a pointer is the more honest trade -- but a DUPLICATED rule is a rule that
+#: can drift, so what must not drift is written down rather than assumed:
+#:
+#:   THE CLAMP AT ZERO IS THE WHOLE THING. text[max(0, start - 160):start] is empty for a span at
+#:   the head of a document. text[-160:0] is also empty -- but text[-160:] is the LAST 160
+#:   characters, a plausible-looking value from entirely the wrong end. Get the clamp wrong and
+#:   every span near the head of every document carries context from its tail, and nothing about
+#:   the value looks wrong.
+#:
+#: Python slices code points and Start/Stop are code-point offsets, so the two agree by
+#: construction -- which is what lets R re-cut the same window with stringi::stri_sub and compare.
+CUE = 160
+
+#: The two context columns, last in the row and after every extra, so the order matches matcon's.
+CUE_COLS = ["CueBefore", "CueAfter"]
+
+COLUMNS = CORE + EXTRA + CUE_COLS
 
 # Annotation attribute -> output column, per label. Read off the annotation with getattr, so an
 # attribute a LexNLP version does not carry arrives as null instead of raising.
@@ -244,6 +265,21 @@ def _extra_values(label, ann):
 
 
 _NO_EXTRA = (None,) * len(EXTRA)
+_NO_CUE = (None, None)
+
+
+def _cues(text, start, stop):
+    """The characters either side of a span, as a pair.
+
+    See the CUE comment above for why this is duplicated from matcon_extract._io.Emitter.cues()
+    rather than shared, and for the one property that must not drift between the two.
+
+    :param text: the document; the offsets index it directly.
+    :return: (before, after), each a string. Width 0 would emit None, matching matcon.
+    """
+    before = text[max(0, start - CUE):start] if CUE else None
+    after = text[stop:stop + CUE] if CUE else None
+    return before, after
 
 
 def write_output(rows, path):
@@ -260,6 +296,11 @@ def write_output(rows, path):
     for col in EXTRA:
         if col not in ("EntityId", "EntityPriority", "Score"):
             out[col] = out[col].astype("string")
+    # THE CUE COLUMNS ARE TEXT AND ONLY TEXT. Left to pandas they would stay object dtype, which
+    # serialises to parquet as a string anyway -- but declaring it means a document whose context
+    # happens to be entirely digits cannot be inferred as a number by some later reader.
+    for col in CUE_COLS:
+        out[col] = out[col].astype("string")
     out.to_parquet(path, index=False)
     return out
 
@@ -317,14 +358,16 @@ def extract_one(args):
                 start, stop = ann.coords
                 if 0 <= start < stop <= n:
                     rows.append((docid, start, stop, text[start:stop], label, raw,
-                                 "lexnlp", "lexnlp") + _extra_values(label, ann))
+                                 "lexnlp", "lexnlp") + _extra_values(label, ann)
+                                + _cues(text, start, stop))
     # one marker row per timed-out extractor (null span; survives into the store
     # only long enough for ner_db_append to read Status, then dropped)
     for raw in timed_out:
         rows.append((docid, None, None, None, None, f"timeout:{raw}", "lexnlp", "lexnlp")
-                    + _NO_EXTRA)
+                    + _NO_EXTRA + _NO_CUE)
     if not rows:                                    # genuine no-hit -> sentinel
-        rows.append((docid, None, None, None, None, None, "lexnlp", "lexnlp") + _NO_EXTRA)
+        rows.append((docid, None, None, None, None, None, "lexnlp", "lexnlp")
+                    + _NO_EXTRA + _NO_CUE)
     return rows
 
 

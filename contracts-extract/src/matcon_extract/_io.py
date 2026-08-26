@@ -47,6 +47,15 @@ from tqdm import tqdm
 #: The columns every extractor emits, in this order, before its own extras.
 CORE = ["DocID", "Start", "Stop", "Span", "Label", "LabelRaw", "Engine", "Model"]
 
+#: Characters of context kept either side of every span, by default.
+#:
+#: ONE NUMBER FOR EVERY EXTRACTOR. The three rules that read text want 120, 120 and 60 characters --
+#: geo_law()'s cue window, dte_describe()'s end cue, mny_load()'s par filter -- and a per-extractor
+#: width would freeze each of those into the store, so refining one cue list would mean
+#: re-extracting. A single generous width stores more than any rule needs and lets every rule narrow
+#: it downstream at no cost. Being too narrow costs a re-extraction; being generous costs disk.
+DEFAULT_CUE = 160
+
 #: Stamped into every row. The provenance axis: which tool found this span, not which suite it
 #: was shipped in. Third-party engines stamp their own name ("lexnlp", "spacy"); everything in
 #: this package is "matcon".
@@ -110,21 +119,53 @@ class Emitter:
     rows most easily got wrong and least likely to be noticed.
     """
 
-    def __init__(self, model, extras=()):
+    def __init__(self, model, extras=(), cue_before=0, cue_after=0):
         """
         :param model: the MODEL constant -- the version tag stamped into every row.
         :param extras: this extractor's extra column names, in output order.
+        :param cue_before: characters of context kept BEFORE each span; 0 emits a null column.
+        :param cue_after: characters kept AFTER; same convention.
         """
         self.model = model
         self.extras = tuple(extras)
-        self.columns = CORE + list(self.extras)
+        self.cue_before = max(0, int(cue_before))
+        self.cue_after = max(0, int(cue_after))
+        # CUE COLUMNS ARE ALWAYS PRESENT, EVEN AT ZERO WIDTH. A schema that changes shape with a
+        # run-time flag is a schema no consumer can rely on: a store ingested at 0 and then at 160
+        # would carry two column sets under one model tag, and the second ingest would fail on a
+        # mismatch rather than on the thing that actually differs. Width 0 emits nulls.
+        self.columns = CORE + list(self.extras) + ["CueBefore", "CueAfter"]
         self._nulls = (None,) * len(self.extras)
 
-    def row(self, docid, start, stop, span, label, label_raw, extras=None):
+    def cues(self, text, start, stop):
+        """The characters either side of a span, as a pair.
+
+        SLICED FROM THE TEXT THE OFFSETS INDEX, which is why this lives here and not in R. The
+        extractor already holds the document and the offsets in one scope, so the cut is free;
+        recovering it downstream would mean opening 1.19 million documents a second time, which is
+        the eight-hour cost the stored column exists to remove.
+
+        Python slices code points, and Start/Stop are code-point offsets, so the two agree by
+        construction. Clamping at 0 is what keeps a span near the head of a document from wrapping
+        to its tail -- text[-40:0] is empty, but text[-40:] is the LAST forty characters, which
+        would be a plausible-looking value from entirely the wrong place.
+
+        :return: (before, after). Either is None where its width is 0, so a null column and an
+            empty string mean different things: not asked for, against asked for and nothing there.
+        """
+        before = text[max(0, start - self.cue_before):start] if self.cue_before else None
+        after = text[stop:stop + self.cue_after] if self.cue_after else None
+        return before, after
+
+    def row(self, docid, start, stop, span, label, label_raw, extras=None, text=None):
         """One found span.
 
         :param extras: tuple in the declared extras order, or None for all-null. Length is
             asserted, because a short tuple would silently shift every later column.
+        :param text: the document, for the cue columns. Passed EXPLICITLY rather than held on the
+            emitter between calls: a worker's globals die with the process and this object is
+            rebuilt per module at import, so per-document state on it is the one shape of bug that
+            survives every local test and fails only under multiprocessing.
         """
         if extras is None:
             extras = self._nulls
@@ -132,18 +173,22 @@ class Emitter:
             raise ValueError(
                 f"{self.model}: {len(extras)} extra(s) supplied, {len(self.extras)} declared"
             )
-        return (docid, start, stop, span, label, label_raw, ENGINE, self.model) + tuple(extras)
+        cue = self.cues(text, start, stop) if text is not None else (None, None)
+        return ((docid, start, stop, span, label, label_raw, ENGINE, self.model)
+                + tuple(extras) + cue)
 
     def sentinel(self, docid):
         """A document that was processed and matched nothing.
 
         NOT the same as an absent document, and the difference is the whole reason this exists.
         """
-        return (docid, None, None, None, None, None, ENGINE, self.model) + self._nulls
+        return ((docid, None, None, None, None, None, ENGINE, self.model)
+                + self._nulls + (None, None))
 
     def timeout(self, docid, name):
         """A document cut off by the per-document cap. R reads LabelRaw to set Status."""
-        return (docid, None, None, None, None, f"timeout:{name}", ENGINE, self.model) + self._nulls
+        return ((docid, None, None, None, None, f"timeout:{name}", ENGINE, self.model)
+                + self._nulls + (None, None))
 
     def error(self, docid, name):
         """A document that raised something other than a timeout.
@@ -157,7 +202,8 @@ class Emitter:
         One pathological document must not end a corpus pass, so the exception is still swallowed.
         It is simply no longer swallowed silently.
         """
-        return (docid, None, None, None, None, f"error:{name}", ENGINE, self.model) + self._nulls
+        return ((docid, None, None, None, None, f"error:{name}", ENGINE, self.model)
+                + self._nulls + (None, None))
 
 
 # 3. Overlaps ----------------------------------------------------------------------------------
@@ -416,7 +462,7 @@ def verify_offsets(frame, texts_by_id):
 
 # 7. The shared command line -------------------------------------------------------------------
 
-def add_common_arguments(ap, default_timeout=0, default_chunk_size=64):
+def add_common_arguments(ap, default_timeout=0, default_chunk_size=64, default_cue=DEFAULT_CUE):
     """The flags every extractor takes, so their names and meanings cannot drift.
 
     Defaults that genuinely differ by extractor -- the gazetteer needs a cap and a small chunk
@@ -435,6 +481,17 @@ def add_common_arguments(ap, default_timeout=0, default_chunk_size=64):
     ap.add_argument("--chunk-size", type=int, default=default_chunk_size,
                     help="docs per task when parallelising")
     ap.add_argument("--no-progress", action="store_true", help="disable the progress bar")
+    # CONTEXT WIDTH IS A RUN-TIME CHOICE, AND IT IS IN EVERY EXTRACTOR'S SPEC. Every rule that
+    # currently opens a document does so for the same reason -- the characters around a span -- so
+    # storing them at extraction turns three text-reading rules into three column reads. The width
+    # belongs in SPEC rather than only here: a store holding rows cut at 160 beside rows cut at 0
+    # under one model tag would give a rule full context from some spans and none from others, and
+    # nothing would say which. Changing it therefore moves the hash and clears the store, which is
+    # expensive and correct.
+    ap.add_argument("--cue-before", type=int, default=default_cue,
+                    help="characters of context kept before each span (0 = off)")
+    ap.add_argument("--cue-after", type=int, default=default_cue,
+                    help="characters kept after each span (0 = off)")
     return ap
 
 

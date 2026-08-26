@@ -229,13 +229,64 @@ ner_spacy_installed <- function() {
   ))
   if (length(raw_) == 0L || !is.null(attr(raw_, "status"))) {
     cli::cli_warn("Could not ask the spaCy family which models it has; assuming none.")
-    return(tibble::tibble(Model = character(0), Version = character(0)))
+    return(tibble::tibble(Model = character(0), Version = character(0),
+                          SpecHash = character(0)))
   }
 
   lst_ <- jsonlite::fromJSON(paste(raw_, collapse = ""), simplifyVector = FALSE)
-  if (length(lst_) == 0L) return(tibble::tibble(Model = character(0), Version = character(0)))
+  if (length(lst_) == 0L) return(tibble::tibble(Model = character(0), Version = character(0),
+                          SpecHash = character(0)))
 
-  tibble::tibble(Model = names(lst_), Version = as.character(unlist(lst_)))
+  tibble::tibble(Model = names(lst_), Version = as.character(unlist(lst_))) |>
+    dplyr::mutate(SpecHash = ner_spacy_spec(.model = .data$Model, .version = .data$Version))
+}
+
+#' The spaCy family's spec hash -- the script AND the model, together
+#'
+#' H5, AND IT WAS AN IDENTITY DEFECT RATHER THAN A COSMETIC ONE. ner_describe() set this family's
+#' SpecHash to the MODEL VERSION -- 3.8.0 -- while matcon and lexnlp both reported a 12-character
+#' content hash. Three consequences followed from that one line:
+#'
+#'   EDITING extract_spacy.py MOVED NOTHING. The script decides which columns are emitted and how
+#'   offsets are shifted across windows, and none of it touched the identity. ner_manifest_write()
+#'   would have admitted rows from the edited script beside rows from the old one under an unchanged
+#'   tag, and the store would hold two generations with nothing able to tell them apart. That is
+#'   exactly the failure the manifest exists to catch, and it was unreachable for this family.
+#'
+#'   THE COLUMN HELD TWO DIFFERENT KINDS OF THING. A hash on two families and a version string on
+#'   the third, so any comparison across families was comparing a fingerprint with a label.
+#'
+#'   AND IT BLOCKED THE SCHEMA. The cue columns could not be added to spaCy until this was fixed,
+#'   because adding them is precisely an edit whose identity would not have moved.
+#'
+#' BOTH INPUTS MATTER, SO BOTH ARE HASHED. The model determines which spans are found; the script
+#' determines what is emitted about them and how the window offsets are resolved. A hash over either
+#' alone leaves the other free to change silently.
+#'
+#' @param .model Model name, vectorised.
+#' @param .version Installed version of that model, vectorised alongside.
+#' @return Character vector of 12-character hashes, one per model.
+ner_spacy_spec <- function(.model, .version) {
+  if (FALSE) {
+    .model   <- "en_core_web_trf"
+    .version <- "3.8.0"
+  }
+
+  path_ <- fs::path(.ner_family_dir("spacy"), "extract_spacy.py")
+  # ABSENT IS ITS OWN VALUE, NOT AN ERROR. A missing script is a real state during a partial
+  # install, and it must hash to something stable and obviously wrong rather than abort a describe
+  # that is being run precisely to find out what is missing.
+  file_ <- if (fs::file_exists(path_)) {
+    substr(digest::digest(file = path_, algo = "sha256"), 1L, 12L)
+  } else {
+    "absent"
+  }
+
+  purrr::map2_chr(.model, .version, \(.m, .v) {
+    substr(
+      digest::digest(list(Script = file_, Model = .m, Version = .v), algo = "sha256"), 1L, 12L
+    )
+  })
 }
 
 #' Is the LexNLP container usable, and does it match the sources it was built from?
@@ -455,9 +506,16 @@ ner_describe <- function(.spacy_models = c("en_core_web_sm", "en_core_web_md",
     dplyr::left_join(have_, by = dplyr::join_by(Model)) |>
     dplyr::transmute(
       .data$Family, .data$Model, .data$Entity,
-      SpecHash = .data$Version,
+      # H5: A CONTENT HASH, LIKE EVERY OTHER FAMILY. This column used to carry the model version
+      # here and a 12-character hash on matcon and lexnlp rows -- two different kinds of thing under
+      # one name. ner_spacy_spec() folds the script and the model together, so an edit to either
+      # moves it and a comparison across families compares like with like. The version has not been
+      # lost; it moved to Note, where it is metadata rather than identity.
+      .data$SpecHash,
       Ready    = !is.na(.data$Version),
-      Note     = dplyr::if_else(is.na(.data$Version), "not installed; spacy download it", "")
+      Note     = dplyr::if_else(
+        is.na(.data$Version), "not installed; spacy download it", paste0("model ", .data$Version)
+      )
     )
 
   dplyr::bind_rows(mat_, lex_, spa_) |>

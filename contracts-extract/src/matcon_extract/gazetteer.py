@@ -160,6 +160,10 @@ def spec(lookup_path=DEFAULT_LOOKUP):
         "state_window": STATE_WINDOW,
         "word_window": WORD_WINDOW,
         "extras": EXTRAS,
+        # THE CONTEXT WIDTH IS PART OF THIS EXTRACTOR'S IDENTITY, for the same reason the lookup is.
+        # A store holding rows cut at 160 beside rows cut at 0 under one model tag would give a rule
+        # full context from some spans and none from others, with nothing to say which.
+        "cue": _io.DEFAULT_CUE,
     }
     path = Path(lookup_path)
     out["lookup"] = _io.file_hash(path) if path.exists() else "absent"
@@ -167,7 +171,10 @@ def spec(lookup_path=DEFAULT_LOOKUP):
 
 
 SPEC = spec()
-EMIT = _io.Emitter(MODEL, EXTRAS)
+# THE EMITTER IS BUILT AT IMPORT AND THE WIDTHS ARE MODULE STATE, NOT PER-DOCUMENT STATE. A worker's
+# globals die with the process, so anything set per document on this object would be lost across a
+# pool boundary -- which is why row() takes the text explicitly rather than the emitter holding it.
+EMIT = _io.Emitter(MODEL, EXTRAS, _io.DEFAULT_CUE, _io.DEFAULT_CUE)
 
 
 # 3. The index -----------------------------------------------------------------------------------
@@ -397,7 +404,7 @@ def extract_one(args):
                 klass, is_word, geo_key, n_parent, iso2, iso3 = info
                 rows.append(EMIT.row(
                     docid, s, e, text[s:e], "GPE", klass,
-                    (geo_key, is_word, n_parent, iso2, iso3, kind)
+                    (geo_key, is_word, n_parent, iso2, iso3, kind), text
                 ))
         except _io.ExtractorTimeout:
             print(f"[timeout] {docid}: {NAME} > {_io.TIMEOUT}s, skipped", file=sys.stderr)

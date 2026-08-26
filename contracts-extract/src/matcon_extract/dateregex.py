@@ -200,7 +200,15 @@ _RE_PAREN_NUM = re.compile(r"\(\s*(\d{1,3})\s*\)")
 # EVERYTHING THAT CHANGES OUTPUT, AND NOTHING THAT DOES NOT. Edit a pattern and the hash moves;
 # rewrite a docstring and it does not. A moved hash under an unchanged MODEL is an abort, because
 # it means an existing store's dateregex-v3 rows were produced by rules that no longer exist.
+
+# THE CONTEXT WIDTH IS PART OF THIS EXTRACTOR'S IDENTITY. Every rule that opens a document does so
+# for the same reason -- the characters around a span -- so storing them at extraction is what turns
+# three text-reading rules into three column reads. It sits in SPEC because a store holding rows cut
+# at 160 beside rows cut at 0 under one model tag would give a rule full context from some spans and
+# none from others, with nothing to say which. Changing the width therefore moves the hash and
+# clears the store: expensive, and correct.
 SPEC = {
+    "cue": _io.DEFAULT_CUE,
     "months": MONTHS,
     "patterns": PATTERNS,
     "year_pivot": YEAR_PIVOT,
@@ -210,7 +218,10 @@ SPEC = {
     "unit_years": UNIT_YEARS,
 }
 
-EMIT = _io.Emitter(MODEL, EXTRAS)
+# THE EMITTER IS BUILT AT IMPORT AND THE WIDTHS ARE MODULE STATE, NOT PER-DOCUMENT STATE. A worker's
+# globals die with the process, so anything set per document on this object would be lost across a
+# pool boundary -- which is why row() takes the text explicitly rather than the emitter holding it.
+EMIT = _io.Emitter(MODEL, EXTRAS, _io.DEFAULT_CUE, _io.DEFAULT_CUE)
 
 
 # 4. Parsing -------------------------------------------------------------------------------------
@@ -357,7 +368,7 @@ def extract_one(args):
                     span = text[s:e]
                     rows.append(EMIT.row(
                         docid, s, e, span, "DATE", name,
-                        (parse_span(span, ORDER_BY_NAME.get(name)), None, None, None)
+                        (parse_span(span, ORDER_BY_NAME.get(name)), None, None, None), text
                     ))
 
             if "TERM" in WANT:
@@ -365,7 +376,7 @@ def extract_one(args):
                     span = text[s:e]
                     n, unit, years = parse_term(span, TERM_KIND_BY_NAME.get(name))
                     rows.append(EMIT.row(
-                        docid, s, e, span, "TERM", name, (None, n, unit, years)
+                        docid, s, e, span, "TERM", name, (None, n, unit, years), text
                     ))
 
             rows.sort(key=lambda r: (r[4], r[1]))

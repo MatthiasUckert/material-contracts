@@ -138,14 +138,25 @@ PATTERNS = tuple(
 
 RX_SELF = re.compile("|".join(SELF), re.I)
 
+
+# THE CONTEXT WIDTH IS PART OF THIS EXTRACTOR'S IDENTITY. Every rule that opens a document does so
+# for the same reason -- the characters around a span -- so storing them at extraction is what turns
+# three text-reading rules into three column reads. It sits in SPEC because a store holding rows cut
+# at 160 beside rows cut at 0 under one model tag would give a rule full context from some spans and
+# none from others, with nothing to say which. Changing the width therefore moves the hash and
+# clears the store: expensive, and correct.
 SPEC = {
+    "cue": _io.DEFAULT_CUE,
     "cues": CUES,
     "self": SELF,
     "reach": REACH,
     "stop": STOP,
 }
 
-EMIT = _io.Emitter(MODEL, EXTRAS)
+# THE EMITTER IS BUILT AT IMPORT AND THE WIDTHS ARE MODULE STATE, NOT PER-DOCUMENT STATE. A worker's
+# globals die with the process, so anything set per document on this object would be lost across a
+# pool boundary -- which is why row() takes the text explicitly rather than the emitter holding it.
+EMIT = _io.Emitter(MODEL, EXTRAS, _io.DEFAULT_CUE, _io.DEFAULT_CUE)
 
 
 # 2. Finding ------------------------------------------------------------------------------------
@@ -209,7 +220,7 @@ def extract_one(args):
         try:
             _io.start_alarm()
             for s, e, span, klass in find_clauses(text):
-                rows.append(EMIT.row(docid, s, e, span, "LAW", klass))
+                rows.append(EMIT.row(docid, s, e, span, "LAW", klass, None, text))
         except _io.ExtractorTimeout:
             print(f"[timeout] {docid}: {NAME} > {_io.TIMEOUT}s, skipped", file=sys.stderr)
             return [EMIT.timeout(docid, NAME)]

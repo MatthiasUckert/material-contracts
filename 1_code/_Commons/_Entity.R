@@ -531,12 +531,7 @@ ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL
     DATE   = c("DateValue"),
     TERM   = c("TermN", "TermUnit", "TermYears"),
     MONEY  = c("Amount", "Currency"),
-    REDACT = character(0),
-    # LAW CARRIES NONE, AND THAT IS THE DESIGN. lawregex locates a governing-law clause and says
-    # which cue opened it; the jurisdiction is the GPE span sitting INSIDE that clause, resolved
-    # once by the gazetteer rather than twice. Declared explicitly because ent_extras() aborts on
-    # an unknown entity -- which is right, and means every new label must be registered here.
-    LAW    = character(0)
+    REDACT = character()
   ),
   spacy = list(
     ORG    = character(),
@@ -544,6 +539,28 @@ ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL
     GPE    = character()
   )
 )
+
+#: The context columns every matcon extractor emits, APPENDED rather than declared per entity.
+#:
+#: THE SAME ARRANGEMENT AS _io.Emitter, WHICH IS THE POINT. Python puts these two on the emitter
+#: rather than in each module's EXTRAS so that no module can forget them and the column order is
+#: uniform: CORE, the module's own extras, CueBefore, CueAfter. Declaring them per entity here would
+#: reintroduce exactly the drift that arrangement removes -- five entries that must agree, and
+#: nothing to notice when one does not.
+.ent_cues <- c("CueBefore", "CueAfter")
+
+#: Which families emit them. All three, and the third needed H5 fixed first.
+#:
+#: THE BLOCK WAS AN IDENTITY PROBLEM, NOT A SCHEDULING ONE. ner_describe() used to set the spaCy
+#: family's SpecHash from the MODEL version -- 3.8.0 -- so editing extract_spacy.py would have added
+#: two columns while the identity stayed exactly where it was. ner_manifest_write() would have seen
+#: nothing changed and admitted the new rows beside the old, leaving the store holding two
+#: generations under one tag with nothing able to tell them apart.
+#:
+#: ner_spacy_spec() now hashes the script AND the model together, so all three families report the
+#: same KIND of thing and an edit to any of them moves it. The version is still reported, in Note,
+#: where it is metadata rather than identity.
+.ent_cue_families <- c("matcon", "lexnlp", "spacy")
 
 #' The extras one family emits for one entity
 #'
@@ -564,6 +581,10 @@ ent_extras <- function(.family, .entity) {
       "i" = "It declares: {paste(names(fam_), collapse = ', ')}."
     ))
   }
+  # THE CUE COLUMNS ARE APPENDED, NOT DECLARED. Every matcon entity carries them and none of the
+  # entries above names them, so an entity added tomorrow gets them without anyone remembering to.
+  # Order matters and matches the emitter: the module's own extras first, then CueBefore, CueAfter.
+  if (.family %in% .ent_cue_families) out_ <- c(out_, .ent_cues)
   out_
 }
 

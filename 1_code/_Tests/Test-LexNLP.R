@@ -94,6 +94,11 @@ fs::dir_create(.dir_out)
 # never cleared, because the hash was identical every time; the lexnlp rebuild moved it and the
 # ingest aborted. Phase F moves all four matcon hashes at once, so the same abort is waiting for
 # every one of these files.
+# The context width lexnlp now stores either side of every span. It is CUE in extract_lexnlp.py and
+# DEFAULT_CUE in matcon_extract._io -- deliberately the same number, deliberately duplicated code,
+# and this is what checks the two agree.
+.lT$Cue <- 160L
+
 purrr::walk(c(.lT$Spans, .lT$Store), \(.d) if (fs::dir_exists(.d)) fs::dir_delete(.d))
 fs::dir_create(c(.lT$Spans, .lT$Store))
 
@@ -367,6 +372,78 @@ cut_ <- stringi::stri_sub(
 chk("Every span equals the text at its own offsets",
     nrow(tab_all) > 0L && all(cut_ == tab_all$Span),
     paste0(sum(cut_ != tab_all$Span), " mismatch(es) over ", nrow(tab_all), " span(s)"))
+
+cli::cli_h2("The context columns")
+
+# THE SAME COLUMNS AS matcon, CUT BY A DIFFERENT IMPLEMENTATION. extract_lexnlp.py does not import
+# matcon_extract._io -- the container copies two files, and packaging the whole distribution into a
+# Python 3.8 image to share six lines would be the worse trade -- so the slicing is written twice.
+# Duplicated code is code that can drift, and this is where the drift would show.
+#
+# THE CLAMP IS THE PROPERTY THAT MATTERS. text[max(0, start - 160):start] is empty for a span at the
+# head of a document; text[-160:] is the LAST 160 characters. Both look like plausible context and
+# only one is right, so a fixture without a span near the head could not tell them apart.
+
+#' Both cue columns on one lexnlp table, checked against the window re-cut from the fixture
+#'
+#' @param .tab Span table from ent_load_entity().
+#' @param .what Entity name, for the check names.
+#' @return Invisibly NULL.
+cue_checks <- function(.tab, .what) {
+  if (FALSE) {
+    .tab  <- tab_org
+    .what <- "ORG"
+  }
+
+  chk(paste0(.what, ": the cue columns are present"),
+      nrow(.tab) > 0L && all(c("CueBefore", "CueAfter") %in% names(.tab)),
+      if (nrow(.tab) == 0L) "no spans of this entity" else
+        paste(setdiff(c("CueBefore", "CueAfter"), names(.tab)), collapse = ", "))
+
+  if (nrow(.tab) == 0L || !all(c("CueBefore", "CueAfter") %in% names(.tab))) {
+    return(invisible(NULL))
+  }
+
+  txt_ <- tab_docs$TextRaw[match(.tab$DocID, tab_docs$DocID)]
+
+  # stri_sub IS 1-BASED AND INCLUSIVE; the offsets are 0-based and half-open.
+  want_b_ <- stringi::stri_sub(txt_, from = pmax(1L, .tab$Start - .lT$Cue + 1L), to = .tab$Start)
+  want_a_ <- stringi::stri_sub(txt_, from = .tab$Stop + 1L, to = .tab$Stop + .lT$Cue)
+
+  chk(paste0(.what, ": CueBefore matches the window R would cut"),
+      all(.tab$CueBefore == want_b_),
+      paste0(sum(.tab$CueBefore != want_b_), " mismatch(es) over ", nrow(.tab), " span(s)"))
+  chk(paste0(.what, ": CueAfter matches the window R would cut"),
+      all(.tab$CueAfter == want_a_),
+      paste0(sum(.tab$CueAfter != want_a_), " mismatch(es) over ", nrow(.tab), " span(s)"))
+
+  head_ <- dplyr::filter(.tab, .data$Start < .lT$Cue)
+  chk(paste0(.what, ": a span near the head does not wrap to the tail"),
+      nrow(head_) > 0L && all(stringi::stri_length(head_$CueBefore) == head_$Start),
+      if (nrow(head_) == 0L) {
+        "no span starts within the window; the fixture cannot test this"
+      } else {
+        paste0(nrow(head_), " span(s) start within ", .lT$Cue, " of the head")
+      })
+
+  invisible(NULL)
+}
+
+purrr::walk2(
+  list(tab_org, tab_gpe, tab_date, tab_money),
+  c("ORG", "GPE", "DATE", "MONEY"),
+  cue_checks
+)
+
+# THE DUPLICATION, TESTED DIRECTLY. Two implementations of one rule agree here or they do not, and
+# the reason for writing it twice was that sharing the helper meant packaging matcon_extract into a
+# Python 3.8 container. If this fails, that trade was the wrong one.
+chk("lexnlp and matcon cut the same window",
+    nrow(tab_org) > 0L &&
+      all(stringi::stri_length(dplyr::filter(tab_org, .data$Start >= .lT$Cue)$CueBefore)
+          == .lT$Cue),
+    paste0("every span at or beyond offset ", .lT$Cue,
+           " carries exactly that many characters of context"))
 
 cli::cli_h2("The organisation split, which the party chain rests on")
 
