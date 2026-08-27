@@ -1,0 +1,688 @@
+---
+title: "Text Searches -- What the Corpus Says, and When (05A)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
+```
+
+```{r}
+#| label: load-libraries
+#| echo: false
+
+source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
+
+# ORDER IS LOAD-BEARING. _Plots.R rebuilds its level registry empty every time it is sourced, so any
+# library that registers a vocabulary must follow it -- and 03A, _Entity.R and this document's own
+# file all do.
+source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
+
+# 03A owns the contract-type vocabulary and clf_read_text(); 04C owns the corpus reader and the
+# daemon startup that carries clf_read_text() into a fresh session. Both are sourced rather than
+# reimplemented, so this document reads the same bytes 04C extracted spans from.
+purrr::walk(
+  .x = c("03A-ClassifyPrepare", "04C-EntityCorpus"),
+  .f = \(.s) source(
+    file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+    encoding = "UTF-8"
+  )
+)
+
+.name_script <- "05A-TextSearches"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
+))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/05A-TextSearches.R
+))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+This document searches every document in the corpus for a list of stated terms, and records where each
+one was found.
+
+## The question that made it necessary
+
+Filings of material contracts rose in 2020 and 2021. The manuscript reads that rise as the pandemic,
+and referee 2 called the reading speculative and asked for a term search to settle it.
+
+Nothing in the 04 family can answer that. Every rule there is built on spans a producer emitted, and
+no producer emits *pandemic*. The question is about language the documents contain, which needs a
+different instrument.
+
+## The instrument is general, and that is deliberate
+
+A term list is a configuration rather than code, so this document answers the next question of the
+same shape without being rewritten. What it does is fixed: compile plain phrases into patterns, read
+each document once, record every match with its offsets and its surroundings.
+
+## The read is the cost, and three decisions follow from it
+
+04C measured it: one `arrow::read_parquet()` per document, more than a million times, is most of the
+wall clock even at matcon's throughput. A regular expression over text already in memory is nearly
+free beside it.
+
+**Every term rides one pass.** Adding a term to a running pass costs almost nothing; adding one
+afterwards costs a second traversal of the corpus. The term list is therefore generous by design, and
+the validation and placebo families below are free rather than indulgent.
+
+**Hits are stored per term and never per family.** A family is a grouping decided when the results are
+read, so changing one's mind about which terms constitute *pandemic* is a join rather than a re-run.
+
+**The scan is two-stage.** One combined alternation asks whether a document contains anything at all;
+only the documents saying yes pay for per-term location. That helps least where it would help most:
+the boilerplate family matches nearly every agreement ever drafted, so on contracts the second stage
+runs on most of the corpus rather than on a minority. It earns its place on the 8-K and CT order
+sources, where the hit rate is genuinely low.
+
+**Reading and matching happen in the same worker.** A design that read in parallel and matched here
+would leave twenty-three cores idle through the half the two-stage filter does not rescue, and would
+ship about a gigabyte of text per chunk back only to discard it after matching. Sending paths out and
+bringing hits back moves a small fraction of the bytes and uses every core for both halves.
+
+## Four sources, and one of them is not a slice of another
+
+| Source | Text | Offsets index |
+|:--|:--|:--|
+| `Exhibit10` | the attachment, off the mirror | `TextRaw` |
+| `8-K` | the report, off the mirror | `TextRaw` |
+| `CTO` | the confidential-treatment order, off the mirror | `TextRaw` |
+| `Item101` | 01D's extracted summary | `ItemText` |
+
+**Item 1.01 is its own source rather than a window on the 8-K, and the reason is an offset system.**
+01D locates the item span in a whitespace-normalised rendering of the `HTML` column, so its `Start`
+and `Stop` do not index `TextRaw` -- which is what an 8-K scan reads. Testing an 8-K hit for
+containment in the item span would compare two coordinate systems that look alike and are not, and
+the failure would arrive as a plausible number rather than as an error. So the summary is searched as
+its own text, and every row records which string its offsets belong to.
+
+## What comes out
+
+**`term_hits.parquet`, one row per occurrence** -- the term, the offsets, the matched string and eighty
+characters either side. **`term_docs.parquet`, one row per document per family** -- counts, an
+indicator, the first position and an intensity per thousand words. Every scanned document appears in
+every family, including the families it matched nothing in, so a prevalence divides by the documents
+that were looked at rather than by the documents that happened to hit.
+
+**`term_list.parquet`** travels with them. A hit table without the vocabulary that produced it cannot
+be interpreted.
+
+## How results are reported
+
+Console tables throughout, figures in Overview. One table is not a summary and belongs on the page:
+the per-term counts. A term firing on nearly every document is not measuring an event and a term
+firing on none is probably written wrongly, and only the per-term table shows either.
+
+# Configuration
+
+## The parameters, and where they came from
+
+```{r}
+#| label: configure
+
+.lP <- list(
+  Input = list(
+    # THE REGISTER IS THE CORPUS. 02B holds every document with its group and ladder step attached,
+    # so membership and population come from one place. Walking the mirror would make a second,
+    # independent statement about what exists, one that can disagree without either side saying so.
+    Register = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "02B-Register"),
+      "Output", "Documents.parquet"
+    ),
+    # The parsed mirror. utils_doc_path() turns a DocID, a type and a year-quarter into a file here.
+    Mirror = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "01B-EdgarDocuments"),
+      "GetEDGAR"
+    ),
+    # 01D's only artifact, carrying the Item 1.01 summary as its own column.
+    Item101 = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "01D-Item101"),
+      "Output", "Item101.parquet"
+    ),
+    # THE CORPUS LABEL SPINE, AND IT IS A DIRECTORY. 03F writes contract_labels_L<max_len>.parquet,
+    # so the file name depends on the token limit that produced it; ent_release_path() resolves it.
+    # 03A's prepared file is the SAMPLE's, and using it here would silently restrict every
+    # class-conditioned descriptive to 4,398 documents.
+    Labels = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "03F-ClassifyApply"),
+      "release"
+    )
+  ),
+  Output = list(
+    Store   = utils_file_path(.dir_main, "Output", "TextSearch.duckdb"),
+    Release = list(
+      Hits  = utils_file_path(.dir_main, "Output", "term_hits.parquet"),
+      Docs  = utils_file_path(.dir_main, "Output", "term_docs.parquet"),
+      Terms = utils_file_path(.dir_main, "Output", "term_list.parquet")
+    )
+  ),
+  Params = list(
+    # ALL FOUR SOURCES. Referee 2's question is about contracts; Ann-Kristin's is about what the
+    # filer said, which is the 8-K. Running both costs one pass because the read dominates either
+    # way, and running only one would leave the other question needing its own traversal.
+    Sources    = c("Exhibit10", "8-K", "CTO"),
+    # "all" is every attachment rather than the descriptive subset. 04C's argument applies unchanged:
+    # deduplication has already removed the registrant copies, so the wider population is a few per
+    # cent more work for a store that never needs revisiting.
+    Population = "all",
+    # SEPARATOR TOLERANCE. Parsed filing text wraps, so "force majeure" arrives with a newline in the
+    # middle of it often enough to matter, and covid-19 is written three ways by three drafters.
+    SepTolerant = TRUE,
+    # CHARACTERS KEPT EITHER SIDE OF EVERY MATCH. Enough to read the clause the term sits in and
+    # judge whether the match is real. This is the only defence against a false positive that a
+    # prevalence series cannot show.
+    Cue         = 80L,
+    # DOCUMENTS PER CHUNK, and a memory decision rather than a decision about the answer. Larger is
+    # faster until a chunk stops fitting.
+    ChunkSize   = 10000L,
+    # DAEMONS THAT READ AND SCAN. One count rather than two, because one worker does both halves:
+    # it opens the parquet files in its batch and matches against them without the text ever
+    # returning here. 04C measured the read alone at roughly 150 documents a second on this machine.
+    Workers     = 24L,
+    # NULL SCANS THE WHOLE QUEUE. An integer names a fixed cohort -- the first n in hash order -- so a
+    # capped rehearsal is repeatable and raising the number extends the cohort rather than replacing
+    # it.
+    Limit       = NULL,
+    ReportEvery = 5L,
+    # Documents re-read to check that the stored offsets still index the stored text.
+    CheckDocs   = 200L,
+    Engine      = "Bert"
+  )
+)
+
+.lP$Params$Bins <- 20L
+```
+
+## The term list
+
+This is the study design, so it is on the page rather than in the library. Five families, and only the
+first answers the referee.
+
+```{r}
+#| label: build-terms
+
+tab_terms <- txt_terms(
+  .families     = NULL,                       # NULL takes all five
+  .sep_tolerant = .lP$Params$SepTolerant      # internal spaces and hyphens compile to one class
+)
+
+term_hash <- txt_terms_hash(.terms = tab_terms)
+
+tbl_out(
+  .tab   = dplyr::summarise(tab_terms, Terms = paste(.data$Term, collapse = ", "), .by = "Family"),
+  .title = paste0("The published term list (hash ", term_hash, ")")
+)
+```
+
+**PANDEMIC is the question.** It carries the disease names, the public-health vocabulary, and the
+United States relief statute -- CARES Act, Paycheck Protection Program, PPP loan -- because a large
+share of 2020 material agreements were relief loans. A filing spike made of PPP loans is a pandemic
+explanation stated in the only language a credit agreement has for it.
+
+**DISRUPTION is the mechanism.** Force majeure and business interruption are how an agreement responds
+to a pandemic without naming one, which separates *the contract discusses it* from *the contract was
+reopened because of it*.
+
+**RATEREFORM is the instrument check, and it matters more than anything here except the first family.**
+The LIBOR cessation has a date this project did not choose: panels ceased through 2021 and 2023, and
+SOFR replaced them in credit agreements. If this pass cannot recover a shock whose timing is
+externally known, its verdict on a shock whose timing is contested is worth nothing. REGULATION is the
+same check further back, so the instrument is shown to work at both ends of the window.
+
+**BOILERPLATE is the placebo.** Governing law, counterparts and severability appear in nearly every
+agreement in every year, so their series must be flat. If it moves in 2020, what moved is the corpus
+-- its composition, its lengths, its parse quality -- and not its language, and every other series on
+this page inherits that and means nothing.
+
+**The prediction, before anything runs.** Pandemic prevalence is low but not zero before 2020, because
+*epidemic* and *quarantine* sit in insurance and force-majeure boilerplate that long predates
+COVID-19. It rises sharply in 2020Q2. If the rise is what drove the filing spike rather than
+accompanying it, the rise concentrates in amendments and in credit agreements. Boilerplate is flat
+throughout. RateReform is near zero before 2018 and rises through 2021 to 2023.
+
+# Input
+
+## The documents to scan
+
+```{r}
+#| label: build-index
+
+tab_source <- txt_source_index(
+  .path_register = .lP$Input$Register,      # 02B's register: the corpus
+  .dir_mirror    = .lP$Input$Mirror,        # where utils_doc_path() resolves against
+  .sources       = .lP$Params$Sources,      # Exhibit10, 8-K and CTO
+  .population    = .lP$Params$Population    # "all" attachments rather than the descriptive subset
+)
+
+tab_item <- txt_item_index(.path_item = .lP$Input$Item101)
+
+# ATTACHMENTS, NOT REGISTRANT COPIES. A filing naming several registrants produces one file per
+# registrant of the same attachment, and scanning all of them would count one contract's language
+# once per co-filer. PrimaryFiler marks the copy that was read; fanning back out is a join on
+# HashDocument that any firm-level question performs for itself.
+tab_index <- dplyr::bind_rows(
+  tab_source,
+  dplyr::mutate(tab_item, Path = NA_character_, HashDocument = NA_character_) |>
+    dplyr::select("DocID", "Source", "Path", "HashDocument")
+)
+
+tbl_out(
+  .tab   = dplyr::count(tab_index, .data$Source, name = "Documents"),
+  .title = "The queue, by source"
+)
+```
+
+## The per-document facts every descriptive needs
+
+```{r}
+#| label: build-keys
+
+path_release <- ent_release_path(.dir_release = .lP$Input$Labels)
+
+tab_keys <- txt_keys(
+  .path_register = .lP$Input$Register,   # identity, filing date and length
+  .path_release  = path_release,         # 03F's corpus labels; NA leaves the class columns missing
+  .engine        = .lP$Params$Engine,    # which engine's label is authoritative
+  .doc_ids       = NULL                  # NULL takes every primary-filer row
+)
+```
+
+Class and amendment type exist for contracts and not for reports, so the join is left and the hole is
+real rather than an error. An 8-K keeps its row with a missing class.
+
+# Construction
+
+## The store
+
+```{r}
+#| label: open-store
+
+con <- txt_store_open(.path = .lP$Output$Store)
+
+n_queue <- txt_store_queue(.con = con, .tab_index = tab_index)
+```
+
+The ledger is keyed on the document and the term-list hash, not on the document and the term. A
+per-term ledger would write twenty-nine rows per document to record that a document was looked at and
+would buy nothing, because the text is not retained: scanning one new term still means reading the
+document again. **A changed term list is a new pass over the corpus, and that is a property of the
+problem rather than of this implementation.**
+
+## The pass
+
+```{r}
+#| label: run-pass
+
+tab_pass <- txt_pass(
+  .con          = con,                        # the store
+  .terms        = tab_terms,                  # the published list
+  .item_text    = tab_item,                   # Item 1.01 carries its text and is not read off disk
+  .term_hash    = term_hash,                  # what the ledger is keyed on
+  .sources      = NULL,                       # NULL scans every source in the queue
+  .chunk_size   = .lP$Params$ChunkSize,       # documents per chunk
+  .cue          = .lP$Params$Cue,             # characters kept either side of a match
+  .workers      = .lP$Params$Workers,         # daemons that read and scan, both in the worker
+  .limit        = .lP$Params$Limit,           # NULL takes everything outstanding
+  .report_every = .lP$Params$ReportEvery      # chunks between progress lines
+)
+```
+
+**A completed pass makes this chunk a no-op.** Every document carries a ledger row under this hash, so
+the queue comes back empty and a re-render costs a query. That is what allows the document to run its
+own work on every render rather than hiding an expensive step behind a switch.
+
+# Selection
+
+## From occurrences to documents
+
+```{r}
+#| label: build-doc-table
+
+tab_doc <- txt_doc_table(
+  .con       = con,          # the store
+  .terms     = tab_terms,    # supplies the term-to-family map
+  .term_hash = term_hash,    # which pass to read
+  .keys      = tab_keys      # supplies nWords, the intensity denominator
+)
+```
+
+The family is applied here and not in the store, which is the whole point of holding hits per term: a
+different grouping of the same terms is this join and nothing more.
+
+Intensity is per thousand words because the sources differ in length by an order of magnitude. An
+Item 1.01 summary is a paragraph and a credit agreement is a hundred pages, so a raw count would
+compare them on length rather than on language.
+
+# Results
+
+## What the pass cost
+
+```{r}
+#| label: report-pass
+
+txt_report_pass(.tab = tab_pass, .n_queue = n_queue)
+```
+
+## What was scanned
+
+```{r}
+#| label: report-sources
+
+tab_src <- txt_report_sources(.con = con, .term_hash = term_hash)
+
+n_seen <- sum(tab_src$nScanned)
+```
+
+## Every term, and what it found
+
+```{r}
+#| label: report-terms
+
+tab_term_counts <- txt_report_terms(
+  .con       = con,          # the store
+  .terms     = tab_terms,    # the published list, so a silent term still gets a row
+  .term_hash = term_hash,    # which pass to read
+  .n_seen    = n_seen        # the denominator
+)
+```
+
+**This is the table that settles a term list.** The family totals average away exactly the two failures
+worth catching: a term that fires everywhere is not measuring an event, and a term that fires nowhere
+is more often a broken pattern than a fact about contract language.
+
+## The matches, as they appear
+
+```{r}
+#| label: report-examples
+
+txt_report_examples(
+  .con       = con,          # the store
+  .term_hash = term_hash,    # which pass to read
+  .terms     = tab_terms,    # supplies the family's terms
+  .family    = "Pandemic",   # the family under examination
+  .n         = 12L,          # rows to show
+  .chars     = 60L           # characters of context either side
+)
+```
+
+A prevalence series cannot show that *cares act* matched a sentence about who cares, or that
+*epidemic* matched a metaphor. Sixty characters either side can, and the sample is drawn on a hash so
+the same twelve rows return on a re-render and are not all from one filer or one quarter.
+
+# Validation
+
+## Do the stored offsets still index the stored text
+
+```{r}
+#| label: validate-offsets
+
+tab_check <- txt_check_offsets(
+  .con       = con,                    # the store
+  .term_hash = term_hash,              # which pass to check
+  .tab_index = tab_index,              # supplies Path for the disk-backed sources
+  .item_text = tab_item,               # supplies text for the Item 1.01 source
+  .n         = .lP$Params$CheckDocs    # documents re-read
+)
+
+txt_report_checks(.tab = tab_check)
+```
+
+Every hit carries its offsets and the substring they were taken from, so re-slicing the text at those
+offsets must return that substring. **This is the check that would have caught treating Item 1.01 as a
+window on the 8-K**: an offset system is either right or wrong, so a few hundred documents settle it
+as firmly as a million would.
+
+## Two identities the tables cannot violate
+
+```{r}
+#| label: validate-identities
+
+# EVERY SCANNED DOCUMENT APPEARS IN EVERY FAMILY, exactly once. A count other than five per document
+# is a join fault in txt_doc_table(), not a fact about the corpus.
+chk_rows <- tab_doc |>
+  dplyr::summarise(nFamilies = dplyr::n(), .by = c("DocID", "Source")) |>
+  dplyr::count(.data$nFamilies, name = "Documents")
+
+# A DOCUMENT WITH HITS MUST HAVE AN INDICATOR, and one without must not. The two are derived from the
+# same column, so a disagreement is impossible unless the derivation is wrong.
+chk_flag <- tab_doc |>
+  dplyr::summarise(
+    Contradictions = sum((.data$nHits > 0L) != (.data$HasTerm == 1L)),
+    NoFirstPos     = sum(.data$nHits > 0L & is.na(.data$FirstPos))
+  )
+
+tbl_out(.tab = chk_rows, .title = "Families per scanned document")
+tbl_out(.tab = chk_flag, .title = "Indicator against count")
+```
+
+# Robustness
+
+## Prevalence over time
+
+```{r}
+#| label: build-prevalence
+
+tab_prev <- txt_prevalence(
+  .tab_doc = tab_doc,     # one row per document per family
+  .keys    = tab_keys,    # supplies the quarter
+  .sources = NULL,        # NULL keeps every source and reports them separately
+  .by      = NULL         # no extra grouping
+)
+
+tab_prev_c <- txt_prevalence(
+  .tab_doc = tab_doc,
+  .keys    = tab_keys,
+  .sources = "Exhibit10",   # contracts only, which is what the manuscript's figure counts
+  .by      = NULL
+)
+
+tab_count <- tab_prev_c |>
+  dplyr::filter(.data$Family == "Pandemic") |>
+  dplyr::select("YQ", "nDocs")
+
+tbl_out(
+  .tab = tab_prev_c |>
+    dplyr::filter(.data$YQ >= 2019, .data$YQ <= 2021.75,
+                  .data$Family %in% c("Pandemic", "Disruption", "Boilerplate")) |>
+    dplyr::select("YQ", "Family", "nDocs", "Share") |>
+    tidyr::pivot_wider(names_from = "Family", values_from = "Share"),
+  .title = "Contract prevalence around the spike",
+  .pct   = c("Pandemic", "Disruption", "Boilerplate"),
+  .notes = c(
+    Boilerplate = "Flat is the result. Movement here would mean the corpus moved, not the language."
+  )
+)
+```
+
+## The amendment split
+
+```{r}
+#| label: build-amend
+
+tab_prev_amend <- txt_prevalence(
+  .tab_doc = tab_doc,
+  .keys    = tab_keys,
+  .sources = "Exhibit10",
+  .by      = "AmendType"    # Original against Amended
+)
+
+tbl_out(
+  .tab = tab_prev_amend |>
+    dplyr::filter(.data$Family == "Pandemic", .data$YQ >= 2019.75, .data$YQ <= 2021.25) |>
+    dplyr::select("YQ", "AmendType", "nDocs", "Share"),
+  .title = "Pandemic prevalence by amendment type, around the spike",
+  .pct   = "Share",
+  .notes = c(Share = "A spike concentrated in amendments is a renegotiation story.")
+)
+```
+
+## By contract category
+
+```{r}
+#| label: build-class
+
+tab_prev_class <- txt_prevalence_class(
+  .tab_doc = tab_doc,        # one row per document per family
+  .keys    = tab_keys,       # supplies Class and Year
+  .family  = "Pandemic",     # the family under examination
+  .years   = 2020:2021       # the spike years
+)
+
+tbl_out(
+  .tab   = tab_prev_class,
+  .title = "Pandemic prevalence by contract category, 2020 and 2021",
+  .pct   = "Share"
+)
+```
+
+## Where in a document the hits sit
+
+```{r}
+#| label: build-position
+
+tab_pos <- txt_position(
+  .con       = con,             # the store
+  .term_hash = term_hash,       # which pass to read
+  .terms     = tab_terms,       # supplies the term-to-family map
+  .bins      = .lP$Params$Bins  # bins across the relative position
+)
+```
+
+Position separates two things a count cannot. Boilerplate is positional by construction -- governing
+law and counterparts sit in the closing articles -- so its distribution is the shape a
+document-structure effect makes. A pandemic family concentrated in the same place is a boilerplate
+insertion; one spread through the body is substantive drafting.
+
+# Deployment
+
+```{r}
+#| label: deploy-release
+
+txt_write_release(
+  .con       = con,                    # the store
+  .tab_doc   = tab_doc,                # one row per document per family
+  .terms     = tab_terms,              # the vocabulary, written beside the results
+  .term_hash = term_hash,              # which pass is being released
+  .paths     = .lP$Output$Release      # the three destinations
+)
+
+DBI::dbDisconnect(con, shutdown = TRUE)
+```
+
+`term_hits` is the file anyone re-reading a match or testing one against a matcon span wants;
+`term_docs` is the file a regression joins to; `term_list` is what makes either interpretable.
+
+# Overview
+
+```{r}
+#| label: fig-spike
+#| fig-cap: "Attachments filed each quarter, with pandemic prevalence over them. The bars are the rise
+#|   referee 2 asked about; the line is whether the documents behind it say anything different. Read
+#|   apart these are two facts, and read together they are an answer."
+#| fig-height: 3.4
+
+txt_plot_spike(.tab_prev = tab_prev_c, .tab_count = tab_count, .family = "Pandemic")
+```
+
+```{r}
+#| label: fig-prevalence
+#| fig-cap: "Prevalence by quarter for every family, contracts only. Boilerplate is the control: a
+#|   flat line there is what licenses reading movement in the others as language rather than as a
+#|   change in the corpus."
+#| fig-height: 3.4
+
+txt_plot_prevalence(.tab = tab_prev_c, .families = NULL)
+```
+
+```{r}
+#| label: fig-validation
+#| fig-cap: "The instrument on shocks whose dates were set elsewhere. Rate reform should turn on
+#|   through 2021 to 2023 and regulation early in the window. A series that cannot find these cannot
+#|   be trusted on a date that is contested."
+#| fig-height: 3.4
+
+txt_plot_prevalence(.tab = tab_prev_c, .families = c("RateReform", "Regulation"))
+```
+
+```{r}
+#| label: fig-amend
+#| fig-cap: "Pandemic prevalence by amendment type. The mechanism claim: a pandemic that reopened
+#|   existing agreements shows here, and one that only accompanied new ones does not."
+#| fig-height: 3.4
+
+txt_plot_amend(.tab = tab_prev_amend, .family = "Pandemic")
+```
+
+```{r}
+#| label: fig-class
+#| fig-cap: "Pandemic prevalence by contract category across 2020 and 2021. Credit agreements carry
+#|   the relief-loan vocabulary, so a category ranking led by credit is the PPP explanation rather
+#|   than a general one."
+#| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_prev_class$Class))
+
+txt_plot_class(.tab = tab_prev_class)
+```
+
+```{r}
+#| label: fig-position
+#| fig-cap: "Where each family's hits fall through a contract, 0 at the start and 1 at the end.
+#|   Boilerplate is the reference shape a positional effect makes; a family matching that shape is
+#|   sitting in inserted clauses rather than in drafted terms."
+#| fig-height: 4.6
+
+txt_plot_position(.tab = tab_pos, .families = c("Pandemic", "Disruption", "Boilerplate"))
+```
+
+```{r}
+#| label: fig-sources
+#| fig-cap: "Prevalence by quarter across all four sources, pandemic family only. The 8-K and Item
+#|   1.01 series are the filer's own account of why an agreement was entered, which is a different
+#|   witness from the agreement itself."
+#| fig-height: 3.4
+
+txt_plot_prevalence(
+  .tab      = dplyr::filter(tab_prev, .data$Family == "Pandemic") |>
+    dplyr::mutate(Family = plot_factor(.x = .data$Source, .key = "TextSource")),
+  .families = NULL
+)
+```
+
+# Next
+
+06 builds the paper's descriptive tables and figures. It reads `term_docs.parquet` for the pandemic
+indicator, joins it to the register on `DocID`, and reports the prevalence series beside the filing
+counts as the answer to referee 2's fourth comment. `term_hits.parquet` stays available for anyone
+wanting to read the matches behind a number.

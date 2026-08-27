@@ -346,27 +346,26 @@ tab_lens <- ent_doc_lens(
 ```{r}
 #| label: load-spans
 
-tab_spans <- ent_load_entity(
+# THE LOAD AND THE TWO KEYS ARE ONE FUNCTION, and they live in the library rather than here. 04D
+# applies this rule to the corpus by calling these functions, so a step written only in the runbook
+# is a step it would have to reimplement -- and ent_apply() cannot run without SpanKey and CoreKey.
+tab_spans <- ent_load_org(
   .dir_store = .lP$Input$Store,      # the directory; the family is the filename
-  .family    = .lP$Params$Family,    # lexnlp, the only ORG family the corpus pass carries
-  .entity    = .lP$Params$Entity,    # the org table inside it
   .lens      = tab_lens,             # supplies document length, so an offset becomes a position
+  .family    = .lP$Params$Family,    # lexnlp, the only ORG family the corpus pass carries
   .extras    = .lP$Params$Extras,    # the resolved name and the legal form
   .quiet     = FALSE
-) |>
-  dplyr::mutate(
-    # Both keys are built once, outside the rule: the reduction depends on no rule parameter, and
-    # rebuilding it per sweep cell would run the same strings through the same regex to produce the
-    # identical answer.
-    SpanKey = ent_norm_key(.x = .data$Span, .min = 1L),
-    CoreKey = ent_norm_key(.x = dplyr::coalesce(.data$NameCore, .data$Span), .min = 1L)
-  )
+)
 ```
+
+**Both keys are built once, outside the rule.** The reduction depends on no rule parameter, so
+building it per sweep cell would run the same strings through the same regex to produce the identical
+answer; `ent_rule()`'s `.key` then chooses between two columns that already exist.
 
 **Asking for a column that is not there is an abort, not a silent absence.** The loader reads the
 table's real schema and names what is missing, because `any_of()` would have dropped `NameCore`
-without a word -- and the `coalesce` above would then have fallen back to `Span` on every row, turning
-a documented rule into a fallback nobody could see.
+without a word -- and the `coalesce` inside would then have fallen back to `Span` on every row,
+turning a documented rule into a fallback nobody could see.
 
 **The span count covers fewer documents than the sample holds**, and every mean below is over the
 sample rather than over that subset. Documents in which LexNLP proposed no organisation carry no

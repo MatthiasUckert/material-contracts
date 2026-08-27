@@ -200,6 +200,55 @@ ent_rule_set <- function(.rule, .over) {
 }
 
 
+#' Load the ORG spans and build both reduction keys
+#'
+#' THE KEYS WERE BUILT IN THE RUNBOOK AND HAD TO MOVE. A two-line mutate in the qmd is fine while one
+#' document uses it and becomes a copy the moment a second does -- and 04D is that second document.
+#' It applies this rule to the corpus by calling the functions here, so a step living only in the
+#' runbook is a step 04D has to reimplement, which is the mistake this family already made twice with
+#' dte_term() and red_words(). ent_apply() cannot run without these two columns; the function that
+#' produces them therefore sits beside it.
+#'
+#' BOTH KEYS ARE BUILT ONCE, OUTSIDE THE RULE. The reduction depends on no rule parameter, so building
+#' it per sweep cell would run the same strings through the same regex to produce the identical
+#' answer. ent_rule()'s .key then chooses between two columns that already exist.
+#'
+#' ASKING FOR A COLUMN THAT IS NOT THERE IS AN ABORT, not a silent absence. The loader reads the
+#' table's real schema and names what is missing, because any_of() would drop NameCore without a word
+#' and the coalesce below would then fall back to Span on every row -- turning a documented rule into
+#' a fallback nobody could see.
+#'
+#' @param .dir_store Directory holding the family databases.
+#' @param .lens Tibble: DocID and DocLen.
+#' @param .family Character. The family supplying organisations.
+#' @param .extras Character. Columns the reduction reads beside the span.
+#' @param .quiet Logical. Suppress the count message.
+#' @return Tibble: one row per span, with SpanKey and CoreKey.
+ent_load_org <- function(.dir_store, .lens, .family = "lexnlp",
+                         .extras = c("NameCore", "LegalForm", "Description"), .quiet = FALSE) {
+  if (FALSE) {
+    .dir_store <- .lP$Input$Store
+    .lens      <- tab_lens
+    .family    <- "lexnlp"
+    .extras    <- c("NameCore", "LegalForm", "Description")
+    .quiet     <- FALSE
+  }
+
+  ent_load_entity(
+    .dir_store = .dir_store,
+    .family    = .family,
+    .entity    = "ORG",
+    .lens      = .lens,
+    .extras    = .extras,
+    .quiet     = .quiet
+  ) |>
+    dplyr::mutate(
+      SpanKey = ent_norm_key(.x = .data$Span, .min = 1L),
+      CoreKey = ent_norm_key(.x = dplyr::coalesce(.data$NameCore, .data$Span), .min = 1L)
+    )
+}
+
+
 #' Which reduction identifies an entity, under this rule
 #'
 #' TWO FUNCTIONS PICK THE KEY AND THEY MUST PICK THE SAME ONE. ent_entities() collapses mentions into

@@ -260,18 +260,37 @@ apl_labels_path <- function(.dir, .stem = "contract_labels") {
 #' third, and the first only where 03F classified. A document with no label carries NA in Class,
 #' which every rule tolerates because Class is carried and never conditioned on.
 #'
-#' @param .path_labels 03F's corpus labels.
+#' THE LABEL COLUMNS ARE NAMED, because 03F's release does not use 03A's names. The prepared sample
+#' carries ClassDetailed and AmendType; the corpus release carries BertClassDetailed and
+#' BertAmendType, one pair per engine, and no Fold at all -- a fold is a cross-validation artifact of
+#' the sample. Naming them here is what lets one anchor function serve both files.
+#'
+#' THE TRANSFORMER'S LABEL AND NOT THE KEYWORD ARM'S. 03E measured the routing question and returned a
+#' strong null: nested cross-validated policy selection did not improve on the transformer, and the
+#' oracle ceiling equalled BERT-everywhere at 0.882 macro-F1. So the released label is BERT's, and the
+#' keyword columns beside it are a confirmation flag rather than a second opinion to reconcile.
+#'
+#' THE SEMI-JOIN IS DOING MORE THAN IT LOOKS. 03F's release is fanned out to one row per REGISTRANT
+#' COPY, while 04C extracted one row per ATTACHMENT -- the primary copy. Restricting to the index
+#' therefore keeps exactly the primaries, which is the population this pass applies to, and drops the
+#' repeat copies rather than multiplying every document by its number of filers.
+#'
+#' @param .path_labels 03F's corpus label release, resolved by apl_labels_path().
 #' @param .path_register 02B's register.
 #' @param .path_landing 01C's landing pages, for 04B2's precision flag.
 #' @param .index Tibble from apl_corpus_index().
+#' @param .labels Named character. Which columns of the label file hold Class and AmendType.
 #' @param .quiet Logical.
 #' @return Tibble: one row per document in .index.
-apl_keys <- function(.path_labels, .path_register, .path_landing, .index, .quiet = FALSE) {
+apl_keys <- function(.path_labels, .path_register, .path_landing, .index,
+                     .labels = c(Class = "BertClassDetailed", AmendType = "BertAmendType"),
+                     .quiet = FALSE) {
   if (FALSE) {
-    .path_labels   <- .lP$Input$Labels
+    .path_labels   <- apl_labels_path(.dir = .lP$Input$Labels)
     .path_register <- .lP$Input$Register
     .path_landing  <- .lP$Input$Landing
     .index         <- tab_index
+    .labels        <- c(Class = "BertClassDetailed", AmendType = "BertAmendType")
     .quiet         <- FALSE
   }
 
@@ -279,6 +298,7 @@ apl_keys <- function(.path_labels, .path_register, .path_landing, .index, .quiet
     .path_prepared = .path_labels,
     .path_register = .path_register,
     .path_landing  = .path_landing,
+    .labels        = .labels,
     .quiet         = .quiet
   ) |>
     dplyr::semi_join(.index, by = dplyr::join_by(DocID))
@@ -374,12 +394,15 @@ apl_chunk_apply <- function(.frame, .params, .dir_store, .geo) {
 
   # ORG -- 04B1. Grouping, party identification, the window and the tail, then the release and the
   # mention index 04B2 needs.
-  spans_org_ <- ent_load_entity(
-    .dir_store = .dir_store, .family = .params$Family$ORG, .entity = "ORG",
-    .lens = lens_, .extras = ent_extras(.params$Family$ORG, "ORG"), .quiet = TRUE
-  )
+  # ent_load_org() AND NOT ent_load_entity(). ent_apply() reads SpanKey and CoreKey, which are the
+  # reduction and not the store's columns; 04B1 builds them in the loader so that this document calls
+  # one function rather than copying a mutate out of a runbook.
   res_org_ <- ent_apply(
-    .spans = spans_org_, .keys = keys_, .lens = lens_,
+    .spans = ent_load_org(
+      .dir_store = .dir_store, .lens = lens_, .family = .params$Family$ORG,
+      .extras = .params$Extras$ORG, .quiet = TRUE
+    ),
+    .keys = keys_, .lens = lens_,
     .rule = .params$Rule$Org, .spec = .params$Spec$Org
   )
   parties_ <- ent_release_parties(.roles = res_org_$Roles, .party = res_org_$Party)
@@ -442,93 +465,356 @@ apl_chunk_apply <- function(.frame, .params, .dir_store, .geo) {
 }
 
 
+#' Apply one chunk, write its four files, return a summary and not the data
+#'
+#' THE UNIT BOTH PATHS SHARE. The serial loop and the parallel map call this and nothing else, so a
+#' change to what a chunk does cannot apply to one and not the other -- which is the failure mode of
+#' having written the work twice.
+#'
+#' IT RETURNS A SUMMARY, NEVER THE TABLES. A chunk of 20,000 documents produces roughly 160,000 party
+#' rows; handing those back from a daemon would serialise them across a process boundary and rebuild
+#' them in the parent, which is more work than computing them. The worker writes its own parquets --
+#' the names differ by chunk index so two workers never contend -- and returns nine numbers.
+#'
+#' FOUR FILES OR NONE. A chunk directory holding three of four reads as complete on the next render
+#' and leaves one entity short for that chunk, silently.
+#'
+#' @param .frame List from apl_chunk_frame().
+#' @param .index Integer or character. The chunk's index, which names its files.
+#' @param .dir_chunks Directory named for the policy hash.
+#' @param .params The runbook's .lP$Params.
+#' @param .dir_store Directory holding the family databases.
+#' @param .geo List: the gazetteer lookup and candidate list.
+#' @return One-row tibble.
+apl_chunk_run <- function(.frame, .index, .dir_chunks, .params, .dir_store, .geo) {
+  if (FALSE) {
+    .frame      <- frame_
+    .index      <- 1L
+    .dir_chunks <- .lP$Output$Chunks
+    .params     <- .lP$Params
+    .dir_store  <- .lP$Input$Store
+    .geo        <- geo_once
+  }
+
+  names_ <- c("Parties", "Date", "Money", "Redact")
+  paths_ <- purrr::set_names(
+    fs::path(.dir_chunks, paste0(names_, "-", .index, ".parquet")), names_
+  )
+  n_doc_ <- nrow(.frame$Keys)
+
+  if (all(fs::file_exists(paths_))) {
+    return(tibble::tibble(Chunk = as.integer(.index), Docs = n_doc_, Rows = NA_integer_,
+                          Seconds = 0, Status = "cached"))
+  }
+
+  tic_ <- Sys.time()
+  res_ <- try(
+    apl_chunk_apply(.frame = .frame, .params = .params, .dir_store = .dir_store, .geo = .geo),
+    silent = TRUE
+  )
+
+  if (inherits(res_, "try-error")) {
+    return(tibble::tibble(
+      Chunk = as.integer(.index), Docs = n_doc_, Rows = NA_integer_,
+      Seconds = as.numeric(difftime(Sys.time(), tic_, units = "secs")),
+      Status = paste0("error: ", conditionMessage(attr(res_, "condition")))
+    ))
+  }
+
+  purrr::iwalk(res_, \(.t, .n) arrow::write_parquet(.t, paths_[[.n]]))
+
+  tibble::tibble(
+    Chunk = as.integer(.index), Docs = n_doc_, Rows = as.integer(nrow(res_$Parties)),
+    Seconds = as.numeric(difftime(Sys.time(), tic_, units = "secs")), Status = "ran"
+  )
+}
+
+
 #' Run the pass, chunk by chunk, resuming where it stopped
 #'
-#' RESUMPTION IS A PROPERTY, NOT A FEATURE. Each chunk writes four parquets into a directory named for
-#' the policy hash; a chunk whose four files exist is skipped. There is no state to remember between
-#' renders and nothing that could be wrong about itself.
+#' RESUMPTION IS A PROPERTY, NOT A FEATURE. Each chunk writes four parquets into a directory named
+#' for the policy hash; a chunk whose four files exist is skipped. There is no state to remember
+#' between renders and nothing that could be wrong about itself.
 #'
 #' A CHUNK THAT FAILS IS RECORDED AND THE PASS CONTINUES. One document with an impossible offset
-#' should not cost the other 1.19 million, and a chunk that errored is visible in the report and
-#' retried on the next render because its files were never written.
+#' should not cost the other million, and a chunk that errored wrote no file so the next render
+#' retries it.
+#'
+#' ONE WORKER IS THE SERIAL PATH, and it is the same function either way: apl_chunk_run() does the
+#' work and the only difference is what calls it. Writing the loop twice would let the two drift.
+#'
+#' WHY PARALLELISM HELPS HERE AND OFTEN DOES NOT. The rules are dplyr over data already in memory,
+#' which is single-threaded R; the LOAD is DuckDB, which already uses every core. So workers help in
+#' proportion to how much of a chunk is rule rather than read, and the split is reported below rather
+#' than assumed. Oversubscribing costs more than it buys.
+#'
+#' BATCHED RATHER THAN SUBMITTED ALL AT ONCE, for memory. A chunk holds roughly 1.5 million spans
+#' each carrying 320 characters of stored context, which is around half a gigabyte before anything
+#' else; running every chunk at once would put all of them in flight together. A batch is bounded by
+#' the worker count, and it is also what makes progress reportable at all.
 #'
 #' @param .chunks List from apl_chunks().
 #' @param .keys Tibble from apl_keys().
 #' @param .dir_chunks Directory named for the policy hash.
 #' @param .params The runbook's .lP$Params.
 #' @param .dir_store Directory holding the family databases.
-#' @param .geo List: the gazetteer lookup and candidate list.
-#' @param .report_every Integer. Chunks between progress lines.
+#' @param .geo List: the gazetteer lookup and candidate list. Used by the serial path only; a daemon
+#'   builds its own from .path_lookup, because shipping 181,810 rows to every worker per chunk is
+#'   slower than reading the file once per worker.
+#' @param .workers Integer. 1 runs serially in this process.
+#' @param .path_lookup The gazetteer parquet, for the daemons to read.
+#' @param .path_fun Character. Library files every daemon must source.
 #' @return Tibble: one row per chunk.
 apl_pass <- function(.chunks, .keys, .dir_chunks, .params, .dir_store, .geo,
-                     .report_every = 5L) {
+                     .workers = 1L, .path_lookup = NULL, .path_fun = character()) {
   if (FALSE) {
-    .chunks       <- chunks_
-    .keys         <- tab_keys
-    .dir_chunks   <- .lP$Output$Chunks
-    .params       <- .lP$Params
-    .dir_store    <- .lP$Input$Store
-    .geo          <- geo_once
-    .report_every <- 5L
+    .chunks      <- chunks_
+    .keys        <- tab_keys
+    .dir_chunks  <- .lP$Output$Chunks
+    .params      <- .lP$Params
+    .dir_store   <- .lP$Input$Store
+    .geo         <- geo_once
+    .workers     <- 6L
+    .path_lookup <- .lP$Input$Lookup
+    .path_fun    <- .lP$Params$Sources
   }
 
-  names_ <- c("Parties", "Date", "Money", "Redact")
   fs::dir_create(.dir_chunks)
-
   if (length(.chunks) == 0L) {
     cli::cli_alert_info("Nothing outstanding.")
     return(tibble::tibble())
   }
 
-  t0_   <- Sys.time()
-  done_ <- 0L
+  # THE FRAMES ARE CUT IN THE PARENT, and that is what keeps the payload small. .keys is 1.19 million
+  # rows; a daemon needs the twenty thousand belonging to its chunk. Sending the whole table to every
+  # worker would serialise the corpus once per chunk.
+  frames_ <- purrr::imap(.chunks, \(.ids, .i) apl_chunk_frame(.keys = .keys, .doc_ids = .ids))
+  idx_    <- names(.chunks)
+  t0_     <- Sys.time()
+  done_   <- 0L
 
-  out_ <- purrr::imap(.chunks, function(.ids, .i) {
-    paths_ <- purrr::set_names(
-      fs::path(.dir_chunks, paste0(names_, "-", .i, ".parquet")), names_
+  say_ <- function(.k) {
+    el_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+    cli::cli_alert_info(
+      "  {(.k)}/{length(.chunks)} chunks | {format(done_, big.mark = ',')} docs | \\
+       {round(done_ / max(el_, 1e-9), 1)}/s"
     )
-    done_ <<- done_ + length(.ids)
+  }
 
-    if (all(fs::file_exists(paths_))) {
-      return(tibble::tibble(Chunk = as.integer(.i), Docs = length(.ids), Rows = NA_integer_,
-                            Seconds = 0, Status = "cached"))
-    }
+  if (.workers <= 1L) {
+    out_ <- purrr::imap(frames_, function(.f, .i) {
+      r_ <- apl_chunk_run(.frame = .f, .index = .i, .dir_chunks = .dir_chunks,
+                          .params = .params, .dir_store = .dir_store, .geo = .geo)
+      done_ <<- done_ + nrow(.f$Keys)
+      say_(.k = which(idx_ == .i))
+      r_
+    }) |>
+      purrr::list_rbind()
+    return(apl_pass_check(.tab = out_))
+  }
 
-    tic_ <- Sys.time()
-    res_ <- try(
-      apl_chunk_apply(
-        .frame = apl_chunk_frame(.keys = .keys, .doc_ids = .ids),
-        .params = .params, .dir_store = .dir_store, .geo = .geo
-      ),
-      silent = TRUE
-    )
+  # EVERY DAEMON SOURCES THE LIBRARIES BY PATH. A closure does not cross a process boundary with its
+  # environment, so a worker handed a function that calls ent_apply() finds no ent_apply(); the files
+  # have to be named and sourced there. This project has been caught by that before.
+  mirai::daemons(.workers)
+  on.exit(mirai::daemons(0L), add = TRUE)   # SAFE ONLY INSIDE A FUNCTION BODY, which this is
 
-    if (inherits(res_, "try-error")) {
-      cli::cli_alert_danger("chunk {(.i)} failed: {conditionMessage(attr(res_, 'condition'))}")
-      return(tibble::tibble(Chunk = as.integer(.i), Docs = length(.ids), Rows = NA_integer_,
-                            Seconds = as.numeric(difftime(Sys.time(), tic_, units = "secs")),
-                            Status = "error"))
-    }
-
-    # WRITTEN ONLY ONCE ALL FOUR SUCCEEDED, so a chunk directory never holds three files of four --
-    # which would read as complete on the next render and leave one entity short for that chunk.
-    purrr::iwalk(res_, \(.t, .n) arrow::write_parquet(.t, paths_[[.n]]))
-
-    secs_ <- as.numeric(difftime(Sys.time(), tic_, units = "secs"))
-    if (.report_every > 0L &&
-        (as.integer(.i) %% .report_every == 0L || .i == 1L || .i == length(.chunks))) {
-      el_  <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
-      cli::cli_alert_info(
-        "  chunk {(.i)}/{length(.chunks)} | {format(done_, big.mark = ',')} docs | \\
-         {round(done_ / max(el_, 1e-9), 1)}/s"
+  # ASSIGNED INTO THE DAEMON'S GLOBAL ENVIRONMENT EXPLICITLY, and the difference is not cosmetic.
+  # everywhere() with .args evaluates its expression in an environment carrying those arguments,
+  # whose parent is the daemon's global -- so `geo_once <- ...` binds THERE and is gone the moment
+  # the call returns. source() has local = FALSE and writes to the global regardless, which is why
+  # the probe found apl_chunk_run and not the gazetteer: the two were landing in different places.
+  mirai::everywhere(
+    {
+      purrr::walk(.files, \(.f) source(.f, encoding = "UTF-8"))
+      assign(
+        x     = "geo_once",
+        value = list(
+          Lookup = geo_lookup(.path_lookup = .lookup),
+          Cand   = geo_candidates(.path_lookup = .lookup)
+        ),
+        envir = globalenv()
       )
-    }
-    tibble::tibble(Chunk = as.integer(.i), Docs = length(.ids),
-                   Rows = as.integer(nrow(res_$Parties)), Seconds = secs_, Status = "ran")
+    },
+    .args = list(.files = .path_fun, .lookup = .path_lookup)
+  )
+
+  # A DAEMON IS CHECKED BEFORE A HUNDRED MINUTES ARE SPENT ON IT. everywhere() reports nothing about
+  # whether the sourcing worked, so a path that resolved in this process and not in a worker would
+  # fail on every chunk and be discovered at the end. One tiny job settles it.
+  probe_ <- mirai::mirai_map(
+    .x = list(1L),
+    .f = function(.x) c(Fun = exists("apl_chunk_run"), Geo = exists("geo_once"))
+  )[][[1L]]
+
+  # THE PROBE CAN ITSELF COME BACK AS AN ERROR, and a miraiError is a VALUE rather than a condition
+  # -- so all() on it does not do what it looks like. Checked by class before it is read as a result,
+  # which is the same discipline every chunk's return needs.
+  if (inherits(probe_, "miraiError")) {
+    cli::cli_abort(c(
+      "A daemon could not be started or could not source the libraries.",
+      "x" = "{as.character(probe_)}",
+      "i" = "everywhere() sources .path_fun by path, so a path that resolves in this process and
+             not in a worker fails here rather than on every chunk."
+    ))
+  }
+
+  has_fun_ <- isTRUE(probe_[["Fun"]])
+  has_geo_ <- isTRUE(probe_[["Geo"]])
+
+  if (!has_fun_ || !has_geo_) {
+    cli::cli_abort(c(
+      "A daemon is missing what it needs to run a chunk.",
+      "x" = "apl_chunk_run found: {(has_fun_)}. Gazetteer built: {(has_geo_)}.",
+      "i" = "A missing FUNCTION means a file absent from .path_fun. A missing GAZETTEER means the
+             assignment did not reach the daemon's global environment, which is what everywhere()
+             does to a bare `<-` when .args are supplied."
+    ))
+  }
+  cli::cli_alert_success(
+    "{(.workers)} {cli::qty(.workers)}daemon{?s} started, {?has/have} sourced \\
+     {length(.path_fun)} librar{?y/ies} and built the gazetteer."
+  )
+
+  # THE INDEX TRAVELS INSIDE THE ELEMENT, and that is the whole of the fix. mirai_map() maps each
+  # element of .x onto the FIRST argument of .f and nothing else -- the names of .x name the results,
+  # they are not passed as a second argument. A two-argument .f therefore ran with .i missing on
+  # every chunk, ten times, and the error handling reported it ten times exactly as designed.
+  jobs_ <- purrr::imap(frames_, \(.f, .i) list(Frame = .f, Index = .i))
+
+  batches_ <- split(seq_along(frames_), ceiling(seq_along(frames_) / .workers))
+
+  out_ <- purrr::map(batches_, function(.b) {
+    m_ <- mirai::mirai_map(
+      .x = purrr::set_names(jobs_[.b], idx_[.b]),
+      .f = function(.job, .dir, .par, .store) {
+        apl_chunk_run(.frame = .job$Frame, .index = .job$Index, .dir_chunks = .dir,
+                      .params = .par, .dir_store = .store, .geo = geo_once)
+      },
+      .args = list(.dir = .dir_chunks, .par = .params, .store = .dir_store)
+    )
+    res_ <- m_[]
+
+    # ERRORS COME BACK AS VALUES, NOT AS CONDITIONS. An unchecked miraiError is an element of the
+    # list that looks like a result, and list_rbind() on it fails somewhere far from the cause.
+    bad_ <- purrr::map_lgl(res_, \(.r) inherits(.r, "miraiError"))
+    res_[bad_] <- purrr::map2(idx_[.b][bad_], res_[bad_], \(.i, .e) tibble::tibble(
+      Chunk = as.integer(.i), Docs = NA_integer_, Rows = NA_integer_, Seconds = NA_real_,
+      Status = paste0("error: ", as.character(.e))
+    ))
+
+    done_ <<- done_ + sum(purrr::map_int(frames_[.b], \(.f) nrow(.f$Keys)))
+    say_(.k = max(.b))
+    purrr::list_rbind(res_)
   }) |>
     purrr::list_rbind()
 
-  out_
+  apl_pass_check(.tab = out_)
+}
+
+
+#' Say plainly whether any chunk failed
+#'
+#' A FAILURE REPORTED AS A ROW IN A TABLE IS A FAILURE NOBODY READS. The status column carries the
+#' condition message, and a pass with one bad chunk in fifty otherwise looks like a pass.
+#'
+#' @param .tab Tibble from the pass.
+#' @return .tab, invisibly warned about.
+apl_pass_check <- function(.tab) {
+  if (FALSE) .tab <- tab_pass
+
+  bad_ <- dplyr::filter(.tab, stringi::stri_startswith_fixed(.data$Status, "error"))
+  if (nrow(bad_) > 0L) {
+    cli::cli_alert_danger(
+      "{nrow(bad_)} {cli::qty(nrow(bad_))}chunk{?s} failed and wrote no file, so {?it is/they are} \\
+       retried on the next render."
+    )
+    purrr::walk2(bad_$Chunk, bad_$Status, \(.c, .s) cli::cli_bullets(c("x" = "chunk {(.c)}: {(.s)}")))
+  }
+  .tab
+}
+
+
+#' Where one chunk's time goes: reading spans against applying rules
+#'
+#' THE MEASUREMENT THAT DECIDES THE WORKER COUNT. Loading is DuckDB, which already uses every core;
+#' the rules are dplyr over data in memory, which is single-threaded R. Workers therefore help in
+#' proportion to how much of a chunk is APPLY, and oversubscribing a load that is already parallel
+#' costs more than it buys.
+#'
+#' RUN ON ONE CHUNK AND REPORTED, not assumed. The split differs by corpus and by machine, and this
+#' project has enough evidence-free parameters without adding one to the top of a hundred-minute run.
+#'
+#' @param .frame List from apl_chunk_frame().
+#' @param .params The runbook's .lP$Params.
+#' @param .dir_store Directory holding the family databases.
+#' @return Tibble: one row per phase.
+apl_time_split <- function(.frame, .params, .dir_store) {
+  if (FALSE) {
+    .frame     <- frame_
+    .params    <- .lP$Params
+    .dir_store <- .lP$Input$Store
+  }
+
+  lens_ <- .frame$Lens
+  keys_ <- .frame$Keys
+
+  # TIMED BY BRACKETING AND NOT BY A HELPER, and the helper is why. A one-line timer taking the work
+  # as an argument has to get the result back out, and the obvious way -- t_(x <<- expr) -- does not
+  # work: the promise evaluates in the frame that CREATED it, and <<- then starts its search in that
+  # frame's PARENT. So the assignment lands in the global environment and the local stays NULL, which
+  # surfaces three lines later as mutate() applied to NULL rather than as a scoping error.
+  tic_   <- Sys.time()
+  org_   <- ent_load_org(.dir_store = .dir_store, .lens = lens_, .family = .params$Family$ORG,
+                         .extras = .params$Extras$ORG, .quiet = TRUE)
+  t_org_ <- as.numeric(difftime(Sys.time(), tic_, units = "secs"))
+
+  tic_   <- Sys.time()
+  res_   <- ent_apply(.spans = org_, .keys = keys_, .lens = lens_,
+                      .rule = .params$Rule$Org, .spec = .params$Spec$Org)
+  t_app_ <- as.numeric(difftime(Sys.time(), tic_, units = "secs"))
+
+  tibble::tibble(
+    Phase   = c("Load spans (DuckDB, already parallel)", "Apply rule (dplyr, single-threaded)"),
+    Seconds = c(t_org_, t_app_),
+    N       = c(nrow(org_), nrow(res_$Roles))
+  ) |>
+    dplyr::mutate(Share = .data$Seconds / sum(.data$Seconds))
+}
+
+
+#' The timing split, and what it implies for the worker count
+#' @param .tab Tibble from apl_time_split().
+#' @param .workers Integer. The worker count the runbook set.
+#' @return Invisibly .tab.
+apl_report_time_split <- function(.tab, .workers) {
+  if (FALSE) {
+    .tab     <- tab_split
+    .workers <- 6L
+  }
+
+  cli::cli_h2("Where a chunk's time goes")
+  .tab |>
+    dplyr::mutate(
+      Seconds = tbl_num(.data$Seconds),
+      N       = format(.data$N, big.mark = ","),
+      Share   = tbl_pct(.data$Share)
+    ) |>
+    tbl_say(.title = "The ORG chain on one chunk, split into its read and its rule")
+
+  app_ <- .tab$Share[[2L]]
+  cli::cli_alert_info(
+    "ORG IS THE PROBE AND NOT THE WHOLE CHUNK -- it is 362,000 spans of roughly 1.5 million, and the \\
+     heaviest single rule of the five. Read the split rather than the seconds."
+  )
+  cli::cli_alert_info(
+    "APPLY IS {tbl_pct(app_)} OF THIS CHAIN, and that is roughly the share workers can speed up. \\
+     Amdahl bounds the rest: with {(.workers)} workers the ceiling is about \\
+     {tbl_num(1 / ((1 - app_) + app_ / .workers))}x, before any cost of moving data to them. A low \\
+     share here means the pass is waiting on DuckDB, which is already using every core, and adding R \\
+     workers would oversubscribe rather than help."
+  )
+  invisible(.tab)
 }
 
 
@@ -683,7 +969,12 @@ apl_report_pass <- function(.tab, .n_index) {
     return(invisible(tibble::tibble()))
   }
 
+  # THE STATUS CARRIES THE CONDITION MESSAGE, so a failure is "error: <what went wrong>" and never
+  # the bare word. Testing equality against "error" would count none of them and report a clean pass
+  # over a run that failed -- which is the one outcome this table exists to prevent.
   ran_ <- dplyr::filter(.tab, .data$Status == "ran")
+  bad_ <- stringi::stri_startswith_fixed(.tab$Status, "error")
+
   out_ <- tibble::tibble(
     Item = c("Chunks in the pass",
              "Ran this render",
@@ -693,8 +984,8 @@ apl_report_pass <- function(.tab, .n_index) {
     N    = c(nrow(.tab),
              nrow(ran_),
              sum(.tab$Status == "cached"),
-             sum(.tab$Status == "error"),
-             sum(ran_$Docs))
+             sum(bad_),
+             sum(ran_$Docs, na.rm = TRUE))
   )
 
   tbl_say(.tab = out_, .title = "Chunks, and what became of them")
@@ -709,11 +1000,11 @@ apl_report_pass <- function(.tab, .n_index) {
     )
   }
 
-  if (any(.tab$Status == "error")) {
+  if (any(bad_)) {
     cli::cli_alert_warning(
-      "{sum(.tab$Status == 'error')} {cli::qty(sum(.tab$Status == 'error'))}chunk{?s} failed and \\
-       wrote no file, so {?it is/they are} retried on the next render. The pass continued: one bad \\
-       chunk should not cost the other million documents."
+      "{sum(bad_)} {cli::qty(sum(bad_))}chunk{?s} failed and wrote no file, so {?it is/they are} \\
+       retried on the next render. The pass continued: one bad chunk should not cost the other \\
+       million documents."
     )
   }
   invisible(out_)

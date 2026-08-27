@@ -389,11 +389,15 @@ ent_release_path <- function(.dir_release) {
 #' @param .quiet Logical. Suppress the coverage report.
 #' @return Tibble: one row per document with the labels, the company name and key, the filing date
 #'   and, where the landing page was supplied, the two addresses.
-ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL, .quiet = FALSE) {
+ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL,
+                            .labels = c(Class = "ClassDetailed", AmendType = "AmendType",
+                                        Fold = "Fold"),
+                            .quiet = FALSE) {
   if (FALSE) {
     .path_prepared <- .lP$Input$Prepared
     .path_register <- .lP$Input$Register
     .path_landing  <- .lP$Input$Landing
+    .labels        <- c(Class = "ClassDetailed", AmendType = "AmendType", Fold = "Fold")
     .quiet         <- FALSE
   }
 
@@ -404,9 +408,31 @@ ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL
     cli::cli_abort("No register at {.path {(.path_register)}}.")
   }
 
+  # THE LABEL COLUMNS ARE NAMED BY THE CALLER, because two files hold the same three facts under
+  # different names. 03A's prepared sample carries ClassDetailed, AmendType and Fold; 03F's corpus
+  # release carries BertClassDetailed and BertAmendType and no Fold at all, because a fold is a
+  # cross-validation artifact of the sample and the corpus has none. Defaulting to 03A's names leaves
+  # every 04B call unchanged and lets 04D say what its file holds.
+  #
+  # CHECKED AGAINST THE SCHEMA RATHER THAN SELECTED HOPEFULLY. A missing column has to abort naming
+  # the file and the column, because the alternative is arrow's own message -- "Column ClassDetailed
+  # doesn't exist" -- which says nothing about which of the two files was handed in.
+  have_ <- names(arrow::open_dataset(sources = .path_prepared))
+  miss_ <- setdiff(unname(.labels), have_)
+  if (length(miss_) > 0L) {
+    cli::cli_abort(c(
+      "The label file carries {length(miss_)} of the column{?s} {.arg .labels} names.",
+      "x" = "Missing: {paste(miss_, collapse = ', ')}.",
+      "i" = "It holds: {paste(utils::head(have_, 12L), collapse = ', ')}{if (length(have_) > 12L)
+             ', ...' else ''}.",
+      "i" = "03A's prepared sample and 03F's corpus release name these differently."
+    ))
+  }
+
   spine_ <- arrow::open_dataset(sources = .path_prepared) |>
-    dplyr::select("DocID", "ClassDetailed", "AmendType", "Fold") |>
-    dplyr::collect()
+    dplyr::select(dplyr::all_of(c("DocID", unname(.labels)))) |>
+    dplyr::collect() |>
+    stats::setNames(c("DocID", names(.labels)))
 
   # THE REGISTER IS READ WITH open_dataset AND FILTERED BEFORE COLLECTING, because it holds 1.77
   # million rows and this needs 4,398 of them. Selecting by name rather than by a relocate list, for
@@ -440,7 +466,7 @@ ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL
   }
 
   out_ <- out_ |>
-    dplyr::rename(Class = "ClassDetailed") |>
+
     ent_anchor_cols()
 
   if (!.quiet) {

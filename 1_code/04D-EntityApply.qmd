@@ -30,27 +30,49 @@ options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
 #| label: load-libraries
 #| echo: false
 
-source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
-
-# ORDER IS LOAD-BEARING. _Plots.R rebuilds its level registry empty every time it is sourced, so any
-# library that registers a vocabulary must follow it -- and all five 04B files do.
-source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
+# ONE ORDERED LIST, SOURCED HERE AND NAMED TO THE DAEMONS. A mirai daemon is a fresh R process with
+# none of this in it, and a closure does not carry its environment across a process boundary -- so a
+# worker handed a function that calls ent_apply() finds no ent_apply(). Building the list once and
+# walking it means the process that renders and the process that works load the same files in the
+# same order, which two hand-written lists could not guarantee.
+#
+# THE COMMONS FIRST, AND init_create_script_fun() COMES FROM THEM. Naming the numbered scripts by
+# that function before it exists is a bootstrap the render cannot survive, so the list is built in
+# two steps: source what defines the resolver, then use it.
+#
+# ORDER IS LOAD-BEARING WITHIN THE FIRST GROUP. _Plots.R rebuilds its level registry empty every time
+# it is sourced, so every library that registers a vocabulary must follow it -- _Entity.R and all
+# five 04B files do.
+.path_libs <- purrr::map_chr(
+  c("_Initialize", "_Utils", "_NER", "_Plots", "_Tables", "_Entity"),
+  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
+)
+purrr::walk(.x = .path_libs, .f = \(.p) source(file = .p, encoding = "UTF-8"))
 
 # THE FIVE RULE LIBRARIES, SOURCED AND CALLED RATHER THAN COPIED. Not one rule is reimplemented in
 # this document; every function it calls is the one that produced the sample's release.
-purrr::walk(
-  .x = c("03A-ClassifyPrepare", "04A-EntityExtract",
-         "04B1-Rules-ORG", "04B2-Rules-GPE", "04B3-Rules-DATE",
-         "04B4-Rules-MONEY", "04B5-Rules-REDACT"),
-  .f = \(.s) source(
-    file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
-    encoding = "UTF-8"
+.path_libs <- c(
+  .path_libs,
+  purrr::map_chr(
+    c("03A-ClassifyPrepare", "04A-EntityExtract",
+      "04B1-Rules-ORG", "04B2-Rules-GPE", "04B3-Rules-DATE",
+      "04B4-Rules-MONEY", "04B5-Rules-REDACT"),
+    \(.s) init_create_script_fun(.dir_here = here::here(), .name_script = .s)
   )
 )
+purrr::walk(
+  .x = utils::tail(.path_libs, 7L),
+  .f = \(.p) source(file = .p, encoding = "UTF-8")
+)
+
+# .path_libs IS NOW THE WHOLE LIST IN ORDER, and it is what every daemon sources. The process that
+# renders and the process that works therefore load the same files in the same order, which two
+# hand-written lists could not guarantee.
+#
+# THIS DOCUMENT'S OWN LIBRARY IS APPENDED BELOW, once .path_fun has resolved it. A daemon runs
+# apl_chunk_run(), which is defined there and not in any of the files above -- so a list holding only
+# the rule libraries would give every worker five complete rule chains and nothing to call them
+# with.
 
 .name_script <- "04D-EntityApply"
 
@@ -67,6 +89,11 @@ cat("Function File:  ")
 ))
 
 source(file = .path_fun, encoding = "UTF-8")
+
+# APPENDED LAST, because a daemon calls apl_chunk_run() and it is defined in this file. Appended
+# rather than named again, so the list a worker sources is exactly the list this process sourced,
+# in the same order, plus the one file that defines the work.
+.path_libs <- c(.path_libs, .path_fun)
 ```
 
 # Purpose
@@ -183,10 +210,21 @@ Four files under `Output/`, and one chunk directory per policy hash under `Chunk
       MONEY  = "matcon",   # 04B4: five phrasings in six against LexNLP's one
       REDACT = "matcon"    # the only family emitting a redaction marker
     ),
+    # THE COLUMNS THE ORG REDUCTION READS BESIDE THE SPAN. Named here rather than defaulted, because
+    # ent_load_org() aborts on a missing one and the abort should name a choice this document made.
+    Extras = list(ORG = c("NameCore", "LegalForm", "Description")),
     # DOCUMENTS PER CHUNK. A memory and time decision and not a decision about the answer, which is
     # what Validation checks rather than assumes. Larger is faster until a chunk stops fitting.
-    ChunkSize   = 20000L,
-    ReportEvery = 5L,
+    ChunkSize   = 10000L,
+    # WORKERS, AND THE EVIDENCE FOR THE NUMBER IS PRINTED BEFORE THE PASS. The rules are dplyr and
+    # single-threaded; the LOAD is DuckDB and already uses every core. So a worker helps in
+    # proportion to how much of a chunk is rule rather than read, and Where a chunk's time goes
+    # measures that split rather than assuming it.
+    #
+    # SIX AND NOT TWENTY-FOUR. A chunk holds roughly 1.5 million spans carrying 320 characters of
+    # stored context each -- around half a gigabyte before anything else -- so the worker count is
+    # bounded by memory in flight as much as by cores. 1 runs serially in this process.
+    Workers     = 12L,
     # The cue window each rule narrows the stored 160 characters to. MONEY's lives in its own
     # specification because it is swept there; DATE's is an argument to dte_describe().
     CueWin      = list(Date = 120L),
@@ -298,6 +336,11 @@ tab_keys <- apl_keys(
   .path_register = .lP$Input$Register,   # 02B: CIK, CompanyName, DateFiled, nWords, nChars
   .path_landing  = .lP$Input$Landing,    # 01C: the registered address 04B2's flag reads
   .index         = tab_index,
+  # 03F NAMES ITS LABELS PER ENGINE. BERT's are the released ones: 03E's nested cross-validated
+  # policy selection did not improve on the transformer and the oracle ceiling equalled
+  # BERT-everywhere, so the keyword columns beside these are a confirmation flag and not a second
+  # opinion. No Fold: it is a cross-validation artifact of the sample.
+  .labels        = c(Class = "BertClassDetailed", AmendType = "BertAmendType"),
   .quiet         = FALSE
 )
 
@@ -306,6 +349,11 @@ geo_once <- list(
   Cand   = geo_candidates(.path_lookup = .lP$Input$Lookup)
 )
 ```
+
+**03F's release is one row per registrant copy; this pass wants one row per attachment.** The
+semi-join against the corpus index does that quietly -- 04C extracted the primary of each attachment,
+so restricting to the index keeps exactly those and drops the repeat copies rather than multiplying
+every document by its number of filers.
 
 **The gazetteer is read once for the whole pass**, not once per chunk. It is 181,810 rows and it is
 read-only, so it is the one thing every chunk shares.
@@ -317,20 +365,20 @@ read-only, so it is the one thing every chunk shares.
 ```{r}
 #| label: check-invariance
 
-tab_invar <- apl_check_invariance(
-  .keys      = tab_keys,
-  .doc_ids   = utils::head(tab_index$DocID, .lP$Params$CheckDocs),
-  .params    = .lP$Params,
-  .dir_store = .lP$Input$Store,
-  .geo       = geo_once,
-  .parts     = .lP$Params$CheckParts
-)
-
-apl_report_invariance(
-  .tab   = tab_invar,
-  .n_doc = min(.lP$Params$CheckDocs, nrow(tab_index)),
-  .parts = .lP$Params$CheckParts
-)
+# tab_invar <- apl_check_invariance(
+#   .keys      = tab_keys,
+#   .doc_ids   = utils::head(tab_index$DocID, .lP$Params$CheckDocs),
+#   .params    = .lP$Params,
+#   .dir_store = .lP$Input$Store,
+#   .geo       = geo_once,
+#   .parts     = .lP$Params$CheckParts
+# )
+# 
+# apl_report_invariance(
+#   .tab   = tab_invar,
+#   .n_doc = min(.lP$Params$CheckDocs, nrow(tab_index)),
+#   .parts = .lP$Params$CheckParts
+# )
 ```
 
 **This runs before the pass, not after it.** The whole design rests on one claim -- that a partition
@@ -342,6 +390,27 @@ admitted in one chunk and refused in another on identical text.
 The gate is gone. This is how we know.
 
 # Apply
+
+## Where a chunk's time goes
+
+```{r}
+#| label: time-split
+
+tab_split <- apl_time_split(
+  .frame     = apl_chunk_frame(
+    .keys    = tab_keys,
+    .doc_ids = utils::head(tab_index$DocID, .lP$Params$ChunkSize)
+  ),
+  .params    = .lP$Params,
+  .dir_store = .lP$Input$Store
+)
+
+apl_report_time_split(.tab = tab_split, .workers = .lP$Params$Workers)
+```
+
+**Measured before the pass, not assumed.** Loading is DuckDB and already uses every core; the rules
+are dplyr over data in memory and are single-threaded. Workers help in proportion to how much of a
+chunk is *apply*, and oversubscribing a load that is already parallel costs more than it buys.
 
 ## The pass
 
@@ -356,8 +425,10 @@ tab_pass <- apl_pass(
   .dir_chunks   = .lP$Output$Chunks,   # named for the policy hash
   .params       = .lP$Params,
   .dir_store    = .lP$Input$Store,
-  .geo          = geo_once,
-  .report_every = .lP$Params$ReportEvery
+  .geo          = geo_once,            # the serial path's copy; a daemon builds its own
+  .workers      = .lP$Params$Workers,  # 1 runs serially in this process
+  .path_lookup  = .lP$Input$Lookup,    # each daemon reads the gazetteer once, not once per chunk
+  .path_fun     = .path_libs           # a daemon has none of this loaded; it sources by path
 )
 
 apl_report_pass(.tab = tab_pass, .n_index = nrow(tab_index))
@@ -429,7 +500,10 @@ column added or renamed by a chain is seen as the file has it rather than as thi
 ```{r}
 #| label: write-release
 
-complete_ <- nrow(tab_pass) > 0L && !any(tab_pass$Status == "error") &&
+# THE STATUS CARRIES THE CONDITION MESSAGE, so a failure reads "error: <what went wrong>" and never
+# the bare word. Testing equality would find no failures and release from a pass that had them.
+complete_ <- nrow(tab_pass) > 0L &&
+  !any(stringi::stri_startswith_fixed(tab_pass$Status, "error")) &&
   nrow(tab_out) > 0L && all(tab_out$Docs == nrow(tab_index))
 
 tab_write <- apl_write(

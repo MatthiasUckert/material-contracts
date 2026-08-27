@@ -179,8 +179,8 @@ manifest, the corpus index and the failure log. 04B reads them; nothing else doe
     # The read is the dominant cost of the pass and not the extractors: one arrow::read_parquet() per
     # document, 1.19 million times. That is why the parallelism goes there, where it also cannot
     # change a result, because a read is pure.
-    ReadWorkers   = 24L,
-    EngineWorkers = 24L,
+    ReadWorkers   = 20L,
+    EngineWorkers = 20L,
 
     # BATCH SIZE FROM 04A'S BENCHMARK, and the honest note is that it barely matters. Over 4 to 64 the
     # spread was 6% for matcon and 18% for LexNLP, against a worker count that is worth multiples. The
@@ -206,7 +206,7 @@ manifest, the corpus index and the failure log. 04B reads them; nothing else doe
     # the same number is therefore a no-op rather than another n documents, so a rehearsal can be
     # repeated and its numbers compared. The cohort is drawn in hash order, so it is a slice of the
     # corpus rather than its oldest registrants. See cor_pending().
-    Limit  = 100000,
+    Limit  = NULL,
     Reload = FALSE,  # rebuild the corpus index from the register rather than reusing the store's
 
     # CLEARING A CORPUS STORE DISCARDS DAYS OF EXTRACTION, so it happens on an explicit flag and
