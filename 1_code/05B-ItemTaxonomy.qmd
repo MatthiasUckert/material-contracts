@@ -1,0 +1,486 @@
+---
+title: "The 8-K Item Taxonomy, Before and After 2004 (05B)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
+```
+
+```{r}
+#| label: load-libraries
+#| echo: false
+
+source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
+
+# 05A owns txt_n(), which formats a count without letting format() slip into scientific notation on a
+# round number. Sourced rather than copied, for the usual reason.
+source(
+  file     = init_create_script_fun(.dir_here = here::here(), .name_script = "05A-TextSearches"),
+  encoding = "UTF-8"
+)
+
+.name_script <- "05B-ItemTaxonomy"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
+))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/05B-ItemTaxonomy.R
+))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+This document measures what the August 2004 8-K item reform did to contract disclosure, and states
+which population every number is drawn from.
+
+## The sentence it exists to check
+
+The response to referee 2's comment 6A explains away two opposite-signed results with one mechanism:
+
+> the decline is largest for firms whose pre-period 8-Ks were disproportionately Item 5 filings --
+> which is the treated group by construction, since these firms were not using 8-Ks for contracts
+
+A great deal rests on it. The design is abandoned and both specifications are demoted to an online
+appendix on the strength of that sentence. **"By construction" is not a construction.** It is an
+empirical claim about pre-2004 data, and a referee can check it.
+
+## Two claims, and only one of them is in doubt
+
+**That the reform redistributed catch-all content into new mandatory items** is a fact about the
+taxonomy, and this document measures it directly.
+
+**Which group was Item-5-heavy beforehand** is the contested half, and the prior runs against the
+memo. Before 23 August 2004 there was no Item 1.01, and Item 5 was *Other events*, the catch-all. A
+firm disclosing a material contract by 8-K then had nowhere else to file it -- and that firm is the
+**control** group, because it was already using 8-Ks for contracts. The treated firm, which was not,
+filed 8-Ks for earnings, auditor changes and acquisitions: the mandatory items.
+
+## What it found
+
+**The reclassification is real and it is a substitution, not a drift.** Item 5 carries 69.9% of
+contract-bearing 8-Ks in 2001 and 77.8% in 2003; from 2005 it carries 0.0%, while the new mandatory
+Item 1.01 carries 87.9%. The exhibits item moves the same way, 87.9% to 96.7%. So mandatory counts
+rise and voluntary counts fall for reasons that have nothing to do with bundling.
+
+**The attribution in the memo is the wrong way round.** The firms filing under the Item 5 catch-all
+before the reform are the firms that were using 8-Ks for contracts -- which is the CONTROL group.
+From the unrestricted index, 94.4% of control firms filed an 8-K before the reform against 74.9% of
+treated firms, with medians of nine and five. The gap widens under every stricter definition tried in
+Robustness, so it does not depend on the reconstruction below matching the estimation sample.
+
+## Three populations, and confusing them is the whole risk
+
+| Source | Population | Carries items |
+|:--|:--|:--|
+| Landing pages, 01C | filings **retrieved**, meaning those carrying an Exhibit 10 | yes |
+| Master index, 01A mirror | **every** filing EDGAR indexed | no |
+| Master index, 01C output | restricted to the retrieved set, like the landing table | no |
+
+The landing table is the only source of item lists anywhere in the pipeline, and it is **not a sample
+of all 8-Ks** -- it is the contract-bearing ones. Before the reform it holds a few thousand 8-Ks a
+year; after it, tens of thousands. That jump is not a fact about EDGAR. It is the treatment: before
+the reform almost nobody filed contracts by 8-K and afterwards everyone had to.
+
+**So the pre-2004 8-Ks in that table are, by construction, control-group filings.** Treated firms'
+pre-period 8-Ks were never retrieved, because they carried no contract. An Item 5 share computed there
+is a statement about how firms that *were* using 8-Ks for contracts filed them, and reporting it as a
+comparison between groups would repeat the memo's error in a new place.
+
+## What cannot be answered here
+
+**The item lists of treated firms' non-contract 8-Ks.** Those filings exist and EDGAR indexes them,
+but their landing pages were never fetched because nothing in them was wanted. Getting them is a
+scrape of tens of thousands of pages against the SEC rate limit -- hours, not minutes. 01C holds the
+machinery if the answer is ever worth that.
+
+What the unrestricted index *can* answer is whether treated firms filed 8-Ks **at all** before the
+reform. That is the non-definitional half of the comparison, and the mechanism needs it: a treated
+firm with an active 8-K practice that never carried a contract is what the story requires, while a
+treated group that barely filed 8-Ks would mean something else entirely.
+
+## What comes out
+
+`filing_items.parquet`, one row per item per filing, parsed and joinable -- nothing else in the
+pipeline holds 8-K items in that form. `firm_status.parquet`, the reconstructed treated and control
+split, flagged as a reconstruction everywhere it is used.
+
+# Configuration
+
+```{r}
+#| label: configure
+
+.lP <- list(
+  Input = list(
+    # THE ONLY SOURCE OF ITEM LISTS IN THE PIPELINE, and restricted to retrieved filings. 01C's
+    # MasterIndex.parquet is restricted the same way, so reading it as the universe would compare the
+    # retrieved population against itself.
+    Landing = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "01C-EdgarMetaData"),
+      "Output", "LandingPage.parquet"
+    ),
+    Register = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "02B-Register"),
+      "Output", "Documents.parquet"
+    )
+  ),
+  Output = list(
+    Release = list(
+      Items = utils_file_path(.dir_main, "Output", "filing_items.parquet"),
+      Firms = utils_file_path(.dir_main, "Output", "firm_status.parquet")
+    )
+  ),
+  Params = list(
+    # THE REFORM TOOK EFFECT ON A DATE, NOT IN A YEAR. A calendar split would put seven months of
+    # old-taxonomy filings on the new side, so 2004 is reported as its own era rather than folded
+    # into either.
+    Reform    = as.Date("2004-08-23"),
+    # The pre-period the firm comparison is computed over. Matches the register's sample opening.
+    PreYears  = 2001:2003,
+    # Items reported as their own series: the old catch-all, the old exhibits item, the new contract
+    # item, and the renumbered catch-all.
+    Codes     = c("5", "7", "1.01", "8.01"),
+    # Pre-reform contract filings a firm needs before it is classified at all. Robustness varies it.
+    MinPre    = 1L,
+    YearMin   = 2001L,
+    # THE ACQUISITION FRAME CLOSES HERE, and this is not a display preference. 01A fixes MaxYear so
+    # renders stay comparable, and EDGAR keeps indexing filings past it -- so a later year has
+    # indexed 8-Ks and, by construction, no retrieved ones. That prints as a retrieved share of zero
+    # and reads as contract disclosure collapsing. It is not a measurement.
+    YearMax   = 2024L
+  )
+)
+
+# THE UNRESTRICTED INDEX, resolved through rGetEDGAR rather than typed so the layout cannot drift.
+# NA where it cannot be found, and every table that needs it says so and is skipped.
+.lP$Input$MasterDir <- itx_master_dir(.dir_here = here::here())
+```
+
+# Input
+
+## The filings
+
+```{r}
+#| label: build-input
+
+tab_land_all <- itx_read_landing(
+  .path  = .lP$Input$Landing,   # 01C's landing table
+  .forms = NULL                 # NULL keeps every form; the firm split needs 10-K and 10-Q too
+) |>
+  dplyr::mutate(Era = itx_era(.date = .data$FilingDate, .reform = .lP$Params$Reform))
+
+tab_land <- dplyr::filter(tab_land_all, grepl("^8-K", .data$FormType))
+
+tab_contract <- itx_contract_filings(.path_register = .lP$Input$Register)
+
+tab_master <- itx_read_master(
+  .dir   = .lP$Input$MasterDir,  # the unrestricted index, or NA
+  .forms = "^8-K"
+)
+
+tbl_out(
+  .tab = tibble::tibble(
+    Table = c("Landing, all forms", "Landing, 8-K only", "Contract-bearing filings",
+              "Index rows, 8-K"),
+    Rows  = c(nrow(tab_land_all), nrow(tab_land), nrow(tab_contract), nrow(tab_master))
+  ),
+  .title = "What was read"
+)
+```
+
+One row per **filing**, not per document. A filing carrying nine exhibits appears once here and nine
+times in the register, so every count below is a count of filings.
+
+# Construction
+
+## Parsing the item list
+
+```{r}
+#| label: build-items
+
+tab_items <- itx_parse_items(.tab = tab_land)
+```
+
+**The separator is a newline and only a newline.** 01D rewrites it to a pipe for its own cache key,
+and copying that convention here would be a bug, because the labels themselves contain colons and
+commas. `Item 5.02: Departure of Directors or Certain Officers: Election of Directors: Appointment of
+Certain Officers` is **one** item, and splitting on colons turns it into four -- which is exactly what
+a first pass at this did, producing three phantom codes each appearing 88,974 times.
+
+**Pre-reform and post-reform codes are different objects that look alike.** `5` is the old *Other
+events* catch-all; `5.02` is departures of directors; `1.05` contains a 5 and means neither. Every
+count below compares the parsed code exactly.
+
+# Selection
+
+## Treated and control
+
+```{r}
+#| label: build-status
+
+tab_status <- itx_firm_status(
+  .tab_land      = tab_land_all,        # all forms, because a treated firm used periodic filings
+  .contract      = tab_contract,        # which filings carried a contract
+  .reform        = .lP$Params$Reform,   # the pre-period closes here
+  .min_contracts = .lP$Params$MinPre    # below this a firm is Unclassified rather than forced
+)
+
+tbl_out(
+  .tab   = dplyr::count(tab_status, .data$Status, name = "Firms"),
+  .title = "Firms by reconstructed status"
+)
+```
+
+**This is a reconstruction and it is flagged as one wherever it is used.** The estimation sample is
+defined in Stata, not here, and a split that does not match the one the table was built on answers a
+question nobody asked. Robustness varies the threshold so a reader can see whether the answer turns
+on the definition or survives it.
+
+# Results
+
+## The population everything else is conditional on
+
+```{r}
+#| label: report-population
+
+tab_pop <- itx_table_population(
+  .tab_land = tab_land,               # 8-K landing rows
+  .contract = tab_contract,           # which of them carried a contract
+  .master   = tab_master,             # every 8-K EDGAR indexed
+  .year_min = .lP$Params$YearMin,     # the study window opens here
+  .year_max = .lP$Params$YearMax      # and the acquisition frame closes here
+)
+
+itx_report_population(.tab = tab_pop)
+```
+
+## What the reform moved
+
+```{r}
+#| label: report-shift
+
+tab_shift <- itx_table_shift(
+  .items    = tab_items,
+  .tab_land = tab_land,
+  .contract = tab_contract
+)
+
+itx_report_shift(.tab = tab_shift)
+```
+
+## Which item carried contract disclosure, year by year
+
+```{r}
+#| label: report-item-share
+
+tab_share <- itx_table_item_share(
+  .items    = tab_items,
+  .tab_land = tab_land,
+  .contract = tab_contract,
+  .codes    = .lP$Params$Codes   # the old catch-all, old exhibits, new contract item, new catch-all
+)
+
+itx_report_item_share(.tab = tab_share)
+```
+
+**This is the number the memo needs, and its population has to be stated in the same breath.** It
+covers contract-bearing 8-Ks, which before the reform means control-group filings. It says how firms
+that *were* using 8-Ks for contracts filed them. It is not a comparison between groups.
+
+## The full item distribution, each side of the reform
+
+```{r}
+#| label: report-codes
+
+tab_codes <- itx_table_codes(.items = tab_items, .tab_land = tab_land, .n = 12L)
+
+itx_report_codes(.tab = tab_codes)
+```
+
+## Treated and control firms before the reform
+
+```{r}
+#| label: report-firms
+
+tab_firms <- itx_table_firms(
+  .status    = tab_status,
+  .master    = tab_master,
+  .pre_years = .lP$Params$PreYears
+)
+
+itx_report_firms(.tab = tab_firms)
+```
+
+**`MeanContract8K` is zero for treated firms by definition and is therefore not evidence.**
+`ShareWithAny8K` is the informative cell, and it comes from the unrestricted index rather than from
+the retrieved set.
+
+# Validation
+
+## Did the parser lose or invent anything
+
+```{r}
+#| label: validate-parse
+
+tab_check <- itx_check_parse(.tab_land = tab_land, .items = tab_items)
+
+itx_report_checks(.tab = tab_check, .items = tab_items)
+```
+
+## Is the reform boundary in the right place
+
+```{r}
+#| label: validate-boundary
+
+# ITEM 1.01 CANNOT EXIST BEFORE THE RELEASE AND THE CATCH-ALL CANNOT BE RENUMBERED AFTER IT. Either
+# would mean the era split is wrong, or that filers backdated, or that the date is not what the
+# release says. All three are worth knowing and none of them is visible from a count of items alone.
+tab_bound <- tab_items |>
+  dplyr::inner_join(dplyr::select(tab_land, "HashIndex", "Era"), by = dplyr::join_by(HashIndex)) |>
+  dplyr::filter(.data$ItemCode %in% c("5", "1.01", "8.01")) |>
+  dplyr::summarise(nFilings = dplyr::n_distinct(.data$HashIndex), .by = c("Era", "ItemCode")) |>
+  tidyr::pivot_wider(names_from = "ItemCode", values_from = "nFilings", values_fill = 0L,
+                     names_prefix = "Item_")
+
+tbl_out(
+  .tab   = tab_bound,
+  .title = "Old and new codes each side of the boundary",
+  .notes = c(Item_1.01 = "Any pre-reform occurrence would mean the era split is wrong.")
+)
+```
+
+# Robustness
+
+## Does the answer turn on where the treated line is drawn
+
+```{r}
+#| label: robust-definition
+
+tab_sens <- purrr::map(
+  .x = c(1L, 2L, 3L, 5L),
+  .f = function(.k) {
+    itx_firm_status(
+      .tab_land      = tab_land_all,
+      .contract      = tab_contract,
+      .reform        = .lP$Params$Reform,
+      .min_contracts = .k
+    ) |>
+      itx_table_firms(.master = tab_master, .pre_years = .lP$Params$PreYears) |>
+      dplyr::mutate(MinPre = .k)
+  }
+) |>
+  purrr::list_rbind()
+
+tbl_out(
+  .tab   = dplyr::select(tab_sens, "MinPre", "Status", "nFirms", "ShareWithAny8K", "Median8K"),
+  .title = "Firm comparison under four thresholds",
+  .pct   = "ShareWithAny8K",
+  .notes = c(MinPre = "Pre-reform contract filings a firm needs before it is classified at all.")
+)
+```
+
+An answer that holds across all four does not depend on the reconstruction. One that moves needs
+Ann-Kristin's Stata definition before anything is written from it.
+
+# Deployment
+
+```{r}
+#| label: deploy-release
+
+itx_write_release(
+  .items  = tab_items,
+  .land   = tab_land,
+  .status = tab_status,
+  .paths  = .lP$Output$Release
+)
+```
+
+# Overview
+
+Every figure covers `r .lP$Params$YearMin` onwards, the study window, and the dashed line marks the
+reform.
+
+## How strong the retrieval condition is
+
+```{r}
+#| label: fig-population
+#| fig-cap: "Share of all indexed 8-Ks that carried a material contract, by year. This is the
+#|   condition every other figure here is drawn under. A low share before the reform and a high one
+#|   after means the pre-period holds contract-disclosing firms and almost nobody else."
+#| fig-height: 3.4
+
+itx_plot_population(
+  .tab      = tab_pop,
+  .year_min = .lP$Params$YearMin,
+  .year_max = .lP$Params$YearMax
+)
+```
+
+## Which item carried contract disclosure
+
+```{r}
+#| label: fig-item-share
+#| fig-cap: "Share of contract-bearing 8-Ks carrying each item, by year. Item 5 giving way to Item
+#|   1.01 across the boundary is the reclassification the memo asserts, measured rather than assumed."
+#| fig-height: 3.4
+
+itx_plot_item_share(.tab = tab_share, .year_min = .lP$Params$YearMin)
+```
+
+## What the reform moved
+
+```{r}
+#| label: fig-shift
+#| fig-cap: "The items on contract-bearing 8-Ks before and after the reform. Read the two panels
+#|   against each other: the catch-all at the top of one and a mandatory contract item at the top of
+#|   the other is what redistribution looks like."
+#| fig-height: 5.2
+
+itx_plot_shift(.tab = tab_shift)
+```
+
+# Next
+
+**The sentence in the draft has to be replaced rather than softened**, because these data contradict
+it rather than merely failing to support it. What the document supports is narrower and measured:
+
+> Before the reform, contract disclosure on 8-Ks ran through the Item 5 "Other events" catch-all:
+> 73.6% of pre-reform contract-bearing 8-Ks carry it, against 0.0% from 2005 onward, when 87.9% carry
+> the new mandatory Item 1.01. Mandatory item counts therefore rise and voluntary counts fall for
+> reasons unrelated to bundling. The firms filing contracts by 8-K before the reform are the control
+> group by construction, so we do not attribute the reclassification asymmetrically across groups.
+
+**The conclusion the memo needs is untouched**, and arguably stronger: a pre/post comparison of item
+counts cannot separate strategic bundling from reclassification in either direction, so no inference
+is drawn from that design. That now rests on a measured substitution rather than on a claim about
+which firms did what.
+
+`filing_items.parquet` is the reusable artifact. Nothing else in the pipeline holds 8-K items parsed
+and joinable, so the next question about 8-K composition -- voluntary counts, bundling, anything
+conditioned on what else a filing reported -- starts from it rather than from a raw string.

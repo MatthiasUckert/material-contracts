@@ -170,7 +170,7 @@ manifest, the corpus index and the failure log. 04B reads them; nothing else doe
     # DOCUMENTS PER ENGINE INVOCATION. Each chunk is read, staged as one parquet and handed to the
     # extractor, so this trades container startups against staging-file size: at 5,000 documents the
     # pass makes about 240 invocations and stages roughly 165 MB a time.
-    ChunkSize = 50000L,
+    ChunkSize = 10000L,
 
     # TWO WORKER COUNTS, BECAUSE THEY ARE TWO RESOURCES. The daemons read parquet files off disk and
     # finish before the container starts, so the two never contend -- but they are separate settings
@@ -179,8 +179,8 @@ manifest, the corpus index and the failure log. 04B reads them; nothing else doe
     # The read is the dominant cost of the pass and not the extractors: one arrow::read_parquet() per
     # document, 1.19 million times. That is why the parallelism goes there, where it also cannot
     # change a result, because a read is pure.
-    ReadWorkers   = 20L,
-    EngineWorkers = 20L,
+    ReadWorkers   = 24L,
+    EngineWorkers = 24L,
 
     # BATCH SIZE FROM 04A'S BENCHMARK, and the honest note is that it barely matters. Over 4 to 64 the
     # spread was 6% for matcon and 18% for LexNLP, against a worker count that is worth multiples. The

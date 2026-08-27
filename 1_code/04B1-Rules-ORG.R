@@ -1,141 +1,69 @@
-# 04B1-Rules-ORG: the contracting party and its counterparties --------------------------------------------------------
+# 04B1-Rules-ORG: who the parties to a contract are ------------------------------------------------------------------------
 #
 # WHAT THIS FILE DOES
-# Decides, for every contract in the labelled sample, which organisation is the contracting party and
-# which of the others are its counterparties. Function prefix is `ent_`.
+# An extractor proposes organisation names. This turns them into parties: it groups the spellings of
+# one company together, decides which party is the registrant by comparing against the name EDGAR
+# recorded, and assigns every other party a role from where it sits relative to that registrant.
 #
-# Shared tooling lives in _Commons/_Entity.R: the name reduction, the anchor build, the store loader,
-# the span reader, the offset check and the table shapes. Everything here is a RULE, and rules belong
-# to one entity.
+# ONE FILE COMES OUT, AND IT IS AT MENTION GRAIN
+# org_mentions.parquet carries one row per contract per party per MENTION. That is longer than a file
+# about parties needs to be, and it is the right grain for one reason: 04B2 attaches a place to the
+# party named nearest before it, and a party named once in the preamble and again in the signature
+# block is reachable from two positions. A file holding only the first mention cannot reach the
+# second, and the signature block is exactly where a party is named WITH an address.
 #
-# THE RULE IS THREE STEPS AND TWO NUMBERS
-#   1. GROUP. Every organisation name in one contract is reduced to a key, and keys naming the same
-#      party are merged. Two keys are one party when one is the WORD-PREFIX of the other, or when one
-#      is a single word taken UNAMBIGUOUSLY from the other.
-#   2. MATCH. A party whose key agrees with the registrant's EDGAR name -- word for word until one of
-#      the two runs out -- is the contracting party. Where several agree the earliest wins. Where
-#      none does, the first party named is taken and flagged.
-#   3. PLACE. Every other party within 2,000 characters of the contracting party is a counterparty;
-#      one in the final tenth of the document is a signatory, counted separately; anything else is
-#      not counted.
-# The numbers are 2,000 and the final tenth. Nothing else in this file enters an answer.
+# EVERY COUNT IS A GROUP-BY OVER THAT FILE, AND NONE IS STORED
+# NMentions is n() by party. NVariants is n_distinct(SpanKey) by party. The naive ladder is
+# n_distinct at three levels by document. A stored count is a derived copy that can disagree with its
+# source: a reader filters the file, recomputes, gets a different number, and nothing says which is
+# right. ent_party_facts() and ent_doc_facts() are those group-bys, written once, and they are what
+# 04D calls on the corpus.
 #
-# ONE ENGINE, AND THAT IS THE BINDING CONSTRAINT
-# 04C ran two families over the corpus and neither is spaCy. For ORG that leaves lexnlp alone, so the
-# whole rule runs in R over a table that fits in memory and DuckDB is read once.
+# WHAT IS NOT IN THE FILE, AND WHY
+# Class and AmendType are contract facts from 03A's label spine, not results of this rule. Repeating
+# them across nineteen mention rows per document duplicates the spine without adding anything a join
+# on DocID would not give. Every by-class table in the runbook joins them at report time.
+# PartyStart is min(MentionStart) by party and RecursInTail is a mention past a boundary that depends
+# on the tail share -- storing either would freeze a rule parameter into the file, so that moving the
+# parameter would leave the column stale while a derived one follows.
 #
-# 04A's own measurements are why spaCy is not the loss it looks like. On the labelled sample the
-# transformer alone emitted 915,716 ORG spans against lexnlp's 81,467 -- eleven times as many. But
-# volume is not the argument: the positional contrast is. lexnlp's ORG concentrates at the document
-# ends with a contrast of 4.36, the strongest of any producer and entity 04A measured, while spaCy's
-# is 0.97, uniform to within rounding. spaCy finds every organisation named anywhere; lexnlp finds
-# the ones named where parties are named.
+# THE THREE-RUNG NAIVE LADDER
+# Each rung assumes one more thing the rule can do and a reader cannot:
+#   NaiveSpans     every spelling is its own organisation      n_distinct(SpanKey)
+#   NaiveParties   spellings grouped, but no party identified  n_distinct(PartyKey)
+#   NaiveCounter   the registrant known, everyone else counts  NaiveParties - 1
+#   NCounter       the window applied                          the rule
+# The third rung is what earlier versions released as the single naive number. Publishing all four
+# means a reader who disagrees with the grouping, the match or the window can take the rung above
+# whichever step they reject, and reproduce it from the file rather than from this render.
 #
-# WORD-PREFIX COMPARISON REPLACED FOUR ARMS AND A CORPUS-WIDE COUNT
-# The comparison used to have four outcomes -- exact, forward containment, corporate family, reverse
-# containment -- with two length floors and a document-frequency gate. All four say the same thing at
-# different strengths, and comparing WHOLE WORDS from the start says it once:
-#
-#   BOEING                    vs  BOEING                    agree, both run out      -> one party
-#   BOEING                    vs  BOEING CAPITAL            agree, one runs out      -> one party
-#   PENNSYLVANIA POWER LIGHT  vs  PENNSYLVANIA POWER        agree, one runs out      -> one party
-#   CHENIERE ENERGY           vs  CHENIERE CREOLE TRAIL     differ at word two       -> separate
-#   NATIONAL BANK             vs  NATIONAL SEMICONDUCTOR    differ at word two       -> separate
-#
-# TWO THINGS FOLLOW, AND THE SECOND IS THE REASON. The length floors go, because they existed for
-# SUBSTRING matching -- CA sits inside CATERPILLAR and no floor below five could stop it -- and whole
-# words cannot make that mistake. And the document-frequency gate goes: it admitted a SINGLE shared
-# leading word when that word opened a company name in at most 0.5% of documents, which required
-# counting across the whole corpus. That count was the only quantity in this pipeline whose value
-# depended on how the corpus was PARTITIONED, and removing it is what makes this chain chunkable.
-#
-# WHAT IT COST, MEASURED. The old rule matched 77.1% of documents and this one matches 74.9% -- about
-# 97 contracts, which the one-token family arm used to catch and which now fall to the fallback.
-# 91.9% of the matches that remain are exact agreements, so the four arms were one arm and a rounding
-# error.
-#
-# GROUPING RUNS BEFORE MATCHING, AND THAT ORDERING IS LOAD-BEARING
-# lexnlp splits one name across mentions -- "Florida East Coast Railway" at one offset and the bare
-# word "Railway" at another -- and glues neighbouring text onto others: "Grant Date, Hubbell" where
-# the heading ran into the party name. Both are one company arriving as two entities.
-#
-# Grouping first means neither reaches the EDGAR comparison alone. It also means "the first party
-# named" in the fallback is the first UNIQUE PARTY rather than the first raw span.
-#
-# AND IT MADE A PARAMETER DISAPPEAR. The rule used to carry a 500-character reach that preferred a
-# clean exact match sitting just behind a contaminated one -- the Hubbell case. Once the contaminated
-# span and the clean one are ONE PARTY, there is nothing left for that reach to arbitrate: swept at 0
-# and at 500 it produced identical output on every column of every row. It is gone.
-#
-# THE NAME COMES FROM THE MEMBER THAT MATCHED. A group holds several spellings and the release needs
-# one:
-#   THE MEMBER THAT MATCHED EDGAR, because for the registrant we know exactly which one did.
-#   OTHERWISE THE MEMBER MENTIONED MOST OFTEN, earliest position breaking ties, because a
-#   contaminated span is a one-off while the real name recurs.
-# Taking the LONGEST would hand "GRANT DATE HUBBELL" the name over "HUBBELL"; taking the EARLIEST
-# would do the same, since the glued heading is usually the first mention.
-#
-# THE PARTY IS THE ANCHOR, NOT A REGION
-# An earlier design read a fixed head and asked whether the registrant was inside it. Sweeping that
-# head across twenty settings showed the located share rising from 70.6% to 75.1% and the LATE share
-# falling from 6.5% to 2.0%, the two summing to 77.1% in every cell. That is an identity: the match
-# runs on names and cannot depend on a region, so a wider head bought no party and only relabelled
-# one already found. There is no head. The registrant is matched ANYWHERE and the window is centred
-# on where it was found.
-#
-# ONE WINDOW, AND THE ALTERNATIVES ARE SETTLED RATHER THAN OFFERED
-# A gap window -- growing outward through every name whose distance to its neighbour is under a
-# threshold -- was measured against the fixed one and tracks it: gap 500 against +/- 1,000 agrees to
-# within a few hundredths on every contract type. Two rules that agree leave nothing to choose
-# between them but simplicity, so the fixed window is the rule and the gap arm is not in this file.
-#
-# THE TAIL IS RELATIVE AND THAT IS MEASURED. A flat 3,000-character tail is WIDER on the median than
-# a 10% tail -- 3,000 against 2,320 on credit agreements -- and finds fewer names, 2.97 against 5.04,
-# because a relative tail puts its width on the long agreements where the signature blocks with many
-# parties actually are.
-#
-# ONE FILE, AND EVERY DOCUMENT-LEVEL NUMBER IS A COUNT OVER IT
-# The release is one row per contract per party. A contract-level count -- how many counterparties,
-# how many signatories, whether the registrant was matched -- is a group-by over that file rather
-# than a second file carrying its own copy of the answer. Storing a derived quantity beside its
-# source is how a published dataset comes to contradict itself.
-#
-# A CONTRACT IN WHICH NOTHING WAS FOUND STILL GETS A ROW. lexnlp proposed no organisation at all in
-# 116 of 4,398 contracts. Without a sentinel those documents have no rows, so every mean computed
-# from the file silently divides by 4,282 -- about 2.6% too high, with nothing to notice. The
-# extractors solve this the same way: _io.py emits one null-span row per document that yielded
-# nothing, for exactly this reason.
-#
-# EVERY TABLE CARRIES THE NAIVE COUNT
-# NAIVE is every unique party the contract names anywhere, less one for the registrant. It is what
-# this rule replaces and the only honest thing to read the counterparty count against. It is NOT a
-# released column: it is one subtraction from a count over the release, and computing it where it is
-# used rather than storing it is what stops the two disagreeing.
-#
-# TWO COLUMN NAMES ARE THIS PROJECT'S AND NOT LEXNLP'S, and the translation happens once, in
-# ent_load_entity(). NameCore is lexnlp's Name -- renamed because Name means the resolved company for
-# ORG and the resolved place for GPE. LegalForm is lexnlp's TypeAbbr -- renamed because it holds the
-# string "NA" for a National Association, which R prints identically to a missing value.
+# WHICH LAYER READS WHAT
+# Results and Validation read the RELEASED file, so every published quantity is a query 04D can run
+# unchanged on the corpus. Selection and Robustness may read the chain's intermediates, because a
+# sweep is evidence for a parameter and a reading block is inspection -- neither is a released
+# quantity and neither has to survive to corpus scale.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
 # cli/fs/here; pure ASCII; stringi::stri_sub never base substr; {(.arg)} parens in cli interpolation.
 
-if (FALSE) {
-  .path_text <- .lP$Input$Text
-  .dir_store <- .lP$Input$Store
-}
 
-
-# 1. Vocabulary ------------------------------------------------------------------------------------------------------
-# PartyRole is NOT registered here. It orders the role column of the released file, which 04B2 reads
-# without sourcing this file, so it lives in _Commons/_Entity.R where both documents can reach it.
-# What follows is private to this document.
+# 0. Vocabulary ----------------------------------------------------------------------------------------------------------
+#
+# REGISTERED HERE AND NOT IN _Plots.R, because these levels are this rule's own. _Plots.R rebuilds
+# the registry empty every time it is sourced, so a vocabulary must be declared by the file that owns
+# it and sourced after. PartyRole is _Entity.R's, because 04B2 orders by it too.
 
 plot_register_levels(
   .key    = "PartyStatus",
   .levels = c("matched", "first", "no entity"),
   .short  = c("matched", "first", "none")
+)
+
+plot_register_levels(
+  .key    = "MatchKind",
+  .levels = c("exact", "prefix", "fallback", "cofiler", "none"),
+  .short  = c("exact", "prefix", "fallback", "cofiler", "none")
 )
 
 plot_register_levels(
@@ -145,9 +73,7 @@ plot_register_levels(
 )
 
 
-# 2. The rule --------------------------------------------------------------------------------------------------------
-# WINDOW-FREE, all of it. Grouping and matching do not depend on where in the document anything sits,
-# so they are computed once and every window is cut over the same result.
+# 1. The rule ------------------------------------------------------------------------------------------------------------
 
 #' Build one rule specification
 #'
@@ -200,6 +126,8 @@ ent_rule_set <- function(.rule, .over) {
 }
 
 
+# 2. Input ---------------------------------------------------------------------------------------------------------------
+
 #' Load the ORG spans and build both reduction keys
 #'
 #' THE KEYS WERE BUILT IN THE RUNBOOK AND HAD TO MOVE. A two-line mutate in the qmd is fine while one
@@ -249,10 +177,12 @@ ent_load_org <- function(.dir_store, .lens, .family = "lexnlp",
 }
 
 
+# 3. The chain -----------------------------------------------------------------------------------------------------------
+
 #' Which reduction identifies an entity, under this rule
 #'
 #' TWO FUNCTIONS PICK THE KEY AND THEY MUST PICK THE SAME ONE. ent_entities() collapses mentions into
-#' parties and ent_mentions() maps every mention back to the party it belongs to; a rule chosen twice
+#' parties and ent_release_mentions() maps every mention back to the party it owns; a rule chosen twice
 #' is a rule that can be chosen differently, and the mention index would then reference parties that
 #' do not exist.
 #'
@@ -485,13 +415,14 @@ ent_merge_labels <- function(.ent, .pairs, .max = 20L) {
 #' @param .ent Tibble from ent_group_parties().
 #' @param .keys Tibble from ent_anchor_keys().
 #' @return .ent with AnchorKey, IsMatch and IsExact added.
-ent_match_party <- function(.ent, .keys) {
+ent_match_party <- function(.ent, .keys, .filers = NULL) {
   if (FALSE) {
-    .ent  <- tab_grouped
-    .keys <- tab_keys
+    .ent    <- tab_grouped
+    .keys   <- tab_keys
+    .filers <- tab_filers
   }
 
-  .ent |>
+  base_ <- .ent |>
     dplyr::left_join(
       dplyr::select(.keys, DocID, AnchorKey, AnchorTok),
       by = dplyr::join_by(DocID)
@@ -502,6 +433,30 @@ ent_match_party <- function(.ent, .keys) {
                 .data$Shared >= pmin(.data$NTok, .data$AnchorTok),
       IsExact = .data$IsMatch & .data$NTok == .data$AnchorTok
     )
+
+  if (is.null(.filers) || nrow(.filers) == 0L) {
+    return(dplyr::mutate(base_, IsCoFiler = FALSE, CoFilerName = NA_character_))
+  }
+
+  # EQUALITY AND NOT THE PREFIX RULE ABOVE, and the asymmetry is the whole of this step. One anchor
+  # can afford agreement-until-one-runs-out, because the alternative is the first-party-named
+  # fallback. Up to 445 anchors cannot: a bare "AURORA" agrees with twenty-six siblings on one token,
+  # and a rule that admits it would convert a whole corporate group into registrants of every
+  # contract any of them touched. Full agreement in both directions has no such failure mode.
+  co_ <- .filers |>
+    dplyr::filter(!.data$IsPrimary, !is.na(.data$FilerKey)) |>
+    dplyr::select("DocID", "FilerKey", "CompanyName")
+
+  hit_ <- base_ |>
+    dplyr::select("DocID", "PartyId", "Key") |>
+    dplyr::inner_join(co_, by = dplyr::join_by(DocID, Key == FilerKey)) |>
+    dplyr::distinct(.data$DocID, .data$PartyId, .keep_all = TRUE) |>
+    dplyr::transmute(.data$DocID, .data$PartyId, IsCoFiler = TRUE,
+                     CoFilerName = .data$CompanyName)
+
+  base_ |>
+    dplyr::left_join(hit_, by = dplyr::join_by(DocID, PartyId)) |>
+    dplyr::mutate(IsCoFiler = dplyr::coalesce(.data$IsCoFiler, FALSE))
 }
 
 
@@ -538,6 +493,9 @@ ent_party_names <- function(.ent) {
       NameFrom  = dplyr::if_else(dplyr::first(.data$IsMatch), "matched member", "most mentioned"),
       IsMatch   = any(.data$IsMatch),
       IsExact   = any(.data$IsExact),
+      IsCoFiler = any(.data$IsCoFiler),
+      CoFiler   = dplyr::first(.data$CoFilerName[!is.na(.data$CoFilerName)],
+                               default = NA_character_),
       NKeys     = dplyr::n(),
       NOcc      = sum(.data$NOcc),
       # NEITHER BRANCH OF if_else IS LAZY, so sorting the merged kinds inside one would run on an
@@ -636,9 +594,6 @@ ent_locate_party <- function(.party, .keys, .lens) {
 }
 
 
-# 3. The window ------------------------------------------------------------------------------------------------------
-# The ONLY position-dependent step, and therefore the only one the width table has to re-run.
-
 #' Build one window specification
 #'
 #' ONE SHAPE, NOT TWO. A gap window -- growing outward through every name whose distance to its
@@ -713,220 +668,165 @@ ent_window <- function(.party_tab, .party, .spec) {
       HasTail      = .data$TailStart < .data$DocLen,
       InTail       = .data$HasTail & .data$Start >= .data$TailStart & !.data$InWindow,
       RecursInTail = .data$HasTail & .data$MaxStart >= .data$TailStart,
+      # THE CO-FILER SITS ABOVE COUNTERPARTY DELIBERATELY. A subsidiary named as guarantor in the
+      # preamble is inside the window and is not a counterparty: it is on the same side of the
+      # contract as the filer, and EDGAR says so by recording it as a registrant of this filing.
+      # Below registrant, because the primary filer's own match is the one that anchors the window.
       Role         = dplyr::case_when(
-        .data$IsRegistrant ~ "registrant",
-        .data$InWindow     ~ "counterparty",
-        .data$InTail       ~ "signatory",
-        .default           = "other"
+        .data$IsRegistrant                              ~ "registrant",
+        dplyr::coalesce(.data$IsCoFiler, FALSE)         ~ "cofiler",
+        .data$InWindow                                  ~ "counterparty",
+        .data$InTail                                    ~ "signatory",
+        .default = "other"
       )
     )
 }
 
 
-#' The counts, one row per document, with the naive baseline beside them
-#'
-#' NOT WRITTEN. Every column here is a count over the released party file, and this function exists
-#' so the report and the figures have them in memory rather than so the release carries a second copy
-#' that can disagree with the first.
-#'
-#' NAIVE IS THE COMPARISON THIS DOCUMENT IS BUILT AROUND. It is every unique party the contract names
-#' anywhere, less one for the registrant -- what a reader would count without a rule. Removed is the
-#' difference, and it IS what the window did.
-#'
-#' NAIVE SUBTRACTS ONE WHETHER OR NOT A REGISTRANT WAS FOUND, because it is a baseline rather than a
-#' second rule: a reader computing it by hand would subtract the filer without checking whether the
-#' filer was identified. Clamped at zero for the documents naming one party or none.
-#'
-#' @param .roles Tibble from ent_window().
-#' @param .party Tibble from ent_locate_party().
-#' @return Tibble: one row per document with the class facts, the window bounds and the counts.
-ent_counts <- function(.roles, .party) {
-  if (FALSE) {
-    .roles <- tab_roles
-    .party <- tab_party
-  }
+# 4. The release ---------------------------------------------------------------------------------------------------------
 
-  cnt_ <- .roles |>
-    dplyr::summarise(
-      NParties  = dplyr::n_distinct(.data$PartyId),
-      NCounter  = dplyr::n_distinct(.data$PartyId[.data$Role == "counterparty"]),
-      NTailNew  = dplyr::n_distinct(.data$PartyId[.data$Role == "signatory"]),
-      NOther    = dplyr::n_distinct(.data$PartyId[.data$Role == "other"]),
-      NMergedIn = dplyr::n_distinct(.data$PartyId[.data$NKeys > 1L]),
-      NKeysSeen = sum(.data$NKeys),
-      NBothEnds = dplyr::n_distinct(
-        .data$PartyId[.data$Role %in% c("registrant", "counterparty") & .data$RecursInTail]
-      ),
-      WinStart  = dplyr::first(.data$WinStart),
-      WinEnd    = dplyr::first(.data$WinEnd),
-      TailStart = dplyr::first(.data$TailStart),
-      HasTail   = dplyr::first(.data$HasTail),
-      .by = DocID
-    )
-
-  .party |>
-    dplyr::select(DocID, Class, AmendType, Status, IsExact, DocLen, PartyStart, PartyFrac) |>
-    dplyr::left_join(cnt_, by = dplyr::join_by(DocID)) |>
-    dplyr::mutate(
-      dplyr::across(dplyr::starts_with("N"), \(.x) as.integer(dplyr::coalesce(.x, 0L))),
-      HasTail    = dplyr::coalesce(.data$HasTail, FALSE),
-      # AT LEAST ONE PARTY BESIDES THE REGISTRANT, anywhere in the document. The coverage figure a
-      # reader asks for, and not the same population as either count below: a contract can have no
-      # counterparty and still name a signatory.
-      HasAnyParty = .data$NParties > 1L,
-      NNaive      = as.integer(pmax(.data$NParties - 1L, 0L)),
-      NRemoved    = as.integer(.data$NNaive - .data$NCounter),
-      NWithTail   = as.integer(.data$NCounter + .data$NTailNew),
-      WinWidth    = .data$WinEnd - .data$WinStart,
-      TailWidth   = .data$DocLen - .data$TailStart
-    )
-}
-
-
-#' Every mention of every party, with its offsets
+#' The release: one row per contract per party per mention
 #'
-#' THE POSITIONAL INDEX, AND IT IS NOT THE RELEASE. parties_org.parquet carries one row per party at
-#' the offsets of its EARLIEST mention, which is the right shape for a file about parties and the
-#' wrong one for anything measuring what sits beside them. A place named next to a party's third
-#' mention -- the signature block, where an address is written -- cannot reach that party through a
-#' table that only knows where it was first named.
+#' THE ONLY FILE THIS DOCUMENT WRITES. Twelve columns at three grains -- document, party and mention
+#' -- with the party facts repeated across that party's mentions the way a contract fact would repeat
+#' across parties. Repetition at this grain is what lets one file answer both the question 04B2 asks
+#' (what is named where) and the question a reader asks (who the parties are).
 #'
-#' 04B2 MEASURED THE COST. The median party has no place within reach of its first mention at any
-#' window up to 800 characters, while contracts name places in abundance: 105,829 of them, of which
-#' fewer than a fifth attach to anything. Signature blocks are where parties are named WITH
-#' addresses, and this index is what lets a later rule reach them.
+#' A CONTRACT IN WHICH NOTHING WAS FOUND STILL GETS A ROW. lexnlp proposed no organisation at all in
+#' 116 of 4,398 contracts. Without a sentinel those documents have no rows, so a mean computed over
+#' the file divides by 4,282 -- about 2.6% high, with nothing to notice. The sentinel carries a null
+#' PartyKey and null offsets, so n_distinct(DocID) is the sample by construction.
 #'
-#' THIN BY DESIGN. Four columns and one row per surviving span. It is an index for 04B2 and 04D
-#' rather than an artifact anybody analyses, which is why the party facts stay in the release and are
-#' not repeated here.
+#' SpanKey IS THE KEY BEFORE GROUPING AND PartyKey IS THE KEY AFTER. Holding both is what makes the
+#' grouping auditable from the file: a party that merged three spellings has three distinct SpanKeys
+#' under one PartyKey, and the whole naive ladder is n_distinct over one column or the other.
 #'
-#' IsFirst MARKS THE MENTION THE RELEASE CARRIES, so a consumer can reproduce the old behaviour
-#' exactly by filtering to it -- which is what makes the extra mentions a strictly additive change
-#' rather than a different rule.
+#' MatchKind REPLACES A BOOLEAN AND TWO DOCUMENT-LEVEL COLUMNS. Matched said whether a party agreed
+#' with the EDGAR filer name; it could not say whether the agreement was exact, and exactness was
+#' carried separately per document. One four-level column on the party row gives both headline
+#' numbers -- the share of contracts whose registrant matched, and the share of those that matched
+#' word for word -- as group-bys.
+#'
+#' IsFirst MARKS THE MENTION AN EARLIER RELEASE CARRIED, so filtering to it reproduces the old
+#' party-grain file exactly. That is what makes the extra mentions strictly additive.
 #'
 #' @param .spans Tibble from the loader, with SpanKey and CoreKey added.
-#' @param .grouped Tibble from ent_group_parties(). Maps a key to its party.
-#' @param .party Tibble from ent_party_names(). Maps a party to its released name.
+#' @param .roles Tibble from ent_window(). Supplies the role and the party facts.
+#' @param .grouped Tibble from ent_group_parties(). Maps a span key to its party.
+#' @param .party Tibble from ent_locate_party(). Supplies every document and the fallback status.
 #' @param .rule List from ent_rule().
-#' @return Tibble: DocID, PartyKey, MentionStart, MentionStop, IsFirst.
-ent_mentions <- function(.spans, .grouped, .party, .rule) {
+#' @return Tibble: one row per document per party per mention, plus one sentinel per empty document.
+ent_release_mentions <- function(.spans, .roles, .grouped, .party, .rule) {
   if (FALSE) {
     .spans   <- tab_spans
+    .roles   <- tab_roles
     .grouped <- res_base$Grouped
-    .party   <- tab_parties
+    .party   <- tab_party
     .rule    <- .lP$Params$Rule
   }
 
-  ent_key_of(.spans = .spans, .rule = .rule) |>
+  # THE REGISTRANT'S MATCH KIND IS A DOCUMENT FACT WORN BY ONE PARTY. ent_locate_party() records
+  # whether the chosen party matched or was the fallback; ent_match_party() records whether the
+  # agreement was exact. Both land on the registrant row and every other party carries "none",
+  # because a counterparty was never matched against anything.
+  fall_ <- .party |>
+    dplyr::transmute(DocID, ChosenId = .data$PartyId, ChosenStatus = .data$Status)
+
+  facts_ <- .roles |>
+    dplyr::left_join(fall_, by = dplyr::join_by(DocID)) |>
+    dplyr::transmute(
+      .data$DocID,
+      .data$PartyId,
+      PartyKey  = .data$PartyKey,
+      PartyName = .data$PartyName,
+      PartyRole = .data$Role,
+      MatchKind = dplyr::case_when(
+        .data$IsRegistrant & .data$ChosenStatus != "matched" ~ "fallback",
+        .data$IsRegistrant & dplyr::coalesce(.data$IsExact, FALSE) ~ "exact",
+        .data$IsRegistrant                                   ~ "prefix",
+        dplyr::coalesce(.data$IsCoFiler, FALSE)              ~ "cofiler",
+        .default = "none"
+      ),
+      NameFrom  = .data$NameFrom,
+      MergeKind = .data$MergeKind
+    )
+
+  ment_ <- ent_key_of(.spans = .spans, .rule = .rule) |>
     dplyr::inner_join(
       dplyr::distinct(.grouped, .data$DocID, .data$Key, .data$PartyId),
       by = dplyr::join_by(DocID, Key)
     ) |>
-    dplyr::inner_join(
-      dplyr::distinct(.party, .data$DocID, .data$PartyId, .data$PartyKey),
-      by = dplyr::join_by(DocID, PartyId)
-    ) |>
     dplyr::transmute(
       .data$DocID,
-      .data$PartyKey,
+      .data$PartyId,
+      SpanKey      = .data$Key,
+      # STORED RAW, NOT SQUISHED, AND THE REASON IS THE OFFSET CONTRACT. This column and the two
+      # offsets beside it describe one mention, so stri_sub(text, MentionStart, MentionStop) must
+      # equal it exactly. Collapsing whitespace here would break that on every span containing a
+      # newline, and the released file would no longer be checkable against the text it indexes.
+      # Display squishes at report time instead, where it costs nothing.
+      SpanText     = .data$Span,
       MentionStart = as.integer(.data$Start),
       MentionStop  = as.integer(.data$Stop)
     ) |>
-    dplyr::distinct(.data$DocID, .data$PartyKey, .data$MentionStart, .keep_all = TRUE) |>
-    dplyr::arrange(.data$DocID, .data$MentionStart) |>
-    dplyr::mutate(
-      IsFirst = .data$MentionStart == min(.data$MentionStart),
-      .by = c(DocID, PartyKey)
-    )
-}
+    dplyr::distinct(.data$DocID, .data$PartyId, .data$MentionStart, .keep_all = TRUE)
 
-
-#' The release: one row per contract per party
-#'
-#' THE ONLY FILE THIS DOCUMENT WRITES, and every contract-level quantity is a group-by over it. A
-#' second file carrying its own counts would be a derived copy that can disagree with the source: a
-#' reader filters the parties, recomputes, gets a different number, and nothing says which is right.
-#' The counterparty count is sum(PartyRole == "counterparty"); the naive baseline is one subtraction
-#' from a row count; neither is stored.
-#'
-#' A CONTRACT IN WHICH NOTHING WAS FOUND STILL GETS A ROW. lexnlp proposed no organisation at all in
-#' 116 of 4,398 contracts. Without a sentinel those documents have no rows at all, so a mean computed
-#' over the file divides by 4,282 -- about 2.6% high, with nothing to notice. The sentinel carries
-#' PartyRole "none" and a null name, so every contract appears exactly once at minimum and
-#' n_distinct(DocID) is the sample by construction. The extractors solve this the same way, and for
-#' the same reason.
-#'
-#' CLASS AND AMENDTYPE TRAVEL WITH THE PARTIES so the commonest downstream cut -- counterparties by
-#' contract type -- needs no join back to the label spine.
-#'
-#' @param .roles Tibble from ent_window().
-#' @param .party Tibble from ent_locate_party(). Supplies every document, including the empty ones.
-#' @return Tibble: one row per document per party, plus one sentinel per document with no party.
-ent_release_parties <- function(.roles, .party) {
-  if (FALSE) {
-    .roles <- tab_roles
-    .party <- tab_party
-  }
-
-  real_ <- .roles |>
-    dplyr::left_join(dplyr::select(.party, DocID, Class, AmendType), by = dplyr::join_by(DocID)) |>
-    dplyr::transmute(
-      .data$DocID,
-      .data$Class,
-      .data$AmendType,
-      PartyName  = .data$PartyName,
-      PartyKey   = .data$PartyKey,
-      PartyRole  = .data$Role,
-      Matched    = .data$IsMatch,
-      PartyStart = as.integer(.data$Start),
-      PartyStop  = as.integer(.data$Stop),
-      NameFrom   = .data$NameFrom,
-      NVariants  = as.integer(.data$NKeys),
-      NMentions  = as.integer(.data$NOcc)
-    )
+  real_ <- ment_ |>
+    dplyr::inner_join(facts_, by = dplyr::join_by(DocID, PartyId)) |>
+    dplyr::mutate(IsFirst = .data$MentionStart == min(.data$MentionStart),
+                  .by = c(DocID, PartyKey)) |>
+    dplyr::select("DocID", "PartyKey", "PartyName", "PartyRole", "MatchKind", "NameFrom",
+                  "MergeKind", "SpanKey", "SpanText", "MentionStart", "MentionStop", "IsFirst")
 
   none_ <- .party |>
     dplyr::filter(!.data$DocID %in% real_$DocID) |>
     dplyr::transmute(
       .data$DocID,
-      .data$Class,
-      .data$AmendType,
-      PartyName  = NA_character_,
-      PartyKey   = NA_character_,
-      PartyRole  = "none",
-      Matched    = FALSE,
-      PartyStart = NA_integer_,
-      PartyStop  = NA_integer_,
-      NameFrom   = NA_character_,
-      NVariants  = NA_integer_,
-      NMentions  = NA_integer_
+      PartyKey     = NA_character_,
+      PartyName    = NA_character_,
+      PartyRole    = "none",
+      MatchKind    = "none",
+      NameFrom     = NA_character_,
+      MergeKind    = NA_character_,
+      SpanKey      = NA_character_,
+      SpanText     = NA_character_,
+      MentionStart = NA_integer_,
+      MentionStop  = NA_integer_,
+      IsFirst      = NA
     )
 
   dplyr::bind_rows(real_, none_) |>
-    dplyr::arrange(.data$DocID, .data$PartyStart)
+    dplyr::arrange(.data$DocID, .data$MentionStart)
 }
 
 
 #' Apply the rule and the window end to end
+#'
+#' ONE ENTRY POINT, AND 04D CALLS EXACTLY THIS. Every intermediate is returned beside the release so
+#' that a sweep or a reading block can reach the chain without re-running it, and so that a corpus
+#' pass can take Release and discard the rest.
 #'
 #' @param .spans Tibble from the loader, with SpanKey and CoreKey added.
 #' @param .keys Tibble from ent_anchor_keys().
 #' @param .lens Tibble from ent_doc_lens().
 #' @param .rule List from ent_rule().
 #' @param .spec List from ent_window_spec().
-#' @return A list: Rule, Spec, Ent, Parties, Party, Roles, Counts.
-ent_apply <- function(.spans, .keys, .lens, .rule, .spec) {
+#' @param .filers Tibble from ent_filer_keys(). NULL matches the primary filer only, which is
+#'   what the rule did before multi-filer contracts were handled.
+#' @return A list: Rule, Spec, Ent, Grouped, Parties, Party, Roles, Release.
+ent_apply <- function(.spans, .keys, .lens, .rule, .spec, .filers = NULL) {
   if (FALSE) {
-    .spans <- tab_spans
-    .keys  <- tab_keys
-    .lens  <- tab_lens
-    .rule  <- .lP$Params$Rule
-    .spec  <- .lP$Params$Spec
+    .spans  <- tab_spans
+    .keys   <- tab_keys
+    .lens   <- tab_lens
+    .rule   <- .lP$Params$Rule
+    .spec   <- .lP$Params$Spec
+    .filers <- tab_filers
   }
 
   ent_    <- ent_entities(.spans = .spans, .rule = .rule)
   group_  <- ent_group_parties(.ent = ent_, .rule = .rule)
-  match_  <- ent_match_party(.ent = group_, .keys = .keys)
+  match_  <- ent_match_party(.ent = group_, .keys = .keys, .filers = .filers)
   party_  <- ent_party_names(.ent = match_)
   chosen_ <- ent_locate_party(.party = party_, .keys = .keys, .lens = .lens)
   roles_  <- ent_window(.party_tab = party_, .party = chosen_, .spec = .spec)
@@ -934,13 +834,392 @@ ent_apply <- function(.spans, .keys, .lens, .rule, .spec) {
   list(
     Rule = .rule, Spec = .spec, Ent = ent_, Grouped = group_, Parties = party_, Party = chosen_,
     Roles = roles_,
-    Counts   = ent_counts(.roles = roles_, .party = chosen_),
-    Mentions = ent_mentions(.spans = .spans, .grouped = group_, .party = party_, .rule = .rule)
+    Release = ent_release_mentions(
+      .spans = .spans, .roles = roles_, .grouped = group_, .party = chosen_, .rule = .rule
+    )
   )
 }
 
 
-# 4. Evidence for the two numbers ---------------------------------------------------------------------------------------
+#' What every column of the released file means
+#'
+#' A TABLE RATHER THAN PROSE, AND CHECKED AGAINST THE FILE. A dictionary written as text drifts from
+#' the thing it documents and nothing notices; built here and compared to names(), a column added or
+#' renamed without a matching entry aborts the render instead of quietly disagreeing with its own
+#' documentation.
+#'
+#' THE GRAIN COLUMN IS THE POINT. Three of these vary by mention, seven by party and one by document,
+#' and a reader who does not know which is which will average a party fact over its mentions and get
+#' a number weighted by how often each party happened to be named.
+#'
+#' @param .tab Tibble from ent_release_mentions().
+#' @return Tibble: Column, Grain, Meaning, OnSentinel.
+ent_dictionary_mentions <- function(.tab) {
+  if (FALSE) .tab <- tab_release
+
+  dict_ <- tibble::tribble(
+    ~Column,        ~Grain,     ~Meaning,                                                    ~OnSentinel,
+    "DocID",        "document", "the contract; joins to the register and every other 04 file", "present",
+    "PartyKey",     "party",    "the reduced key after grouping; one party, one key",          "null",
+    "PartyName",    "party",    "the party's name, as the member that named it wrote it",      "null",
+    "PartyRole",    "party",    "registrant, cofiler, counterparty, signatory, other or none", "none",
+    "MatchKind",    "party",    "exact, prefix, fallback, cofiler or none",                     "none",
+    "NameFrom",     "party",    "matched member, or most mentioned -- which spelling named it", "null",
+    "MergeKind",    "party",    "how the grouping merged the spellings into this party",       "null",
+    "SpanKey",      "mention",  "the reduced key BEFORE grouping; the naive ladder counts it",  "null",
+    "SpanText",     "mention",  "the surface form, raw: it slices from the two offsets exactly",  "null",
+    "MentionStart", "mention",  "offset of this mention, into 04A's canonical text",           "null",
+    "MentionStop",  "mention",  "offset of the end of this mention",                           "null",
+    "IsFirst",      "mention",  "the mention a party-grain release would have carried",        "null"
+  )
+
+  undoc_  <- setdiff(names(.tab), dict_$Column)
+  unseen_ <- setdiff(dict_$Column, names(.tab))
+  say_    <- function(.x) if (length(.x) == 0L) "none" else paste(.x, collapse = ", ")
+
+  if (length(undoc_) > 0L || length(unseen_) > 0L) {
+    cli::cli_abort(c(
+      "The dictionary and the released file disagree.",
+      "x" = "In the file and undocumented: {say_(undoc_)}.",
+      "x" = "Documented and not in the file: {say_(unseen_)}.",
+      "i" = "A dictionary that can drift from its file documents nothing."
+    ))
+  }
+
+  dict_[match(names(.tab), dict_$Column), ]
+}
+
+
+# 5. Reading the release -------------------------------------------------------------------------------------------------
+#
+# EVERYTHING BELOW READS THE RELEASED FILE AND NOTHING ELSE. That is what makes these the functions
+# 04D borrows: a chunk of the corpus release has the same twelve columns as the sample's, so the same
+# group-by produces the corpus number. No function here touches an intermediate.
+
+#' One row per party, from the mention file
+#'
+#' THE COLLAPSE EVERY PARTY-LEVEL QUESTION GOES THROUGH. NMentions and NVariants used to be stored
+#' columns; they are counts over this file, and computing them here once means a reader who filters
+#' the mentions gets a count consistent with the filter rather than one describing the unfiltered
+#' file.
+#'
+#' THE SENTINEL IS DROPPED HERE AND KEPT IN ent_doc_facts(). A document with no party has no party
+#' row, which is correct for a table whose grain is the party; the document still has to appear in
+#' any per-document rate, which is the other function's job.
+#'
+#' @param .release Tibble or dataset from ent_release_mentions().
+#' @return Tibble: one row per document per party.
+ent_party_facts <- function(.release) {
+  if (FALSE) .release <- tab_release
+
+  .release |>
+    dplyr::filter(!is.na(.data$PartyKey)) |>
+    dplyr::arrange(.data$DocID, .data$MentionStart) |>
+    dplyr::summarise(
+      PartyName  = dplyr::first(.data$PartyName),
+      PartyRole  = dplyr::first(.data$PartyRole),
+      MatchKind  = dplyr::first(.data$MatchKind),
+      NameFrom   = dplyr::first(.data$NameFrom),
+      MergeKind  = dplyr::first(.data$MergeKind),
+      NVariants  = dplyr::n_distinct(.data$SpanKey),
+      NMentions  = dplyr::n(),
+      PartyStart = min(.data$MentionStart),
+      PartyStop  = dplyr::first(.data$MentionStop),
+      MaxStart   = max(.data$MentionStart),
+      .by = c(DocID, PartyKey)
+    ) |>
+    dplyr::arrange(.data$DocID, .data$PartyStart)
+}
+
+
+#' One row per document, from the mention file
+#'
+#' EVERY PUBLISHED PER-DOCUMENT QUANTITY, COMPUTED FROM THE RELEASE. The column names are the ones an
+#' earlier version stored, so a report reading them needs no change; what changed is where they come
+#' from. A number that can only be computed inside the chain cannot be checked by a reader and cannot
+#' be recomputed at corpus scale, and both of those were true of the counts this replaces.
+#'
+#' THE WINDOW BOUNDS ARE DERIVED RATHER THAN STORED, from the registrant's first mention and the two
+#' specification numbers. Storing them would freeze the specification into the file: re-cutting the
+#' window from a released file is then impossible, which is precisely the thing a reader who
+#' disagrees with 2,000 characters wants to do.
+#'
+#' RecursInTail IS DERIVED THE SAME WAY. A party recurs in the tail when its LAST mention sits past
+#' the boundary, and the boundary moves with the tail share.
+#'
+#' @param .release Tibble or dataset from ent_release_mentions().
+#' @param .lens Tibble carrying DocID and DocLen.
+#' @param .spec List from ent_window_spec().
+#' @return Tibble: one row per document.
+ent_doc_facts <- function(.release, .lens, .spec) {
+  if (FALSE) {
+    .release <- tab_release
+    .lens    <- tab_lens
+    .spec    <- .lP$Params$Spec
+  }
+
+  party_ <- ent_party_facts(.release = .release)
+
+  # THE NAIVE LADDER, AND ITS FIRST RUNG NEEDS THE MENTION GRAIN. n_distinct(SpanKey) counts the
+  # spellings the extractor proposed before anything merged them, which no party-level table can
+  # recover.
+  spans_ <- .release |>
+    dplyr::summarise(
+      NaiveSpans = dplyr::n_distinct(.data$SpanKey[!is.na(.data$SpanKey)]),
+      .by = DocID
+    )
+
+  reg_ <- party_ |>
+    dplyr::filter(.data$PartyRole == "registrant") |>
+    dplyr::transmute(DocID, RegStart = .data$PartyStart, RegMatch = .data$MatchKind)
+
+  cnt_ <- party_ |>
+    dplyr::summarise(
+      NParties  = dplyr::n_distinct(.data$PartyKey),
+      NCounter  = dplyr::n_distinct(.data$PartyKey[.data$PartyRole == "counterparty"]),
+      NCoFiler  = dplyr::n_distinct(.data$PartyKey[.data$PartyRole == "cofiler"]),
+      NTailNew  = dplyr::n_distinct(.data$PartyKey[.data$PartyRole == "signatory"]),
+      NOther    = dplyr::n_distinct(.data$PartyKey[.data$PartyRole == "other"]),
+      NMergedIn = dplyr::n_distinct(.data$PartyKey[.data$NVariants > 1L]),
+      NKeysSeen = sum(.data$NVariants),
+      .by = DocID
+    )
+
+  tail_ <- party_ |>
+    dplyr::select("DocID", "PartyKey", "PartyRole", "MaxStart")
+
+  dplyr::distinct(.release, .data$DocID) |>
+    dplyr::left_join(.lens,  by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(spans_, by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(cnt_,   by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(reg_,   by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(
+      dplyr::across(c(NaiveSpans, NParties, NCounter, NCoFiler, NTailNew, NOther, NMergedIn,
+                      NKeysSeen),
+                    \(.x) as.integer(dplyr::coalesce(.x, 0L))),
+      Status = dplyr::case_when(
+        .data$NParties == 0L                             ~ "no entity",
+        dplyr::coalesce(.data$RegMatch, "") == "fallback" ~ "first",
+        .default = "matched"
+      ),
+      IsExact    = dplyr::coalesce(.data$RegMatch, "") == "exact",
+      PartyStart = .data$RegStart,
+      PartyFrac  = .data$RegStart / .data$DocLen,
+      WinStart   = pmax(0, .data$RegStart - .spec$Par),
+      WinEnd     = pmin(.data$DocLen, .data$RegStart + .spec$Par),
+      TailStart  = pmax(.data$DocLen - .spec$TailShare * .data$DocLen,
+                        dplyr::coalesce(.data$WinEnd, 0)),
+      HasTail    = .data$TailStart < .data$DocLen,
+      WinWidth   = .data$WinEnd - .data$WinStart,
+      TailWidth  = .data$DocLen - .data$TailStart,
+      # THE LADDER. Each rung assumes one more thing the rule can do and a reader cannot.
+      NaiveParties = .data$NParties,
+      NaiveCounter = as.integer(pmax(.data$NParties - 1L, 0L)),
+      # TWO SUBTRACTIONS AND NOT ONE, because the window and the co-filer rule remove different
+      # things and pooling them would hide which did the work.
+      NRemovedFile = as.integer(.data$NCoFiler),
+      NRemoved     = as.integer(.data$NaiveCounter - .data$NCounter),
+      NWithTail    = as.integer(.data$NCounter + .data$NTailNew),
+      HasAnyParty  = .data$NParties > 1L
+    ) |>
+    dplyr::left_join(
+      tail_ |>
+        dplyr::filter(.data$PartyRole %in% c("registrant", "counterparty")) |>
+        dplyr::select("DocID", "PartyKey", "MaxStart"),
+      by = dplyr::join_by(DocID), relationship = "one-to-many"
+    ) |>
+    dplyr::summarise(
+      dplyr::across(-c("PartyKey", "MaxStart"), dplyr::first),
+      NBothEnds = as.integer(sum(
+        .data$HasTail & !is.na(.data$MaxStart) & .data$MaxStart >= .data$TailStart
+      )),
+      .by = DocID
+    ) |>
+    dplyr::select(-"RegStart", -"RegMatch")
+}
+
+
+#' The four rungs of the naive ladder, by contract type
+#'
+#' THE TABLE THIS DOCUMENT EXISTS TO PRODUCE, and it is four numbers rather than two because there
+#' are three separable things the rule does. SPELLINGS is every distinct name the extractor proposed.
+#' PARTIES is what the grouping merged them into. NAIVE is that less one for the registrant, which is
+#' what a reader gets who can identify the filer and nothing else. RULE is what the window kept.
+#'
+#' A READER WHO REJECTS ONE STEP TAKES THE RUNG ABOVE IT, and every rung is reproducible from the
+#' released file. That is the difference between publishing a robustness claim and publishing the
+#' means to check it.
+#'
+#' @param .doc Tibble from ent_doc_facts(), optionally carrying Class.
+#' @return Tibble: one row per type, and one for the sample.
+ent_table_naive <- function(.doc) {
+  if (FALSE) .doc <- tab_doc
+
+  cols_ <- function(.d) {
+    dplyr::summarise(
+      .d,
+      Docs        = dplyr::n(),
+      MeanSpells  = mean(.data$NaiveSpans),
+      MeanParties = mean(.data$NaiveParties),
+      MeanNaive   = mean(.data$NaiveCounter),
+      MeanCoFile  = mean(.data$NCoFiler),
+      MeanCount   = mean(.data$NCounter),
+      MeanRemove  = mean(.data$NRemoved),
+      PctGrouped  = 1 - sum(.data$NaiveParties) / pmax(sum(.data$NaiveSpans), 1L),
+      PctRemove   = sum(.data$NRemoved) / pmax(sum(.data$NaiveCounter), 1L),
+      PctZero     = mean(.data$NCounter == 0L),
+      PctAny      = mean(.data$HasAnyParty),
+      .by = dplyr::any_of("Class")
+    )
+  }
+
+  dplyr::bind_rows(
+    dplyr::arrange(cols_(.doc), dplyr::desc(.data$Docs)),
+    dplyr::mutate(cols_(dplyr::select(.doc, -dplyr::any_of("Class"))), Class = "All", .before = 1L)
+  )
+}
+
+
+#' What the grouping did, one row per merge kind
+#'
+#' READS THE PARTY COLLAPSE RATHER THAN THE CHAIN, so the shares here describe the file a reader has
+#' rather than an object only this render ever held.
+#'
+#' @param .party Tibble from ent_party_facts().
+#' @return Tibble: one row per MergeKind, and one for the sample.
+ent_table_group <- function(.party) {
+  if (FALSE) .party <- tab_party_facts
+
+  body_ <- .party |>
+    dplyr::summarise(
+      Parties  = dplyr::n(),
+      Keys     = sum(.data$NVariants),
+      MeanKeys = mean(.data$NVariants),
+      .by = MergeKind
+    ) |>
+    dplyr::mutate(PctParty = .data$Parties / sum(.data$Parties)) |>
+    dplyr::arrange(plot_factor(.data$MergeKind, .key = "MergeKind"))
+
+  dplyr::bind_rows(
+    body_,
+    tibble::tibble(
+      MergeKind = "All",
+      Parties   = nrow(.party),
+      Keys      = sum(.party$NVariants),
+      MeanKeys  = mean(.party$NVariants),
+      PctParty  = 1
+    )
+  )
+}
+
+
+#' A few whole contracts, exactly as the file holds them
+#'
+#' THE BLOCK A READER OF THE FILE ACTUALLY NEEDS. Everything else describes the release; this shows
+#' it. Every row of a handful of documents, in the released columns and the released order, so a
+#' reader meeting org_mentions.parquet has already seen what one contract looks like inside it.
+#'
+#' ONE DRAWN DOCUMENT IS ALWAYS A SENTINEL, where the sample holds any. The contracts in which
+#' nothing was found are the rows most likely to be mishandled downstream and the least likely to
+#' turn up in a random draw, so one is included deliberately rather than left to chance.
+#'
+#' A SHORT INDEX IS ADDED, and it is not a released column. DocID is forty-four characters and would
+#' take a fifth of the console width on every row.
+#'
+#' @param .tab Tibble from ent_release_mentions().
+#' @param .n Integer. Documents drawn, the sentinel among them.
+#' @param .seed Integer. Sampling seed.
+#' @return Tibble: every released row of the drawn documents, with Doc added for display.
+ent_release_sample <- function(.tab, .n = 4L, .seed = 42L) {
+  if (FALSE) {
+    .tab  <- tab_release
+    .n    <- 4L
+    .seed <- 42L
+  }
+
+  none_ <- unique(.tab$DocID[.tab$PartyRole == "none"])
+  some_ <- setdiff(unique(.tab$DocID), none_)
+
+  pick_none_ <- if (length(none_) > 0L) {
+    withr::with_seed(.seed, sample(none_, size = 1L))
+  } else {
+    character(0)
+  }
+  n_some_ <- max(.n - length(pick_none_), 0L)
+  pick_some_ <- withr::with_seed(
+    .seed, sample(some_, size = min(n_some_, length(some_)))
+  )
+
+  .tab |>
+    dplyr::filter(.data$DocID %in% c(pick_some_, pick_none_)) |>
+    dplyr::arrange(.data$DocID, .data$MentionStart) |>
+    dplyr::mutate(Doc = dplyr::dense_rank(.data$DocID), .before = 1L)
+}
+
+
+#' Where the contracting party was found, by contract type
+#' @param .doc Tibble from ent_doc_facts().
+#' @return Tibble: one row per type, and one for the sample.
+ent_table_where <- function(.doc) {
+  if (FALSE) .doc <- tab_doc
+
+  cols_ <- function(.d) {
+    dplyr::summarise(
+      .d,
+      Docs     = dplyr::n(),
+      PctMatch = mean(.data$Status == "matched"),
+      PctFirst = mean(.data$Status == "first"),
+      PctNone  = mean(.data$Status == "no entity"),
+      MedStart = stats::median(.data$PartyStart, na.rm = TRUE),
+      MedFrac  = stats::median(.data$PartyFrac, na.rm = TRUE),
+      .by = dplyr::any_of("Class")
+    )
+  }
+
+  dplyr::bind_rows(
+    dplyr::arrange(cols_(.doc), dplyr::desc(.data$Docs)),
+    dplyr::mutate(cols_(dplyr::select(.doc, -dplyr::any_of("Class"))), Class = "All", .before = 1L)
+  )
+}
+
+
+#' What the signature block adds, by contract type
+#'
+#' MeanTailNew is parties named ONLY in the tail -- ones the window never saw -- and it is the number
+#' that decides whether the signature block discovers parties or repeats them. It varies twenty-fold
+#' by contract type, which is why the two counts are released apart rather than pooled.
+#'
+#' @param .doc Tibble from ent_doc_facts().
+#' @return Tibble: one row per type, and one for the sample.
+ent_table_tail <- function(.doc) {
+  if (FALSE) .doc <- tab_doc
+
+  cols_ <- function(.d) {
+    dplyr::summarise(
+      .d,
+      Docs         = dplyr::n(),
+      MedTail      = stats::median(.data$TailWidth, na.rm = TRUE),
+      MeanCount    = mean(.data$NCounter),
+      MeanTailNew  = mean(.data$NTailNew),
+      MeanWithTail = mean(.data$NWithTail),
+      PctAnyTail   = mean(.data$NTailNew > 0L),
+      PctBoth      = mean(.data$NBothEnds > 0L),
+      .by = dplyr::any_of("Class")
+    )
+  }
+
+  dplyr::bind_rows(
+    dplyr::arrange(cols_(.doc), dplyr::desc(.data$Docs)),
+    dplyr::mutate(cols_(dplyr::select(.doc, -dplyr::any_of("Class"))), Class = "All", .before = 1L)
+  )
+}
+
+
+# 6. Evidence for the two numbers ----------------------------------------------------------------------------------------
+#
+# THE SWEEPS READ THE CHAIN'S INTERMEDIATES AND THAT IS DELIBERATE. A sweep is evidence for a
+# parameter rather than a released quantity: it re-cuts the window at widths the release does not
+# use, so there is no file for it to read. Nothing here has to survive to corpus scale.
 
 #' What each candidate half-width would have counted
 #'
@@ -954,12 +1233,66 @@ ent_apply <- function(.spans, .keys, .lens, .rule, .spec) {
 #' @param .tail_share Numeric. Held at the released value throughout.
 #' @param .quiet Logical. Suppress the progress bar.
 #' @return Tibble: one row per document per width.
-ent_sweep_window <- function(.party_tab, .party, .pars = c(500, 1000, 2000, 4000),
+#' Per-document counts for one cut of the window
+#'
+#' THE SWEEP'S OWN COUNTER, AND IT IS NOT ent_doc_facts(). That function reads the released file,
+#' which exists at one width only -- the released one. A sweep re-cuts the window at widths no file
+#' was ever written for, so it counts from ent_window()'s output directly. The two agree at the
+#' released width by construction, because both take the role assignment as given and count it.
+#'
+#' ONLY THE COLUMNS THE SWEEP REPORTS. An earlier version returned the full count set at every width,
+#' which was four times the work to answer a question about one number.
+#'
+#' @param .roles Tibble from ent_window().
+#' @param .party Tibble from ent_locate_party(). Supplies every document, Class and DocLen.
+#' @return Tibble: one row per document.
+.ent_sweep_counts <- function(.roles, .party) {
+  if (FALSE) {
+    .roles <- tab_roles
+    .party <- tab_party
+  }
+
+  cnt_ <- .roles |>
+    dplyr::summarise(
+      NParties = dplyr::n_distinct(.data$PartyId),
+      NCounter = dplyr::n_distinct(.data$PartyId[.data$Role == "counterparty"]),
+      NTailNew = dplyr::n_distinct(.data$PartyId[.data$Role == "signatory"]),
+      .by = DocID
+    )
+
+  .party |>
+    dplyr::select("DocID", dplyr::any_of("Class"), "DocLen") |>
+    dplyr::left_join(cnt_, by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(
+      dplyr::across(c(NParties, NCounter, NTailNew), \(.x) as.integer(dplyr::coalesce(.x, 0L))),
+      NaiveCounter = as.integer(pmax(.data$NParties - 1L, 0L)),
+      NRemoved     = as.integer(.data$NaiveCounter - .data$NCounter)
+    )
+}
+
+
+#' What each candidate half-width would have counted
+#'
+#' EVIDENCE, NOT A CHOICE. The released rule uses one window; this table exists so a reader who
+#' disagrees with 2,000 can see what the alternatives give without opening the code. The rule is
+#' window-free, so the grouping and the match are computed once and each width only re-cuts.
+#'
+#' THREE WIDTHS AND NOT FIVE. The released value is bracketed rather than surveyed: a sweep is worth
+#' the render time it costs only while the answer is in question, and it is not. One width either
+#' side is enough to show the count is not sitting on a cliff.
+#'
+#' @param .party_tab Tibble from ent_party_names().
+#' @param .party Tibble from ent_locate_party().
+#' @param .pars Numeric vector of half-widths to score.
+#' @param .tail_share Numeric. Held at the released value throughout.
+#' @param .quiet Logical. Suppress the progress bar.
+#' @return Tibble: one row per document per width.
+ent_sweep_window <- function(.party_tab, .party, .pars = c(1000, 2000, 3000),
                              .tail_share = 0.10, .quiet = FALSE) {
   if (FALSE) {
     .party_tab  <- tab_parties
     .party      <- tab_party
-    .pars       <- c(500, 1000, 2000, 4000)
+    .pars       <- c(1000, 2000, 3000)
     .tail_share <- 0.10
     .quiet      <- FALSE
   }
@@ -967,7 +1300,7 @@ ent_sweep_window <- function(.party_tab, .party, .pars = c(500, 1000, 2000, 4000
   purrr::map(.pars, function(.p) {
     spec_ <- ent_window_spec(.par = .p, .tail_share = .tail_share)
     ent_window(.party_tab = .party_tab, .party = .party, .spec = spec_) |>
-      ent_counts(.party = .party) |>
+      .ent_sweep_counts(.party = .party) |>
       dplyr::mutate(Spec = spec_$Label, Par = .p, .before = 1L)
   }, .progress = !.quiet) |>
     purrr::list_rbind()
@@ -985,16 +1318,18 @@ ent_sweep_window <- function(.party_tab, .party, .pars = c(500, 1000, 2000, 4000
 #' @param .lens Tibble from ent_doc_lens().
 #' @param .base List from ent_rule(). The released rule.
 #' @param .spec List from ent_window_spec(). Held fixed.
+#' @param .filers Tibble from ent_filer_keys(), held constant across arms.
 #' @param .quiet Logical. Suppress the progress bar.
 #' @return Tibble: one row per rule.
-ent_sweep_rule <- function(.spans, .keys, .lens, .base, .spec, .quiet = FALSE) {
+ent_sweep_rule <- function(.spans, .keys, .lens, .base, .spec, .filers = NULL, .quiet = FALSE) {
   if (FALSE) {
     .spans <- tab_spans
     .keys  <- tab_keys
     .lens  <- tab_lens
-    .base  <- .lP$Params$Rule
-    .spec  <- .lP$Params$Spec
-    .quiet <- FALSE
+    .base   <- .lP$Params$Rule
+    .spec   <- .lP$Params$Spec
+    .filers <- tab_filers
+    .quiet  <- FALSE
   }
 
   rules_ <- list(
@@ -1004,16 +1339,22 @@ ent_sweep_rule <- function(.spans, .keys, .lens, .base, .spec, .quiet = FALSE) {
 
   n_ <- dplyr::n_distinct(.keys$DocID)
 
+  # SCORED THROUGH THE RELEASE, because ent_apply() no longer returns a count table -- every count is
+  # a group-by over the file it writes. Each arm therefore builds its own release and reads it with
+  # ent_doc_facts(), which is the same function Results uses. That is stricter than the old path as
+  # well as necessary: an arm is now scored by exactly the code that scores the released rule, so a
+  # difference between the two arms cannot come from a difference in how they were counted.
   purrr::map(rules_, function(.r) {
-    cnt_ <- ent_apply(.spans = .spans, .keys = .keys, .lens = .lens,
-                      .rule = .r, .spec = .spec)$Counts
+    res_ <- ent_apply(.spans = .spans, .keys = .keys, .lens = .lens,
+                      .rule = .r, .spec = .spec, .filers = .filers)
+    cnt_ <- ent_doc_facts(.release = res_$Release, .lens = .lens, .spec = .spec)
     tibble::tibble(
       Rule      = if (.r$MergeFragments) "prefix + fragment" else "prefix only",
       PctMatch  = mean(cnt_$Status == "matched"),
       PctExact  = .ent_share_or_na(.x = cnt_$IsExact[cnt_$Status == "matched"]),
       MeanKeys  = mean(cnt_$NKeysSeen),
       MeanParty = mean(cnt_$NParties),
-      MeanNaive = mean(cnt_$NNaive),
+      MeanNaive = mean(cnt_$NaiveCounter),
       MeanCount = mean(cnt_$NCounter),
       Docs      = n_
     )
@@ -1034,8 +1375,6 @@ ent_sweep_rule <- function(.spans, .keys, .lens, .base, .spec, .quiet = FALSE) {
   if (length(.x) == 0L) NA_real_ else mean(.x)
 }
 
-
-# 5. Description -----------------------------------------------------------------------------------------------------
 
 #' How many parties sit within each candidate half-width
 #'
@@ -1130,145 +1469,21 @@ ent_window_terms <- function(.roles, .n_docs) {
 }
 
 
-# 6. Tables ----------------------------------------------------------------------------------------------------------
-
-#' Where the contracting party was found, by contract type
-#' @param .counts Tibble from ent_counts().
-#' @return Tibble: one row per type, and one for the sample.
-ent_table_where <- function(.counts) {
-  if (FALSE) .counts <- tab_counts
-
-  cols_ <- function(.d) {
-    dplyr::summarise(
-      .d,
-      Docs     = dplyr::n(),
-      PctMatch = mean(.data$Status == "matched"),
-      PctFirst = mean(.data$Status == "first"),
-      PctNone  = mean(.data$Status == "no entity"),
-      MedStart = stats::median(.data$PartyStart, na.rm = TRUE),
-      MedFrac  = stats::median(.data$PartyFrac, na.rm = TRUE),
-      .by = dplyr::any_of("Class")
-    )
-  }
-
-  dplyr::bind_rows(
-    dplyr::arrange(cols_(.counts), dplyr::desc(.data$Docs)),
-    dplyr::mutate(cols_(dplyr::select(.counts, -"Class")), Class = "All", .before = 1L)
-  )
-}
-
-
-#' What the rule removed from the naive count, by contract type
-#'
-#' THE TABLE THIS DOCUMENT EXISTS TO PRODUCE. NAIVE is every unique party the contract names less one
-#' for the registrant; COUNT is what the window kept. A reader who disagrees with the window can read
-#' the first column and ignore the second, and both are reproducible from the released file.
-#'
-#' @param .counts Tibble from ent_counts().
-#' @return Tibble: one row per type, and one for the sample.
-ent_table_naive <- function(.counts) {
-  if (FALSE) .counts <- tab_counts
-
-  cols_ <- function(.d) {
-    dplyr::summarise(
-      .d,
-      Docs       = dplyr::n(),
-      MeanNaive  = mean(.data$NNaive),
-      MeanCount  = mean(.data$NCounter),
-      MedNaive   = stats::median(.data$NNaive),
-      MedCount   = stats::median(.data$NCounter),
-      MeanRemove = mean(.data$NRemoved),
-      PctRemove  = sum(.data$NRemoved) / pmax(sum(.data$NNaive), 1L),
-      PctZero    = mean(.data$NCounter == 0L),
-      PctAny     = mean(.data$HasAnyParty),
-      .by = dplyr::any_of("Class")
-    )
-  }
-
-  dplyr::bind_rows(
-    dplyr::arrange(cols_(.counts), dplyr::desc(.data$Docs)),
-    dplyr::mutate(cols_(dplyr::select(.counts, -"Class")), Class = "All", .before = 1L)
-  )
-}
-
-
-#' What the signature block adds, by contract type
-#'
-#' MeanTailNew is parties named ONLY in the tail -- ones the window never saw -- and it is the number
-#' that decides whether the signature block discovers parties or repeats them. It varies twenty-fold
-#' by contract type, which is why the two counts are released apart rather than pooled.
-#'
-#' @param .counts Tibble from ent_counts().
-#' @return Tibble: one row per type, and one for the sample.
-ent_table_tail <- function(.counts) {
-  if (FALSE) .counts <- tab_counts
-
-  cols_ <- function(.d) {
-    dplyr::summarise(
-      .d,
-      Docs         = dplyr::n(),
-      MedTail      = stats::median(.data$TailWidth, na.rm = TRUE),
-      MeanCount    = mean(.data$NCounter),
-      MeanTailNew  = mean(.data$NTailNew),
-      MeanWithTail = mean(.data$NWithTail),
-      PctAnyTail   = mean(.data$NTailNew > 0L),
-      PctBoth      = mean(.data$NBothEnds > 0L),
-      .by = dplyr::any_of("Class")
-    )
-  }
-
-  dplyr::bind_rows(
-    dplyr::arrange(cols_(.counts), dplyr::desc(.data$Docs)),
-    dplyr::mutate(cols_(dplyr::select(.counts, -"Class")), Class = "All", .before = 1L)
-  )
-}
-
-
-#' What the grouping did, one row per merge kind
-#'
-#' @param .roles Tibble from ent_window().
-#' @return Tibble: one row per MergeKind, and one for the sample.
-ent_table_group <- function(.roles) {
-  if (FALSE) .roles <- tab_roles
-
-  body_ <- .roles |>
-    dplyr::summarise(
-      Parties  = dplyr::n(),
-      Keys     = sum(.data$NKeys),
-      MeanKeys = mean(.data$NKeys),
-      .by = MergeKind
-    ) |>
-    dplyr::mutate(PctParty = .data$Parties / sum(.data$Parties)) |>
-    dplyr::arrange(plot_factor(.data$MergeKind, .key = "MergeKind"))
-
-  dplyr::bind_rows(
-    body_,
-    tibble::tibble(
-      MergeKind = "All",
-      Parties   = nrow(.roles),
-      Keys      = sum(.roles$NKeys),
-      MeanKeys  = mean(.roles$NKeys),
-      PctParty  = 1
-    )
-  )
-}
-
-
 #' What each candidate width would have counted, by contract type
 #' @param .sweep Tibble from ent_sweep_window().
-#' @param .counts Tibble from ent_counts(). Supplies the naive column.
+#' @param .doc Tibble from ent_doc_facts(). Supplies the naive column.
 #' @return Tibble: one row per type, one column per width.
-ent_table_window <- function(.sweep, .counts) {
+ent_table_window <- function(.sweep, .doc) {
   if (FALSE) {
-    .sweep  <- tab_sweep
-    .counts <- tab_counts
+    .sweep <- tab_sweep
+    .doc   <- tab_doc
   }
 
   .sweep |>
     dplyr::summarise(Mean = mean(.data$NCounter), .by = c(Spec, Class)) |>
     tidyr::pivot_wider(names_from = Spec, values_from = Mean) |>
     dplyr::left_join(
-      dplyr::summarise(.counts, Docs = dplyr::n(), Naive = mean(.data$NNaive), .by = Class),
+      dplyr::summarise(.doc, Docs = dplyr::n(), Naive = mean(.data$NaiveCounter), .by = Class),
       by = dplyr::join_by(Class)
     ) |>
     dplyr::relocate(Docs, Naive, .after = Class) |>
@@ -1287,7 +1502,7 @@ ent_table_length <- function(.sweep) {
     dplyr::summarise(
       Docs      = dplyr::n(),
       MedLen    = stats::median(.data$DocLen),
-      MeanNaive = mean(.data$NNaive),
+      MeanNaive = mean(.data$NaiveCounter),
       MeanCount = mean(.data$NCounter),
       .by = c(Spec, Decile)
     ) |>
@@ -1295,7 +1510,7 @@ ent_table_length <- function(.sweep) {
 }
 
 
-# 7. Reading ---------------------------------------------------------------------------------------------------------
+# 7. Reading blocks ------------------------------------------------------------------------------------------------------
 
 #' Every party a few documents name, in order, with its assigned role
 #'
@@ -1357,103 +1572,7 @@ ent_read_merged <- function(.roles, .n = 8L) {
 }
 
 
-#' A few whole contracts, exactly as the file holds them
-#'
-#' THE BLOCK A READER OF THE FILE ACTUALLY NEEDS. Everything else in this document describes the
-#' release; this shows it. Every row of a handful of documents, in the released columns and the
-#' released order, so a reader meeting parties_org.parquet has already seen what one contract looks
-#' like inside it.
-#'
-#' ONE DRAWN DOCUMENT IS ALWAYS A SENTINEL, where the sample holds any. The 116 contracts in which
-#' nothing was found are the rows most likely to be mishandled downstream and the least likely to
-#' turn up in a random draw, so one is included deliberately rather than left to chance.
-#'
-#' A SHORT INDEX IS ADDED, and it is not a released column. DocID is forty-four characters and would
-#' take a fifth of the console width on every row, which is what the reporting convention warns
-#' about: decompose the long identifier and report it once underneath. Doc is what links the two
-#' tables the reporter prints.
-#'
-#' @param .tab Tibble from ent_release_parties().
-#' @param .n Integer. Documents drawn, the sentinel among them.
-#' @param .seed Integer. Sampling seed.
-#' @return Tibble: every released row of the drawn documents, with Doc added for display.
-ent_release_sample <- function(.tab, .n = 4L, .seed = 42L) {
-  if (FALSE) {
-    .tab  <- tab_release
-    .n    <- 4L
-    .seed <- 42L
-  }
-
-  none_ <- unique(.tab$DocID[.tab$PartyRole == "none"])
-  some_ <- setdiff(unique(.tab$DocID), none_)
-
-  pick_none_ <- if (length(none_) > 0L) {
-    withr::with_seed(.seed, sample(none_, size = 1L))
-  } else {
-    character(0)
-  }
-  n_some_ <- max(.n - length(pick_none_), 0L)
-  pick_some_ <- withr::with_seed(
-    .seed, sample(some_, size = min(n_some_, length(some_)))
-  )
-
-  .tab |>
-    dplyr::filter(.data$DocID %in% c(pick_some_, pick_none_)) |>
-    dplyr::arrange(.data$DocID, .data$PartyStart) |>
-    dplyr::mutate(Doc = dplyr::dense_rank(.data$DocID), .before = 1L)
-}
-
-
-#' What every column of the released file means
-#'
-#' A TABLE RATHER THAN PROSE, AND CHECKED AGAINST THE FILE. A dictionary written as text drifts from
-#' the thing it documents and nothing notices; built here and compared to names(), a column added or
-#' renamed without a matching entry aborts the render instead of quietly disagreeing with its own
-#' documentation. That is the discipline 04A applies to its own store description.
-#'
-#' @param .tab Tibble from ent_release_parties().
-#' @return Tibble: Column, Meaning, OnSentinel.
-ent_dictionary_parties <- function(.tab) {
-  if (FALSE) .tab <- tab_release
-
-  dict_ <- tibble::tribble(
-    ~Column,       ~Meaning,                                                        ~OnSentinel,
-    "DocID",       "the contract; joins to the register and every other 04 file",   "present",
-    "Class",       "contract type, from 03A's label spine",                         "present",
-    "AmendType",   "original or amended, from the same spine",                      "present",
-    "PartyName",   "the party's name, as the member that named it wrote it",        "null",
-    "PartyKey",    "the reduced key, matching the same party across contracts",     "null",
-    "PartyRole",   "registrant, counterparty, signatory, other, or none",           "none",
-    "Matched",     "did this party's key agree with the EDGAR filer name",          "FALSE",
-    "PartyStart",  "offset of its earliest mention, into 04A's canonical text",     "null",
-    "PartyStop",   "offset of the end of that mention",                             "null",
-    "NameFrom",    "matched member, or most mentioned -- which spelling named it",  "null",
-    "NVariants",   "how many spellings the grouping merged into this party",        "null",
-    "NMentions",   "how often the contract names it, across every spelling",        "null"
-  )
-
-  # The two failure directions are named separately because they mean different things: a column in
-  # the file with no entry is undocumented output, and an entry with no column is a dictionary
-  # describing something that no longer exists.
-  undoc_  <- setdiff(names(.tab), dict_$Column)
-  unseen_ <- setdiff(dict_$Column, names(.tab))
-  say_    <- function(.x) if (length(.x) == 0L) "none" else paste(.x, collapse = ", ")
-
-  if (length(undoc_) > 0L || length(unseen_) > 0L) {
-    cli::cli_abort(c(
-      "The dictionary and the released file disagree.",
-      "x" = "In the file and undocumented: {say_(undoc_)}.",
-      "x" = "Documented and not in the file: {say_(unseen_)}.",
-      "i" = "A dictionary that can drift from its file documents nothing."
-    ))
-  }
-
-  dict_[match(names(.tab), dict_$Column), ]
-}
-
-
-
-# 8. Report ----------------------------------------------------------------------------------------------------------
+# 8. Report --------------------------------------------------------------------------------------------------------------
 
 #' How many documents carry a usable anchor key at all
 #' @param .tab Tibble from ent_anchor_keys().
@@ -1596,31 +1715,148 @@ ent_report_where <- function(.tab) {
 }
 
 
-#' The rule against the naive count
+#' The naive ladder, reported
 #' @param .tab Tibble from ent_table_naive().
 #' @return Invisibly .tab.
 ent_report_naive <- function(.tab) {
   if (FALSE) .tab <- tab_naive
 
-  cli::cli_h2("The rule against the naive count")
+  cli::cli_h2("The rule against the naive ladder")
   .tab |>
     dplyr::mutate(
-      dplyr::across(c(MeanNaive, MeanCount, MeanRemove), \(.x) tbl_num(.x)),
+      dplyr::across(dplyr::starts_with("Mean"), \(.x) tbl_num(.x)),
       dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x))
     ) |>
-    tbl_say(.title = "Counterparties against the naive count, by contract type")
+    tbl_say(.title = "Four counts of the same contracts, by contract type")
 
   cli::cli_alert_info(
-    "NAIVE is every unique party the contract names anywhere, less one for the registrant -- what a \\
-     reader gets without a rule. COUNT is what the window kept. PctRemove is the share of the naive \\
-     total the rule discarded: too low and the rule is doing nothing, too high and it is cutting \\
-     parties rather than noise. PctZero is the documents left with no counterparty at all, and it \\
-     should be read against the contract type rather than on its own -- an employment agreement's \\
-     counterparty is a PERSON, which no organisation extractor can find. PctAny is the coverage \\
-     figure: at least one party besides the registrant found ANYWHERE, whether the window kept it \\
-     or not, and it is the honest answer to how much of the sample this rule reaches."
+    "EACH COLUMN ASSUMES ONE MORE THING THE RULE CAN DO. MeanSpells is every distinct spelling the \\
+     extractor proposed. MeanParties is what the grouping merged them into, and PctGrouped is the \\
+     share of spellings that merged. MeanNaive is parties less one for the registrant -- what a \\
+     reader gets who can identify the filer and nothing else. MeanCount is what the window kept, and \\
+     PctRemove is the share of the naive count it discarded."
+  )
+  cli::cli_alert_info(
+    "PctZero is the documents left with no counterparty at all, and it should be read against the \\
+     contract type rather than on its own -- an employment agreement's counterparty is a PERSON, \\
+     which no organisation extractor can find. PctAny is at least one party besides the registrant \\
+     found ANYWHERE, whether the window kept it or not, and it is the honest answer to how much of \\
+     the sample this rule reaches."
+  )
+  cli::cli_alert_info(
+    "EVERY COLUMN IS A GROUP-BY OVER THE RELEASED FILE. A reader who rejects the grouping takes \\
+     MeanSpells, one who rejects the window takes MeanNaive, and neither has to re-run anything."
   )
   invisible(.tab)
+}
+
+
+#' What the released file holds, by role
+#' @param .tab Tibble from ent_release_mentions().
+#' @param .party Tibble from ent_party_facts().
+#' @return Invisibly the summary.
+ent_report_release <- function(.tab, .party) {
+  if (FALSE) {
+    .tab   <- tab_release
+    .party <- tab_party_facts
+  }
+
+  cli::cli_h2("The released file")
+
+  out_ <- .tab |>
+    dplyr::summarise(Mentions = dplyr::n(), Docs = dplyr::n_distinct(.data$DocID), .by = PartyRole) |>
+    dplyr::left_join(
+      dplyr::summarise(.party, Parties = dplyr::n(), .by = PartyRole),
+      by = dplyr::join_by(PartyRole)
+    ) |>
+    dplyr::mutate(
+      Parties  = as.integer(dplyr::coalesce(.data$Parties, 0L)),
+      # A FLOOR IN THE DENOMINATOR IS NOT A ZERO GUARD HERE. The sentinel role has no parties at
+      # all, so pmax(Parties, 1) turned 116 mentions into a PerParty of 116 -- a number with no
+      # referent, printed with three decimals as though it meant something. NaN suppressed to a dash
+      # says the quantity does not exist for that row, which is the truth.
+      PerParty = dplyr::if_else(.data$Parties > 0L,
+                                .data$Mentions / .data$Parties, NA_real_),
+      Share    = tbl_pct(.data$Mentions / sum(.data$Mentions))
+    ) |>
+    dplyr::arrange(plot_factor(.data$PartyRole, .key = "PartyRole"))
+
+  out_ |>
+    dplyr::mutate(
+      PerParty = dplyr::if_else(is.finite(.data$PerParty), tbl_num(.data$PerParty), "-"),
+      dplyr::across(c(Mentions, Docs, Parties), \(.x) format(.x, big.mark = ","))
+    ) |>
+    tbl_say(.title = "One row per contract per party per mention, by role")
+
+  cli::cli_alert_info(
+    "PerParty IS WHY THIS FILE IS AT MENTION GRAIN. A party named once is reachable from one \\
+     position and a party named five times from five, and 04B2 attaches a place to whichever \\
+     mention sits nearest before it. A party-grain file carries the first mention only."
+  )
+  cli::cli_alert_info(
+    "OTHER IS THE LARGEST ROLE AND THAT IS THE DESIGN. Those are the parties the window excluded, \\
+     kept in the file so a reader can recompute the naive count or re-cut the window from the \\
+     release rather than from this render. They are the control group, not discarded data."
+  )
+  cli::cli_alert_info(
+    "NONE is the sentinel: a contract in which lexnlp proposed no organisation at all still gets one \\
+     row, so n_distinct(DocID) over this file is the whole sample. Without it every mean computed \\
+     downstream would divide by the documents that worked, and nothing would say so."
+  )
+  invisible(out_)
+}
+
+
+#' The rule in one table
+#'
+#' OVERVIEW REARRANGES WHAT IS ESTABLISHED; IT DOES NOT REPEAT IT. Every number the rule produced, in
+#' one place, each already argued above.
+#'
+#' @param .doc Tibble from ent_doc_facts().
+#' @param .release Tibble from ent_release_mentions().
+#' @return Invisibly the table.
+ent_report_headline <- function(.doc, .release) {
+  if (FALSE) {
+    .doc     <- tab_doc
+    .release <- tab_release
+  }
+
+  cli::cli_h2("The rule in one table")
+
+  matched_ <- .doc$Status == "matched"
+
+  out_ <- tibble::tribble(
+    ~Item,                                        ~Value,
+    "Contracts",                                  format(nrow(.doc), big.mark = ","),
+    "Parties found",                              format(sum(.doc$NParties), big.mark = ","),
+    "Mentions of them",                           format(sum(!is.na(.release$MentionStart)),
+                                                          big.mark = ","),
+    "Registrant matched to EDGAR",                tbl_pct(mean(matched_)),
+    "Of those, word for word",                    tbl_pct_safe(
+                                                    sum(.doc$IsExact) / pmax(sum(matched_), 1L)
+                                                  ),
+    "Registrant taken as the first party named",  tbl_pct(mean(.doc$Status == "first")),
+    "No organisation found at all",               tbl_pct(mean(.doc$Status == "no entity")),
+    "At least one party besides the registrant",  tbl_pct(mean(.doc$HasAnyParty)),
+    "Spellings per contract",                     tbl_num(mean(.doc$NaiveSpans)),
+    "Parties per contract, after grouping",       tbl_num(mean(.doc$NaiveParties)),
+    "Naive counterparties per contract",          tbl_num(mean(.doc$NaiveCounter)),
+    "Of those, the filer's own co-registrants",   tbl_num(mean(.doc$NCoFiler)),
+    "Counterparties per contract, this rule",     tbl_num(mean(.doc$NCounter)),
+    "Share of the naive count removed",           tbl_pct(sum(.doc$NRemoved) /
+                                                            pmax(sum(.doc$NaiveCounter), 1L)),
+    "Signatories per contract, counted apart",    tbl_num(mean(.doc$NTailNew)),
+    "Rows in the released file",                  format(nrow(.release), big.mark = ",")
+  )
+
+  tbl_say(.tab = out_, .title = "Everything this document decided")
+
+  cli::cli_alert_info(
+    "THE FOUR COUNT ROWS ARE THE WHOLE RESULT, and they are a ladder rather than a comparison: \\
+     spellings, then parties, then parties less the registrant, then what the window kept. Every \\
+     other row says how far that answer can be trusted."
+  )
+  invisible(out_)
 }
 
 
@@ -1744,13 +1980,13 @@ ent_report_terms <- function(.tab, .n = 25L) {
 
 #' Every party of a few documents, read in order
 #' @param .tab Tibble from ent_read_entities().
-#' @param .counts Tibble from ent_counts().
+#' @param .doc Tibble from ent_doc_facts().
 #' @param .title Character. Table title.
 #' @return Invisibly .tab.
-ent_report_entities <- function(.tab, .counts, .title = "Whole documents, read in order") {
+ent_report_entities <- function(.tab, .doc, .title = "Whole documents, read in order") {
   if (FALSE) {
     .tab    <- tab_read
-    .counts <- tab_counts
+    .doc    <- tab_doc
     .title  <- "Whole documents, read in order"
   }
 
@@ -1762,9 +1998,12 @@ ent_report_entities <- function(.tab, .counts, .title = "Whole documents, read i
   cli::cli_h2(.title)
 
   .tab |>
-    dplyr::left_join(dplyr::select(.counts, DocID, NNaive, NCounter), by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(
+      dplyr::select(.doc, DocID, NaiveCounter, NCoFiler, NCounter),
+      by = dplyr::join_by(DocID)
+    ) |>
     dplyr::select("DocID", "CompanyName", "PartyName", "Role", "MergeKind", "NKeys", "Start",
-                  "NNaive", "NCounter") |>
+                  "NaiveCounter", "NCoFiler", "NCounter") |>
     tbl_say(.title = "CompanyName is what EDGAR records; PartyName is what the contract wrote")
 
   cli::cli_alert_info(
@@ -1801,80 +2040,6 @@ ent_report_merged <- function(.tab) {
 }
 
 
-#' The rule in one table
-#'
-#' OVERVIEW REARRANGES WHAT IS ESTABLISHED; IT DOES NOT REPEAT IT. An earlier version called every
-#' report function again here, which printed eleven tables twice and made the rendered document
-#' impossible to navigate -- a reader scrolling could not tell which half they were in. This is the
-#' answer instead: every number the rule produced, in one place, each already argued above.
-#'
-#' @param .counts Tibble from ent_counts().
-#' @param .release Tibble from ent_release_parties().
-#' @return Invisibly the table.
-ent_report_headline <- function(.counts, .release) {
-  if (FALSE) {
-    .counts  <- tab_counts
-    .release <- tab_release
-  }
-
-  cli::cli_h2("The rule in one table")
-
-  out_ <- tibble::tribble(
-    ~Item,                                        ~Value,
-    "Contracts",                                  format(nrow(.counts), big.mark = ","),
-    "Parties found",                              format(sum(.counts$NParties), big.mark = ","),
-    "Registrant matched to EDGAR",                tbl_pct(mean(.counts$Status == "matched")),
-    "Registrant taken as the first party named",  tbl_pct(mean(.counts$Status == "first")),
-    "No organisation found at all",               tbl_pct(mean(.counts$Status == "no entity")),
-    "At least one party besides the registrant",  tbl_pct(mean(.counts$HasAnyParty)),
-    "Naive counterparties per contract",          tbl_num(mean(.counts$NNaive)),
-    "Counterparties per contract, this rule",     tbl_num(mean(.counts$NCounter)),
-    "Share of the naive count removed",           tbl_pct(sum(.counts$NRemoved) /
-                                                            pmax(sum(.counts$NNaive), 1L)),
-    "Signatories per contract, counted apart",    tbl_num(mean(.counts$NTailNew)),
-    "Rows in the released file",                  format(nrow(.release), big.mark = ",")
-  )
-
-  tbl_say(.tab = out_, .title = "Everything this document decided")
-
-  cli::cli_alert_info(
-    "The two counterparty rows are the whole result: a reader counting every party a contract names \\
-     and subtracting the registrant gets the first, and this rule gives the second. Every other row \\
-     says how far that answer can be trusted."
-  )
-  invisible(out_)
-}
-
-
-#' What the released file holds, by role
-#' @param .tab Tibble from ent_release_parties().
-#' @return Invisibly the summary.
-ent_report_release <- function(.tab) {
-  if (FALSE) .tab <- tab_release
-
-  cli::cli_h2("The released file")
-
-  out_ <- .tab |>
-    dplyr::summarise(Rows = dplyr::n(), Docs = dplyr::n_distinct(.data$DocID), .by = PartyRole) |>
-    dplyr::mutate(Share = tbl_pct(.data$Rows / sum(.data$Rows))) |>
-    dplyr::arrange(plot_factor(.data$PartyRole, .key = "PartyRole"))
-
-  tbl_say(.tab = out_, .title = "One row per contract per party, by role")
-
-  cli::cli_alert_info(
-    "OTHER IS THE LARGEST ROLE AND THAT IS THE DESIGN. Those are the parties the window excluded, \\
-     kept in the file so a reader can recompute the naive count or re-cut the window from the \\
-     release rather than from this render. They are the control group, not discarded data."
-  )
-  cli::cli_alert_info(
-    "NONE is the sentinel: a contract in which lexnlp proposed no organisation at all still gets one \\
-     row, so n_distinct(DocID) over this file is the whole sample. Without it every mean computed \\
-     downstream would divide by the documents that worked, and nothing would say so."
-  )
-  invisible(out_)
-}
-
-
 #' A few whole contracts, printed as the file holds them
 #'
 #' TWO TABLES, AND THE FIRST IS WHY. What EDGAR recorded is not a column of the released file -- it
@@ -1895,21 +2060,32 @@ ent_report_release_sample <- function(.tab, .keys) {
 
   cli::cli_h2("The released file, read")
 
+  # CLASS AND AMENDTYPE ARE JOINED, NOT READ OFF THE FILE. They are contract facts from 03A's label
+  # spine rather than results of this rule, so the release does not repeat them across nineteen
+  # mention rows per document. The join is the whole cost of having dropped them.
   .tab |>
-    dplyr::distinct(.data$Doc, .data$DocID, .data$Class, .data$AmendType) |>
-    dplyr::left_join(dplyr::select(.keys, DocID, CompanyName), by = dplyr::join_by(DocID)) |>
+    dplyr::distinct(.data$Doc, .data$DocID) |>
+    dplyr::left_join(
+      dplyr::select(.keys, DocID, CompanyName, dplyr::any_of(c("Class", "AmendType"))),
+      by = dplyr::join_by(DocID)
+    ) |>
     tbl_say(.title = "The drawn contracts, and what EDGAR records as the filer")
 
   .tab |>
-    dplyr::select("Doc", "PartyName", "PartyKey", "PartyRole", "Matched", "PartyStart",
-                  "PartyStop", "NameFrom", "NVariants", "NMentions") |>
-    tbl_say(.title = "Every party of those contracts, as the file holds them")
+    dplyr::select("Doc", "PartyName", "PartyKey", "PartyRole", "MatchKind", "SpanKey", "SpanText",
+                  "MentionStart", "MentionStop", "IsFirst") |>
+    tbl_say(.title = "Every mention of every party of those contracts, as the file holds them")
 
   cli::cli_alert_info(
-    "READ THE TWO TOGETHER. Matched says whether a party agreed with the CompanyName above, so a \\
-     registrant marked FALSE is the fallback: nothing in that contract resembled the EDGAR name and \\
-     the first party found was taken. Doc links the tables; DocID, Class and AmendType are on every \\
-     row of the file and are reported once here because they do not vary within a contract."
+    "READ THE TWO TOGETHER. MatchKind says how a party agreed with the CompanyName above -- exact, \\
+     prefix, or fallback where nothing in the contract resembled the EDGAR name and the first party \\
+     found was taken. Doc links the tables; DocID is on every row of the file and is reported once \\
+     here because it does not vary within a contract."
+  )
+  cli::cli_alert_info(
+    "ONE PARTY OCCUPIES SEVERAL ROWS, and that is the grain. PartyName and PartyRole repeat across \\
+     them while SpanKey, SpanText and the offsets vary -- so a count of these rows is a count of \\
+     MENTIONS, and n_distinct(PartyKey) is the count of parties."
   )
   cli::cli_alert_info(
     "ONE OF THESE DOCUMENTS IS A SENTINEL, drawn deliberately: it carries the role none and a null \\
@@ -1921,45 +2097,8 @@ ent_report_release_sample <- function(.tab, .keys) {
 }
 
 
-#' What the mention index holds
-#' @param .tab Tibble from ent_mentions().
-#' @param .release Tibble from ent_release_parties().
-#' @return Invisibly the summary.
-ent_report_mentions <- function(.tab, .release) {
-  if (FALSE) {
-    .tab     <- tab_mentions
-    .release <- tab_release
-  }
-
-  cli::cli_h2("The mention index")
-
-  party_ <- dplyr::filter(.release, .data$PartyRole != "none")
-  out_ <- tibble::tibble(
-    Item = c("Parties in the release",
-             "Mentions of them",
-             "Parties named more than once",
-             "Mentions that are not the first"),
-    N    = c(nrow(party_),
-             nrow(.tab),
-             sum(dplyr::count(.tab, .data$DocID, .data$PartyKey)$n > 1L),
-             sum(!.tab$IsFirst))
-  ) |>
-    dplyr::mutate(Share = tbl_pct(.data$N / pmax(nrow(.tab), 1L)))
-
-  tbl_say(.tab = out_, .title = "One row per mention, four columns")
-
-  cli::cli_alert_info(
-    "THE RELEASE KNOWS WHERE A PARTY WAS FIRST NAMED; THIS KNOWS WHERE IT WAS NAMED AT ALL. The last \\
-     row is the whole reason the index exists: those are the occurrences a rule measuring context \\
-     could not previously reach, and a signature block -- where a party is named WITH an address -- \\
-     is almost always among them. Filtering to IsFirst reproduces the old behaviour exactly."
-  )
-  invisible(out_)
-}
-
-
 #' The column dictionary
-#' @param .tab Tibble from ent_dictionary_parties().
+#' @param .tab Tibble from ent_dictionary_mentions().
 #' @return Invisibly .tab.
 ent_report_dictionary <- function(.tab) {
   if (FALSE) .tab <- tab_dict
@@ -1977,7 +2116,7 @@ ent_report_dictionary <- function(.tab) {
 }
 
 
-# 9. Figures ---------------------------------------------------------------------------------------------------------
+# 9. Figures -------------------------------------------------------------------------------------------------------------
 
 #' Where organisation spans sit in the document, weighted two ways
 #'
@@ -2031,7 +2170,7 @@ ent_plot_naive <- function(.tab) {
 #' Adding a y scale here would put a continuous scale on the contract types. It also computes the
 #' share itself through .share, so raw counts go in.
 #'
-#' @param .tab Tibble from ent_counts().
+#' @param .tab Tibble from ent_doc_facts().
 #' @return A ggplot.
 ent_plot_status <- function(.tab) {
   if (FALSE) .tab <- tab_counts
@@ -2076,10 +2215,13 @@ ent_plot_tail <- function(.tab) {
 
 
 #' How many keys each party stood for
-#' @param .tab Tibble from ent_window().
+#'
+#' READS THE PARTY COLLAPSE, so the figure describes the released file rather than an intermediate.
+#'
+#' @param .tab Tibble from ent_party_facts().
 #' @return A ggplot.
 ent_plot_group <- function(.tab) {
-  if (FALSE) .tab <- tab_roles
+  if (FALSE) .tab <- tab_party_facts
 
   .tab |>
     dplyr::summarise(N = dplyr::n(), .by = MergeKind) |>
@@ -2089,7 +2231,7 @@ ent_plot_group <- function(.tab) {
       .val      = "Share",
       .key      = "MergeKind",
       .short    = TRUE,
-      .pct      = TRUE,   # the helper owns the value scale; .pct makes it a percent axis
+      .pct      = TRUE,
       .accuracy = 1
     ) +
     ggplot2::labs(x = "Share of all parties found, registrant included")

@@ -1,66 +1,39 @@
-# 04B5-Rules-REDACT: what was withheld -----------------------------------------------------------------------------------
+# 04B5-Rules-REDACT: what a contract withheld ----------------------------------------------------------------------------
 #
 # WHAT THIS FILE DOES
-# Counts redaction markers by kind and asks what each one replaced. Function prefix is `red_`.
+# redaction.py marks six kinds of place where text was removed. This file counts them, and it applies
+# no filter at all -- there is nothing to choose, only a taxonomy and arithmetic.
 #
-# SIX KINDS, ONE COLUMN EACH, AND THAT IS THE WHOLE RULE
-# redaction.py emits a class on every span and this releases all six of them separately:
+# ONE FILE COMES OUT AND IT IS LONG
+# redact_spans.parquet is one row per marker. Every count the previous release stored -- six per
+# class, three totals, two ratios -- is a group-by over it, so a reader who wants a different
+# definition writes a predicate instead of taking one.
 #
-#   RedactExplicit  a bracket naming confidential treatment -- CONFIDENTIAL, REDACT, CTR
-#   RedactSymbol    a bracket holding only whitespace and asterisks -- [***], [ * * * ], [*]
-#   RedactBlank     a bracket holding only whitespace and underscores -- [___], [__]
-#   OmitExplicit    a bracket recording deletion -- INTENTIONALLY, OMITTED, DELETE
-#   OmitSymbol      a bracket holding only bullets or ellipses, or three dots
-#   RedactBare      an unbracketed run of three or more asterisks
+# THE THREE CANDIDATE DEFINITIONS ARE THREE PREDICATES
+#   NBracketed  Bracketed          the PUBLISHED definition: 06-Redactions.R matched bracketed text
+#   NWithheld   Withheld           redaction rather than omission
+#   NRedact     every row          everything the extractor marked
+# Bracketed and Withheld are stored rather than derived, and that is deliberate. They are not
+# measurements, they are the definitions themselves -- membership in a five-of-six and a four-of-six
+# list -- and a reader should not have to reconstruct either from prose to reproduce a published
+# figure.
 #
-# THE VERSION THIS REPLACES THREW FIVE OF THEM AWAY. It tested whether LabelRaw contained "BARE" and
-# called everything else "bracketed", so the four published classes and the one addition arrived as a
-# single bucket. Releasing the classes separately costs four columns and makes every question below a
-# filter rather than a decision taken here.
+# THE MARKER IS MATCHED TO WHAT IT REPLACED, AND MONEY IS THE FIRST CASE
+# moneyregex emits a currency with the number removed -- $[***], $** -- and redaction.py marks the
+# bracket inside it. The same redaction is therefore in two files, described from two sides: one
+# knows a PRICE was withheld, the other knows a MARKER is there. Overlapping their offsets gives each
+# marker a RedactedEntity, and NRedactMoney is the count of prices a contract withheld.
 #
-# THE PUBLISHED METHOD IS BRACKETS ONLY, and that is not an inference. 06-Redactions.R extracted
-# \\[.+?\\] from uppercased, whitespace-collapsed text and joined a curated indicator list: no
-# unbracketed pattern could reach it. So NBracketed -- the five bracketed classes summed -- is the
-# quantity Table 3 was built on, and it is released as its own column so the published figure is
-# reproducible from this file rather than only from the old code.
+# MEASURED BEFORE IT WAS BUILT. The offsets overlap rather than abut: $[***] puts the marker five
+# characters inside the money span, and the observed gaps run from -9 to +6 with nothing beyond. So
+# the test is interval overlap with a small tolerance, and the tolerance is a specification dial
+# rather than a constant.
 #
-# REDACT IS NOT OMIT, and pooling them counts absent text as withheld text. "[INTENTIONALLY OMITTED]"
-# is a placeholder where a schedule was left out; "[***]" is confidential treatment. Both are gaps in
-# a contract and only one is a redaction, so they get separate columns and a reader chooses.
-#
-# ONE FILING CARRIES 14,689 BARE MARKERS
-# 24% of every redaction span in the sample, from a single document. Nothing here removes it: it is a
-# real count of a real document and the by-kind columns make it visible without a rule -- its markers
-# are entirely RedactBare, so any measure built on the bracketed classes never sees it.
-#
-# WHAT IT COST WHEN THE KINDS WERE POOLED is the reason the class contrast is computed FOUR WAYS,
-# span-weighted and document-weighted, with bare markers and without. Employment: Compensation once
-# showed a positional contrast of 13.29 against 1 to 5 everywhere else, and that was one filing. A
-# finding surviving all four cells is a finding; one appearing only in the span-weighted pooled cell
-# is a flood document.
-#
-# THE RATIO IS THE COMPARABLE QUANTITY
-# Contracts run from roughly 4,200 to 17,400 words by class, so a count of markers is partly a count
-# of words. Markers per thousand words is what makes a class or industry comparison mean anything,
-# and it is what referee 2 asked for when they wanted redaction intensity by firm-quarter.
-#
-# THE DENOMINATOR COMES FROM THE REGISTER, AND THIS DOCUMENT OPENS NOTHING
-# 02B carries nWords for all 1,771,923 documents. Counting \\S+ over the canonical text works on 4,398
-# and cannot work on 1.19 million, because 04C writes no corpus text file. The recount is available as
-# an agreement check on the sample and is skipped entirely when no text path is given, which is what
-# the corpus run does.
-#
-# WITH 04B2, 04B3 AND 04B4 ALREADY MOVED TO STORED CUE COLUMNS, no rule in the 04B family needs a
-# document. 04D's Cues dial has nothing left to gate.
-#
-# WHAT A MARKER REPLACED
-# A marker beside a currency symbol hid an amount; beside an organisation, a party name. That is a
-# proximity question of exactly the kind 04B2 answers, and it is the only thing here that goes beyond
-# counting. It is reported and NOT released, because 82% of markers had no labelled entity within
-# forty characters and a variable missing four times in five is a diagnostic rather than a measure.
-#
-# ONE FILE, ONE ROW PER CONTRACT
-# What a contract withheld belongs to the contract and to no party in it.
+# AND THE MATCH IS A VALIDATION RESULT. On the withheld prices -- where a second extractor
+# independently establishes that something WAS removed -- roughly half the markers are RedactBare,
+# which is the one class no bracketed measure sees. That is a sharper statement of the bare-marker
+# problem than a single pathological filing, because the population is one where the redaction is not
+# in doubt.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
@@ -145,7 +118,7 @@ red_load <- function(.dir_store, .lens, .family = "matcon", .quiet = FALSE) {
     cli::cli_abort(c(
       "redaction.py emits {length(bad_)} class{?es} the vocabulary does not name: \\
        {paste(bad_, collapse = ', ')}.",
-      "i" = "Register {?it/them} in RedactKind, and add {?a column/columns} to red_release()."
+      "i" = "Register {?it/them} in RedactKind; red_collapse() then gives {?it/them} a column."
     ))
   }
   out_
@@ -225,76 +198,325 @@ red_words <- function(.keys, .path_text = NULL, .quiet = FALSE) {
 }
 
 
-# 3. The variables -------------------------------------------------------------------------------------------------------
+# 3. The specification ---------------------------------------------------------------------------------------------------
 
-#' The release: one row per contract, one column per marker class
+#' Build one redaction specification
 #'
-#' SIX COUNTS AND THREE TOTALS, so every candidate definition is a column rather than a decision taken
-#' here. NBracketed is the published one -- 06-Redactions.R matched bracketed text and joined a
-#' curated indicator list, so no unbracketed pattern could reach it. NWithheld separates redaction
-#' from omission. NRedact is everything.
+#' ONE DIAL, AND IT IS A TOLERANCE RATHER THAN A REACH. A marker and the withheld money span that
+#' contains it are the SAME redaction seen by two extractors, so the test is interval overlap. The
+#' tolerance exists only for the adjacent form, where moneyregex stopped at the currency symbol and
+#' the marker starts one or two characters later.
 #'
-#' EVERY CONTRACT GETS A ROW, including the ones carrying no marker at all. They carry zeros rather
-#' than missing values, because a contract that withheld nothing withheld nothing -- that is a
-#' measurement and not a gap, and a mean over the file should divide by the sample.
+#' TEN CHARACTERS, AND THE NUMBER IS MEASURED. The observed gaps between a withheld money span and
+#' its nearest marker run from -9 to +6 with nothing beyond, so ten covers the whole cluster and
+#' reaches no further. Swept in Selection rather than asserted here.
 #'
-#' TWO RATIOS AND NOT SIX, because a ratio is a count over a denominator and both are in the file.
-#' The two released are the two candidate headline definitions; anything else is one division.
-#'
-#' @param .marks Tibble from red_load().
-#' @param .words Tibble from red_words().
-#' @param .keys Tibble from ent_anchor_keys().
-#' @return Tibble: one row per contract, sixteen columns.
-red_release <- function(.marks, .words, .keys) {
+#' @param .tol Integer. Characters of slack allowed between a marker and a withheld span that do not
+#'   overlap outright.
+#' @param .label Character or NULL. Overrides the generated label.
+#' @return A named list carrying the specification.
+red_spec <- function(.tol = 10L, .label = NULL) {
   if (FALSE) {
-    .marks <- tab_marks
-    .words <- tab_words
-    .keys  <- tab_keys
+    .tol   <- 10L
+    .label <- NULL
   }
 
-  wide_ <- .marks |>
-    dplyr::count(.data$DocID, .data$Kind) |>
-    tidyr::pivot_wider(names_from = Kind, values_from = n, values_fill = 0L)
+  list(
+    Tol   = as.integer(.tol),
+    Label = .label %||% paste0("overlap +/- ", .tol, " chars")
+  )
+}
 
-  # NAMED EXPLICITLY RATHER THAN BY PREFIX. pivot_wider() emits a column only for a class that
-  # appears somewhere in the data, so a sample holding no OmitSymbol would produce a file with a
-  # different schema from one that does, and nothing would say so. Declaring the six here means an
-  # absent class is a column of zeros rather than an absent column.
-  for (nm_ in setdiff(plot_levels("RedactKind"), names(wide_))) wide_[[nm_]] <- 0L
 
-  .keys |>
-    dplyr::select("DocID", "Class", "AmendType") |>
-    dplyr::left_join(.words, by = dplyr::join_by(DocID)) |>
-    dplyr::left_join(wide_, by = dplyr::join_by(DocID)) |>
+# 4. The release ---------------------------------------------------------------------------------------------------------
+
+#' Match each marker to the entity it replaced
+#'
+#' TWO EXTRACTORS ON ONE REDACTION. moneyregex matches a currency whose number was removed and keeps
+#' the currency; redaction.py matches the bracket and keeps the class. Neither alone says what was
+#' withheld -- the first knows a price is missing, the second knows a marker is there -- and the join
+#' of their offsets says both.
+#'
+#' OVERLAP, NOT PROXIMITY, WITH A TOLERANCE FOR THE ADJACENT FORM. "$[***]" puts the marker inside the
+#' money span; "$ [***]" puts it just after. The first is an interval containment and the second is a
+#' two-character gap, so the test is overlap OR a gap within the specification's tolerance.
+#'
+#' NEAREST WINS WHERE SEVERAL COULD MATCH, by absolute gap then by position, so a marker is claimed by
+#' at most one withheld span and a span by at most one marker.
+#'
+#' EXTENSIBLE BY CONSTRUCTION. RedactedEntity is a column rather than a boolean, so DATE and GPE join
+#' the same way later without a second rule.
+#'
+#' @param .marks Tibble from red_load().
+#' @param .money Tibble from mny_load(), filtered to Withheld.
+#' @param .spec List from red_spec().
+#' @return Tibble: DocID, Start, RedactedEntity, RedactedRef, RedactedText.
+red_match_entity <- function(.marks, .money, .spec) {
+  if (FALSE) {
+    .marks <- tab_marks
+    .money <- dplyr::filter(tab_money, .data$Withheld)
+    .spec  <- .lP$Params$Spec
+  }
+
+  if (nrow(.money) == 0L) {
+    return(tibble::tibble(DocID = character(0), Start = integer(0),
+                          RedactedEntity = character(0), RedactedRef = integer(0),
+                          RedactedText = character(0)))
+  }
+
+  dplyr::inner_join(
+    dplyr::select(.marks, "DocID", "Start", "Stop"),
+    dplyr::transmute(.money, .data$DocID, MStart = .data$Start, MStop = .data$Stop,
+                     MSpan = .data$Span),
+    by = dplyr::join_by(DocID), relationship = "many-to-many"
+  ) |>
     dplyr::mutate(
-      dplyr::across(dplyr::all_of(plot_levels("RedactKind")),
-                    \(.x) as.integer(dplyr::coalesce(.x, 0L)))
+      # OVERLAP IS A TEST ON TWO INTERVALS and not on two points. Half-open spans overlap when each
+      # starts before the other ends, which is what catches "$[***]" where the marker sits wholly
+      # inside the money span.
+      Overlap = .data$Start < .data$MStop & .data$MStart < .data$Stop,
+      Gap     = dplyr::if_else(.data$Start >= .data$MStop, .data$Start - .data$MStop,
+                               .data$MStart - .data$Stop)
     ) |>
+    dplyr::filter(.data$Overlap | .data$Gap <= .spec$Tol) |>
+    dplyr::arrange(.data$DocID, .data$Start, dplyr::desc(.data$Overlap), abs(.data$Gap),
+                   .data$MStart) |>
+    dplyr::slice_head(n = 1L, by = c(DocID, Start)) |>
     dplyr::transmute(
-      .data$DocID, .data$Class, .data$AmendType,
-      NWords          = as.integer(.data$NWords),
-      NRedactExplicit = .data$RedactExplicit,
-      NRedactSymbol   = .data$RedactSymbol,
-      NRedactBlank    = .data$RedactBlank,
-      NOmitExplicit   = .data$OmitExplicit,
-      NOmitSymbol     = .data$OmitSymbol,
-      NRedactBare     = .data$RedactBare,
-      NBracketed      = .data$RedactExplicit + .data$RedactSymbol + .data$RedactBlank +
-                        .data$OmitExplicit + .data$OmitSymbol,
-      NWithheld       = .data$RedactExplicit + .data$RedactSymbol + .data$RedactBlank +
-                        .data$RedactBare,
-      NRedact         = .data$RedactExplicit + .data$RedactSymbol + .data$RedactBlank +
-                        .data$OmitExplicit + .data$OmitSymbol + .data$RedactBare,
-      RedactRatio     = 1000 * .data$NBracketed / pmax(.data$NWords, 1L),
-      RedactRatioAll  = 1000 * .data$NRedact / pmax(.data$NWords, 1L),
-      HasRedact       = .data$NBracketed > 0L,
-      HasBare         = .data$NRedactBare > 0L
+      .data$DocID, .data$Start,
+      RedactedEntity = "money",
+      RedactedRef    = as.integer(.data$MStart),
+      RedactedText   = .data$MSpan
+    )
+}
+
+
+#' The release: one row per marker
+#'
+#' NO FILTER ANYWHERE. Every marker the extractor found is here, with the class it assigned. This is
+#' the one entity in the family with nothing to choose: the rule is a taxonomy, and the three
+#' candidate definitions are three predicates over one column.
+#'
+#' Bracketed AND Withheld ARE STORED RATHER THAN DERIVED, and that is the one deliberate exception to
+#' this family's habit. They are not measurements about a marker; they ARE the published definitions,
+#' membership in a five-of-six and a four-of-six list. A reader reproducing 06-Redactions.R's figure
+#' should filter a column rather than reconstruct a class list from prose.
+#'
+#' @param .marks Tibble from red_load().
+#' @param .entity Tibble from red_match_entity().
+#' @return Tibble: one row per marker.
+red_release_spans <- function(.marks, .entity) {
+  if (FALSE) {
+    .marks  <- tab_marks
+    .entity <- tab_entity
+  }
+
+  .marks |>
+    dplyr::left_join(.entity, by = dplyr::join_by(DocID, Start)) |>
+    dplyr::transmute(
+      .data$DocID,
+      MarkStart  = as.integer(.data$Start),
+      MarkStop   = as.integer(.data$Stop),
+      MarkText   = .data$Span,
+      .data$Kind,
+      Bracketed  = .data$Kind %in% .red_bracketed,
+      Withheld   = .data$Kind %in% .red_withheld,
+      RedactedEntity = dplyr::coalesce(.data$RedactedEntity, "unmatched"),
+      RedactedRef    = .data$RedactedRef,
+      RedactedText   = .data$RedactedText
     ) |>
+    dplyr::arrange(.data$DocID, .data$MarkStart)
+}
+
+
+#' What every column of the marker file means
+#' @param .tab Tibble from red_release_spans().
+#' @return Tibble: Column, Grain, Meaning.
+red_dictionary_spans <- function(.tab) {
+  if (FALSE) .tab <- tab_release
+
+  dict_ <- tibble::tribble(
+    ~Column,          ~Grain,     ~Meaning,
+    "DocID",          "document", "the contract",
+    "MarkStart",      "marker",   "offset of the marker, into 04A's canonical text",
+    "MarkStop",       "marker",   "offset one past its last character",
+    "MarkText",       "marker",   "the surface form, raw: it slices from the two offsets exactly",
+    "Kind",           "marker",   "one of the six classes redaction.py assigns",
+    "Bracketed",      "marker",   "one of the five bracketed classes -- THE PUBLISHED DEFINITION",
+    "Withheld",       "marker",   "redaction rather than omission; a placeholder is not a redaction",
+    "RedactedEntity", "marker",   "what this marker replaced, where another extractor knows",
+    "RedactedRef",    "marker",   "offset of the span that says so; null where nothing matched",
+    "RedactedText",   "marker",   "that span as written, so the match is readable"
+  )
+
+  undoc_  <- setdiff(names(.tab), dict_$Column)
+  unseen_ <- setdiff(dict_$Column, names(.tab))
+  say_    <- function(.x) if (length(.x) == 0L) "none" else paste(.x, collapse = ", ")
+
+  if (length(undoc_) > 0L || length(unseen_) > 0L) {
+    cli::cli_abort(c(
+      "The marker dictionary and the released file disagree.",
+      "x" = "In the file and undocumented: {say_(undoc_)}.",
+      "x" = "Documented and not in the file: {say_(unseen_)}."
+    ))
+  }
+
+  dict_[match(names(.tab), dict_$Column), ]
+}
+
+
+# 5. The collapse --------------------------------------------------------------------------------------------------------
+
+#' One row per contract, from the marker file
+#'
+#' DEFINED HERE AND WRITTEN NOWHERE. Nine counts and two ratios, all group-bys over the released file.
+#' The export calls this; a count stored as data is a count that can disagree with the rows it came
+#' from.
+#'
+#' THE WORD COUNT IS THE DOCUMENT'S AND NOT THE MARKER'S. It comes from the register, so every ratio
+#' below has a denominator that no extractor produced and that a reader can check independently.
+#'
+#' EVERY CONTRACT GETS A ROW, including those carrying no marker at all. They carry zeros rather than
+#' missing values, because a contract that withheld nothing withheld nothing -- a measurement, not a
+#' gap -- and a mean over the file should divide by the sample.
+#'
+#' @param .release Tibble or dataset from red_release_spans().
+#' @param .words Tibble from red_words(). Supplies NWords.
+#' @param .keys Tibble from ent_anchor_keys(). Supplies the population.
+#' @return Tibble: one row per document in .keys.
+red_collapse <- function(.release, .words, .keys) {
+  if (FALSE) {
+    .release <- tab_release
+    .words   <- tab_words
+    .keys    <- tab_keys
+  }
+
+  kinds_ <- plot_levels("RedactKind")
+
+  by_kind_ <- .release |>
+    dplyr::summarise(N = dplyr::n(), .by = c(DocID, Kind)) |>
+    tidyr::pivot_wider(names_from = "Kind", values_from = "N", names_prefix = "N")
+
+  totals_ <- .release |>
+    dplyr::summarise(
+      NBracketed   = sum(.data$Bracketed),
+      NWithheld    = sum(.data$Withheld),
+      NRedact      = dplyr::n(),
+      NRedactMoney = sum(.data$RedactedEntity == "money"),
+      .by = DocID
+    )
+
+  out_ <- .keys |>
+    dplyr::select("DocID") |>
+    dplyr::left_join(dplyr::select(.words, DocID, NWords), by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(by_kind_, by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(totals_,  by = dplyr::join_by(DocID))
+
+  # A CLASS THE SAMPLE NEVER SAW STILL GETS A COLUMN OF ZEROS. pivot_wider makes columns from the
+  # values present, so an absent class would leave the release one column short and the dictionary
+  # would abort -- correctly, and unhelpfully. Naming the columns from the vocabulary makes the shape
+  # a property of the taxonomy rather than of this sample.
+  miss_ <- setdiff(paste0("N", kinds_), names(out_))
+  for (nm_ in miss_) out_[[nm_]] <- 0L
+
+  out_ |>
+    dplyr::mutate(
+      # NAMED EXPLICITLY AND NOT BY PREFIX. starts_with("N") also matches NWords, which is a
+      # denominator from the register rather than a count of markers, and coalescing it to zero would
+      # turn a document with no register row into one of infinite redaction density.
+      dplyr::across(
+        dplyr::any_of(c(paste0("N", kinds_), "NBracketed", "NWithheld", "NRedact",
+                        "NRedactMoney")),
+        \(.x) as.integer(dplyr::coalesce(.x, 0L))
+      ),
+      NWords         = as.integer(.data$NWords),
+      RedactRatio    = 1000 * .data$NBracketed / pmax(.data$NWords, 1L),
+      RedactRatioAll = 1000 * .data$NRedact / pmax(.data$NWords, 1L),
+      HasRedact      = .data$NBracketed > 0L,
+      HasBare        = .data$NRedactBare > 0L
+    ) |>
+    dplyr::select("DocID", "NWords", dplyr::all_of(paste0("N", kinds_)),
+                  "NBracketed", "NWithheld", "NRedact", "NRedactMoney",
+                  "RedactRatio", "RedactRatioAll", "HasRedact", "HasBare") |>
     dplyr::arrange(.data$DocID)
 }
 
 
-# 4. What a marker replaced ------------------------------------------------------------------------------------------
+#' Apply the rule end to end
+#'
+#' ONE ENTRY POINT, AND 04D CALLS EXACTLY THIS. The release comes out; the collapse is returned beside
+#' it because this document reports on it, and the export computes it again from the file.
+#'
+#' @param .marks Tibble from red_load().
+#' @param .money Tibble from mny_load(). Filtered to Withheld inside.
+#' @param .words Tibble from red_words().
+#' @param .keys Tibble from ent_anchor_keys().
+#' @param .spec List from red_spec().
+#' @return A list: Spec, Release, Counts.
+red_apply <- function(.marks, .money, .words, .keys, .spec) {
+  if (FALSE) {
+    .marks <- tab_marks
+    .money <- tab_money
+    .words <- tab_words
+    .keys  <- tab_keys
+    .spec  <- .lP$Params$Spec
+  }
+
+  entity_  <- red_match_entity(
+    .marks = .marks,
+    .money = dplyr::filter(.money, .data$Withheld),
+    .spec  = .spec
+  )
+  release_ <- red_release_spans(.marks = .marks, .entity = entity_)
+
+  list(
+    Spec    = .spec,
+    Release = release_,
+    Counts  = red_collapse(.release = release_, .words = .words, .keys = .keys)
+  )
+}
+
+
+# 6. What the markers replaced -------------------------------------------------------------------------------------------
+
+#' Withheld prices matched to a marker, and the class of the marker that matched
+#'
+#' THE VALIDATION RESULT THIS DOCUMENT EXISTS TO PRODUCE. A withheld money span is independent
+#' evidence that something WAS redacted -- moneyregex found a currency with the number removed -- so
+#' the markers sitting on those spans are a population where the redaction is not in doubt. What
+#' share of them a bracketed measure would see is then a statement about the published definition
+#' rather than about one unusual filing.
+#'
+#' @param .release Tibble from red_release_spans().
+#' @param .money Tibble from mny_load(), unfiltered.
+#' @return Tibble: one row per marker kind, plus the unmatched prices.
+red_table_money <- function(.release, .money) {
+  if (FALSE) {
+    .release <- tab_release
+    .money   <- tab_money
+  }
+
+  held_ <- sum(.money$Withheld)
+  hit_  <- dplyr::filter(.release, .data$RedactedEntity == "money")
+
+  body_ <- hit_ |>
+    dplyr::summarise(Markers = dplyr::n(), .by = c(Kind, Bracketed)) |>
+    dplyr::mutate(PctMatched = .data$Markers / pmax(nrow(hit_), 1L)) |>
+    dplyr::arrange(plot_factor(.data$Kind, .key = "RedactKind"))
+
+  dplyr::bind_rows(
+    body_,
+    tibble::tibble(
+      Kind       = "no marker found",
+      Bracketed  = NA,
+      Markers    = held_ - nrow(hit_),
+      PctMatched = NA_real_
+    )
+  )
+}
+
+
+# 7. Tables --------------------------------------------------------------------------------------------------------------
 
 #' The nearest labelled entity to each marker
 #'
@@ -357,11 +579,9 @@ red_neighbour <- function(.marks, .dir_store, .lens, .labels = c("MONEY", "GPE",
 }
 
 
-# 5. Evidence ------------------------------------------------------------------------------------------------------------
-
 #' What each class contributes, and to how many documents
 #' @param .marks Tibble from red_load().
-#' @param .release Tibble from red_release().
+#' @param .release Tibble from red_collapse().
 #' @return Tibble: one row per class, and one for every marker.
 red_table_kind <- function(.marks, .release) {
   if (FALSE) {
@@ -395,7 +615,7 @@ red_table_kind <- function(.marks, .release) {
 #' this sample holds one carrying 14,689 bare markers.
 #'
 #' @param .marks Tibble from red_load().
-#' @param .release Tibble from red_release().
+#' @param .release Tibble from red_collapse().
 #' @return Tibble: one row per class and weighting.
 red_contrast <- function(.marks, .release) {
   if (FALSE) {
@@ -430,7 +650,7 @@ red_contrast <- function(.marks, .release) {
 
 
 #' Redaction intensity by contract type
-#' @param .release Tibble from red_release().
+#' @param .release Tibble from red_collapse().
 #' @return Tibble: one row per type, and one for the sample.
 red_table_class <- function(.release) {
   if (FALSE) .release <- tab_release
@@ -455,8 +675,6 @@ red_table_class <- function(.release) {
 }
 
 
-# 6. Reading ---------------------------------------------------------------------------------------------------------
-
 #' Real markers of every class, as the extractor found them
 #'
 #' THE BLOCK THAT DECIDES WHICH CLASSES A HEADLINE VARIABLE SHOULD USE. Six classes are six claims
@@ -470,27 +688,36 @@ red_table_class <- function(.release) {
 #' @param .marks Tibble from red_load(), after red_neighbour().
 #' @param .n Integer. Distinct spans drawn per class.
 #' @param .seed Integer. Sampling seed.
-#' @return Tibble: Kind, Span, Near, and how often that exact span occurs.
-red_read_kinds <- function(.marks, .n = 4L, .seed = 42L) {
+#' @return Tibble: Kind, Span, PctMoney, and how often that exact span occurs.
+red_read_kinds <- function(.release, .n = 4L, .seed = 42L) {
   if (FALSE) {
-    .marks <- tab_near
-    .n     <- 4L
-    .seed  <- 42L
+    .release <- tab_release
+    .n       <- 4L
+    .seed    <- 42L
   }
 
   # COLLAPSED WHITESPACE FOR DISPLAY ONLY. A marker written "[ * * * ]" is the same drafting act as
-  # "[***]" and printing both wastes a row; the STORE keeps the raw span, and the offsets index it.
-  src_ <- .marks |>
+  # "[***]" and printing both wastes a row; the FILE keeps the raw span, and the offsets index it.
+  src_ <- .release |>
     dplyr::mutate(
-      Shown = stringi::stri_replace_all_regex(dplyr::coalesce(.data$Span, ""), "\\s+", " ")
+      Shown = stringi::stri_replace_all_regex(dplyr::coalesce(.data$MarkText, ""), "\\s+", " ")
     ) |>
     dplyr::filter(nzchar(.data$Shown))
 
+  # REPLACED RATHER THAN NEAR, and the difference is a guess against a fact. The previous version
+  # took the commonest labelled entity within forty characters, which is proximity; RedactedEntity is
+  # an OVERLAP -- a second extractor found a currency with its number removed at these very offsets.
+  # It answers for money only, so a class dominated by "unmatched" is a class nothing else can speak
+  # to rather than one sitting alone in the text.
   freq_ <- src_ |>
     dplyr::summarise(
-      Times = dplyr::n(),
-      Docs  = dplyr::n_distinct(.data$DocID),
-      Near  = names(sort(table(.data$Near), decreasing = TRUE))[[1L]],
+      Times    = dplyr::n(),
+      Docs     = dplyr::n_distinct(.data$DocID),
+      # A SHARE AND NOT A MODE. Three thousand markers of sixty-one thousand overlap a withheld
+      # price, so the commonest RedactedEntity is "unmatched" on every row of every class and the
+      # column says nothing. The share says how often THIS exact span sits on a price -- which is
+      # the question, and which varies from nothing to most of them across the spans below.
+      PctMoney = mean(.data$RedactedEntity == "money"),
       .by = c(Kind, Shown)
     )
 
@@ -513,7 +740,7 @@ red_read_kinds <- function(.marks, .n = 4L, .seed = 42L) {
       Shown = stringi::stri_sub(.data$Shown, to = 44L),
       Share = .data$Times / sum(.data$Times)
     ) |>
-    dplyr::select("Kind", Span = "Shown", "Times", "Docs", "Near") |>
+    dplyr::select("Kind", Span = "Shown", "Times", "Docs", "PctMoney") |>
     dplyr::arrange(plot_factor(.data$Kind, .key = "RedactKind"), dplyr::desc(.data$Times))
 }
 
@@ -597,7 +824,7 @@ red_read_context <- function(.marks, .width = 108L) {
 #' READ RATHER THAN AVERAGED. A mean over a distribution with one observation at 14,689 is a fiction,
 #' and this is what that observation looks like beside the ones around it.
 #'
-#' @param .release Tibble from red_release().
+#' @param .release Tibble from red_collapse().
 #' @param .n Integer. Documents listed.
 #' @return Tibble: the heaviest documents.
 red_read_heavy <- function(.release, .n = 10L) {
@@ -614,51 +841,54 @@ red_read_heavy <- function(.release, .n = 10L) {
 }
 
 
-#' What every column of the released file means
-#' @param .tab Tibble from red_release().
-#' @return Tibble: Column, Meaning.
-red_dictionary <- function(.tab) {
-  if (FALSE) .tab <- tab_release
-
-  dict_ <- tibble::tribble(
-    ~Column,           ~Meaning,
-    "DocID",           "the contract; joins to every other 04 file",
-    "Class",           "contract type, from 03A's label spine",
-    "AmendType",       "original or amended, from the same spine",
-    "NWords",          "the denominator, from 02B's register",
-    "NRedactExplicit", "brackets naming confidential treatment: CONFIDENTIAL, REDACT, CTR",
-    "NRedactSymbol",   "brackets of whitespace and asterisks: [***], [ * * * ], [*]",
-    "NRedactBlank",    "brackets of whitespace and underscores: [___], [__]",
-    "NOmitExplicit",   "brackets recording deletion: INTENTIONALLY, OMITTED, DELETE",
-    "NOmitSymbol",     "brackets of bullets or ellipses, or three dots",
-    "NRedactBare",     "unbracketed runs of three or more asterisks; NOT in the published method",
-    "NBracketed",      "the five bracketed classes; THE PUBLISHED DEFINITION",
-    "NWithheld",       "the Redact classes only, bare included; omission excluded",
-    "NRedact",         "every marker of every class",
-    "RedactRatio",     "NBracketed per thousand words -- the comparable quantity",
-    "RedactRatioAll",  "NRedact per thousand words",
-    "HasRedact",       "did this contract carry a bracketed marker",
-    "HasBare",         "did it carry an unbracketed run of asterisks"
-  )
-
-  undoc_  <- setdiff(names(.tab), dict_$Column)
-  unseen_ <- setdiff(dict_$Column, names(.tab))
-  say_    <- function(.x) if (length(.x) == 0L) "none" else paste(.x, collapse = ", ")
-
-  if (length(undoc_) > 0L || length(unseen_) > 0L) {
-    cli::cli_abort(c(
-      "The dictionary and the released file disagree.",
-      "x" = "In the file and undocumented: {say_(undoc_)}.",
-      "x" = "Documented and not in the file: {say_(unseen_)}.",
-      "i" = "A dictionary that can drift from its file documents nothing."
-    ))
+#' Withheld prices by contract type
+#'
+#' THE RESEARCH VARIABLE THIS DOCUMENT PRODUCES, and it is not a count of markers. NRedactMoney is
+#' how many PRICES a contract withheld -- established by two extractors agreeing on the same offsets
+#' -- which is a different quantity from how many brackets it carries and much closer to what a study
+#' of disclosure would use.
+#'
+#' PctBracketed IS THE CAVEAT THAT TRAVELS WITH IT. Where a type's withheld prices are mostly marked
+#' by unbracketed runs, any measure built on the published definition understates that type
+#' specifically rather than uniformly, and a comparison across types inherits the bias.
+#'
+#' @param .release Tibble from red_release_spans().
+#' @param .counts Tibble from red_collapse(), optionally carrying Class.
+#' @return Tibble: one row per contract type, and one for the sample.
+red_table_money_class <- function(.release, .counts) {
+  if (FALSE) {
+    .release <- tab_release
+    .counts  <- tab_counts
   }
 
-  dict_[match(names(.tab), dict_$Column), ]
+  brack_ <- .release |>
+    dplyr::filter(.data$RedactedEntity == "money") |>
+    dplyr::summarise(NMoneyBracketed = sum(.data$Bracketed), .by = DocID)
+
+  src_ <- .counts |>
+    dplyr::left_join(brack_, by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(NMoneyBracketed = as.integer(dplyr::coalesce(.data$NMoneyBracketed, 0L)))
+
+  cols_ <- function(.d) {
+    dplyr::summarise(
+      .d,
+      Docs         = dplyr::n(),
+      PctAnyPrice  = mean(.data$NRedactMoney > 0L),
+      MeanPrices   = mean(.data$NRedactMoney),
+      MaxPrices    = max(.data$NRedactMoney),
+      PctBracketed = sum(.data$NMoneyBracketed) / pmax(sum(.data$NRedactMoney), 1L),
+      .by = dplyr::any_of("Class")
+    )
+  }
+
+  dplyr::bind_rows(
+    dplyr::arrange(cols_(src_), dplyr::desc(.data$Docs)),
+    dplyr::mutate(cols_(dplyr::select(src_, -dplyr::any_of("Class"))), Class = "All", .before = 1L)
+  )
 }
 
 
-# 7. Report --------------------------------------------------------------------------------------------------------------
+# 8. Report --------------------------------------------------------------------------------------------------------------
 
 #' What each class contributes
 #' @param .tab Tibble from red_table_kind().
@@ -690,7 +920,10 @@ red_report_read_kinds <- function(.tab) {
 
   cli::cli_h2("What each class actually catches")
   .tab |>
-    dplyr::mutate(Times = format(.data$Times, big.mark = ",")) |>
+    dplyr::mutate(
+      Times    = format(.data$Times, big.mark = ","),
+      PctMoney = tbl_pct_safe(.data$PctMoney)
+    ) |>
     tbl_say(.title = "The commonest spans of each class, and one drawn at random")
 
   cli::cli_alert_info(
@@ -700,8 +933,11 @@ red_report_read_kinds <- function(.tab) {
      and is not confidential treatment, which is why they are separate columns rather than one."
   )
   cli::cli_alert_info(
-    "NEAR IS THE COMMONEST THING WITHIN FORTY CHARACTERS of that exact span. It is reported and not \\
-     released, because most markers have nothing labelled beside them at all."
+    "PctMoney IS AN OVERLAP AND NOT A NEIGHBOUR. It is the share of THIS exact span's occurrences \\
+     that a withheld money figure covers -- a second extractor finding a currency with its number \\
+     removed at those very offsets, so the marker and the price are one redaction seen twice. A zero \\
+     means no other extractor speaks to that span, not that it sits alone in the text: only money \\
+     currently answers."
   )
   invisible(.tab)
 }
@@ -756,35 +992,134 @@ red_report_class <- function(.tab) {
 }
 
 
+#' The withheld prices, matched
+#' @param .tab Tibble from red_table_money().
+#' @return Invisibly .tab.
+red_report_money <- function(.tab) {
+  if (FALSE) .tab <- tab_money_tab
+
+  cli::cli_h2("What a marker replaced, where a second extractor knows")
+
+  if (nrow(.tab) == 0L) {
+    cli::cli_alert_warning("No withheld price matched a marker.")
+    return(invisible(.tab))
+  }
+
+  .tab |>
+    dplyr::mutate(
+      Markers    = format(.data$Markers, big.mark = ","),
+      PctMatched = tbl_pct_safe(.data$PctMatched)
+    ) |>
+    tbl_say(.title = "Markers sitting on a withheld price, by the class the extractor gave them")
+
+  hit_   <- dplyr::filter(.tab, .data$Kind != "no marker found")
+  brack_ <- sum(hit_$Markers[dplyr::coalesce(hit_$Bracketed, FALSE)])
+  all_   <- sum(hit_$Markers)
+
+  cli::cli_alert_info(
+    "THIS IS A POPULATION WHERE THE REDACTION IS NOT IN DOUBT. moneyregex found a currency with the \\
+     number removed, independently of redaction.py, so every marker in this table sits on a place \\
+     something WAS withheld from. That is what makes the next line a statement about the published \\
+     definition rather than about one unusual filing."
+  )
+  cli::cli_alert_warning(
+    "A BRACKETED MEASURE SEES {tbl_pct_safe(brack_ / max(all_, 1L))} OF THEM. The rest are \\
+     RedactBare -- a marker carrying no bracket -- which NBracketed excludes by construction, and \\
+     which is therefore invisible to the figure 06-Redactions.R produced."
+  )
+  cli::cli_alert_info(
+    "THE LAST ROW IS WITHHELD PRICES NO MARKER MATCHED. A large count there means the two extractors \\
+     disagree about what a redaction is, which is a finding about the extractors; a small one means \\
+     they agree and the classes above are the whole story."
+  )
+  invisible(.tab)
+}
+
+
+#' Withheld prices by contract type, reported
+#' @param .tab Tibble from red_table_money_class().
+#' @return Invisibly .tab.
+red_report_money_class <- function(.tab) {
+  if (FALSE) .tab <- tab_money_class
+
+  cli::cli_h2("Which contracts withhold a price")
+  .tab |>
+    dplyr::mutate(
+      Docs       = format(.data$Docs, big.mark = ","),
+      MeanPrices = tbl_num(.data$MeanPrices),
+      dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct_safe(.x))
+    ) |>
+    tbl_say(.title = "Prices a contract withheld, and how many of them a bracket marked")
+
+  cli::cli_alert_info(
+    "NRedactMoney IS A COUNT OF PRICES AND NOT OF MARKERS. It counts the places two extractors agree \\
+     on -- a currency whose number was removed, with a redaction marker at the same offsets -- so it \\
+     measures what a contract withheld rather than how much bracket syntax it contains."
+  )
+  # THE WORST CLASS IS NAMED FROM THE TABLE AND NOT TYPED HERE. A sentence about a specific contract
+  # type is a claim about this sample, so it has to be computed from the sample or it goes stale the
+  # first time the corpus changes. Restricted to types carrying a material number of prices, because
+  # a class with four of them can score 0% on noise.
+  body_ <- .tab |>
+    dplyr::filter(.data$Class != "All", .data$MeanPrices * .data$Docs >= 50)
+
+  if (nrow(body_) > 0L) {
+    worst_ <- dplyr::slice_min(body_, .data$PctBracketed, n = 1L, with_ties = FALSE)
+    all_   <- dplyr::filter(.tab, .data$Class == "All")
+    cli::cli_alert_danger(
+      "THE PUBLISHED DEFINITION DOES NOT UNDERSTATE UNIFORMLY -- IT REORDERS THE TYPES. Across the \\
+       sample it sees {tbl_pct_safe(all_$PctBracketed[[1L]])} of withheld prices. On \\
+       {(worst_$Class[[1L]])} it sees {tbl_pct_safe(worst_$PctBracketed[[1L]])}, so a measure built \\
+       on brackets reports {tbl_num(worst_$MeanPrices[[1L]] * worst_$PctBracketed[[1L]])} prices \\
+       per contract there against {tbl_num(worst_$MeanPrices[[1L]])} actually withheld."
+    )
+    cli::cli_alert_warning(
+      "A COMPARISON ACROSS CONTRACT TYPES THEREFORE INHERITS A BIAS THAT DIFFERS BY CELL, which is a \\
+       harder problem than a constant undercount: the ranking of types by redaction is not preserved. \\
+       PctBracketed is what says by how much, type by type."
+    )
+  }
+  invisible(.tab)
+}
+
+
 #' What the released file holds
-#' @param .tab Tibble from red_release().
+#' @param .release Tibble from red_release_spans().
+#' @param .counts Tibble from red_collapse().
 #' @return Invisibly the summary.
-red_report_release <- function(.tab) {
-  if (FALSE) .tab <- tab_release
+red_report_release <- function(.release, .counts) {
+  if (FALSE) {
+    .release <- tab_release
+    .counts  <- tab_counts
+  }
 
   cli::cli_h2("The released file")
 
   out_ <- tibble::tibble(
-    Item = c("Contracts",
-             "Carrying a bracketed marker",
-             "Carrying an unbracketed run of asterisks",
-             "Carrying neither",
-             "Carrying an omission but no redaction"),
-    N    = c(nrow(.tab),
-             sum(.tab$NBracketed > 0L),
-             sum(.tab$NRedactBare > 0L),
-             sum(.tab$NRedact == 0L),
-             sum((.tab$NOmitExplicit + .tab$NOmitSymbol) > 0L & .tab$NWithheld == 0L))
+    Item = c("Markers released",
+             "Contracts carrying any marker",
+             "Contracts in the collapse",
+             "Contracts carrying a bracketed marker",
+             "Contracts carrying a bare marker"),
+    N    = c(nrow(.release),
+             dplyr::n_distinct(.release$DocID),
+             nrow(.counts),
+             sum(.counts$HasRedact),
+             sum(.counts$HasBare))
   ) |>
-    dplyr::mutate(Share = tbl_pct(.data$N / nrow(.tab)))
+    dplyr::mutate(N = format(.data$N, big.mark = ","))
 
-  tbl_say(.tab = out_, .title = "One row per contract, by what it carried")
+  tbl_say(.tab = out_, .title = "redact_spans.parquet, and the collapse it supports")
 
   cli::cli_alert_info(
-    "THE LAST ROW IS WHY OMISSION AND REDACTION ARE SEPARATE COLUMNS. Those contracts left a schedule \\
-     out and withheld nothing; a measure pooling the classes counts them as redacting. Every contract \\
-     gets a row and a contract carrying no marker carries ZEROS rather than missing values, because \\
-     withholding nothing is a measurement and not a gap."
+    "NO FILTER ANYWHERE. This is the one entity in the family with nothing to choose: the rule is a \\
+     taxonomy, and the three candidate definitions are three predicates over one column. Bracketed \\
+     and Withheld are stored because they ARE those definitions, not because they are measurements."
+  )
+  cli::cli_alert_info(
+    "THE COLLAPSE IS NOT WRITTEN. red_collapse() produces one row per contract and the export calls \\
+     it; this document checks its shape against a dictionary so the export cannot produce a \\
+     different one."
   )
   invisible(out_)
 }
@@ -841,12 +1176,16 @@ red_report_context <- function(.tab) {
 
 
 #' The column dictionary
-#' @param .tab Tibble from red_dictionary().
+#' @param .tab Any of this document's dictionary tables.
+#' @param .title Character. Heading, since the reporter is shared.
 #' @return Invisibly .tab.
-red_report_dictionary <- function(.tab) {
-  if (FALSE) .tab <- tab_dict
+red_report_dictionary <- function(.tab, .title = "The columns, in the order the file carries them") {
+  if (FALSE) {
+    .tab   <- tab_dict
+    .title <- "redact_spans.parquet"
+  }
 
-  cli::cli_h2("What every column means")
+  cli::cli_h2(.title)
   tbl_say(.tab = .tab, .title = "Seventeen columns, in the order the file carries them")
 
   cli::cli_alert_info(
@@ -860,10 +1199,12 @@ red_report_dictionary <- function(.tab) {
 
 
 #' The rule in one table
-#' @param .release Tibble from red_release().
+#' @param .release Tibble from red_collapse().
 #' @param .marks Tibble from red_load().
+#' @param .n_spans Integer. Rows in redact_spans.parquet, which is the released file --
+#'   .release is the collapse and has one row per contract rather than per marker.
 #' @return Invisibly the table.
-red_report_headline <- function(.release, .marks) {
+red_report_headline <- function(.release, .marks, .n_spans) {
   if (FALSE) {
     .release <- tab_release
     .marks   <- tab_marks
@@ -883,7 +1224,10 @@ red_report_headline <- function(.release, .marks) {
     "Median markers per thousand words",        tbl_num(stats::median(any_)),
     "Markers in the heaviest single document",  format(max(.release$NRedact), big.mark = ","),
     "That document's share of every marker",    tbl_pct(max(.release$NRedact) / nrow(.marks)),
-    "Rows in the released file",                format(nrow(.release), big.mark = ",")
+    "Prices a marker was found for",          format(sum(.release$NRedactMoney),
+                                                     big.mark = ","),
+    "Contracts withholding a price",          tbl_pct(mean(.release$NRedactMoney > 0L)),
+    "Markers in the released file",           format(.n_spans, big.mark = ",")
   )
 
   tbl_say(.tab = out_, .title = "Everything this document decided")
@@ -897,7 +1241,7 @@ red_report_headline <- function(.release, .marks) {
 }
 
 
-# 8. Figures -------------------------------------------------------------------------------------------------------------
+# 9. Figures -------------------------------------------------------------------------------------------------------------
 
 #' What each class contributes
 #' @param .tab Tibble from red_table_kind().
@@ -923,7 +1267,7 @@ red_plot_kind <- function(.tab) {
 
 
 #' Redaction intensity by contract type
-#' @param .release Tibble from red_release().
+#' @param .release Tibble from red_collapse().
 #' @return A ggplot.
 red_plot_ratio <- function(.release) {
   if (FALSE) .release <- tab_release
@@ -985,4 +1329,60 @@ red_plot_near <- function(.near) {
       .accuracy = 1
     ) +
     ggplot2::labs(x = "Markers with that label nearest")
+}
+
+
+#' Markers on a withheld price, bracketed against bare
+#'
+#' THE VALIDATION RESULT AS A FIGURE. Every bar is a marker class sitting on a place where a second
+#' extractor established that a price was removed, so the split between bracketed and bare is the
+#' share of an undisputed redaction population that the published definition can and cannot see.
+#'
+#' @param .tab Tibble from red_table_money().
+#' @return A ggplot.
+red_plot_money <- function(.tab) {
+  if (FALSE) .tab <- tab_money_tab
+
+  .tab |>
+    dplyr::filter(.data$Kind != "no marker found") |>
+    dplyr::mutate(
+      Sees = dplyr::if_else(dplyr::coalesce(.data$Bracketed, FALSE),
+                            "a bracketed measure sees it", "it does not")
+    ) |>
+    plot_bar_stacked(
+      .cat   = "Kind",
+      .val   = "Markers",
+      .fill  = "Sees",
+      .key   = "RedactKind",
+      .short = TRUE
+    ) +
+    ggplot2::labs(x = "Markers sitting on a withheld price")
+}
+
+
+#' Where a contract withholds a price, by contract type
+#'
+#' THE INCIDENCE AND NOT THE VOLUME. A contract withholding one price and a contract withholding forty
+#' are one row each here, because the question this answers is which kinds of agreement redact a price
+#' at all -- volume is MeanPrices in the table, and it is decided by a handful of heavy filings.
+#'
+#' READ IT AGAINST PctBracketed IN THE TABLE. The types highest here are not necessarily the types a
+#' published measure sees, and where those two orders differ a cross-type comparison built on
+#' NBracketed is biased by type rather than uniformly.
+#'
+#' @param .tab Tibble from red_table_money_class().
+#' @return A ggplot.
+red_plot_money_class <- function(.tab) {
+  if (FALSE) .tab <- tab_money_class
+
+  .tab |>
+    dplyr::filter(.data$Class != "All") |>
+    plot_bar_ranked(
+      .cat      = "Class",
+      .val      = "PctAnyPrice",
+      .short    = TRUE,
+      .pct      = TRUE,   # the helper owns the value scale; .pct makes it a percent axis
+      .accuracy = 1
+    ) +
+    ggplot2::labs(x = "Share of contracts withholding at least one price")
 }

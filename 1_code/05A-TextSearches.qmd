@@ -162,6 +162,13 @@ firing on none is probably written wrongly, and only the per-term table shows ei
       init_create_script_dir(.dir_here = here::here(), .name_script = "02B-Register"),
       "Output", "Documents.parquet"
     ),
+    # 01C's landing table, read only if the register turns out not to carry FormType. It appears in
+    # 02B's reg_shape() inside relocate(any_of(...)), which ignores a name that is not there, so it
+    # is checked rather than assumed.
+    Landing = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "01C-EdgarMetaData"),
+      "Output", "LandingPage.parquet"
+    ),
     # The parsed mirror. utils_doc_path() turns a DocID, a type and a year-quarter into a file here.
     Mirror = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "01B-EdgarDocuments"),
@@ -201,22 +208,70 @@ firing on none is probably written wrongly, and only the per-term table shows ei
     # SEPARATOR TOLERANCE. Parsed filing text wraps, so "force majeure" arrives with a newline in the
     # middle of it often enough to matter, and covid-19 is written three ways by three drafters.
     SepTolerant = TRUE,
+    # PLURAL TOLERANCE, AND IT WAS ADDED AFTER THE FIRST CORPUS PASS RATHER THAN BEFORE IT. The
+    # closing word break refused every plural, so "supply chain disruption" found 43 documents in
+    # 1.77 million while "force majeure" found 69,483. That gap is not contract language, it is the
+    # boundary. Terms written as singular nouns -- disruption, pandemic, epidemic, quarantine, loan
+    # -- were all affected.
+    PluralTolerant = TRUE,
     # CHARACTERS KEPT EITHER SIDE OF EVERY MATCH. Enough to read the clause the term sits in and
     # judge whether the match is real. This is the only defence against a false positive that a
     # prevalence series cannot show.
     Cue         = 80L,
     # DOCUMENTS PER CHUNK, and a memory decision rather than a decision about the answer. Larger is
     # faster until a chunk stops fitting.
-    ChunkSize   = 10000L,
+    ChunkSize   = 20000L,
     # DAEMONS THAT READ AND SCAN. One count rather than two, because one worker does both halves:
     # it opens the parquet files in its batch and matches against them without the text ever
     # returning here. 04C measured the read alone at roughly 150 documents a second on this machine.
     Workers     = 24L,
-    # NULL SCANS THE WHOLE QUEUE. An integer names a fixed cohort -- the first n in hash order -- so a
-    # capped rehearsal is repeatable and raising the number extends the cohort rather than replacing
-    # it.
+    # NULL SCANS THE WHOLE QUEUE. An integer names a fixed cohort, and the ordering is md5(DocID) --
+    # a DocID is a filer number and a content hash, so its digest carries no trace of when the
+    # document was filed, which type it is or how long it runs. A capped run is therefore a
+    # proportional random sample of the queue rather than its alphabetical head, and the shape of a
+    # time series survives it even where a thin cell does not.
+    #
+    # THE COHORT IS FIXED, SO A REHEARSAL IS NOT WASTED WORK. The same n documents are chosen every
+    # render, and raising the number extends that set rather than drawing a new one -- so a capped
+    # pass followed by an uncapped one scans each document exactly once. That holds only while the
+    # vocabulary holds: change a term and the hash changes, and the rehearsal is discarded with
+    # everything else.
     Limit       = NULL,
     ReportEvery = 5L,
+    # THE REPORTING WINDOW, AND IT IS A DISPLAY DIAL RATHER THAN A DATA ONE. The pass reads every
+    # attachment EDGAR holds, which reaches back to 1993; the study window opens in 2001. Those
+    # earlier years were really scanned and they stay in the store and in the released files, so
+    # nothing has to be read again to recover them -- they are simply not drawn, because eight years
+    # of thin counts on the left of a time series invite a reading the paper does not make. The
+    # sample restriction proper is applied once, at export, with the rest of the sample definition.
+    YearMin     = 2001L,
+    # NULL runs to the end of the corpus. Set it when a partial final quarter starts pulling the
+    # right-hand end of a line somewhere the underlying documents do not go.
+    YearMax     = NULL,
+    # THE QUARTER THE COMPOSITION CHECK EXAMINES, and the quarters it is read against. 2021Q1 is the
+    # largest single quarter in the series and the one the pandemic reading cannot explain, because
+    # pandemic language peaked three quarters earlier.
+    Focus       = 2021.1,
+    FocusBase   = c(2019.1, 2020.1),
+    # THE RUN OF QUARTERS THE COMPOSITION IS READ OVER. 2021Q1 was decomposed against the same quarter
+    # in two prior years, which is right for one spike and wrong for asking whether 2020 moved too --
+    # and the memo currently attributes the 2020 elevation to the pandemic without anyone checking.
+    # Built as year plus quarter tenths, which is how the register writes YQ, so the equality match
+    # in the filter compares numbers produced the same way rather than two roundings of one idea.
+    CompQuarters = sort(as.numeric(outer(2019:2021, (1:4) / 10, "+"))),
+    # The peak quarter and the recent quarters it is read against, for the intensive margin.
+    Peak        = 2020.2,
+    Later       = c(2023.4, 2024.1, 2024.2),
+    # Named spans for the position comparison. Two is enough: the shock and the settled period after.
+    Periods     = list(`2020 shock` = 2020L, `2022-2024` = 2022:2024),
+    # THE BREAK THE PER-TERM DIAGNOSTIC TESTS AT. First year of the post period, so a term is
+    # measured on 2001-2019 against 2020 onward. An event term steps here and a boilerplate term does
+    # not, whatever the term appears to mean.
+    Break       = 2020L,
+    # Ratio bounds for the verdict. At or below Flat a term is called flat; at or above Step it is
+    # called stepped; between them it is mixed and needs a human.
+    Flat        = 1.5,
+    Step        = 3,
     # Documents re-read to check that the stored offsets still index the stored text.
     CheckDocs   = 200L,
     Engine      = "Bert"
@@ -235,8 +290,9 @@ first answers the referee.
 #| label: build-terms
 
 tab_terms <- txt_terms(
-  .families     = NULL,                       # NULL takes all five
-  .sep_tolerant = .lP$Params$SepTolerant      # internal spaces and hyphens compile to one class
+  .families        = NULL,                          # NULL takes all five
+  .sep_tolerant    = .lP$Params$SepTolerant,        # internal spaces and hyphens compile to one class
+  .plural_tolerant = .lP$Params$PluralTolerant      # a trailing s or es joins the match
 )
 
 term_hash <- txt_terms_hash(.terms = tab_terms)
@@ -252,9 +308,20 @@ United States relief statute -- CARES Act, Paycheck Protection Program, PPP loan
 share of 2020 material agreements were relief loans. A filing spike made of PPP loans is a pandemic
 explanation stated in the only language a credit agreement has for it.
 
-**DISRUPTION is the mechanism.** Force majeure and business interruption are how an agreement responds
-to a pandemic without naming one, which separates *the contract discusses it* from *the contract was
-reopened because of it*.
+**It no longer carries `epidemic` or `quarantine`, and that is measured rather than stylistic.** On
+the first corpus pass `epidemic` came out as the *largest* term in this family, ahead of `covid`,
+which cannot be right. The break diagnostic in Robustness then put its pre-2020 rate at 1.0% of
+contracts against 2.7% after -- a ratio of 2.7, where `covid` is unbounded and `pandemic` is 43. Both
+terms live inside force-majeure enumerations that predate COVID-19 by decades, so they were carrying
+this family's baseline without measuring the event. **The move costs something and it is worth saying
+so:** ratios of 2.7 and 2.2 are real responses, so some genuine signal leaves with them. It is
+affordable because `covid`, `covid-19`, `coronavirus` and `pandemic` already cover the event.
+
+**DISRUPTION is the mechanism**, and now also the home of those two. Force majeure and business
+interruption are how an agreement responds to a pandemic without naming one, which separates *the
+contract discusses it* from *the contract was reopened because of it*. `epidemic` and `quarantine`
+behave like the rest of this family -- present in every year, moving mildly with events -- rather than
+like event markers.
 
 **RATEREFORM is the instrument check, and it matters more than anything here except the first family.**
 The LIBOR cessation has a date this project did not choose: panels ceased through 2021 and 2023, and
@@ -267,9 +334,22 @@ agreement in every year, so their series must be flat. If it moves in 2020, what
 -- its composition, its lengths, its parse quality -- and not its language, and every other series on
 this page inherits that and means nothing.
 
-**The prediction, before anything runs.** Pandemic prevalence is low but not zero before 2020, because
-*epidemic* and *quarantine* sit in insurance and force-majeure boilerplate that long predates
-COVID-19. It rises sharply in 2020Q2. If the rise is what drove the filing spike rather than
+**Regrouping a term is free; changing one is not.** `txt_terms_hash()` hashes the compiled patterns
+and not the family labels, so moving `epidemic` and `quarantine` between families left the hash
+untouched, the ledger matched, and the corpus was not read again. That is the whole reason hits are
+stored per term rather than per family.
+
+**Changing any dial above changes every pattern, and therefore the hash.** The ledger is keyed on
+that hash, so a corpus already scanned under the old vocabulary contributes nothing to the new one
+and the pass reads all 1.77 million documents again. That is the cost of the plural repair, and it is
+the reason to settle the vocabulary in one sitting rather than to discover it a term at a time.
+
+**The prediction, and what became of it.** The first version of this document predicted that pandemic
+prevalence would be low but not zero before 2020, because *epidemic* and *quarantine* sit in
+force-majeure boilerplate that long predates COVID-19. That prediction was correct and has been acted
+on: the break diagnostic measured the contamination and both terms moved to DISRUPTION, so the
+baseline this version reports is the residual rather than the original. Prevalence still rises sharply
+in 2020Q2. If the rise is what drove the filing spike rather than
 accompanying it, the rise concentrates in amendments and in credit agreements. Boilerplate is flat
 throughout. RateReform is near zero before 2018 and rises through 2021 to 2023.
 
@@ -331,6 +411,16 @@ real rather than an error. An 8-K keeps its row with a missing class.
 #| label: open-store
 
 con <- txt_store_open(.path = .lP$Output$Store)
+
+# ONE PASS LIVES HERE AT A TIME. Every query already filters on the hash, so a stale pass would not
+# corrupt an answer -- it would just sit in the file forever, one vocabulary per revision. Dropping
+# it is safe because nothing in this store is a source: every row was derived from the mirror by a
+# stated term list, so the cost of being wrong is the corpus read and not the data.
+txt_store_purge(
+  .con       = con,          # the store
+  .term_hash = term_hash,    # the pass to KEEP; every other hash is dropped
+  .drop_all  = FALSE         # TRUE empties the store completely, including this hash
+)
 
 n_queue <- txt_store_queue(.con = con, .tab_index = tab_index)
 ```
@@ -496,17 +586,21 @@ tbl_out(.tab = chk_flag, .title = "Indicator against count")
 #| label: build-prevalence
 
 tab_prev <- txt_prevalence(
-  .tab_doc = tab_doc,     # one row per document per family
-  .keys    = tab_keys,    # supplies the quarter
-  .sources = NULL,        # NULL keeps every source and reports them separately
-  .by      = NULL         # no extra grouping
+  .tab_doc  = tab_doc,            # one row per document per family
+  .keys     = tab_keys,           # supplies the quarter and the year
+  .sources  = NULL,               # NULL keeps every source and reports them separately
+  .by       = NULL,               # no extra grouping
+  .year_min = .lP$Params$YearMin, # the study window opens in 2001
+  .year_max = .lP$Params$YearMax
 )
 
 tab_prev_c <- txt_prevalence(
-  .tab_doc = tab_doc,
-  .keys    = tab_keys,
-  .sources = "Exhibit10",   # contracts only, which is what the manuscript's figure counts
-  .by      = NULL
+  .tab_doc  = tab_doc,
+  .keys     = tab_keys,
+  .sources  = "Exhibit10",        # contracts only, which is what the manuscript's figure counts
+  .by       = NULL,
+  .year_min = .lP$Params$YearMin,
+  .year_max = .lP$Params$YearMax
 )
 
 tab_count <- tab_prev_c |>
@@ -533,10 +627,12 @@ tbl_out(
 #| label: build-amend
 
 tab_prev_amend <- txt_prevalence(
-  .tab_doc = tab_doc,
-  .keys    = tab_keys,
-  .sources = "Exhibit10",
-  .by      = "AmendType"    # Original against Amended
+  .tab_doc  = tab_doc,
+  .keys     = tab_keys,
+  .sources  = "Exhibit10",
+  .by       = "AmendType",        # Original against Amended
+  .year_min = .lP$Params$YearMin,
+  .year_max = .lP$Params$YearMax
 )
 
 tbl_out(
@@ -568,16 +664,201 @@ tbl_out(
 )
 ```
 
+## Does each term measure the event, or sit there all along
+
+```{r}
+#| label: build-break
+
+tab_break <- txt_term_break(
+  .con       = con,                  # the store
+  .term_hash = term_hash,            # which pass to read
+  .terms     = tab_terms,            # the published vocabulary
+  .keys      = tab_keys,             # supplies the filing year
+  .source    = "Exhibit10",          # contracts, which is what the claim is about
+  .break     = .lP$Params$Break,     # first year of the post period
+  .year_min  = .lP$Params$YearMin,
+  .year_max  = .lP$Params$YearMax,
+  .flat      = .lP$Params$Flat,      # at or below this ratio, flat
+  .step      = .lP$Params$Step       # at or above this ratio, stepped
+)
+
+txt_report_break(.tab = tab_break, .family = "Pandemic")
+```
+
+**This exists because the first corpus pass produced a result that could not be right.** `epidemic`
+came out as the largest term in the pandemic family, ahead of `covid`, and the stored context said
+why: *war, terrorism, civil commotion, labor strike or lock-out, epidemic* is a force-majeure
+enumeration that predates COVID-19 by decades. One example is a suspicion; a rate either side of a
+date is evidence.
+
+**An event term steps and a boilerplate term does not, and that is the whole test.** `covid` cannot
+appear before 2020 and must appear after. `counterparts` is in most agreements of every year. A term
+sitting in the pandemic family whose ratio is near one is not measuring the pandemic, whatever it
+appears to mean.
+
+**The pre-period rate matters separately from the ratio.** A term can step convincingly and still
+carry a large pre-period rate, and that rate is contamination -- the part of the family's baseline
+that has nothing to do with the event. The ratio says whether the term responds to the break; the
+pre-period rate says what including it costs.
+
+**Boilerplate is the control here too.** It must be flat at *any* break, which is what makes a step
+elsewhere on this page readable. Rate reform steps at this break for a reason of its own, the LIBOR
+cessation falling in the same window, and should not be read as a pandemic response.
+
+## What kind of filing the 2021 contracts arrived under
+
+```{r}
+#| label: build-composition
+
+tab_forms <- txt_form_types(
+  .path_register = .lP$Input$Register,   # FormType if it is there
+  .path_landing  = .lP$Input$Landing     # 01C's landing table if it is not
+)
+
+tab_comp <- txt_table_composition(
+  .keys     = tab_keys,             # supplies the quarter
+  .forms    = tab_forms,            # supplies the filing form
+  .year_min = .lP$Params$YearMin,
+  .year_max = .lP$Params$YearMax
+)
+
+txt_report_composition(
+  .tab      = tab_comp,
+  .focus    = .lP$Params$Focus,          # 2021Q1
+  .base     = .lP$Params$FocusBase,      # the same quarter in the two prior years
+  .quarters = .lP$Params$CompQuarters    # 2019Q1 to 2021Q4, so 2020 is decomposed as well
+)
+
+tab_form_fam <- txt_table_form_family(
+  .tab_doc  = tab_doc,
+  .keys     = tab_keys,
+  .forms    = tab_forms,
+  .family   = "Pandemic",
+  .quarters = .lP$Params$Focus
+)
+
+txt_report_form_family(.tab = tab_form_fam, .label = "2021Q1")
+```
+
+**This is where the referee's question is actually settled, and the paper's own Figure 2 points at
+it.** That figure pools 8-K with S-1, S-4, F-1 and F-4 as "ad-hoc filings", and in 2021 the ad-hoc
+share jumps while annual filings collapse. But those two things are not alike: an 8-K reports a
+material agreement as it happens, while an S-1 or S-4 registers an offering or a merger and carries
+whatever exhibits that transaction produced.
+
+**The two candidate explanations land in different halves of that pool.** Pandemic contracting is
+8-K. A transaction wave -- and 2021Q1 was the peak of the SPAC boom, a shell's S-1 followed by a
+de-SPAC S-4 -- is registration. Pooled, they cannot be told apart, which is why the question cannot
+be answered from Figure 2 as drawn.
+
+**The second table is the harder test.** Composition alone shows only that the mix changed. If the
+rise were pandemic contracting, the surging form would carry pandemic language at least as often as
+the others do; a transaction wave brings a great many exhibits drafted for a deal rather than for a
+year, and those should carry it less.
+
+## Was it a blank cheque wave, or capital markets in general
+
+```{r}
+#| label: build-sic
+
+tab_sic <- txt_filer_sic(
+  .path_register = .lP$Input$Register,   # DocID and HashIndex
+  .path_landing  = .lP$Input$Landing     # SIC, which the register does not carry
+)
+
+tab_forms_split <- txt_form_types(
+  .path_register = .lP$Input$Register,
+  .path_landing  = .lP$Input$Landing,
+  .split         = TRUE                  # S-1 offerings apart from S-4 mergers
+)
+
+tab_comp_split <- txt_table_composition(
+  .keys     = tab_keys,
+  .forms    = tab_forms_split,
+  .year_min = .lP$Params$YearMin,
+  .year_max = .lP$Params$YearMax
+)
+
+txt_report_composition(
+  .tab      = tab_comp_split,
+  .focus    = .lP$Params$Focus,
+  .base     = .lP$Params$FocusBase,
+  .quarters = .lP$Params$CompQuarters
+)
+
+tab_sic_reg <- txt_table_sic(
+  .keys       = tab_keys,
+  .forms      = tab_forms,
+  .sic        = tab_sic,
+  .quarters   = .lP$Params$CompQuarters,
+  .form_group = "Registration"           # who filed the exhibits that surged
+)
+
+txt_report_sic(
+  .tab   = tab_sic_reg,
+  .focus = .lP$Params$Focus,
+  .base  = .lP$Params$FocusBase
+)
+```
+
+**SIC 6770 is the SEC's own code for blank cheque companies**, so this is the difference between
+naming the wave and describing it. A special purpose acquisition company is a shell with no
+operations that lists purely to raise cash into trust and then merges with a private business, which
+is why it files twice -- an S-1 for the shell and an S-4 for the merger -- and why each filing carries
+an unusual number of material agreements.
+
+**Three patterns are distinguishable and they mean different things.** A blank cheque wave lifts both
+registration forms, with offerings leading and mergers following as the shells complete. A
+conventional listing boom lifts offerings alone. Ordinary M&A lifts mergers alone. Read against
+*other finance* rather than against everything, because shells are financial filers and a rise that
+came with banks and funds would be finance in general.
+
+## How much a mentioning contract says
+
+```{r}
+#| label: build-intensity
+
+tab_int <- txt_table_intensity(
+  .tab_doc  = tab_doc,
+  .keys     = tab_keys,
+  .family   = "Pandemic",
+  .year_min = 2019L,                 # the shock and everything after it
+  .year_max = .lP$Params$YearMax
+)
+
+txt_report_intensity(
+  .tab   = tab_int,
+  .peak  = .lP$Params$Peak,          # 2020Q2
+  .later = .lP$Params$Later          # the most recent quarters
+)
+```
+
+**This is the question the prevalence series cannot answer, and a referee will ask it.** The line
+peaks at 11.8% and settles near 6% through 2024 -- still tens of times the pre-2020 level. It never
+comes back down. Two stories produce that shape. Under **templating**, drafters added a pandemic
+carve-out to the material-adverse-effect definition and never removed it, so every agreement now says
+COVID once, in the same place, indefinitely. Under **substantive contracting**, agreements are still
+being written around pandemic conditions.
+
+**Conditional on mentioning, and that is the whole design.** An unconditional mean would fall simply
+because fewer contracts mention anything, which is the extensive margin again in a different coat.
+Under templating this figure collapses toward one while prevalence holds; under substantive
+contracting it does not.
+
 ## Where in a document the hits sit
 
 ```{r}
 #| label: build-position
 
 tab_pos <- txt_position(
-  .con       = con,             # the store
-  .term_hash = term_hash,       # which pass to read
-  .terms     = tab_terms,       # supplies the term-to-family map
-  .bins      = .lP$Params$Bins  # bins across the relative position
+  .con       = con,               # the store
+  .term_hash = term_hash,         # which pass to read
+  .terms     = tab_terms,         # supplies the term-to-family map
+  .keys      = tab_keys,          # supplies the filing year, which the hits table does not carry
+  .bins      = .lP$Params$Bins,   # bins across the relative position
+  .year_min  = .lP$Params$YearMin,
+  .year_max  = .lP$Params$YearMax,
+  .periods   = .lP$Params$Periods # the shock read against the settled period after it
 )
 ```
 
@@ -585,6 +866,71 @@ Position separates two things a count cannot. Boilerplate is positional by const
 law and counterparts sit in the closing articles -- so its distribution is the shape a
 document-structure effect makes. A pandemic family concentrated in the same place is a boilerplate
 insertion; one spread through the body is substantive drafting.
+
+**Split by period, this becomes independent evidence on the templating question.** If the 2022-2024
+mentions concentrate at whatever relative position the definitions article occupies while the 2020
+ones are spread through the body, the language migrated into a template. Position and intensity are
+measured from different columns -- `RelPos` against `nHits` -- so agreement between them is two facts
+rather than one fact reported twice.
+
+## Which industries the pandemic contracts came from
+
+```{r}
+#| label: build-class-sic
+
+tab_class_sic <- txt_table_class_sic(
+  .tab_doc = tab_doc,
+  .keys    = tab_keys,
+  .sic     = tab_sic,
+  .family  = "Pandemic",
+  .years   = 2020:2021
+)
+
+txt_report_class_sic(.tab = tab_class_sic, .class = "R&D")
+```
+
+**R&D leads the category ranking and everyone has read that as vaccine and therapeutic collaboration
+-- including this document, repeatedly, without checking.** It is an inference from a class label
+until a filer industry code agrees with it. This is the check, and it can come back negative.
+
+## The clauses themselves
+
+```{r}
+#| label: report-clauses
+
+ids_peak_ <- tab_keys$DocID[tab_keys$Source == "Exhibit10" &
+                              !is.na(tab_keys$YQ) & tab_keys$YQ == .lP$Params$Peak]
+
+ids_late_ <- tab_keys$DocID[tab_keys$Source == "Exhibit10" &
+                              !is.na(tab_keys$Year) & tab_keys$Year %in% 2023:2024]
+
+txt_report_examples(
+  .con       = con,
+  .term_hash = term_hash,
+  .terms     = tab_terms,
+  .family    = "Pandemic",
+  .n         = 10L,
+  .chars     = 60L,
+  .doc_ids   = ids_peak_,          # the shock quarter
+  .label     = "2020Q2"
+)
+
+txt_report_examples(
+  .con       = con,
+  .term_hash = term_hash,
+  .terms     = tab_terms,
+  .family    = "Pandemic",
+  .n         = 10L,
+  .chars     = 60L,
+  .doc_ids   = ids_late_,          # three and four years later
+  .label     = "2023-2024"
+)
+```
+
+**The only check here that can surprise anyone.** Every other test on this page turns a number into a
+different number; this one puts the actual clauses side by side. If the later matches read as
+carve-out language in a definitions list while the earlier ones read as operative terms, the
+templating question is settled in a way no ratio settles it.
 
 # Deployment
 
@@ -605,13 +951,38 @@ DBI::dbDisconnect(con, shutdown = TRUE)
 `term_hits` is the file anyone re-reading a match or testing one against a matcon span wants;
 `term_docs` is the file a regression joins to; `term_list` is what makes either interpretable.
 
+**A capped pass writes `_partial` files instead, and the name is doing real work.** A rehearsal over a
+hundred thousand documents produces a `term_docs` with the same columns, the same types and entirely
+plausible prevalences, and it joins to anything without complaint -- nothing downstream could discover
+that its denominator was a twentieth of the corpus. Coverage is measured against the queue rather than
+read off the `Limit` argument, so an interrupted pass and an excluded source are caught by the same
+test as a deliberate cap.
+
 # Overview
+
+Every figure below is one of two kinds, and the difference matters more than any single panel.
+
+**Every figure reports 2001 onwards**, which is the study window. The pass itself reads back to 1993,
+because EDGAR holds filings from then and excluding them from the queue would mean another corpus read
+to recover them; they are in the store and in the released files and simply are not drawn here.
+
+**The contract figures** use Exhibit 10 attachments only -- 1,189,805 documents, the corpus the
+manuscript's tables are built on. **The source figures** put all four document types beside each
+other. They are four witnesses to the same events rather than four samples of one population: a
+contract is what the parties agreed, an 8-K is what the registrant told the market it had agreed,
+Item 1.01 is the regulated paragraph of that report, and a CT order is the Commission's reply about
+what may stay hidden. Their levels are not comparable -- an Item 1.01 summary is a paragraph and a
+credit agreement is a hundred pages, so the short document mentions fewer of everything -- but their
+shapes are, and the shape is what a claim about timing rests on.
+
+## Contracts: the question referee 2 asked
 
 ```{r}
 #| label: fig-spike
-#| fig-cap: "Attachments filed each quarter, with pandemic prevalence over them. The bars are the rise
-#|   referee 2 asked about; the line is whether the documents behind it say anything different. Read
-#|   apart these are two facts, and read together they are an answer."
+#| fig-cap: "Exhibit 10 attachments filed each quarter, with pandemic prevalence over them. The bars
+#|   are the rise referee 2 asked about; the line is whether the documents behind it say anything
+#|   different. Read apart these are two facts, and read together they are an answer -- including if
+#|   the two peaks fall in different quarters."
 #| fig-height: 3.4
 
 txt_plot_spike(.tab_prev = tab_prev_c, .tab_count = tab_count, .family = "Pandemic")
@@ -619,28 +990,31 @@ txt_plot_spike(.tab_prev = tab_prev_c, .tab_count = tab_count, .family = "Pandem
 
 ```{r}
 #| label: fig-prevalence
-#| fig-cap: "Prevalence by quarter for every family, contracts only. Boilerplate is the control: a
-#|   flat line there is what licenses reading movement in the others as language rather than as a
-#|   change in the corpus."
+#| fig-cap: "Prevalence by quarter for every family, contracts only. Boilerplate is the control: it
+#|   is flat only if the corpus itself is stable, so any drift in that line is the amount of movement
+#|   that must be discounted from every other line on the panel."
 #| fig-height: 3.4
 
 txt_plot_prevalence(.tab = tab_prev_c, .families = NULL)
 ```
 
 ```{r}
-#| label: fig-validation
-#| fig-cap: "The instrument on shocks whose dates were set elsewhere. Rate reform should turn on
-#|   through 2021 to 2023 and regulation early in the window. A series that cannot find these cannot
-#|   be trusted on a date that is contested."
-#| fig-height: 3.4
+#| label: fig-break
+#| fig-cap: "Each term's prevalence in contracts before and after 2020, on a log scale. The line
+#|   length is the finding: a term whose two points sit together does not respond to the break, and a
+#|   term in the pandemic family that does not respond is not measuring the pandemic."
+#| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_break$Term))
 
-txt_plot_prevalence(.tab = tab_prev_c, .families = c("RateReform", "Regulation"))
+txt_plot_break(.tab = tab_break, .families = c("Pandemic", "Disruption", "Boilerplate"))
 ```
+
+## Contracts: is the pandemic where the mechanism says it should be
 
 ```{r}
 #| label: fig-amend
-#| fig-cap: "Pandemic prevalence by amendment type. The mechanism claim: a pandemic that reopened
-#|   existing agreements shows here, and one that only accompanied new ones does not."
+#| fig-cap: "Pandemic prevalence by amendment type, contracts only. The mechanism claim: a pandemic
+#|   that reopened existing agreements separates these two lines, and one that merely accompanied new
+#|   agreements leaves them together."
 #| fig-height: 3.4
 
 txt_plot_amend(.tab = tab_prev_amend, .family = "Pandemic")
@@ -648,9 +1022,9 @@ txt_plot_amend(.tab = tab_prev_amend, .family = "Pandemic")
 
 ```{r}
 #| label: fig-class
-#| fig-cap: "Pandemic prevalence by contract category across 2020 and 2021. Credit agreements carry
-#|   the relief-loan vocabulary, so a category ranking led by credit is the PPP explanation rather
-#|   than a general one."
+#| fig-cap: "Pandemic prevalence by contract category across 2020 and 2021, contracts only. Which
+#|   kind of agreement carries the language is a sharper claim than how many do, because each
+#|   category implies a different story about why the agreement was signed."
 #| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_prev_class$Class))
 
 txt_plot_class(.tab = tab_prev_class)
@@ -658,27 +1032,79 @@ txt_plot_class(.tab = tab_prev_class)
 
 ```{r}
 #| label: fig-position
-#| fig-cap: "Where each family's hits fall through a contract, 0 at the start and 1 at the end.
-#|   Boilerplate is the reference shape a positional effect makes; a family matching that shape is
-#|   sitting in inserted clauses rather than in drafted terms."
+#| fig-cap: "Where each family's hits fall through a contract, 0 at the start and 1 at the end,
+#|   contracts only. Boilerplate is the reference shape a positional effect makes; a family matching
+#|   that shape is sitting in inserted clauses rather than in drafted terms."
 #| fig-height: 4.6
 
 txt_plot_position(.tab = tab_pos, .families = c("Pandemic", "Disruption", "Boilerplate"))
 ```
 
 ```{r}
-#| label: fig-sources
-#| fig-cap: "Prevalence by quarter across all four sources, pandemic family only. The 8-K and Item
-#|   1.01 series are the filer's own account of why an agreement was entered, which is a different
-#|   witness from the agreement itself."
+#| label: fig-intensity
+#| fig-cap: "Prevalence in bars against mentions per mentioning contract as a line. If the bars hold
+#|   while the line falls toward one, the language has become a clause that was added once and left
+#|   in place rather than a subject contracts are still being written about."
 #| fig-height: 3.4
 
-txt_plot_prevalence(
-  .tab      = dplyr::filter(tab_prev, .data$Family == "Pandemic") |>
-    dplyr::mutate(Family = plot_factor(.x = .data$Source, .key = "TextSource")),
-  .families = NULL
-)
+txt_plot_intensity(.tab = tab_int)
 ```
+
+```{r}
+#| label: fig-composition
+#| fig-cap: "Contract attachments by the filing form they arrived under, each quarter. The paper's
+#|   Figure 2 pools 8-K with S-1 and S-4 as ad-hoc; separated, the 2021 rise is visible as a shift
+#|   into registration statements rather than into current reports."
+#| fig-height: 3.4
+
+txt_plot_composition(.tab = tab_comp)
+```
+
+```{r}
+#| label: fig-composition-split
+#| fig-cap: "The same composition with the registration pool opened into offerings and mergers. A
+#|   blank cheque wave lifts both with offerings leading; a listing boom lifts offerings alone;
+#|   ordinary M&A lifts mergers alone."
+#| fig-height: 3.4
+
+txt_plot_composition(.tab = tab_comp_split, .key = "FormDetail")
+```
+
+## Contracts: does the instrument find a shock whose date is already known
+
+```{r}
+#| label: fig-validation
+#| fig-cap: "The instrument on shocks whose dates were set elsewhere, contracts only. Rate reform
+#|   should turn on through 2021 to 2023 and regulation early in the window. A series that cannot
+#|   find these cannot be trusted on a date that is contested."
+#| fig-height: 3.4
+
+txt_plot_prevalence(.tab = tab_prev_c, .families = c("RateReform", "Regulation"))
+```
+
+## All four document types compared
+
+```{r}
+#| label: fig-sources-pandemic
+#| fig-cap: "Pandemic prevalence by quarter across all four document types. The 8-K and Item 1.01
+#|   series are the filer's own account of why an agreement was entered, which is a different witness
+#|   from the agreement itself. CT orders are the Commission's reply and carry none of this language
+#|   at all, which is why their line sits on zero."
+#| fig-height: 3.4
+
+txt_plot_sources(.tab = tab_prev, .family = "Pandemic", .drop_silent = FALSE)
+```
+
+```{r}
+#| label: fig-sources-disruption
+#| fig-cap: "Disruption prevalence by quarter across the document types that carry it. Force majeure
+#|   and business interruption are contract machinery, so the contract line should sit far above the
+#|   report lines -- a summary describes an agreement without reciting its clauses."
+#| fig-height: 3.4
+
+txt_plot_sources(.tab = tab_prev, .family = "Disruption", .drop_silent = TRUE)
+```
+
 
 # Next
 

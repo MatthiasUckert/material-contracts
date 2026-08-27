@@ -1,91 +1,35 @@
-# 04B4-Rules-MONEY: what a contract says it is worth ----------------------------------------------------------------------
+# 04B4-Rules-MONEY: what a contract is worth -----------------------------------------------------------------------------
 #
 # WHAT THIS FILE DOES
-# Turns parsed amounts into contract-level money variables. Function prefix is `mny_`.
+# moneyregex proposes figures with a currency. Two of them are not amounts anybody owes -- a zero and
+# a figure with par-value language beside it -- and a third is a price the filer removed. This says
+# which is which and leaves the arithmetic to a query.
 #
-# THE LEAST OPINIONATED OF THE FIVE, AND IT SHOULD BE
-# There is no external fact to anchor an amount against and no taxonomy that says what a contract's
-# value is, so this document does not invent one. It reports what the extractor found, removes the two
-# things that are demonstrably not amounts anybody owes, and puts the numbers beside the contract type
-# so a reader can see whether the ordering makes sense.
+# ONE FILE COMES OUT AND IT IS LONG
+# money_spans.parquet is one row per figure, with every filter as a COLUMN rather than as a filter.
+# mny_collapse() aggregates it per contract and currency block, and the export calls that; this
+# document scores it, reports it and checks its shape.
 #
-# THE RULE IS TWO FILTERS AND NO NUMBER
-#   1. A ZERO IS NOT AN AMOUNT. The store's two commonest money spans are "$ 0" and "$ 0.00", which is
-#      boilerplate about share denomination rather than anything a party owes.
-#   2. A FIGURE BESIDE PAR-VALUE LANGUAGE IS NOT AN AMOUNT EITHER. "par value $0.0001 per share",
-#      "stated value of $0.01", "shares of $0.01 par value per share" -- share denomination again, and
-#      the commonest way a contract names a number that means nothing about its worth.
-# Neither is a judgement about whether a figure MATTERS. Both are figures that are not amounts, and
-# the unfiltered count stays in every table so a reader sees what was removed.
+# NOTHING IS DISCARDED, WHICH IS WHY THIS ENTITY WAS THE EASIEST TO MOVE. The filters were already
+# computed as flags and then applied one step later, so the long file is what the chain already held
+# in memory. Parsed, Withheld, IsZero, IsPar and ParSide are all columns of it.
 #
-# ONE ENGINE, AND THE MEASUREMENT IS DECISIVE
-# LexNLP's money grammar accepts ONE PHRASING IN SIX. Measured on a fixture and confirmed on the
-# sample: of "$9,752,233.001", "$2,500,000", "US$5,000,000", "5,000,000 dollars", "USD 5,000,000" and
-# "Five Million Dollars", only the last matches. The consequence at scale is a coverage of 0.163
-# against matcon's 0.712 on the corpus pass, and 0.260 against 0.830 on the sample.
+# THE NAIVE LADDER IS THREE FILTERS OVER ONE FILE
+#   Parsed                      every figure this document can compute with
+#   Parsed & !IsZero            after the zero filter
+#   Parsed & !IsZero & !IsPar   the rule
+# So NaiveMaxUSD, NaiveSumUSD, NDroppedZero and NDroppedPar stop being stored: each is the same
+# aggregate with one filter switched off, and a reader who disagrees with either takes the rung above
+# it and recomputes from the file.
 #
-# AND IT SETTLES A CLAIM THAT WAS IN THE PROSE. An earlier version kept both families on "of 2,541
-# mentions the two both found, ZERO share identical offsets, so neither replaces the other". That
-# sentence is true and its reading was wrong: zero agreement between a producer that finds five
-# phrasings in six and one that finds one is not two engines disagreeing, it is one engine largely
-# ABSENT. Releasing both would give every second row a column of nulls, so matcon is the release.
+# A WITHHELD FIGURE IS A THIRD OUTCOME, NOT A PARSE FAILURE. Three moneyregex patterns match a
+# currency with no number -- the filer removed the price. They are counted and never summed, because
+# an arithmetic including them would have to invent a value, and Withheld keys on the PATTERN NAME
+# rather than on a null amount so that a removed price and an unreadable one stay distinguishable.
 #
-# THE PAR CUE IS A COLUMN NOW, AND THIS WAS THE LAST TEXT READ IN THE FAMILY
-# mny_load() used to open 04A's canonical text and cut sixty characters before every amount. Every
-# matcon span carries CueBefore and CueAfter -- 160 raw characters either side, stored at extraction
-# where the document and the offsets were already in one scope -- so the test is a column read.
-#
-# WITH 04B2 AND 04B3 ALREADY MOVED, NO RULE IN THE 04B FAMILY OPENS A DOCUMENT. 04D's Cues dial
-# existed to switch those three reads off at corpus scale, and switching them off is what made the
-# governing-law columns vanish from the release. There is nothing left for it to gate.
-#
-# AND THE WINDOW READS BOTH SIDES, WHICH IT COULD NOT BEFORE. The old roxygen promised "characters
-# either side of an amount" and the code cut a window ENDING at the span, so par language written
-# AFTER the figure was structurally invisible: "shares of $0.01 par value per share" passed the filter
-# every time. Test-MatCon-MONEY.R pinned both halves of that and its doc08 check is written to FLIP
-# when a rule reads CueAfter, which is how this change proves itself rather than being asserted.
-#
-# CURRENCIES ARE NEVER POOLED
-# A maximum across currencies is not a quantity. Currency is populated on 100% of matcon's rows, so
-# the split costs no coverage at all, and USD and non-USD sit in columns of one row rather than in two
-# tables nobody joins.
-#
-# A WITHHELD FIGURE IS A MEASUREMENT, NOT A PARSE FAILURE
-# moneyregex has three patterns for an amount the filer removed -- symbol_redact for "$[***]", "$**",
-# "$TBD" and "$____"; symbol_redact_open for an unclosed "$[ ***"; and symbol_bare for a currency
-# symbol sitting immediately before "per", as in "a minimum market price of $ per share". All three
-# emit a CURRENCY and a NULL AMOUNT, deliberately, and the module says why: "the amounts a filer
-# withholds are systematically the material ones. Returning zero, or dropping the row, would erase
-# exactly the observation that matters."
-#
-# THIS DOCUMENT WAS ERASING IT. Parsed required both an amount and a currency, and the aggregation
-# began by filtering on it, so every withheld figure was gone before the first summarise and the
-# parse table counted it as a failure to cast. It is not a failure. It is a contract naming a price
-# and refusing to say what it is.
-#
-# AND IT IS SHARPER THAN ANYTHING 04B5 CAN OFFER. NRedactSymbol counts "[***]" wherever it falls --
-# in a schedule, a definition, a party's name. A symbol_redact span is "[***]" STANDING WHERE A
-# DOLLAR FIGURE BELONGS, which is a different and much narrower claim, and it is the one referee 2's
-# question about redaction intensity actually points at.
-#
-# THE REPETITION RATIO IS WHY SUM SURVIVES
-# A contract restating the same fifty million across five clauses sums to two hundred and fifty
-# million, and no filter can tell a restatement from a second obligation. So distinct amounts over
-# total spans is reported beside the sum: it says how much of a total is repetition, which is the
-# caveat the sum needs rather than an argument for dropping it.
-#
-# MAX IS THE ONE UNAMBIGUOUS FIGURE -- the largest amount the contract names -- and it is the column a
-# reader wanting one number should take.
-#
-# EVERY TABLE CARRIES THE UNFILTERED COUNT
-# NAIVE is every parsed amount, both filters off: what a reader gets by summing what the extractor
-# emitted. It sits beside the rule in every table and in the released file, because the difference
-# between the two IS what the filters did.
-#
-# ONE FILE, ONE ROW PER CONTRACT
-# A contract's value belongs to the contract and to no party in it, so this writes its own file. That
-# is not the two-file problem 04B1 removed: the counts in that second file were DERIVED from the first
-# and could contradict it, while an amount is an independent measurement nothing else computes.
+# ParCue SHIPS BESIDE IsPar, for the reason CueHit ships beside HasEndCue in 04B3: storing only the
+# boolean would freeze the cue list into the file, and storing the term that fired makes testing a
+# shorter list a query. The window stays a specification dial and the sweep is what covers it.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
@@ -97,6 +41,7 @@ if (FALSE) {
 
 
 # 1. Vocabulary ----------------------------------------------------------------------------------------------------------
+
 
 plot_register_levels(
   .key    = "MoneyBlock",
@@ -112,8 +57,8 @@ plot_register_levels(
 
 plot_register_levels(
   .key    = "MoneyDrop",
-  .levels = c("kept", "zero", "par", "unparsed"),
-  .short  = c("kept", "zero", "par", "unparsed")
+  .levels = c("kept", "zero", "par", "withheld", "unparsed"),
+  .short  = c("kept", "zero", "par", "withheld", "unparsed")
 )
 
 
@@ -135,6 +80,8 @@ plot_register_levels(
 #: up as a column of zeros rather than as silence.
 .mny_redact_form <- c("symbol_redact", "symbol_redact_open", "symbol_bare")
 
+
+# 3. Input ---------------------------------------------------------------------------------------------------------------
 
 #' Build one money specification
 #'
@@ -172,8 +119,6 @@ mny_spec <- function(.filter = "par", .cue_win = 60L, .label = NULL) {
   )
 }
 
-
-# 3. Input ---------------------------------------------------------------------------------------------------------------
 
 #' Load the money spans, with the cue columns they arrive with
 #'
@@ -226,6 +171,8 @@ mny_load <- function(.dir_store, .lens, .family = "matcon", .quiet = FALSE) {
 }
 
 
+# 4. What is not an amount -----------------------------------------------------------------------------------------------
+
 #' Mark the amounts that sit beside par-value language
 #'
 #' BOTH SIDES, AND THAT IS THE CHANGE. A drafter writes the phrase either way round -- "par value
@@ -239,7 +186,7 @@ mny_load <- function(.dir_store, .lens, .family = "matcon", .quiet = FALSE) {
 #'
 #' @param .money Tibble from mny_load().
 #' @param .spec List from mny_spec(). Supplies the window.
-#' @return .money with Before, After and IsPar added.
+#' @return .money with Before, After, ParCue, IsPar and ParSide added.
 mny_mark_par <- function(.money, .spec) {
   if (FALSE) {
     .money <- tab_money
@@ -257,6 +204,19 @@ mny_mark_par <- function(.money, .spec) {
     Reduce(`|`, lapply(.terms, function(.t) stringi::stri_detect_fixed(.txt, .t)))
   }
 
+  # WHICH PHRASE, NOT WHETHER A PHRASE. Storing only the boolean would freeze the cue list into the
+  # released file; storing the term that fired makes testing a shorter list a query over it. First by
+  # list order where several match, which is attribution rather than counting.
+  which_ <- function(.before, .after, .terms) {
+    out_ <- rep(NA_character_, length(.before))
+    for (.t in .terms) {
+      m_ <- is.na(out_) &
+        (stringi::stri_detect_fixed(.before, .t) | stringi::stri_detect_fixed(.after, .t))
+      out_[m_] <- .t
+    }
+    out_
+  }
+
   norm_ <- function(.x) {
     stringi::stri_trans_toupper(stringi::stri_replace_all_regex(dplyr::coalesce(.x, ""), "\\s+", " "))
   }
@@ -265,7 +225,8 @@ mny_mark_par <- function(.money, .spec) {
     dplyr::mutate(
       Before = norm_(stringi::stri_sub(.data$CueBefore, from = -.spec$CueWin)),
       After  = norm_(stringi::stri_sub(.data$CueAfter,  to   =  .spec$CueWin)),
-      IsPar  = hit_(.data$Before, .mny_par_cue) | hit_(.data$After, .mny_par_cue),
+      ParCue = which_(.data$Before, .data$After, .mny_par_cue),
+      IsPar  = !is.na(.data$ParCue),
       ParSide = dplyr::case_when(
         !.data$IsPar                          ~ "none",
         hit_(.data$Before, .mny_par_cue) &
@@ -274,71 +235,6 @@ mny_mark_par <- function(.money, .spec) {
         .default                              = "after"
       )
     )
-}
-
-
-# 4. The variables -------------------------------------------------------------------------------------------------------
-
-#' Apply one specification and aggregate per contract and currency block
-#'
-#' SUM, MAX AND MEDIAN ALL SURVIVE, with the repetition ratio beside them. Max is the only one that is
-#' unambiguous -- the largest figure the contract names -- but a reader wanting a total should have
-#' one, and distinct amounts over total spans is the caveat it needs.
-#'
-#' THE NAIVE FIGURES ARE COMPUTED WHATEVER THE SPECIFICATION ASKS FOR, because they are the comparison
-#' every table is read against and they cannot be derived later: the filtered rows are gone by then.
-#'
-#' @param .money Tibble from mny_mark_par().
-#' @param .spec List from mny_spec().
-#' @return Tibble: one row per document and currency block.
-mny_aggregate <- function(.money, .spec) {
-  if (FALSE) {
-    .money <- tab_marked
-    .spec  <- .lP$Params$Spec
-  }
-
-  # THE WITHHELD ARE COUNTED FROM THE WHOLE TABLE and never enter a sum, a maximum or a median: they
-  # carry no number, so an arithmetic that included them would have to invent one. They are a count
-  # of an event -- this contract named a price and removed it -- and that is all they can be.
-  held_ <- .money |>
-    dplyr::filter(.data$Withheld) |>
-    dplyr::summarise(NWithheld = dplyr::n(), .by = c(DocID, Block))
-
-  src_ <- dplyr::filter(.money, .data$Parsed)
-
-  keep_ <- switch(
-    .spec$Filter,
-    none = rep(TRUE, nrow(src_)),
-    zero = !src_$IsZero,
-    par  = !src_$IsZero & !src_$IsPar
-  )
-
-  src_ |>
-    dplyr::mutate(Keep = keep_) |>
-    dplyr::summarise(
-      NSpans      = sum(.data$Keep),
-      NDistinct   = dplyr::n_distinct(.data$Amount[.data$Keep]),
-      MoneyMax    = .mny_stat_or_na(.x = .data$Amount[.data$Keep], .f = max),
-      MoneySum    = sum(.data$Amount[.data$Keep]),
-      MoneyMed    = .mny_stat_or_na(.x = .data$Amount[.data$Keep], .f = stats::median),
-      NaiveSpans  = dplyr::n(),
-      NaiveMax    = .mny_stat_or_na(.x = .data$Amount, .f = max),
-      NaiveSum    = sum(.data$Amount),
-      NDropZero   = sum(.data$IsZero),
-      NDropPar    = sum(!.data$IsZero & .data$IsPar),
-      .by = c(DocID, Block)
-    ) |>
-    # FULL JOIN, because a contract can withhold every figure it names and parse none of them --
-    # "$[***] per share" and nothing else -- and an inner join would drop exactly the document the
-    # variable exists to find.
-    dplyr::full_join(held_, by = dplyr::join_by(DocID, Block)) |>
-    dplyr::mutate(
-      dplyr::across(c(NSpans, NDistinct, NaiveSpans, NDropZero, NDropPar, NWithheld),
-                    \(.x) as.integer(dplyr::coalesce(.x, 0L))),
-      dplyr::across(c(MoneySum, NaiveSum), \(.x) dplyr::coalesce(.x, 0)),
-      RepeatRatio = dplyr::if_else(.data$NSpans > 0L, .data$NDistinct / .data$NSpans, NA_real_)
-    ) |>
-    dplyr::filter(.data$NaiveSpans > 0L | .data$NWithheld > 0L, !is.na(.data$Block))
 }
 
 
@@ -360,106 +256,203 @@ mny_aggregate <- function(.money, .spec) {
 }
 
 
-#' The release: one row per contract, USD and non-USD side by side
-#'
-#' EVERY CONTRACT GETS A ROW, including the ones matcon found no amount in. They carry zero spans and
-#' a missing maximum, so a mean over the file divides by the sample rather than by the documents that
-#' named a figure.
-#'
-#' THE TWO BLOCKS ARE COLUMNS OF ONE ROW rather than two rows or two tables. A maximum across
-#' currencies is not a quantity, so they can never be pooled -- but a reader wanting the USD figure
-#' should not have to filter, and one wanting both should not have to join.
-#'
-#' NWithheldUSD AND NWithheldOther ARE THE VARIABLE THIS DOCUMENT WAS THROWING AWAY. A currency with
-#' no figure: the contract named a price and removed it. It is a narrower and sharper claim than
-#' 04B5's NRedactSymbol, which counts "[***]" wherever it falls -- in a schedule, a definition, a
-#' party's name -- while this counts it standing where a dollar figure belongs.
-#'
-#' THEY ENTER NO ARITHMETIC. A withheld figure carries no number, so a sum or a maximum including it
-#' would have to invent one. It is a count of an EVENT and nothing else.
-#'
-#' EVERY QUANTITY IS PER BLOCK, AND NAmounts WAS THE ONE THAT WAS NOT. Maxima, sums, distinct counts,
-#' naive figures and withheld prices all split USD from the rest; the kept COUNT was pooled, so a
-#' ratio of distinct USD amounts over it mixed a USD numerator with a two-block denominator and
-#' understated repetition wherever a contract named a foreign figure. NAmountsUSD and NAmountsOther
-#' remove that, and NAmounts stays as their total because a reader wanting one number should not have
-#' to add two.
-#'
-#' THE NAIVE COLUMNS ARE RELEASED, and they are the definition this document argues against. Without
-#' them the comparison every table makes cannot be reproduced from the file, because the filtered
-#' spans are not in it. Publishing the baseline beside the rule is the same discipline that keeps the
-#' excluded parties in 04B1's file.
-#'
-#' @param .agg Tibble from mny_aggregate().
-#' @param .keys Tibble from ent_anchor_keys().
-#' @return Tibble: one row per contract, seventeen columns.
-mny_release <- function(.agg, .keys) {
-  if (FALSE) {
-    .agg  <- tab_agg
-    .keys <- tab_keys
-  }
+# 5. The release ---------------------------------------------------------------------------------------------------------
 
-  wide_ <- .agg |>
-    dplyr::select("DocID", "Block", "NSpans", "NDistinct", "MoneyMax", "MoneySum",
-                  "NaiveSpans", "NaiveMax", "NaiveSum", "NWithheld") |>
-    tidyr::pivot_wider(
-      names_from  = Block,
-      values_from = c(NSpans, NDistinct, MoneyMax, MoneySum, NaiveSpans, NaiveMax, NaiveSum,
-                      NWithheld),
-      names_sep   = ""
-    )
+#' The release: one row per figure, every filter a column
+#'
+#' NOTHING IS DROPPED HERE. A zero, a par-value figure, a withheld price and a span that would not
+#' cast are all in the file, each marked by the column that describes it. That is what makes the
+#' naive ladder a filter rather than a second computation, and what lets a reader who disagrees with
+#' either filter recompute the aggregate rather than take it.
+#'
+#' MoneyDrop IS THE FOUR OUTCOMES IN ONE COLUMN, so the commonest cut needs no boolean algebra: kept,
+#' zero, par, unparsed. Withheld is separate and deliberately so -- a removed price is not a dropped
+#' amount, it is a measurement about the filing.
+#'
+#' @param .money Tibble from mny_mark_par().
+#' @return Tibble: one row per figure.
+mny_release_spans <- function(.money) {
+  if (FALSE) .money <- tab_marked
 
-  drop_ <- .agg |>
-    dplyr::summarise(NDropZero = sum(.data$NDropZero), NDropPar = sum(.data$NDropPar),
-                     .by = DocID)
-
-  # NAMED EXPLICITLY RATHER THAN BY PREFIX. pivot_wider() emits a column only for a block that
-  # appears somewhere in the data, so a sample holding no non-USD amount would produce a file with a
-  # different schema from one that does -- and nothing would say so. Declaring the names here means a
-  # missing block is a column of zeros rather than an absent column.
-  need_ <- c("NSpansUSD", "NSpansnon-USD", "NDistinctUSD", "NDistinctnon-USD",
-             "MoneyMaxUSD", "MoneyMaxnon-USD", "MoneySumUSD", "MoneySumnon-USD",
-             "NaiveSpansUSD", "NaiveSpansnon-USD", "NaiveMaxUSD", "NaiveMaxnon-USD",
-             "NaiveSumUSD", "NaiveSumnon-USD", "NWithheldUSD", "NWithheldnon-USD")
-  for (nm_ in setdiff(need_, names(wide_))) wide_[[nm_]] <- NA_real_
-
-  .keys |>
-    dplyr::select("DocID", "Class", "AmendType") |>
-    dplyr::left_join(wide_, by = dplyr::join_by(DocID)) |>
-    dplyr::left_join(drop_, by = dplyr::join_by(DocID)) |>
+  .money |>
     dplyr::transmute(
-      .data$DocID, .data$Class, .data$AmendType,
-      NAmounts     = as.integer(dplyr::coalesce(.data$NSpansUSD, 0) +
-                                dplyr::coalesce(.data$`NSpansnon-USD`, 0)),
-      NAmountsUSD   = as.integer(dplyr::coalesce(.data$NSpansUSD, 0)),
-      NAmountsOther = as.integer(dplyr::coalesce(.data$`NSpansnon-USD`, 0)),
-      NAmountsRaw  = as.integer(dplyr::coalesce(.data$NaiveSpansUSD, 0) +
-                                dplyr::coalesce(.data$`NaiveSpansnon-USD`, 0)),
-      NDroppedZero = as.integer(dplyr::coalesce(.data$NDropZero, 0L)),
-      NDroppedPar  = as.integer(dplyr::coalesce(.data$NDropPar, 0L)),
-      NWithheldUSD   = as.integer(dplyr::coalesce(.data$NWithheldUSD, 0L)),
-      NWithheldOther = as.integer(dplyr::coalesce(.data$`NWithheldnon-USD`, 0L)),
-      MoneyMaxUSD     = .data$MoneyMaxUSD,
-      MoneySumUSD     = .data$MoneySumUSD,
-      NDistinctUSD    = as.integer(dplyr::coalesce(.data$NDistinctUSD, 0L)),
-      NaiveMaxUSD     = .data$NaiveMaxUSD,
-      NaiveSumUSD     = .data$NaiveSumUSD,
-      MoneyMaxOther   = .data$`MoneyMaxnon-USD`,
-      MoneySumOther   = .data$`MoneySumnon-USD`,
-      NDistinctOther  = as.integer(dplyr::coalesce(.data$`NDistinctnon-USD`, 0L)),
-      NaiveMaxOther   = .data$`NaiveMaxnon-USD`,
-      NaiveSumOther   = .data$`NaiveSumnon-USD`
+      .data$DocID,
+      MoneyStart = as.integer(.data$Start),
+      MoneyStop  = as.integer(.data$Stop),
+      MoneyText  = .data$Span,
+      Pattern    = .data$LabelRaw,
+      .data$AmountRaw,
+      .data$Amount,
+      .data$Currency,
+      .data$Block,
+      .data$Parsed,
+      .data$Withheld,
+      .data$IsZero,
+      .data$IsPar,
+      .data$ParSide,
+      .data$ParCue,
+      # WITHHELD OUTRANKS UNPARSED, and the order is the whole of it. A withheld figure has no number
+      # to cast, so Parsed is FALSE and it would otherwise land in "unparsed" -- which says this
+      # document could not read a figure, when the truth is that the filer removed one. Two opposite
+      # findings under one label, and the count was identical to the withheld count because every
+      # unparsed row WAS a withheld row.
+      MoneyDrop  = dplyr::case_when(
+        .data$Withheld ~ "withheld",
+        !.data$Parsed  ~ "unparsed",
+        .data$IsZero   ~ "zero",
+        .data$IsPar    ~ "par",
+        .default       = "kept"
+      )
     ) |>
-    dplyr::arrange(.data$DocID)
+    dplyr::arrange(.data$DocID, .data$MoneyStart)
 }
 
 
-#' Apply one specification end to end
+#' What every column of the money file means
+#' @param .tab Tibble from mny_release_spans().
+#' @return Tibble: Column, Grain, Meaning.
+mny_dictionary_spans <- function(.tab) {
+  if (FALSE) .tab <- tab_release
+
+  dict_ <- tibble::tribble(
+    ~Column,      ~Grain,     ~Meaning,
+    "DocID",      "document", "the contract",
+    "MoneyStart", "figure",   "offset of the figure, into 04A's canonical text",
+    "MoneyStop",  "figure",   "offset one past its last character",
+    "MoneyText",  "figure",   "the surface form, raw: it slices from the two offsets exactly",
+    "Pattern",    "figure",   "which moneyregex pattern matched",
+    "AmountRaw",  "figure",   "the number as the extractor wrote it, before casting",
+    "Amount",     "figure",   "that number as a double; null where the cast failed or none was there",
+    "Currency",   "figure",   "the currency the extractor resolved",
+    "Block",      "figure",   "USD or non-USD; the aggregate never mixes them",
+    "Parsed",     "figure",   "a figure this document can compute with",
+    "Withheld",   "figure",   "a currency with no number -- the filer removed the price",
+    "IsZero",     "figure",   "exactly zero; the two commonest money spans are $0 and $0.00",
+    "IsPar",      "figure",   "par-value language sits within the window on either side",
+    "ParSide",    "figure",   "before, after, both or none -- which side the cue was on",
+    "ParCue",     "figure",   "the phrase that fired IsPar, so a shorter list is a query",
+    "MoneyDrop",  "figure",   "kept, zero, par, withheld or unparsed -- every outcome, one column"
+  )
+
+  undoc_  <- setdiff(names(.tab), dict_$Column)
+  unseen_ <- setdiff(dict_$Column, names(.tab))
+  say_    <- function(.x) if (length(.x) == 0L) "none" else paste(.x, collapse = ", ")
+
+  if (length(undoc_) > 0L || length(unseen_) > 0L) {
+    cli::cli_abort(c(
+      "The money dictionary and the released file disagree.",
+      "x" = "In the file and undocumented: {say_(undoc_)}.",
+      "x" = "Documented and not in the file: {say_(unseen_)}."
+    ))
+  }
+
+  dict_[match(names(.tab), dict_$Column), ]
+}
+
+
+#' The collapse: one row per contract, from the figure file
+#'
+#' DEFINED HERE AND WRITTEN NOWHERE. This document scores it, reports it and checks its shape; the
+#' export calls it to materialise one row per contract. An aggregate stored as data is an aggregate
+#' whose filters cannot be changed without re-releasing, and both of these filters are ones a reader
+#' might reasonably reject.
+#'
+#' THE NAIVE FIGURES ARE THE SAME AGGREGATE WITH ONE FILTER OFF, computed here rather than stored,
+#' because the file still holds the rows a stored version would have thrown away.
+#'
+#' @param .release Tibble or dataset from mny_release_spans().
+#' @param .keys Tibble from ent_anchor_keys(). Supplies the population.
+#' @param .spec List from mny_spec(). Selects which filters apply.
+#' @return Tibble: one row per document in .keys.
+mny_collapse <- function(.release, .keys, .spec) {
+  if (FALSE) {
+    .release <- tab_release
+    .keys    <- tab_keys
+    .spec    <- .lP$Params$Spec
+  }
+
+  # WHICH FILTERS THE SPECIFICATION ASKS FOR. "none" keeps every parsed figure, "zero" drops the
+  # zeros, "par" drops both. The rows are still in the file either way.
+  keep_ <- .release |>
+    dplyr::filter(.data$Parsed) |>
+    dplyr::filter(!(.spec$Filter %in% c("zero", "par") & .data$IsZero)) |>
+    dplyr::filter(!(.spec$Filter == "par" & .data$IsPar))
+
+  agg_ <- function(.d, .suffix) {
+    .d |>
+      dplyr::summarise(
+        N        = dplyr::n(),
+        NDistinct = dplyr::n_distinct(.data$Amount),
+        Max      = .mny_stat_or_na(.x = .data$Amount, .f = max),
+        Sum      = .mny_stat_or_na(.x = .data$Amount, .f = sum),
+        Median   = .mny_stat_or_na(.x = .data$Amount, .f = stats::median),
+        .by = c(DocID, Block)
+      ) |>
+      tidyr::pivot_wider(
+        names_from  = "Block",
+        values_from = c("N", "NDistinct", "Max", "Sum", "Median"),
+        names_glue  = paste0("{.value}{Block}", .suffix)
+      )
+  }
+
+  rule_  <- agg_(.d = keep_, .suffix = "")
+  naive_ <- agg_(.d = dplyr::filter(.release, .data$Parsed), .suffix = "Naive")
+
+  counts_ <- .release |>
+    dplyr::summarise(
+      NAmountsRaw    = sum(.data$Parsed),
+      NDroppedZero   = sum(.data$Parsed & .data$IsZero),
+      NDroppedPar    = sum(.data$Parsed & !.data$IsZero & .data$IsPar),
+      NUnparsed      = sum(!.data$Parsed & !.data$Withheld),
+      NWithheldUSD   = sum(.data$Withheld & dplyr::coalesce(.data$Block, "") == "USD"),
+      NWithheldOther = sum(.data$Withheld & dplyr::coalesce(.data$Block, "") != "USD"),
+      .by = DocID
+    )
+
+  .keys |>
+    dplyr::select("DocID") |>
+    dplyr::left_join(counts_, by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(rule_,   by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(naive_,  by = dplyr::join_by(DocID)) |>
+    dplyr::rename(dplyr::any_of(c(
+      NAmountsUSD = "NUSD", NAmountsOther = "Nnon-USD",
+      NDistinctUSD = "NDistinctUSD", NDistinctOther = "NDistinctnon-USD",
+      MoneyMaxUSD = "MaxUSD", MoneyMaxOther = "Maxnon-USD",
+      MoneySumUSD = "SumUSD", MoneySumOther = "Sumnon-USD",
+      MoneyMedUSD = "MedianUSD", MoneyMedOther = "Mediannon-USD",
+      NaiveMaxUSD = "MaxUSDNaive", NaiveMaxOther = "Maxnon-USDNaive",
+      NaiveSumUSD = "SumUSDNaive", NaiveSumOther = "Sumnon-USDNaive"
+    ))) |>
+    # NAMED EXPLICITLY AND NOT BY PREFIX. starts_with("N") also matches NaiveMaxUSD and NaiveSumUSD,
+    # which are AMOUNTS rather than counts -- casting those to integer would overflow anything above
+    # 2.1 billion and turn a contract with no naive figure from missing into zero. A count is missing
+    # because none was found and belongs at zero; an amount is missing because none was named and
+    # does not.
+    dplyr::mutate(
+      dplyr::across(
+        dplyr::any_of(c("NAmountsRaw", "NDroppedZero", "NDroppedPar", "NUnparsed",
+                        "NWithheldUSD", "NWithheldOther", "NAmountsUSD", "NAmountsOther",
+                        "NDistinctUSD", "NDistinctOther")),
+        \(.x) as.integer(dplyr::coalesce(.x, 0L))
+      ),
+      NAmounts = as.integer(dplyr::coalesce(.data$NAmountsUSD, 0L) +
+                              dplyr::coalesce(.data$NAmountsOther, 0L))
+    ) |>
+    dplyr::select(-dplyr::any_of(c("NDistinctUSDNaive", "NDistinctnon-USDNaive",
+                                   "NUSDNaive", "Nnon-USDNaive",
+                                   "MedianUSDNaive", "Mediannon-USDNaive")))
+}
+
+
+#' Apply the rule end to end
+#'
+#' ONE ENTRY POINT, AND 04D CALLS EXACTLY THIS. The release comes out; the collapse is returned beside
+#' it because this document reports on it, and the export computes it again from the file.
 #'
 #' @param .money Tibble from mny_load().
 #' @param .keys Tibble from ent_anchor_keys().
 #' @param .spec List from mny_spec().
-#' @return A list: Spec, Marked, Agg, Release.
+#' @return A list: Spec, Marked, Release, Agg.
 mny_apply <- function(.money, .keys, .spec) {
   if (FALSE) {
     .money <- tab_money
@@ -467,19 +460,74 @@ mny_apply <- function(.money, .keys, .spec) {
     .spec  <- .lP$Params$Spec
   }
 
-  marked_ <- mny_mark_par(.money = .money, .spec = .spec)
-  agg_    <- mny_aggregate(.money = marked_, .spec = .spec)
+  marked_  <- mny_mark_par(.money = .money, .spec = .spec)
+  release_ <- mny_release_spans(.money = marked_)
 
-  list(Spec = .spec, Marked = marked_, Agg = agg_,
-       Release = mny_release(.agg = agg_, .keys = .keys))
+  list(
+    Spec    = .spec,
+    Marked  = marked_,
+    Release = release_,
+    Agg     = mny_collapse(.release = release_, .keys = .keys, .spec = .spec)
+  )
 }
 
 
-# 5. Evidence ------------------------------------------------------------------------------------------------------------
+#' The naive ladder, by contract type
+#'
+#' THREE RUNGS AND THE STEP BETWEEN EACH PAIR IS ONE FILTER. Parsed to no-zero is the zero filter;
+#' no-zero to the rule is the par-value filter. Both are computable from the released file, so a
+#' reader who rejects either takes the rung above it.
+#'
+#' @param .doc Tibble from mny_collapse(), optionally carrying Class.
+#' @return Tibble: one row per type, and one for the sample.
+mny_table_ladder <- function(.doc) {
+  if (FALSE) .doc <- tab_agg
+
+  cols_ <- function(.d) {
+    dplyr::summarise(
+      .d,
+      Docs        = dplyr::n(),
+      MeanRaw     = mean(.data$NAmountsRaw),
+      MeanKept    = mean(.data$NAmounts),
+      PctZero     = sum(.data$NDroppedZero) / pmax(sum(.data$NAmountsRaw), 1L),
+      PctPar      = sum(.data$NDroppedPar) / pmax(sum(.data$NAmountsRaw), 1L),
+      PctAnyUSD   = mean(!is.na(.data$MoneyMaxUSD)),
+      MedMaxUSD   = .mny_stat_or_na(.x = .data$MoneyMaxUSD, .f = stats::median),
+      MedNaiveUSD = .mny_stat_or_na(.x = .data$NaiveMaxUSD, .f = stats::median),
+      PctWithheld = mean((.data$NWithheldUSD + .data$NWithheldOther) > 0L),
+      .by = dplyr::any_of("Class")
+    )
+  }
+
+  dplyr::bind_rows(
+    dplyr::arrange(cols_(.doc), dplyr::desc(.data$Docs)),
+    dplyr::mutate(cols_(dplyr::select(.doc, -dplyr::any_of("Class"))), Class = "All", .before = 1L)
+  )
+}
+
+
+#' What became of every figure the extractor proposed
+#' @param .release Tibble from mny_release_spans().
+#' @return Tibble: one row per outcome.
+mny_table_outcome <- function(.release) {
+  if (FALSE) .release <- tab_release
+
+  .release |>
+    dplyr::summarise(
+      Figures  = dplyr::n(),
+      MedValue = .mny_stat_or_na(.x = .data$Amount, .f = stats::median),
+      .by = MoneyDrop
+    ) |>
+    dplyr::mutate(Share = .data$Figures / sum(.data$Figures)) |>
+    dplyr::arrange(plot_factor(.data$MoneyDrop, .key = "MoneyDrop"))
+}
+
+
+# 7. Evidence ------------------------------------------------------------------------------------------------------------
 
 #' Reduce one specification to a comparable row
 #'
-#' @param .agg Tibble from mny_aggregate().
+#' @param .agg Tibble from mny_collapse(), one wide row per document.
 #' @param .spec List from mny_spec().
 #' @param .n_docs Integer. Documents in the sample.
 #' @return Tibble: one row per currency block.
@@ -490,18 +538,36 @@ mny_row <- function(.agg, .spec, .n_docs) {
     .n_docs <- nrow(tab_keys)
   }
 
-  .agg |>
-    dplyr::filter(.data$NSpans > 0L) |>
-    dplyr::summarise(
-      Docs        = dplyr::n(),
-      PctOfSample = dplyr::n() / .n_docs,
-      Spans       = sum(.data$NSpans),
-      MeanSpans   = mean(.data$NSpans),
-      RepeatRatio = mean(.data$RepeatRatio, na.rm = TRUE),
-      MedMax      = stats::median(.data$MoneyMax, na.rm = TRUE),
-      MedSum      = stats::median(.data$MoneySum, na.rm = TRUE),
-      .by = Block
-    ) |>
+  # THE COLLAPSE IS WIDE AND THIS ROW IS PER BLOCK, so the two currency blocks are unstacked here
+  # rather than carried long through mny_collapse(). The collapse is what the export materialises and
+  # a downstream file wants one row per contract; the sweep is a report and wants one row per block.
+  # Doing it here keeps the shape decision with the thing that needs the shape.
+  block_ <- function(.suffix, .name) {
+    n_       <- .agg[[paste0("NAmounts", .suffix)]]
+    distinct_ <- .agg[[paste0("NDistinct", .suffix)]]
+    max_     <- .agg[[paste0("MoneyMax", .suffix)]]
+    sum_     <- .agg[[paste0("MoneySum", .suffix)]]
+    has_     <- !is.na(n_) & n_ > 0L
+
+    tibble::tibble(
+      Block       = .name,
+      Docs        = sum(has_),
+      PctOfSample = sum(has_) / .n_docs,
+      Spans       = sum(n_[has_]),
+      MeanSpans   = .mny_stat_or_na(.x = n_[has_], .f = mean),
+      # DISTINCT AMOUNTS OVER TOTAL SPANS, and it is the caveat MoneySum needs: no filter can tell a
+      # restatement from a second obligation, so a ratio near zero means the sum counts one figure
+      # many times.
+      RepeatRatio = .mny_stat_or_na(
+        .x = (distinct_[has_] / pmax(n_[has_], 1L)), .f = mean
+      ),
+      MedMax      = .mny_stat_or_na(.x = max_[has_], .f = stats::median),
+      MedSum      = .mny_stat_or_na(.x = sum_[has_], .f = stats::median)
+    )
+  }
+
+  dplyr::bind_rows(block_(.suffix = "USD", .name = "USD"),
+                   block_(.suffix = "Other", .name = "non-USD")) |>
     dplyr::mutate(Filter = .spec$Label, CueWin = .spec$CueWin, .before = 1L)
 }
 
@@ -555,7 +621,7 @@ mny_par_side <- function(.marked) {
 }
 
 
-# 6. Tables --------------------------------------------------------------------------------------------------------------
+# 8. Tables --------------------------------------------------------------------------------------------------------------
 
 #' What the extractor found and how much of it parsed
 #' @param .money Tibble from mny_load().
@@ -579,53 +645,8 @@ mny_table_parse <- function(.money) {
 }
 
 
-#' What each filter removed, by contract type
-#'
-#' THE TABLE THIS DOCUMENT EXISTS TO PRODUCE. NAIVE is every parsed amount, both filters off -- what a
-#' reader gets by summing what the extractor emitted. RULE is what the two filters left.
-#'
-#' @param .release Tibble from mny_release().
-#' @return Tibble: one row per type, and one for the sample.
-mny_table_naive <- function(.release) {
-  if (FALSE) .release <- tab_release
-
-  cols_ <- function(.d) {
-    dplyr::summarise(
-      .d,
-      Docs        = dplyr::n(),
-      PctAny      = mean(.data$NAmounts > 0L),
-      MeanNaive   = mean(.data$NAmountsRaw),
-      MeanRule    = mean(.data$NAmounts),
-      PctRemove   = sum(.data$NAmountsRaw - .data$NAmounts) / pmax(sum(.data$NAmountsRaw), 1L),
-      # BOTH MEDIANS OVER ONE POPULATION, and getting that wrong made the rule look like it RAISED
-      # contract value. A contract whose only figures were zeros or par values has a NaiveMaxUSD --
-      # nought, or a hundredth of a dollar -- and no MoneyMaxUSD at all, so a median over each
-      # column's own non-missing rows compares a set that includes those with a set that excludes
-      # them. The boilerplate-only contracts drag the naive median DOWN, and the filtered median then
-      # sits above it: five of thirteen contract types reported exactly that, against a per-contract
-      # identity that holds on every single row.
-      #
-      # The population is the contracts the rule kept a USD amount in. On those, MoneyMaxUSD is at
-      # most NaiveMaxUSD by construction, so the medians can only order one way.
-      MedMaxNaive = stats::median(.data$NaiveMaxUSD[!is.na(.data$MoneyMaxUSD)], na.rm = TRUE),
-      MedMaxRule  = stats::median(.data$MoneyMaxUSD[!is.na(.data$MoneyMaxUSD)], na.rm = TRUE),
-      # AND THE OTHER HALF OF THE STORY, which the old table could not show: contracts that named a
-      # USD figure and kept none of it. Those are exactly the rows the median has to exclude, so the
-      # count belongs beside it rather than nowhere.
-      PctAllPar   = mean(!is.na(.data$NaiveMaxUSD) & is.na(.data$MoneyMaxUSD)),
-      .by = dplyr::any_of("Class")
-    )
-  }
-
-  dplyr::bind_rows(
-    dplyr::arrange(cols_(.release), dplyr::desc(.data$Docs)),
-    dplyr::mutate(cols_(dplyr::select(.release, -"Class")), Class = "All", .before = 1L)
-  )
-}
-
-
 #' Why each dropped amount was dropped
-#' @param .release Tibble from mny_release().
+#' @param .release Tibble from mny_collapse().
 #' @return Tibble: one row per reason.
 mny_table_dropped <- function(.release) {
   if (FALSE) .release <- tab_release
@@ -649,7 +670,7 @@ mny_table_dropped <- function(.release) {
 #' document has: there is no ground truth for what a contract is worth, but a credit agreement should
 #' out-value an employment agreement and a reader can say whether it does.
 #'
-#' @param .release Tibble from mny_release().
+#' @param .release Tibble from mny_collapse().
 #' @return Tibble: one row per type, and one for the sample.
 mny_table_class <- function(.release) {
   if (FALSE) .release <- tab_release
@@ -697,7 +718,7 @@ mny_table_class <- function(.release) {
 #' would mostly show rows of nulls and say nothing about the rule. Two of them are drawn from the
 #' contracts where a filter actually removed a figure, which is the shape a reader needs to recognise.
 #'
-#' @param .tab Tibble from mny_release().
+#' @param .tab Tibble from mny_collapse().
 #' @param .n Integer. Contracts drawn.
 #' @param .seed Integer. Sampling seed.
 #' @return Tibble: the drawn rows.
@@ -724,59 +745,7 @@ mny_release_sample <- function(.tab, .n = 8L, .seed = 42L) {
 }
 
 
-#' What every column of the released file means
-#'
-#' A TABLE RATHER THAN PROSE, AND CHECKED AGAINST THE FILE. A column added or renamed without a
-#' matching entry aborts the render rather than leaving the documentation quietly wrong.
-#'
-#' @param .tab Tibble from mny_release().
-#' @return Tibble: Column, Meaning.
-mny_dictionary <- function(.tab) {
-  if (FALSE) .tab <- tab_release
-
-  dict_ <- tibble::tribble(
-    ~Column,          ~Meaning,
-    "DocID",          "the contract; joins to every other 04 file",
-    "Class",          "contract type, from 03A's label spine",
-    "AmendType",      "original or amended, from the same spine",
-    "NAmounts",       "amounts the rule kept, both currency blocks",
-    "NAmountsUSD",    "of those, USD; the denominator a USD ratio needs",
-    "NAmountsOther",  "of those, every other currency",
-    "NAmountsRaw",    "amounts the extractor parsed, before either filter",
-    "NDroppedZero",   "of those, figures of exactly zero",
-    "NDroppedPar",    "of those, figures with par-value language beside them",
-    "NWithheldUSD",   "USD prices the CONTRACT removed: $[***], $**, $TBD, $ per share",
-    "NWithheldOther", "the same in every other currency",
-    "MoneyMaxUSD",    "the largest USD amount the rule kept; the one unambiguous figure",
-    "MoneySumUSD",    "their total; read against NDistinctUSD, which says how much is repetition",
-    "NDistinctUSD",   "distinct kept USD amounts",
-    "NaiveMaxUSD",    "the largest USD amount before either filter",
-    "NaiveSumUSD",    "their total before either filter",
-    "MoneyMaxOther",  "the same maximum for every non-USD currency, never pooled with USD",
-    "MoneySumOther",  "their total",
-    "NDistinctOther", "distinct kept non-USD amounts",
-    "NaiveMaxOther",  "the non-USD maximum before either filter",
-    "NaiveSumOther",  "their total before either filter"
-  )
-
-  undoc_  <- setdiff(names(.tab), dict_$Column)
-  unseen_ <- setdiff(dict_$Column, names(.tab))
-  say_    <- function(.x) if (length(.x) == 0L) "none" else paste(.x, collapse = ", ")
-
-  if (length(undoc_) > 0L || length(unseen_) > 0L) {
-    cli::cli_abort(c(
-      "The dictionary and the released file disagree.",
-      "x" = "In the file and undocumented: {say_(undoc_)}.",
-      "x" = "Documented and not in the file: {say_(unseen_)}.",
-      "i" = "A dictionary that can drift from its file documents nothing."
-    ))
-  }
-
-  dict_[match(names(.tab), dict_$Column), ]
-}
-
-
-# 7. Report --------------------------------------------------------------------------------------------------------------
+# 9. Report --------------------------------------------------------------------------------------------------------------
 
 #' What the extractor found and how much of it parsed
 #' @param .tab Tibble from mny_table_parse().
@@ -848,33 +817,6 @@ mny_report_dropped <- function(.tab) {
 }
 
 
-#' The rule against the unfiltered count
-#' @param .tab Tibble from mny_table_naive().
-#' @return Invisibly .tab.
-mny_report_naive <- function(.tab) {
-  if (FALSE) .tab <- tab_naive
-
-  cli::cli_h2("The rule against the unfiltered count")
-  .tab |>
-    dplyr::mutate(
-      dplyr::across(c(MeanNaive, MeanRule), \(.x) tbl_num(.x)),
-      dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x)),
-      dplyr::across(dplyr::starts_with("MedMax"), \(.x) format(round(.x), big.mark = ","))
-    ) |>
-    tbl_say(.title = "Amounts kept against amounts found, by contract type")
-
-  cli::cli_alert_info(
-    "PctRemove IS THE SHARE OF PARSED AMOUNTS THE TWO FILTERS DISCARDED: too low and the rule is \\
-     doing nothing, too high and it is cutting figures rather than boilerplate. The two MedMax \\
-     columns are over the SAME contracts -- the ones that kept a USD amount -- so MedMaxRule can \\
-     never exceed MedMaxNaive, and where they differ the largest figure the contract named was a par \\
-     value or a zero. PctAllPar is the contracts excluded from both: they named a USD figure and the \\
-     filters removed every one of it."
-  )
-  invisible(.tab)
-}
-
-
 #' The money variables by contract type
 #' @param .tab Tibble from mny_table_class().
 #' @return Invisibly .tab.
@@ -934,35 +876,113 @@ mny_report_sweep <- function(.tab) {
 }
 
 
+#' The naive ladder, reported
+#' @param .tab Tibble from mny_table_ladder().
+#' @return Invisibly .tab.
+mny_report_ladder <- function(.tab) {
+  if (FALSE) .tab <- tab_ladder
+
+  cli::cli_h2("The rule against the naive ladder")
+  .tab |>
+    dplyr::mutate(
+      dplyr::across(dplyr::starts_with("Mean"), \(.x) tbl_num(.x)),
+      dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct(.x)),
+      dplyr::across(dplyr::starts_with("Med"), \(.x) format(round(.x), big.mark = ","))
+    ) |>
+    tbl_say(.title = "Figures per contract before and after the filters, by contract type")
+
+  cli::cli_alert_info(
+    "PctZero AND PctPar ARE THE TWO FILTERS, each as a share of every figure the extractor read. A \\
+     zero is not an amount anybody owes and the two commonest money spans in this corpus are $0 and \\
+     $0.00. A figure beside par-value language is a share's nominal value, and the cue is read on \\
+     BOTH sides because a drafter writes it either way round."
+  )
+  cli::cli_alert_info(
+    "MedMaxUSD AGAINST MedNaiveUSD IS WHAT THE FILTERS COST OR BOUGHT. Both are the largest USD \\
+     figure per contract, before and after; a large gap means the filters are removing figures that \\
+     were the maximum, which is exactly what par-value language beside a small number cannot cause \\
+     and what a zero cannot cause either."
+  )
+  cli::cli_alert_info(
+    "PctWithheld IS NOT A FILTER. It is contracts naming a price the filer removed -- a currency \\
+     with no number -- and they are counted and never summed, because an arithmetic including them \\
+     would have to invent a value."
+  )
+  invisible(.tab)
+}
+
+
+#' What became of every figure
+#' @param .tab Tibble from mny_table_outcome().
+#' @param .release Tibble from mny_release_spans().
+#' @return Invisibly .tab.
+mny_report_outcome <- function(.tab, .release) {
+  if (FALSE) {
+    .tab     <- tab_outcome
+    .release <- tab_release
+  }
+
+  cli::cli_h2("What became of every figure the extractor proposed")
+  .tab |>
+    dplyr::mutate(
+      Figures  = format(.data$Figures, big.mark = ","),
+      MedValue = dplyr::if_else(is.finite(.data$MedValue),
+                                format(round(.data$MedValue), big.mark = ","), "-"),
+      Share    = tbl_pct(.data$Share)
+    ) |>
+    tbl_say(.title = "One row per outcome, over every figure in the released file")
+
+  unp_ <- sum(.release$MoneyDrop == "unparsed")
+  cli::cli_alert_info(
+    "EVERY ROW IS IN THE FILE, including the four that no aggregate uses. That is what makes the \\
+     ladder a filter rather than a second computation: a reader who wants the zeros back writes one \\
+     predicate instead of re-running the rule."
+  )
+  cli::cli_alert_info(
+    "WITHHELD IS NOT UNPARSED, and separating them is the reason both levels exist. A withheld \\
+     figure is a currency the filer wrote with the number removed; an unparsed one is a figure this \\
+     document could not read. Both carry a null amount, so keying on the moneyregex PATTERN rather \\
+     than on the null is what tells two opposite findings apart."
+  )
+  cli::cli_alert_info(
+    "UNPARSED IS {format(unp_, big.mark = ',')}, and a small number here is a finding about the \\
+     extractor: moneyregex emits a figure it cannot cast only through the three withheld patterns, \\
+     so anything else in this row would be a currency it matched and then failed to read."
+  )
+  invisible(.tab)
+}
+
+
 #' What the released file holds
-#' @param .tab Tibble from mny_release().
+#' @param .release Tibble from mny_release_spans().
+#' @param .agg Tibble from mny_collapse().
 #' @return Invisibly the summary.
-mny_report_release <- function(.tab) {
-  if (FALSE) .tab <- tab_release
+mny_report_release <- function(.release, .agg) {
+  if (FALSE) {
+    .release <- tab_release
+    .agg     <- tab_agg
+  }
 
   cli::cli_h2("The released file")
 
   out_ <- tibble::tibble(
-    Item = c("Contracts",
-             "Naming a USD amount",
-             "Naming a non-USD amount",
-             "Naming neither",
-             "Where a filter removed something"),
-    N    = c(nrow(.tab),
-             sum(!is.na(.tab$MoneyMaxUSD)),
-             sum(!is.na(.tab$MoneyMaxOther)),
-             sum(.tab$NAmounts == 0L),
-             sum(.tab$NDroppedZero + .tab$NDroppedPar > 0L))
+    Item = c("Figures released",
+             "Contracts naming any figure",
+             "Contracts in the collapse",
+             "Contracts with a USD amount after the filters"),
+    N    = c(nrow(.release),
+             dplyr::n_distinct(.release$DocID),
+             nrow(.agg),
+             sum(!is.na(.agg$MoneyMaxUSD)))
   ) |>
-    dplyr::mutate(Share = tbl_pct(.data$N / nrow(.tab)))
+    dplyr::mutate(N = format(.data$N, big.mark = ","))
 
-  tbl_say(.tab = out_, .title = "One row per contract, by what it named")
+  tbl_say(.tab = out_, .title = "money_spans.parquet, and the collapse it supports")
 
   cli::cli_alert_info(
-    "EVERY CONTRACT GETS A ROW, including the ones naming no figure at all -- those carry zero spans \\
-     and a missing maximum, so a mean over the file divides by the sample rather than by the \\
-     documents that named something. The naive columns are released beside the rule so the \\
-     comparison every table makes can be reproduced from the file."
+    "THE COLLAPSE IS NOT WRITTEN. mny_collapse() produces one row per contract and the export calls \\
+     it; this document checks its shape against a dictionary so the export cannot produce a \\
+     different one. An aggregate stored as data is an aggregate whose filters cannot be changed."
   )
   invisible(out_)
 }
@@ -999,12 +1019,16 @@ mny_report_release_sample <- function(.tab) {
 
 
 #' The column dictionary
-#' @param .tab Tibble from mny_dictionary().
+#' @param .tab Any of this document's dictionary tables.
+#' @param .title Character. Heading, since the reporter is shared.
 #' @return Invisibly .tab.
-mny_report_dictionary <- function(.tab) {
-  if (FALSE) .tab <- tab_dict
+mny_report_dictionary <- function(.tab, .title = "The columns, in the order the file carries them") {
+  if (FALSE) {
+    .tab   <- tab_dict
+    .title <- "money_spans.parquet"
+  }
 
-  cli::cli_h2("What every column means")
+  cli::cli_h2(.title)
   tbl_say(.tab = .tab, .title = "Seventeen columns, in the order the file carries them")
 
   cli::cli_alert_info(
@@ -1018,10 +1042,12 @@ mny_report_dictionary <- function(.tab) {
 
 
 #' The rule in one table
-#' @param .release Tibble from mny_release().
+#' @param .release Tibble from mny_collapse().
 #' @param .side Tibble from mny_par_side().
+#' @param .n_spans Integer. Rows in money_spans.parquet, which is the released file --
+#'   .release is the collapse, and it has one row per contract rather than per figure.
 #' @return Invisibly the table.
-mny_report_headline <- function(.release, .side) {
+mny_report_headline <- function(.release, .side, .n_spans) {
   if (FALSE) {
     .release <- tab_release
     .side    <- tab_side
@@ -1055,7 +1081,7 @@ mny_report_headline <- function(.release, .side) {
     "Median largest USD amount, unfiltered",   format(round(stats::median(nai_)), big.mark = ","),
     "Median largest USD amount, this rule",    format(round(stats::median(usd_)), big.mark = ","),
     "Contracts whose every USD figure went",   format(lost_, big.mark = ","),
-    "Rows in the released file",               format(nrow(.release), big.mark = ",")
+    "Figures in the released file",              format(.n_spans, big.mark = ",")
   )
 
   tbl_say(.tab = out_, .title = "Everything this document decided")
@@ -1074,17 +1100,17 @@ mny_report_headline <- function(.release, .side) {
 }
 
 
-# 8. Figures -------------------------------------------------------------------------------------------------------------
+# 10. Figures ------------------------------------------------------------------------------------------------------------
 
 #' The rule against the unfiltered count, by contract type
-#' @param .tab Tibble from mny_table_naive().
+#' @param .tab Tibble from mny_table_ladder().
 #' @return A ggplot.
 mny_plot_naive <- function(.tab) {
-  if (FALSE) .tab <- tab_naive
+  if (FALSE) .tab <- tab_ladder
 
   .tab |>
     dplyr::filter(.data$Class != "All") |>
-    dplyr::select("Class", Unfiltered = "MeanNaive", Rule = "MeanRule") |>
+    dplyr::select("Class", Unfiltered = "MeanRaw", Rule = "MeanKept") |>
     tidyr::pivot_longer(cols = c("Unfiltered", "Rule"), names_to = "Measure",
                         values_to = "Amounts") |>
     ggplot2::ggplot(ggplot2::aes(x = .data$Amounts,
@@ -1099,7 +1125,7 @@ mny_plot_naive <- function(.tab) {
 
 
 #' The largest USD amount, by contract type
-#' @param .release Tibble from mny_release().
+#' @param .release Tibble from mny_collapse().
 #' @return A ggplot.
 mny_plot_max <- function(.release) {
   if (FALSE) .release <- tab_release
@@ -1135,7 +1161,7 @@ mny_plot_par_side <- function(.tab) {
 
 
 #' How much of a contract's total is repetition
-#' @param .release Tibble from mny_release().
+#' @param .release Tibble from mny_collapse().
 #' @return A ggplot.
 mny_plot_repeat <- function(.release) {
   if (FALSE) .release <- tab_release
@@ -1151,3 +1177,5 @@ mny_plot_repeat <- function(.release) {
     ggplot2::labs(x = "Distinct amounts over amounts kept", y = "Contracts") +
     plot_theme(.grid = "y")
 }
+
+

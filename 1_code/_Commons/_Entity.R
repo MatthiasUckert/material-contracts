@@ -52,8 +52,8 @@ if (FALSE) {
 
 plot_register_levels(
   .key    = "PartyRole",
-  .levels = c("registrant", "counterparty", "signatory", "other", "none"),
-  .short  = c("registrant", "counter", "signer", "other", "none")
+  .levels = c("registrant", "cofiler", "counterparty", "signatory", "other", "none"),
+  .short  = c("registrant", "cofiler", "counter", "signer", "other", "none")
 )
 
 
@@ -206,7 +206,103 @@ ent_anchor_cols <- function(.tab) {
       AnchorTight  = stringi::stri_replace_all_fixed(.data$AnchorKey, " ", ""),
       AnchorLen    = nchar(.data$AnchorKey),
       AnchorTok    = stringi::stri_count_fixed(.data$AnchorKey, " ") + 1L
+    ) |>
+    # HOW MANY REGISTRANTS FILED THIS DOCUMENT, carried so that every rate can be reported for the
+    # single-filer and multi-filer populations apart. 8.4% of the sample is multi-filer and the
+    # median of those has ten filers, which is far too large a group to average silently into the
+    # rest. Guarded because the register is the only source that has it and some callers hand in a
+    # narrower frame.
+    dplyr::mutate(
+      NFilers = if ("nCIK" %in% names(.tab)) {
+        as.integer(dplyr::coalesce(.data$nCIK, 1L))
+      } else {
+        NA_integer_
+      }
     )
+}
+
+
+#' Every registrant that filed a document, not only the one whose copy was extracted
+#'
+#' WHY THE ANCHOR IS A LIST AND NOT A NAME. A contract filed by several registrants exists in EDGAR
+#' once per filer, and 04C extracts the PRIMARY copy only -- so the anchor built from that copy knows
+#' one filer and the rule can match one filer. Every other registrant of the same contract is then
+#' found by the extractor, fails to match anything, and is classified as a counterparty.
+#'
+#' THE PRIMARY IS NOT STABLE WITHIN A GROUP, which is what makes this more than a labelling problem.
+#' Aurora Diagnostics filed twenty-nine contracts under twenty-six co-registrants, and the primary is
+#' a different subsidiary each time -- Massachusetts on two, then Georgia, Greensboro, Michigan. So a
+#' contract naming the parent matches an anchor naming a subsidiary and falls through to the
+#' first-party-named fallback. Matching against every filer rescues exactly those.
+#'
+#' AND IT IS WHAT THE REMOVED FAMILY GATE WAS FOR. A lab roll-up names its subsidiaries as guarantors
+#' in the preamble, well inside the window, so twenty-five siblings become twenty-five counterparties
+#' on a contract with one. ent_rule()'s family-frequency gate existed to catch that and was removed
+#' because its denominator became the chunk under 04D. This needs no denominator: a party matching a
+#' co-registrant of the same filing is a member of the filer's own group because EDGAR says so.
+#'
+#' ONE ROW PER DOCUMENT PER FILER, and the document is the TARGET document -- the extracted primary
+#' copy -- rather than the filer's own copy. That is what lets the rule join on the DocID it already
+#' has.
+#'
+#' @param .path_register 02B's Documents.parquet, which carries HashDocument for every copy.
+#' @param .doc_ids Character. The documents the rule will run on.
+#' @param .quiet Logical. Suppress the count line.
+#' @return Tibble: DocID, CIK, CompanyName, FilerKey, FilerTok, IsPrimary.
+ent_filer_keys <- function(.path_register, .doc_ids, .quiet = FALSE) {
+  if (FALSE) {
+    .path_register <- .lP$Input$Register
+    .doc_ids       <- tab_keys$DocID
+    .quiet         <- FALSE
+  }
+
+  reg_ <- arrow::open_dataset(sources = .path_register)
+
+  own_ <- reg_ |>
+    dplyr::select("DocID", "HashDocument") |>
+    dplyr::filter(.data$DocID %in% .doc_ids) |>
+    dplyr::collect()
+
+  # EVERY COPY OF THOSE DOCUMENTS, found through the hash rather than through the identifier. Two
+  # filings of one contract carry different DocIDs and the same HashDocument, which is the only
+  # column that says they are the same document.
+  all_ <- reg_ |>
+    dplyr::select("DocID", "HashDocument", "CIK", "CompanyName") |>
+    dplyr::filter(.data$HashDocument %in% own_$HashDocument) |>
+    dplyr::collect() |>
+    dplyr::rename(CopyDocID = "DocID")
+
+  out_ <- own_ |>
+    dplyr::left_join(all_, by = dplyr::join_by(HashDocument), relationship = "many-to-many") |>
+    dplyr::mutate(
+      IsPrimary = .data$CopyDocID == .data$DocID,
+      FilerKey  = ent_norm_key(.x = ent_strip_conformed(.x = .data$CompanyName), .min = 1L)
+    ) |>
+    dplyr::filter(!is.na(.data$FilerKey)) |>
+    dplyr::mutate(FilerTok = stringi::stri_count_fixed(.data$FilerKey, " ") + 1L) |>
+    dplyr::distinct(.data$DocID, .data$FilerKey, .keep_all = TRUE) |>
+    dplyr::select("DocID", "CIK", "CompanyName", "FilerKey", "FilerTok", "IsPrimary") |>
+    dplyr::arrange(.data$DocID, dplyr::desc(.data$IsPrimary), .data$FilerKey)
+
+  if (!.quiet) {
+    n_doc_  <- dplyr::n_distinct(out_$DocID)
+    n_mult_ <- out_ |>
+      dplyr::summarise(N = dplyr::n(), .by = DocID) |>
+      dplyr::filter(.data$N > 1L) |>
+      nrow()
+    cli::cli_alert_success(
+      "{format(nrow(out_), big.mark = ',')} {cli::qty(nrow(out_))}filer name{?s} for \\
+       {format(n_doc_, big.mark = ',')} {cli::qty(n_doc_)}document{?s}."
+    )
+    cli::cli_alert_info(
+      "{format(n_mult_, big.mark = ',')} {cli::qty(n_mult_)}document{?s} \\
+       ({tbl_pct(n_mult_ / max(n_doc_, 1L))}) {cli::qty(n_mult_)}{?was/were} filed by more than one \\
+       registrant. Every \\
+       one of those names is a registrant of this contract, and a rule matching only the primary \\
+       would call the others counterparties."
+    )
+  }
+  out_
 }
 
 
@@ -244,7 +340,7 @@ ent_corpus_keys <- function(.path_register, .path_release = NA_character_, .engi
 
   reg_ <- arrow::open_dataset(sources = .path_register) |>
     dplyr::select("DocID", "HashDocument", "HashIndex", "CIK", "CompanyName", "DateFiled",
-                  "nWords", "nChars")
+                  "nWords", "nChars", "nCIK")
   if (!is.null(.doc_ids)) reg_ <- dplyr::filter(reg_, .data$DocID %in% .doc_ids)
 
   out_ <- reg_ |>
@@ -440,7 +536,7 @@ ent_anchor_keys <- function(.path_prepared, .path_register, .path_landing = NULL
   # neither a superset nor a subset of what is actually there.
   reg_ <- arrow::open_dataset(sources = .path_register) |>
     dplyr::select("DocID", "HashDocument", "HashIndex", "CIK", "CompanyName", "DateFiled",
-                  "nWords", "nChars") |>
+                  "nWords", "nChars", "nCIK") |>
     dplyr::filter(.data$DocID %in% spine_$DocID) |>
     dplyr::collect()
 

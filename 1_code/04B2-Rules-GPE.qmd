@@ -1,5 +1,5 @@
 ---
-title: "Entity Rules -- Where Each Party Is (04B2)"
+title: "Rules -- Where Each Party Is (04B2)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -30,148 +30,77 @@ options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
 #| label: load-libraries
 #| echo: false
 
-source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
-
 # ORDER IS LOAD-BEARING. _Plots.R rebuilds its level registry empty every time it is sourced, so any
-# library that registers a vocabulary must follow it -- and both _Entity.R and this document's own
-# file do.
-source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
-
-# _Entity.R registers PartyRole, which 04B1 writes and this document orders every table by.
-source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
-
-# 03A owns the contract-type vocabulary and the label spine; 04A owns the sample and the stores.
+# library that registers a vocabulary must follow it -- _Entity.R, 04B1 and this document's own file
+# all do.
 purrr::walk(
-  .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
-  .f = \(.s) source(
-    file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
-    encoding = "UTF-8"
-  )
+  .x = c("_Initialize", "_Utils", "_NER", "_Plots", "_Tables", "_Entity"),
+  .f = \(.s) source(here::here("1_code", "_Commons", paste0(.s, ".R")), encoding = "UTF-8")
 )
+
+# 04B1 OWNS THE PARTY COLLAPSE, and this document reads its file rather than reimplementing the
+# group-by. ent_party_facts() is the one definition of "one row per party".
+source(here::here("1_code", "04B1-Rules-ORG.R"), encoding = "UTF-8")
 
 .name_script <- "04B2-Rules-GPE"
 
 cat("Main Directory: ")
-(.dir_main <- init_create_script_dir(
-  .dir_here    = here::here(), # project root
-  .name_script = .name_script  # this document's name; the output directory is derived from it
-))
+(.dir_main <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script))
 
 cat("Function File:  ")
-(.path_fun <- init_create_script_fun(
-  .dir_here    = here::here(), # project root
-  .name_script = .name_script  # resolves to 1_code/04B2-Rules-GPE.R
-))
+(.path_fun <- init_create_script_fun(.dir_here = here::here(), .name_script = .name_script))
 
 source(file = .path_fun, encoding = "UTF-8")
 ```
 
 # Purpose
 
-04B1 found the parties of every contract. This document attaches a place to each of them, and records
-the jurisdiction whose law the contract chose.
+matcon proposes place names with offsets. This decides which of them describe a party's location,
+which one names the governing law rather than an address, and what each resolves to.
 
-## What comes out
+## The rule, in five steps
 
-**One file: `parties_geo.parquet`, one row per contract per party.** It is 04B1's file with geography
-added to the same rows, so every count anyone computed over the party file survives unchanged and a
-party with no place keeps its row and carries nulls.
+**Resolve.** Look each name up in the gazetteer. A name existing under more than one parent --
+`SPRINGFIELD` is in 33 states -- is marked ambiguous and given no state. The gazetteer refuses to
+guess.
 
-| Level | Columns added |
-|:--|:--|
-| Party | `GeoState`, `GeoStateFrom`, `GeoCity`, `GeoCounty` |
-| Party | `GeoCountry`, `GeoCountryIso`, `NGeoNear`, `EdgarAgrees` |
-| Contract | `GoverningLaw`, `LawSpecified` -- repeated on every row, like `Class` |
+**Exclude the law.** A place whose offsets fall *inside* a governing-law clause names the law, not an
+address. Containment rather than proximity: in *"...the laws of the State of New York. Delaware
+corporations shall..."* Delaware is 47 characters from the cue and is not the jurisdiction.
 
-**Governing law is a contract term and never a party's address**, which is the whole reason the rule
-below withholds those places from attachment.
+**Attach.** A place belongs to the party named within **200 characters before it** -- any mention,
+not only the first. Backwards only, because a preamble names a company and then qualifies it.
 
-## The rule, in one paragraph
+**Resolve the ambiguous city.** It takes whichever of *its own* candidate states the contract names,
+nearest first and ties to the one named most often. A name whose candidates the contract never
+mentions keeps no state: a fallback would send every unresolved `SPRINGFIELD` to the same state, and
+a constant error reads as a real geographic pattern.
 
-A place sitting **inside a governing-law clause** leaves the attachment entirely: it names the law
-that applies, and it becomes a contract variable instead. Every other place belongs to the party
-named within **200 characters before it**, because a preamble names the company and then qualifies
-it. Where several places attach to one party, the nearest of each kind wins.
+**Collapse -- defined here, written nowhere.** The **nearest** attached place wins, ties broken by
+the earliest place offset. State and country are read off that one place, so they cannot disagree.
 
-One number, 200. Nothing else in this document enters an answer.
+## Two long files, and no per-party table
 
-## One engine, and the reason is coverage rather than quality
+`places_geo.parquet` is one row per place **including the ones the rule refused**, and
+`law_clauses.parquet` is one row per governing-law clause. `geo_collapse()` turns the first into one
+row per party; this document scores it, reports it and checks its shape, and the export calls it.
 
-matcon's gazetteer carries **181,810 rows** and reaches cities and counties. LexNLP's dictionary
-carries **437 entities and has no cities and no counties at all** -- it reaches countries and
-first-level subdivisions and stops. Releasing both engines would give every second row a
-guaranteed-null half: no city, no county, and a state that could never be inferred from a city. So
-matcon is the release, and the family comparison stays in 04A where it belongs.
+A collapse stored as data cannot be changed without re-releasing. A collapse stored as a query can be
+changed by whoever disagrees with it, and there is a decision inside this one that a reader may well
+want to change.
 
-## The governing-law exclusion repairs a defect
-
-Attachment used to run over every place with no exception. In
-*"...ACME CORPORATION. This Agreement shall be governed by the laws of the State of New York"*, a
-clause falling within reach of a company name put **New York in that company's state column**. 04B2
-measured 95% of governing-law spans attaching to no organisation, which bounds the damage without
-removing it: the 5% that did attach biased the released geography toward New York and Delaware.
-
-`lawregex` emits the clause as a span, so the fix is **containment rather than proximity** -- a
-non-equi join on offsets that reads no text at all. And the same join answers both questions: which
-places to withhold, and which jurisdiction the contract chose.
-
-**Containment beats proximity, and one document says why.** In *"...governed by the laws of the State
-of New York. Delaware corporations shall deliver..."* Delaware begins 47 characters after the cue --
-comfortably inside any window, and not the jurisdiction. The full stop closes the clause before
-Delaware begins.
-
-**A heading is a clause too, and it outranks nothing.** *"GOVERNING LAW. This Agreement is made under
-the laws of the State of Texas."* is two clauses: the heading, closed by its own full stop at zero
-useful characters, and the sentence carrying Texas. Ordering by position alone takes the heading and
-discards Texas, so a clause that found a place outranks one that did not.
-
-## The ambiguous city is the only real decision in the resolution
-
-Two thirds of city names exist in more than one state: `SPRINGFIELD` sits in 33 of them, and the
-gazetteer has no population, rank or primary-place column to order them by. Three arms:
-
-| The city name | Gets |
-|:--|:--|
-| exists in one state only | that state |
-| ambiguous, and the contract names one of **its** states | the nearest; ties to the one named most often |
-| ambiguous, and the contract names none of them | no state |
-
-**The constraint on the second arm is what makes it safe.** Taking the nearest state named *anywhere*
-would put `SPRINGFIELD` in Delaware whenever the party is a Delaware corporation -- and Delaware is
-incorporation boilerplate in a large share of contracts, so every Delaware-registered filer would drag
-its cities there and the release would show a concentration that is an artifact of the rule.
-
-**Position first, frequency second.** *"Springfield, Illinois"* puts the state two characters away and
-position settles it outright; frequency first would lose that wherever the contract mentioned another
-candidate state more often. Frequency counts mentions **within the contract**, so nothing here depends
-on how the corpus is partitioned.
-
-**The third arm refuses rather than guesses**, and that is a decision. A fallback would send every
-unresolved `SPRINGFIELD` to the same state, and a constant error is not noise -- it averages out of
-nothing and reads as a real geographic pattern.
-
-## What is upstream and not in this document
-
-`gazetteer.py` admits a place through a three-tier gate before this document sees it: a country or a
-state unconditionally, a **distinctive** city name only where a state anchor sits within 200
-characters, and a **word-like** name -- `Mobile`, `Reading`, `Enterprise` -- only within 40. A bare
-city with no state beside it is refused. That is why city coverage looks the way it does.
+The clauses are a second file because of one level. A clause naming no place at all produces no place
+row, so a jurisdiction carried as a column of a file of places could never express it -- and that is
+exactly what distinguishes a contract with no governing-law clause from one whose clause named no
+jurisdiction.
 
 ## How results are reported
 
-Console tables throughout, four figures in `# Overview`, and one reading block: whole contracts as the
-file holds them.
-
-## Where things are written
-
-**One file**, one row per contract per party, superseding 04B1's for downstream use.
+Console tables throughout, and the same sorting rule 04B1 uses: **Input** describes the data,
+**Construction** walks the rule's steps, **Selection** justifies the numbers, **Results** reports the
+output, **Validation** proves identities, **Robustness** reads examples. Every figure is in Overview.
 
 # Configuration
-
-## The parameters, and where they came from
 
 ```{r}
 #| label: configure
@@ -188,17 +117,11 @@ file holds them.
     # and is safe for a specific reason: gazetteer.py folds a content hash of this exact file into
     # its spec hash, so a lookup that changed moves the model's hash and the next ingest aborts.
     Lookup = here::here("contracts-extract", "src", "matcon_extract", "data", "geo_lookup.parquet"),
-    # 04B1's parties: the role, the name and the offsets of the FIRST mention.
-    Party = fs::path(
-      init_create_script_dir(.dir_here = here::here(), .name_script = "04B1-Rules-ORG"),
-      "Output", "parties_org.parquet"
-    ),
-    # AND EVERY MENTION OF THEM. A place beside a party's third mention cannot reach that party
-    # through a table holding only its first, and a signature block is exactly where a party is
-    # named WITH an address. This index is what the attachment interleaves.
+    # 04B1's mention index: one row per contract per party per mention. The attachment interleaves
+    # place offsets with THESE, so a place beside a party's third mention still reaches it.
     Mentions = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "04B1-Rules-ORG"),
-      "Output", "mentions_org.parquet"
+      "Output", "org_mentions.parquet"
     ),
     # The anchor, for the registered address the precision check reads.
     Prepared = fs::path(
@@ -212,71 +135,76 @@ file holds them.
     Landing = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "01C-EdgarMetaData"),
       "Output", "LandingPage.parquet"
+    ),
+    Text = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
+      "Output", "sample_text.parquet"
     )
   ),
   Output = list(
-    Parties = utils_file_path(.dir_main, "Output", "parties_geo.parquet")
+    Places = utils_file_path(.dir_main, "Output", "places_geo.parquet"),
+    Law    = utils_file_path(.dir_main, "Output", "law_clauses.parquet")
   ),
   Params = list(
-    Family   = "matcon",  # the only family reaching cities and counties
-    Reaches  = c(50, 100, 200, 400, 800), # candidates the evidence table reports
-    LawTopN  = 15L,       # jurisdictions listed
-    ReadDocs = 4L,        # contracts read whole from the released file
-    Seed     = 42L        # fixed, so the same contracts are read on every render
+    Family   = "matcon",         # the only family reaching cities and counties
+    Reaches  = c(100, 200, 400), # the released value, bracketed one either side
+    LawTopN  = 15L,              # jurisdictions listed
+    ReadDocs = 4L,               # contracts read whole from the released file
+    Seed     = 42L               # fixed, so the same contracts are read on every render
   )
 )
 
 # ONE NUMBER. 200 characters is generous for a state -- "a Delaware corporation" attaches at a median
-# of five -- and about right for a city behind an address. The alternatives are reported in Selection
-# as evidence rather than offered as a choice, and the registered-address check is what says whether
-# the number is too wide.
-.lP$Params$Spec <- geo_spec(
-  .reach = 200   # furthest a party may be and still claim a place
-)
+# of a few characters -- and tight enough that a place in the next sentence does not reach back.
+.lP$Params$Spec <- geo_spec(.reach = 200)
 
-fs::dir_create(fs::path_dir(.lP$Output$Parties))
+fs::dir_create(fs::path_dir(.lP$Output$Places))
 
 tab_inputs <- tibble::tibble(
   Input  = names(.lP$Input),
   Path   = purrr::map_chr(.lP$Input, \(.p) fs::path_rel(.p, start = here::here())),
-  Exists = purrr::map_lgl(.lP$Input, \(.p) fs::file_exists(.p) || fs::dir_exists(.p))
+  Exists = purrr::map_lgl(.lP$Input, fs::file_exists)
 )
 
 tbl_say(.tab = tab_inputs, .title = "Every input resolves before anything is computed")
 
-# A TABLE OF FALSE IS A REPORT, NOT A GATE, and the difference cost a render: a mistyped Landing path
-# read FALSE in this very table while the document went on to print a whole precision measure as
-# NA%, with confident prose beside it saying what the number meant. ent_anchor_keys() takes the
-# address path as OPTIONAL and skips it where the file is absent, which is right for a document that
-# does not need it and wrong for this one, which is the only place the addresses are used.
+# A TABLE OF FALSE IS A REPORT, NOT A GATE, and the difference has cost a render before: a mistyped
+# Landing path read FALSE in this very table while the document rendered a precision measure as NA
+# with confident prose beside it saying what the number meant.
 if (any(!tab_inputs$Exists)) {
   cli::cli_abort(c(
     "{sum(!tab_inputs$Exists)} input{?s} {?does/do} not resolve.",
-    "x" = "{paste(tab_inputs$Input[!tab_inputs$Exists], collapse = ', ')}.",
-    "i" = "Every path here is required. Landing carries the registered addresses, and without it
-           the precision check silently reports nothing rather than failing."
+    "x" = "{paste(tab_inputs$Input[!tab_inputs$Exists], collapse = ', ')}."
   ))
 }
 ```
 
 # Input
 
-## The anchor, from EDGAR
+## The anchor and the parties
 
 ```{r}
 #| label: build-keys
 
 tab_keys <- ent_anchor_keys(
-  .path_prepared = .lP$Input$Prepared,  # 03A: DocID, ClassDetailed, AmendType, Fold
+  .path_prepared = .lP$Input$Prepared,  # 03A: DocID, ClassDetailed, AmendType
   .path_register = .lP$Input$Register,  # 02B: CIK, CompanyName, DateFiled
-  .path_landing  = .lP$Input$Landing,   # 01C: the registered address, for the precision check
+  .path_landing  = .lP$Input$Landing,   # 01C: the registered address the precision check reads
   .quiet         = FALSE
 )
-```
 
-The registered address is read here and nowhere else. It is the **only precision measure** in this
-document, and it is a flag rather than a fill: using EDGAR to supply a missing location would make the
-variable partly what the contract says and partly what EDGAR says, with nothing able to tell which.
+tab_mentions <- arrow::read_parquet(.lP$Input$Mentions)
+
+# ONE DEFINITION OF "ONE ROW PER PARTY", and it is 04B1's. Recomputing the collapse here would be a
+# second implementation of a group-by that already exists, free to disagree at the third decimal.
+tab_party_facts <- ent_party_facts(.release = tab_mentions)
+
+tibble::tibble(
+  Item = c("Documents", "Mentions 04B1 released", "Parties behind them"),
+  N    = c(nrow(tab_keys), sum(!is.na(tab_mentions$MentionStart)), nrow(tab_party_facts))
+) |>
+  tbl_say(.title = "What 04B1 hands over")
+```
 
 ## The gazetteer
 
@@ -284,61 +212,17 @@ variable partly what the contract says and partly what EDGAR says, with nothing 
 #| label: load-gazetteer
 
 geo_once <- list(
-  Lookup = geo_lookup(.path_lookup = .lP$Input$Lookup),      # the state and county per place
-  Cand   = geo_candidates(.path_lookup = .lP$Input$Lookup)   # every state a city name exists in
+  Lookup = geo_lookup(.path_lookup = .lP$Input$Lookup),
+  Cand   = geo_candidates(.path_lookup = .lP$Input$Lookup)
 )
-
-tibble::tibble(
-  Item = c("Rows in the lookup", "Distinct city names", "City names in more than one state"),
-  N    = c(nrow(geo_once$Lookup),
-           dplyr::n_distinct(geo_once$Cand$GeoKey),
-           sum(dplyr::count(geo_once$Cand, .data$GeoKey)$n > 1L))
-) |>
-  tbl_say(.title = "What the gazetteer supplies")
 ```
 
-**The candidate list is what the ambiguous-city rule runs on.** `geo_lookup()` nulls the parents of a
-name existing in several states; `geo_candidates()` keeps them, so a city can be resolved by asking
-which of *its own* states the contract names rather than which state is nearest.
-
-## The parties
-
-```{r}
-#| label: load-parties
-
-tab_party    <- arrow::read_parquet(.lP$Input$Party)
-tab_mentions <- arrow::read_parquet(.lP$Input$Mentions)
-
-tab_party |>
-  dplyr::summarise(Rows = dplyr::n(), Docs = dplyr::n_distinct(.data$DocID), .by = PartyRole) |>
-  dplyr::arrange(plot_factor(.data$PartyRole, .key = "PartyRole")) |>
-  tbl_say(.title = "What 04B1 released")
-
-tibble::tibble(
-  Item = c("Parties", "Mentions of them", "Mentions that are not the first"),
-  N    = c(sum(tab_party$PartyRole != "none"), nrow(tab_mentions), sum(!tab_mentions$IsFirst))
-) |>
-  dplyr::mutate(Share = tbl_pct(.data$N / pmax(nrow(tab_mentions), 1L))) |>
-  tbl_say(.title = "And where else each of them was named")
-```
-
-**The attachment runs over mentions, not parties.** 04B1's release carries a party at the offsets of
-its first mention, which is the right shape for a file about parties and the wrong one for anything
-measuring what sits beside them. The last row above is what a first-mention table cannot see, and a
-signature block -- where a party is named *with* an address -- is almost always among them.
-
-## The places, and the governing-law clauses
+## The places and the clauses
 
 ```{r}
 #| label: load-spans
 
-tab_lens <- tab_party |>
-  dplyr::distinct(.data$DocID) |>
-  dplyr::left_join(
-    dplyr::transmute(tab_keys, DocID, DocLen = as.integer(.data$nChars)),
-    by = dplyr::join_by(DocID)
-  ) |>
-  dplyr::filter(!is.na(.data$DocLen), .data$DocLen > 0L)
+tab_lens <- ent_doc_lens(.path_text = .lP$Input$Text)
 
 tab_spans <- ent_load_entity(
   .dir_store = .lP$Input$Store,
@@ -352,16 +236,12 @@ tab_spans <- ent_load_entity(
 tab_law <- ent_load_entity(
   .dir_store = .lP$Input$Store,
   .family    = .lP$Params$Family,
-  .entity    = "LAW",                                 # lawregex: the clause as a span
+  .entity    = "LAW",
   .lens      = tab_lens,
   .extras    = ent_extras(.lP$Params$Family, "LAW"),  # none; the cue is in the core LabelRaw
   .quiet     = FALSE
 )
 ```
-
-**The length comes from the register rather than from the text.** `nChars` was measured against
-`stri_length()` on 31,981 documents and agreed exactly on every one, and recomputing it here would
-open every contract to reproduce a stored column.
 
 # Construction
 
@@ -371,21 +251,18 @@ open every contract to reproduce a stored column.
 #| label: apply-rule
 
 res_base <- geo_apply(
-  .spans    = tab_spans,       # every matcon place, unresolved
-  .law      = tab_law,         # the governing-law clauses, as spans
-  .party    = tab_party,       # 04B1's parties: the role, the name, the released row
-  .mentions = tab_mentions,    # where each of them was named, every time
-  .keys     = tab_keys,        # runs from the key side, so a document with no clause survives
-  .geo      = geo_once,        # the lookup and the candidate list
-  .spec     = .lP$Params$Spec  # the one reach
+  .spans    = tab_spans,      # every matcon GPE span
+  .law      = tab_law,        # the governing-law clauses, as spans with offsets
+  .mentions = tab_mentions,   # 04B1's mention index; the attachment interleaves with it
+  .geo      = geo_once,       # the gazetteer, read once
+  .spec     = .lP$Params$Spec # the one reach
 )
 
-tab_places  <- res_base$Places   # every place, resolved to a level and a country
-tab_inside  <- res_base$Inside   # the places sitting inside a governing-law clause
-tab_law_doc <- res_base$Law      # one row per document: the jurisdiction
-tab_roles   <- res_base$Roles    # every place, with the party it attached to
-tab_geo     <- res_base$Party    # one row per party, with its geography
-tab_release <- res_base$Release  # the file
+tab_places  <- res_base$Places    # every place, resolved, before anything was removed
+tab_inside  <- res_base$Inside    # the places a governing-law clause contains
+tab_free    <- res_base$Attached  # the places offered to the attachment, with its columns
+tab_release <- res_base$Release   # THE FILE: one row per place, refusals included
+tab_law_rel <- res_base$Law       # THE FILE: one row per governing-law clause
 ```
 
 ## What the gazetteer resolved
@@ -393,9 +270,7 @@ tab_release <- res_base$Release  # the file
 ```{r}
 #| label: report-resolve
 
-tab_resolve <- geo_table_resolve(.geo = tab_places)
-
-geo_report_resolve(.tab = tab_resolve)
+geo_report_resolve(.tab = geo_table_resolve(.geo = tab_places))
 ```
 
 ## How every city got its state
@@ -408,29 +283,29 @@ tab_city <- geo_table_city(.geo = tab_places)
 geo_report_city(.tab = tab_city)
 ```
 
+**The constraint on the middle arm is what makes it safe.** Taking the nearest state named anywhere
+would put `SPRINGFIELD` in Delaware whenever the party is a Delaware corporation. Requiring that a
+`SPRINGFIELD` exist in that state does not, and it uses no new data -- the candidate list is already
+in the lookup.
+
 ## What the governing-law exclusion withheld
 
 ```{r}
 #| label: report-exclude
 
-tab_exclude <- geo_table_exclude(.places = tab_places, .inside = tab_inside)
-
-geo_report_exclude(.tab = tab_exclude)
+geo_report_exclude(.tab = geo_table_exclude(.places = tab_places, .inside = tab_inside))
 ```
-
-**Every one of those places was available to a party before.** The exclusion is an anti-join on the
-same offsets the jurisdiction is found by, so a place cannot be withheld from attachment and missing
-from the governing-law variable at the same time.
 
 ## How far a place sits from its party
 
 ```{r}
-#| label: report-dist
+#| label: measure-distances
 
-tab_dist <- geo_dist_profile(.roles = tab_roles)
-
-geo_report_dist(.tab = tab_dist)
+geo_report_dist(.tab = geo_dist_profile(.roles = tab_free))
 ```
+
+**This is the evidence the reach is chosen against.** A reach has to clear the gap between a party
+name and the place that qualifies it, and not so much more that the next sentence reaches back.
 
 # Selection
 
@@ -439,164 +314,185 @@ geo_report_dist(.tab = tab_dist)
 ```{r}
 #| label: sweep-reach
 
-tab_sweep <- geo_sweep_reach(
-  .geo      = dplyr::anti_join(tab_places, tab_inside, by = dplyr::join_by(DocID, Start)),
-  .party    = tab_party,
-  .mentions = tab_mentions,
-  .keys     = tab_keys,
-  .reaches  = .lP$Params$Reaches,  # the candidates, the released value among them
-  .quiet    = FALSE
+geo_report_sweep(
+  .tab = geo_sweep_reach(
+    .geo      = tab_places,          # resolved once; each arm only re-attaches
+    .party    = tab_party_facts,     # the parties, held constant
+    .mentions = tab_mentions,
+    .keys     = tab_keys,
+    .inside   = tab_inside,          # the exclusion, held constant across arms
+    .reaches  = .lP$Params$Reaches,  # the released value, bracketed one either side
+    .quiet    = FALSE
+  )
 )
-
-geo_report_sweep(.tab = tab_sweep)
 ```
 
-**Coverage rises with the reach and precision is what stops it.** A wider window attaches more places
-to every party; whether the extra ones are right is a different question, and the registered-address
-check is the only thing in this document that can answer it.
+**Three reaches and not five.** The released value is bracketed rather than surveyed, and each arm is
+scored by the same `geo_collapse()` that scores the released rule -- so a difference between arms
+cannot come from a difference in how they were counted.
 
 # Results
 
-## What geography each role got
+## The naive ladder
+
+```{r}
+#| label: table-naive
+
+tab_doc <- geo_doc_facts(
+  .release = tab_release,       # every place, refusals included
+  .party   = tab_party_facts,   # supplies the role, so the rule rung can take counterparties only
+  .keys    = tab_keys           # the population, so a contract naming no place still gets a row
+) |>
+  dplyr::left_join(
+    dplyr::select(tab_keys, DocID, Class),  # joined for the by-class cut; never stored on a place
+    by = dplyr::join_by(DocID)
+  )
+
+tab_naive <- geo_table_naive(.doc = tab_doc)
+
+geo_report_naive(.tab = tab_naive)
+```
+
+## What the collapse gives each party
 
 ```{r}
 #| label: table-cover
 
-tab_cover <- geo_table_cover(.tab = tab_release)
+tab_collapse <- geo_collapse(.release = tab_release, .party = tab_party_facts)
+
+tab_cover <- geo_table_cover(.tab = tab_collapse)
 
 geo_report_cover(.tab = tab_cover)
 ```
-
-## What reaching past the first mention bought
-
-```{r}
-#| label: table-gain
-
-tab_gain <- geo_table_gain(.tab = tab_geo)
-
-geo_report_gain(.tab = tab_gain)
-```
-
-**The change can only add.** The roll-up prefers a party's earliest mention, so a party that already
-had a state under the previous release keeps exactly that state -- `PctLater` is coverage that was
-simply unreachable, not coverage taken from somewhere else.
 
 ## The governing law
 
 ```{r}
 #| label: table-law
 
-tab_law_tab <- geo_table_law(.law = tab_law_doc)
-tab_law_top <- geo_table_law_top(.law = tab_law_doc, .n = .lP$Params$LawTopN)
-
-geo_report_law(.tab = tab_law_tab, .top = tab_law_top)
+geo_report_law(
+  .tab = geo_table_law(.law = tab_law_rel, .keys = tab_keys),
+  .top = geo_table_law_top(.law = tab_law_rel, .n = .lP$Params$LawTopN)
+)
 ```
 
 # Validation
 
-## Every party 04B1 released still has its row
+## Four identities the files cannot violate
 
 ```{r}
-#| label: validate-rows
+#| label: validate-counts
 
-# THE IDENTITY THIS DOCUMENT CANNOT VIOLATE. Geography is added to rows rather than filtered onto
-# them, so the release must carry exactly the rows 04B1 wrote -- no more and no fewer. A shortfall is
-# a join that dropped parties; an excess is one that duplicated them.
+hold_ <- dplyr::filter(tab_release, .data$InLawClause)
+
 tibble::tibble(
-  Item = c("Rows 04B1 released",
-           "Rows this document releases",
-           "Documents in both",
-           "Parties carrying a place they were not attached to"),
-  N    = c(nrow(tab_party),
-           nrow(tab_release),
-           dplyr::n_distinct(intersect(tab_party$DocID, tab_release$DocID)),
-           sum(tab_release$NGeoNear == 0L &
-                 (!is.na(tab_release$GeoState) | !is.na(tab_release$GeoCity))))
+  Item = c("Places in the file",
+           "Where a law-clause place was never attached",
+           "Where an attached place has a party and a distance",
+           "Where an attached distance is inside the reach",
+           "Parties in the collapse, against 04B1's count"),
+  N    = c(nrow(tab_release),
+           sum(!hold_$Attached),
+           sum(tab_release$Attached &
+                 !is.na(tab_release$PartyKey) & !is.na(tab_release$DistToParty)),
+           sum(tab_release$DistToParty[tab_release$Attached] <= .lP$Params$Spec$Reach),
+           nrow(tab_collapse))
 ) |>
-  tbl_say(.title = "The release is 04B1's rows, widened")
+  dplyr::mutate(
+    Of    = c(nrow(tab_release), nrow(hold_), sum(tab_release$Attached),
+              sum(tab_release$Attached), nrow(tab_party_facts)),
+    Share = tbl_pct(.data$N / pmax(.data$Of, 1L))
+  ) |>
+  tbl_say(.title = "Four identities the files cannot violate")
 
 cli::cli_alert_info(
-  "The first two rows must be equal and the fourth must be ZERO: a party with nothing attached \\
-   cannot carry a place, so a nonzero fourth row is a join fanning out rather than a rule."
+  "ROWS TWO TO FIVE MUST ALL READ 100%. A law-clause place is never offered to the attachment, so \\
+   one below 100% means the exclusion ran after the attachment rather than before it. An attached \\
+   place without a party or a distance is a join that produced a row it should not have. And the \\
+   collapse adds geography to 04B1's parties rather than filtering them, so the party count cannot \\
+   move."
 )
 ```
 
-## No governing-law place reached a party
+## Offsets index the canonical text
 
 ```{r}
-#| label: validate-exclusion
+#| label: validate-offsets
 
-# THE EXCLUSION, CHECKED RATHER THAN ASSUMED. Every place inside a clause should be absent from the
-# attachment table entirely, so the intersection of the two offset sets must be empty.
+tab_verify <- ent_verify_span(
+  .tab       = tab_release,
+  .path_text = .lP$Input$Text,
+  .col_start = "PlaceStart",
+  .col_stop  = "PlaceStop",
+  .col_span  = "PlaceText",
+  .n         = 500L,            # drawn rather than exhaustive; the text read is the cost
+  .seed      = .lP$Params$Seed
+)
+
 tibble::tibble(
-  Item = c("Places inside a governing-law clause",
-           "Of those, still present in the attachment table",
-           "Of those, attached to a party"),
-  N    = c(nrow(tab_inside),
-           sum(paste(tab_inside$DocID, tab_inside$Start) %in%
-                 paste(tab_roles$DocID, tab_roles$Start)),
-           sum(paste(tab_inside$DocID, tab_inside$Start) %in%
-                 paste(tab_roles$DocID[tab_roles$Attached], tab_roles$Start[tab_roles$Attached])))
+  Item = c("Place spans checked", "Sliced text equals the stored span"),
+  N    = c(nrow(tab_verify), sum(tab_verify$Exact))
 ) |>
-  tbl_say(.title = "The exclusion holds")
+  dplyr::mutate(Share = tbl_pct(.data$N / pmax(nrow(tab_verify), 1L))) |>
+  tbl_say(.title = "Offsets index the canonical text")
 
 cli::cli_alert_info(
-  "The second and third rows must both be ZERO. A nonzero third row means a jurisdiction is sitting \\
-   in some party's state column, which is the exact defect this rule exists to remove."
+  "The span and the two offsets are one row of the released file, so this compares a thing with \\
+   itself and must be 100%. Anything below is an offset problem rather than a rule one."
+)
+```
+
+# Robustness
+
+## The place file, read
+
+```{r}
+#| label: read-release
+
+geo_report_release_sample(
+  .tab = geo_release_sample(
+    .tab  = tab_release,
+    .n    = .lP$Params$ReadDocs,   # one of them carries a refusal, drawn deliberately
+    .seed = .lP$Params$Seed
+  )
 )
 ```
 
 # Deployment
 
-## The release
+## The two releases
 
 ```{r}
 #| label: write-artifact
 
-arrow::write_parquet(tab_release, .lP$Output$Parties)
+arrow::write_parquet(tab_release, .lP$Output$Places)
+arrow::write_parquet(tab_law_rel, .lP$Output$Law)
 
-geo_report_release(.tab = tab_release)
+geo_report_release(.places = tab_release, .law = tab_law_rel)
 ```
-
-## The released file, read
-
-```{r}
-#| label: read-release
-
-tab_sample <- geo_release_sample(
-  .tab  = tab_release,
-  .n    = .lP$Params$ReadDocs,   # drawn from contracts that placed something
-  .seed = .lP$Params$Seed
-)
-
-geo_report_release_sample(.tab = tab_sample)
-```
-
-**This is the file.** Read one contract's rows top to bottom: the registrant with the place its
-preamble qualified it with, the counterparties beside it, and the governing law reported once above
-because it belongs to the contract rather than to any of them.
 
 ## What every column means
 
 ```{r}
 #| label: report-dictionary
 
-tab_dict <- geo_dictionary_parties(.tab = tab_release)
+geo_report_dictionary(
+  .tab   = geo_dictionary_places(.tab = tab_release),
+  .title = "places_geo.parquet"
+)
 
-geo_report_dictionary(.tab = tab_dict)
-```
+geo_report_dictionary(
+  .tab   = geo_dictionary_law(.tab = tab_law_rel),
+  .title = "law_clauses.parquet"
+)
 
-**Every contract-level variable is one `summarise`, as it was in 04B1:**
-
-```r
-tab_release |>
-  dplyr::summarise(
-    GoverningLaw    = dplyr::first(.data$GoverningLaw),
-    RegistrantState = .data$GeoState[.data$PartyRole == "registrant"][1L],
-    NCounterparties = sum(.data$PartyRole == "counterparty"),
-    NPlaced         = sum(!is.na(.data$GeoState)),
-    .by = c(DocID, Class, AmendType)
-  )
+# THE COLLAPSE IS CHECKED TOO, AND IT IS NOT A FILE. Nothing writes this shape; the export calls
+# geo_collapse() and gets it. Checking the function's output is what says the export cannot produce
+# a different one.
+geo_report_dictionary(
+  .tab   = geo_dictionary_parties(.tab = tab_collapse),
+  .title = "geo_collapse(), which is checked but never written"
+)
 ```
 
 # Overview
@@ -606,17 +502,25 @@ tab_release |>
 ```{r}
 #| label: report-headline
 
-geo_report_headline(.release = tab_release, .law = tab_law_doc, .inside = tab_inside)
+geo_report_headline(.doc = tab_doc, .collapse = tab_collapse, .places = tab_release)
 ```
 
-## Registrant against counterparty
+## The ladder, by contract type
+
+```{r}
+#| label: fig-naive
+#| fig-height: !expr plot_height(dplyr::n_distinct(tab_naive$Class))
+#| fig-cap: "Distinct states per contract at three rungs, by contract type."
+
+geo_plot_naive(.tab = tab_naive)
+```
+
+## Coverage by role
 
 ```{r}
 #| label: fig-cover
-#| fig-cap: "The share of parties given a state, a city and a country, by the role 04B1 assigned
-#|   them. The registrant should lead every other role, because the preamble qualifies it first and
-#|   at length."
-#| fig-height: 3.4
+#| fig-height: 2.4
+#| fig-cap: "Share of parties given a state and a country, by role."
 
 geo_plot_cover(.tab = tab_cover)
 ```
@@ -625,37 +529,24 @@ geo_plot_cover(.tab = tab_cover)
 
 ```{r}
 #| label: fig-city
-#| fig-cap: "How each city mention was placed in a state. Unresolved is an ambiguous name whose
-#|   states the contract never mentions, left empty rather than guessed."
 #| fig-height: 2.4
+#| fig-cap: "How each city got its state: uniquely, from a state the contract named, or not at all."
 
 geo_plot_city(.tab = tab_city)
-```
-
-## Coverage against precision, by reach
-
-```{r}
-#| label: fig-sweep
-#| fig-cap: "What each candidate reach attaches, and how often the registrant's place then appears
-#|   in the address EDGAR records. Coverage rises with the reach; agreement is what says whether the
-#|   extra places are right."
-#| fig-height: 3.4
-
-geo_plot_sweep(.tab = tab_sweep)
 ```
 
 ## The commonest jurisdictions
 
 ```{r}
 #| label: fig-law
-#| fig-cap: "The jurisdictions contracts name most often, among those naming one at all. Read
-#|   against the exclusion: every one of these would otherwise have been some party's address."
-#| fig-height: !expr plot_height(.n_rows = nrow(tab_law_top))
+#| fig-height: 4.6
+#| fig-cap: "The jurisdictions contracts choose, as a share of the clauses that named one."
 
-geo_plot_law(.tab = tab_law_top)
+geo_plot_law(.tab = geo_table_law_top(.law = tab_law_rel, .n = .lP$Params$LawTopN))
 ```
 
 # Next
 
-04B3 turns parsed dates and stated terms into a contract duration. It reads the same stores and the
-same anchor, and it is the last of the rules that measures anything from where a party was found.
+**04B3** reads the DATE and TERM spans and needs nothing from this document. **04D** calls
+`geo_apply()` on chunks of the corpus and writes the same two files at scale, and the **export**
+calls `geo_collapse()` to turn the places into one row per party.

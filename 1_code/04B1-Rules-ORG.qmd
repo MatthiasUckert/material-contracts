@@ -1,5 +1,5 @@
 ---
-title: "Entity Rules -- The Contracting Party and its Counterparties (04B1)"
+title: "Rules -- Who the Parties Are (04B1)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -9,9 +9,6 @@ date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 #| include: false
 #| purl: false
 
-# here::i_am() anchors the project root on a declaration rather than on whichever marker file the
-# search happens to find first. _quarto.yml lives in 1_code/, so Quarto's execute-dir is 1_code/ and
-# not the repository root; every path below is written against the root.
 here::i_am("1_code/_Commons/_Initialize.R")
 knitr::opts_knit$set(root.dir = here::here())
 
@@ -33,185 +30,72 @@ options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
 #| label: load-libraries
 #| echo: false
 
-source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_NER.R"),        encoding = "UTF-8")
-
 # ORDER IS LOAD-BEARING. _Plots.R rebuilds its level registry empty every time it is sourced, so any
 # library that registers a vocabulary must follow it -- and both _Entity.R and this document's own
 # file do.
-source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
-source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
-
-# What every 04B document shares: the name reduction, the anchor build, the entity-table loader, the
-# span reader, the offset check and the table shapes.
-source(here::here("1_code", "_Commons", "_Entity.R"),     encoding = "UTF-8")
-
-# 03A owns the contract-type vocabulary and the label spine; 04A owns the sample, the canonical text
-# and the sample stores.
 purrr::walk(
-  .x = c("03A-ClassifyPrepare", "04A-EntityExtract"),
-  .f = \(.s) source(
-    file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
-    encoding = "UTF-8"
-  )
+  .x = c("_Initialize", "_Utils", "_NER", "_Plots", "_Tables", "_Entity"),
+  .f = \(.s) source(here::here("1_code", "_Commons", paste0(.s, ".R")), encoding = "UTF-8")
 )
 
 .name_script <- "04B1-Rules-ORG"
 
 cat("Main Directory: ")
-(.dir_main <- init_create_script_dir(
-  .dir_here    = here::here(), # project root
-  .name_script = .name_script  # this document's name; the output directory is derived from it
-))
+(.dir_main <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script))
 
 cat("Function File:  ")
-(.path_fun <- init_create_script_fun(
-  .dir_here    = here::here(), # project root
-  .name_script = .name_script  # resolves to 1_code/04B1-Rules-ORG.R
-))
+(.path_fun <- init_create_script_fun(.dir_here = here::here(), .name_script = .name_script))
 
 source(file = .path_fun, encoding = "UTF-8")
 ```
 
 # Purpose
 
-This document decides, for every contract in the labelled sample, which organisation is the
-contracting party and which of the others are its counterparties.
+An extractor proposes organisation names. This turns them into **parties**: it groups the spellings
+of one company, decides which parties are registrants by comparing against the names EDGAR recorded,
+and assigns every other party a role from where it sits relative to the registrant.
 
-## What comes out
+## The rule, in five steps
 
-**One file: `parties_org.parquet`, one row per contract per party.** Every contract-level number is
-a group-by over it, so there is no second file that can disagree with the first.
+**Reduce.** Strip legal suffixes, so `ACME CORPORATION` and `ACME CORP.` share one key.
 
-Each party carries a role, and the four roles partition every organisation the rule found:
+**Group.** Within a document, two keys are one party when one is a word-prefix of the other, or when
+one is a single word unambiguously taken from one longer name. `ACME` where both `ACME CORP` and
+`ACME HOLDINGS` exist is refused.
 
-| Role | What it means |
-|:--|:--|
-| `registrant` | the SEC filer, matched to its EDGAR name -- exactly one per contract |
-| `counterparty` | a party named within 2,000 characters of the registrant |
-| `signatory` | a party named only in the final tenth of the document |
-| `other` | named somewhere else, and not counted |
-| `none` | a sentinel: this contract named no organisation at all |
+**Match.** Against the **primary filer**, agreement until one name runs out, so `ACME` reaches
+`ACME CORPORATION`; earliest match wins and that party is the registrant. Against **every other
+filer of the same document**, full agreement in both directions only; those parties are co-filers.
+Where nothing matches the primary, the first party named is taken and `MatchKind` records it.
 
-**The naive baseline is everything except the registrant. The rule's answer is the counterparties
-alone.** That distinction runs through every table below, and the difference between the two is what
-the rule did.
+The asymmetry is the point. One anchor can afford a loose rule because the alternative is the
+fallback. Up to 445 anchors cannot: a bare `AURORA` agrees with twenty-six siblings on one token,
+and admitting that would make a whole corporate group registrants of every contract any of them
+touched.
 
-## The rule, in one paragraph
+**Assign roles**, first match winning: registrant, then co-filer, then counterparty within +/-2,000
+characters of the registrant, then signatory in the final tenth, then other. Co-filer sits above
+counterparty because a subsidiary named as guarantor in the preamble is inside the window and is on
+the same side of the contract as the filer.
 
-Every organisation name LexNLP found is reduced to a comparable key, and keys naming the same party
-are merged into one. A party whose key agrees with the registrant's EDGAR name -- **word for word,
-until one of the two names runs out** -- is the contracting party; where several agree the earliest
-wins, and where none does the first party named is taken and flagged. Every other party within
-**2,000 characters** of the contracting party is a counterparty. Parties in the **final tenth** of
-the document are counted separately, and everything else is not counted at all.
+**Write** one row per contract per party per mention.
 
-Three steps, two numbers. Nothing else in this document enters an answer.
+## Why the file is at mention grain
 
-## One engine, and why that decides the rest
+04B2 attaches a place to the party named nearest before it, and a party named once in the preamble
+and again in the signature block is reachable from two positions. A party-grain file carries the
+first mention only, and the signature block is exactly where a party is named *with* an address.
 
-04C ran two families over the corpus and neither is spaCy, so for organisations LexNLP is the only
-producer this rule can use. The whole rule therefore runs in R over a table that fits in memory.
-
-04A's measurements are why spaCy is not the loss it looks like. On this sample the transformer emitted
-**915,716** ORG spans against LexNLP's **81,467** -- eleven times as many -- but volume is not the
-argument, position is. LexNLP's organisations concentrate at the document ends with a contrast of
-**4.36**, the strongest of any producer and entity 04A measured; spaCy's is **0.97**, uniform to
-within rounding. spaCy finds every organisation named anywhere. LexNLP finds the ones named where
-parties are named.
-
-## Comparing whole words replaced four arms and a corpus-wide count
-
-The comparison used to have four outcomes -- exact, forward containment, corporate family, reverse
-containment -- gated by two length floors and a document-frequency threshold. All four say the same
-thing at different strengths, and comparing whole words from the beginning says it once:
-
-| EDGAR name | Contract name | |
-|:--|:--|:--|
-| `BOEING` | `BOEING` | agree, both run out |
-| `BOEING` | `BOEING CAPITAL` | agree, one runs out |
-| `PENNSYLVANIA POWER LIGHT` | `PENNSYLVANIA POWER` | agree, one runs out |
-| `CHENIERE ENERGY` | `CHENIERE CREOLE TRAIL` | differ at word two |
-| `NATIONAL BANK` | `NATIONAL SEMICONDUCTOR` | differ at word two |
-
-**The length floors go with it.** They existed for *substring* matching, where `CA` sits inside
-`CATERPILLAR` and no floor below five could stop it. Whole words cannot make that mistake.
-
-**And so does the only corpus-wide quantity in this pipeline.** The old family arm admitted a single
-shared leading word when that word opened a company name in at most 0.5% of documents -- a share
-computed across every contract in the corpus, whose value therefore depended on how the corpus was
-partitioned. That is why the organisation chain could not be run in chunks. Comparing whole words
-needs no such gate.
-
-**What it cost is measured rather than assumed.** The old rule matched 77.1% of documents and this one
-matches 74.9% -- about 97 contracts, which now fall to the fallback. And 91.9% of the matches that
-remain are exact agreements, so the four arms were one arm and a rounding error.
-
-## Grouping runs before matching
-
-LexNLP splits one name across mentions -- `Florida East Coast Railway` at one offset and the bare word
-`Railway` at another -- and glues neighbouring text onto others, as in `Grant Date, Hubbell` where a
-heading ran into the party name. Both are one company arriving as two entities.
-
-Two names in one contract are one party when **one is the beginning of the other**, or when **one is a
-single word taken unambiguously from the other** -- a word inside two longer names joins neither.
-Grouping first means neither reaches the EDGAR comparison alone, and it means the fallback's "first
-party named" is the first *unique party* rather than the first raw span.
-
-**It also decides what the party is called:**
-
-> A party takes the name of the member that matched EDGAR. Where no member matched, it takes the name
-> of the member mentioned most often, with the earliest mention breaking ties.
-
-Neither longest nor earliest would do: both hand `GRANT DATE HUBBELL` the name over `HUBBELL`, the
-first because it has more words and the second because the glued heading is usually the first mention.
-
-**And it made a parameter disappear.** The rule used to carry a 500-character reach that preferred a
-clean exact match sitting just behind a contaminated one. Once the two are one party there is nothing
-left to arbitrate: swept at 0 and at 500 it produced identical output on every column of every row.
-
-## Why there is no head, and why there is one window
-
-An earlier design read a fixed head and asked whether the registrant was inside it. Sweeping that head
-across twenty settings showed the located share rising from 70.6% to 75.1% and the late share falling
-from 6.5% to 2.0%, **the two summing to 77.1% in every cell**. That is an identity: the match runs on
-names and cannot depend on a region.
-
-A **gap window** -- growing outward through every name whose distance to its neighbour is under a
-threshold -- was measured against the fixed one and tracks it, agreeing to within a few hundredths on
-every contract type. Two rules that agree leave nothing to choose between them but simplicity, so the
-fixed window is the rule and the gap arm is not in the code.
-
-The **tail is relative rather than flat**, and the evidence is direct: a flat 3,000-character tail is
-wider on the median than a 10% tail -- 3,000 against 2,320 on credit agreements -- and finds fewer
-names, 2.97 against 5.04, because a relative tail puts its width on the long agreements where the
-signature blocks with many parties actually are.
-
-## Every table carries the naive count
-
-**Naive** is every unique party the contract names anywhere, less one for the registrant -- what a
-reader gets without a rule. It sits beside the rule's count in every table and in the headline figure,
-because the difference between the two *is* what the grouping and the window did. It is not a released
-column: it is one subtraction from a count over the released file, and computing it where it is used
-rather than storing it is what stops the two disagreeing.
+Every count is a group-by over that file and none is stored. A stored count is a derived copy that
+can disagree with its source, and none of them would survive to corpus scale.
 
 ## How results are reported
 
-Console tables throughout, five figures in `# Overview`, and two reading blocks where a count cannot
-settle the question: the documents where grouping merged the most keys, and whole documents read in
-position order.
-
-## Where things are written
-
-**One file**, one row per contract per party. Every contract-level quantity is a group-by over it.
-
-Beside it a four-column **mention index** -- where else each party was named -- which 04B2 reads and
-nobody analyses.
+Console tables throughout, and one sorting rule: **Input** describes the data, **Construction**
+walks the rule's steps, **Selection** justifies the numbers, **Results** reports the output,
+**Validation** proves identities, **Robustness** reads examples. Every figure is in Overview.
 
 # Configuration
-
-## The parameters, and where they came from
 
 ```{r}
 #| label: configure
@@ -224,14 +108,13 @@ nobody analyses.
       "Output", "sample_text.parquet"
     ),
     # 04A's sample stores, ONE PER FAMILY. The directory is the argument and the family is the
-    # filename, so there is no engine token to type -- and no combination string to get wrong.
+    # filename, so there is no engine token to type.
     Store = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "04A-EntityExtract"),
       "Output"
     ),
-    # THE ANCHOR IS BUILT, NOT READ. The registrant's own facts are not extraction results, so no
-    # artifact of 04A's owes them to this document: 03A's prepared sample supplies the labels and the
-    # folds, 02B's register supplies the identity and the filing date, and _Entity.R joins them.
+    # THE ANCHOR IS BUILT, NOT READ. 03A's prepared sample supplies the labels, 02B's register the
+    # identity and the filing date, and _Entity.R joins them.
     Prepared = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "03A-ClassifyPrepare"),
       "prepared.parquet"
@@ -242,12 +125,8 @@ nobody analyses.
     )
   ),
   Output = list(
-    # THE RELEASE, one row per contract per party.
-    Parties  = utils_file_path(.dir_main, "Output", "parties_org.parquet"),
-    # AND A POSITIONAL INDEX, one row per mention. Not a release: four columns that let a later rule
-    # measure what sits beside a party wherever it was named, rather than only where it was named
-    # first. 04B2 reads it; nothing else does.
-    Mentions = utils_file_path(.dir_main, "Output", "mentions_org.parquet")
+    # ONE FILE. One row per contract per party per mention; every count is a group-by over it.
+    Mentions = utils_file_path(.dir_main, "Output", "org_mentions.parquet")
   ),
   Params = list(
     Family    = "lexnlp",  # the only ORG family 04C ran over the corpus
@@ -255,66 +134,59 @@ nobody analyses.
     # This project's names for lexnlp's resolved company and legal form. ent_load_entity()
     # translates; nothing below sees lexnlp's own names.
     Extras    = c("NameCore", "LegalForm", "Description"),
-    Bins      = 50L,       # bins across relative position in the density figure
+    Bounds    = c(500, 1000, 2000, 4000, 10000), # half-widths the distance profile reports
+    Widths    = c(1000, 2000, 3000),             # the released value, bracketed one either side
     TermsN    = 25L,       # names listed in the document-frequency block
     ReadDocs  = 6L,        # documents read whole
     ReadMax   = 12L,       # rows per document, so one table-heavy filing cannot fill the page
     ReadMerge = 8L,        # documents whose merges are read back
     CheckN    = 500L,      # party spans cut from the text and compared to what was stored
-    Bounds    = c(500, 1000, 2000, 4000, 10000), # half-widths the distance profile reports
-    Widths    = c(500, 1000, 2000, 4000),        # half-widths the evidence table reports
     Seed      = 42L        # fixed, so the same documents are read on every render
   )
 )
 
-# TWO PARAMETERS, AND THE SECOND IS THE ONLY ONE SWEPT. The rule is window-free: it decides which
-# party anchors the window, never how many names fall inside it.
+# TWO PARAMETERS AND ONE CAP. The rule is window-free -- it decides which names are one party and
+# which party is the registrant, and neither depends on a distance. The window is applied afterwards
+# and is the only number swept.
 .lP$Params$Rule <- ent_rule(
-  .key             = "core", # the resolved name, which lexnlp fills on every span it emits
-  .merge_fragments = TRUE    # a single word taken unambiguously from a longer name is that name
+  .key             = "core",  # the reduced key, suffixes stripped
+  .merge_fragments = TRUE     # a single word unambiguously taken from one longer name
 )
 
-# ONE WINDOW. +/- 2,000 clears the P90 gap between adjacent names reported below, which is the
-# argument for it: a window narrower than that gap cuts a list of parties in half, and the distance
-# distribution itself has no elbow to pick a width from. The alternatives are reported in Selection
-# as evidence rather than offered as a choice.
 .lP$Params$Spec <- ent_window_spec(
-  .par        = 2000, # half-width in characters either side of the contracting party
-  .tail_share = 0.10  # tail as a share of the document, clamped past the window
+  .par        = 2000,  # characters either side of the registrant
+  .tail_share = 0.10   # the final tenth, counted as signatories
 )
 
-fs::dir_create(fs::path_dir(.lP$Output$Parties))
+fs::dir_create(fs::path_dir(.lP$Output$Mentions))
 
-tibble::tibble(
+tab_inputs <- tibble::tibble(
   Input  = names(.lP$Input),
   Path   = purrr::map_chr(.lP$Input, \(.p) fs::path_rel(.p, start = here::here())),
-  Exists = purrr::map_lgl(.lP$Input, \(.p) fs::file_exists(.p) || fs::dir_exists(.p))
-) |>
-  tbl_say(.title = "Every input resolves before anything is computed")
-```
+  Exists = purrr::map_lgl(.lP$Input, fs::file_exists)
+)
 
-Failing here rather than three chunks later is deliberate: a missing upstream artifact should stop the
-document where the path is declared. `Store` is a directory rather than a file, because the family is
-the filename and `ent_load_entity()` resolves it.
+tbl_say(.tab = tab_inputs, .title = "Every input resolves before anything is computed")
+
+# A TABLE OF FALSE IS A REPORT, NOT A GATE, and the difference has cost a render before.
+if (any(!tab_inputs$Exists)) {
+  cli::cli_abort(c(
+    "{sum(!tab_inputs$Exists)} input{?s} {?does/do} not resolve.",
+    "x" = "{paste(tab_inputs$Input[!tab_inputs$Exists], collapse = ', ')}."
+  ))
+}
+```
 
 # Input
 
 ## The anchor, from EDGAR
-
-Both sides run through one reduction: strip EDGAR's conformed-name artifact, uppercase, an ampersand
-between spaces to `AND`, punctuation to space, whitespace collapsed, a leading connective dropped,
-trailing corporate suffixes stripped.
-
-The suffix list holds the **dotted forms as separate tokens** -- `L P`, `L L C`, `N V` -- because
-punctuation-to-space turns `WILLIAMS PARTNERS L.P.` into `WILLIAMS PARTNERS L P`, and a list holding
-only `LP` strips nothing.
 
 ```{r}
 #| label: build-keys
 
 tab_keys <- ent_anchor_keys(
   .path_prepared = .lP$Input$Prepared,   # 03A: DocID, ClassDetailed, AmendType, Fold
-  .path_register = .lP$Input$Register,   # 02B: CIK, CompanyName, DateFiled
+  .path_register = .lP$Input$Register,   # 02B: CIK, CompanyName, DateFiled, nCIK
   .path_landing  = NULL,                 # the addresses are 04B2's; not read here
   .quiet         = FALSE
 )
@@ -322,33 +194,38 @@ tab_keys <- ent_anchor_keys(
 ent_report_keys(.tab = tab_keys)
 ```
 
-**The join is reported rather than assumed.** A document the register does not carry has no company
-name to match against and can only take a fallback party. A left join makes that visible; an inner
-join would have computed coverage over the documents that worked.
-
-**The one-word anchor is the case to watch.** A registrant whose reduced name is a single word agrees
-with any contract name beginning with that word. That is right for `BOEING` and would be wrong for a
-registrant reducing to a common word, which is why the count is reported rather than assumed to be
-zero.
-
-## The document lengths
+## Every filer, not only the one whose copy was extracted
 
 ```{r}
-#| label: load-lengths
+#| label: build-filers
 
-tab_lens <- ent_doc_lens(
-  .path_text = .lP$Input$Text   # the canonical text; length in code points, not bytes
+tab_filers <- ent_filer_keys(
+  .path_register = .lP$Input$Register,  # HashDocument is what says two copies are one document
+  .doc_ids       = tab_keys$DocID,      # the documents this rule will run on
+  .quiet         = FALSE
 )
 ```
 
-## The organisation spans
+**A contract filed by several registrants exists in EDGAR once per filer, and 04C extracts the
+primary copy only.** So an anchor built from that copy knows one filer, and every other registrant
+of the same contract would be found by the extractor, match nothing, and be counted as a
+counterparty.
+
+The primary is not stable within a corporate group, which is what makes this more than a labelling
+problem. One diagnostics group filed twenty-nine contracts under twenty-six co-registrants and the
+primary is a different subsidiary each time, so a contract naming the parent matches an anchor
+naming a subsidiary and falls through to the fallback. Matching against every filer rescues exactly
+those.
+
+## The document lengths, and the spans
 
 ```{r}
 #| label: load-spans
 
-# THE LOAD AND THE TWO KEYS ARE ONE FUNCTION, and they live in the library rather than here. 04D
-# applies this rule to the corpus by calling these functions, so a step written only in the runbook
-# is a step it would have to reimplement -- and ent_apply() cannot run without SpanKey and CoreKey.
+tab_lens <- ent_doc_lens(
+  .path_text = .lP$Input$Text   # the canonical text; length in code points, not bytes
+)
+
 tab_spans <- ent_load_org(
   .dir_store = .lP$Input$Store,      # the directory; the family is the filename
   .lens      = tab_lens,             # supplies document length, so an offset becomes a position
@@ -358,24 +235,7 @@ tab_spans <- ent_load_org(
 )
 ```
 
-**Both keys are built once, outside the rule.** The reduction depends on no rule parameter, so
-building it per sweep cell would run the same strings through the same regex to produce the identical
-answer; `ent_rule()`'s `.key` then chooses between two columns that already exist.
-
-**Asking for a column that is not there is an abort, not a silent absence.** The loader reads the
-table's real schema and names what is missing, because `any_of()` would have dropped `NameCore`
-without a word -- and the `coalesce` inside would then have fallen back to `Span` on every row,
-turning a documented rule into a fallback nobody could see.
-
-**The span count covers fewer documents than the sample holds**, and every mean below is over the
-sample rather than over that subset. Documents in which LexNLP proposed no organisation carry no
-offsets, no window and no tail, and enter every average as a zero. That is the honest denominator: the
-rule has to answer for a document it found nothing in.
-
 # Construction
-
-Everything in this section is window-free, which is what makes the width table in Selection
-affordable: the grouping and the match are computed once and every width is cut over the same parties.
 
 ## Applying the rule
 
@@ -383,19 +243,19 @@ affordable: the grouping and the match are computed once and every width is cut 
 #| label: apply-rule
 
 res_base <- ent_apply(
-  .spans = tab_spans,           # every lexnlp ORG span, with both candidate keys
-  .keys  = tab_keys,            # runs from the key side, so unmatched documents survive
-  .lens  = tab_lens,            # so a document with no organisation at all still carries a length
-  .rule  = .lP$Params$Rule,     # the grouping and the match
-  .spec  = .lP$Params$Spec      # the one window
+  .spans  = tab_spans,           # every lexnlp ORG span, with both candidate keys
+  .keys   = tab_keys,            # runs from the key side, so unmatched documents survive
+  .lens   = tab_lens,            # so a document with no organisation at all still carries a length
+  .rule   = .lP$Params$Rule,     # the grouping and the match
+  .spec   = .lP$Params$Spec,     # the one window
+  .filers = tab_filers           # every registrant of the document, for the co-filer rule
 )
 
-tab_ent      <- res_base$Ent       # one row per document per distinct key, window-free
-tab_parties  <- res_base$Parties   # one row per document per party, after grouping
-tab_party    <- res_base$Party     # one row per document, the contracting party
-tab_roles    <- res_base$Roles     # parties with the window, the tail and the assigned role
-tab_counts   <- res_base$Counts    # one row per document; NOT written, only reported from
-tab_mentions <- res_base$Mentions  # one row per mention, mapped back to its party
+tab_ent     <- res_base$Ent      # one row per document per distinct key, window-free
+tab_parties <- res_base$Parties  # one row per document per party, after grouping
+tab_party   <- res_base$Party    # one row per document, the contracting party
+tab_roles   <- res_base$Roles    # parties with the window, the tail and the assigned role
+tab_release <- res_base$Release  # THE FILE: one row per contract per party per mention
 
 ent_report_match(.tab = tab_party)
 ```
@@ -405,57 +265,27 @@ ent_report_match(.tab = tab_party)
 ```{r}
 #| label: report-grouping
 
-tab_group <- ent_table_group(.roles = tab_roles)
+tab_party_facts <- ent_party_facts(.release = tab_release)
 
-ent_report_group(.tab = tab_group)
+ent_report_group(.tab = ent_table_group(.party = tab_party_facts))
 ```
 
-**Keys above Parties is the whole of what grouping removed.** If the two are equal nothing merged, and
-every table below is measuring the window alone rather than the window and the collapse together.
-
-## Where the spans sit
-
-```{r}
-#| label: measure-density
-
-tab_density <- ent_density(
-  .spans = tab_spans,
-  .bins  = .lP$Params$Bins   # bins across relative position
-)
-```
-
-## How far spans overshoot their names
-
-```{r}
-#| label: measure-boundary
-
-tab_boundary <- ent_boundary(.tab = tab_ent)
-
-ent_report_boundary(
-  .tab  = tab_boundary,
-  .note = paste("Nothing in the party rule depends on a tight boundary. The geography rule assigns",
-                "a place to the NEAREST organisation, so its scale is the neighbour gap reported",
-                "below, and the overshoot has to be read against that.")
-)
-```
+**Read from the released file rather than from the chain.** The shares here describe the object a
+reader has, not one this render alone ever held.
 
 ## How far apart the names sit
 
 ```{r}
 #| label: measure-distances
 
-tab_dist <- ent_dist_profile(
-  .roles  = tab_roles,
-  .bounds = .lP$Params$Bounds   # the candidate half-widths, so the profile answers the same question
+ent_report_dist(
+  .dist = ent_dist_profile(.roles = tab_roles, .bounds = .lP$Params$Bounds),
+  .gap  = ent_gap_profile(.roles = tab_roles, .bound = 4000)
 )
-
-tab_gap <- ent_gap_profile(
-  .roles = tab_roles,
-  .bound = 4000                 # only names near the party; across a contract the gaps are prose
-)
-
-ent_report_dist(.dist = tab_dist, .gap = tab_gap)
 ```
+
+**This is the evidence the window is chosen against.** A half-width has to clear the gap between
+adjacent names, or the rule cuts a party rather than noise.
 
 # Selection
 
@@ -464,108 +294,94 @@ ent_report_dist(.dist = tab_dist, .gap = tab_gap)
 ```{r}
 #| label: sweep-widths
 
+tab_doc <- ent_doc_facts(
+  .release = tab_release,     # every published per-document quantity, from the file
+  .lens    = tab_lens,        # supplies DocLen, which the window bounds are derived from
+  .spec    = .lP$Params$Spec  # so the bounds follow the specification rather than a stored copy
+) |>
+  dplyr::left_join(
+    # JOINED, NEVER STORED ON 22.6 MILLION ROWS. Class and AmendType are 03A's label spine and
+    # NFilers is the register's; none is a result of this rule.
+    dplyr::select(tab_keys, DocID, Class, AmendType, NFilers),
+    by = dplyr::join_by(DocID)
+  )
+
 tab_sweep <- ent_sweep_window(
   .party_tab  = tab_parties,               # the grouped parties, computed once
   .party      = tab_party,                 # the contracting party each width is centred on
-  .pars       = .lP$Params$Widths,         # the candidates, the released value among them
+  .pars       = .lP$Params$Widths,         # the released value, bracketed one either side
   .tail_share = .lP$Params$Spec$TailShare, # held at the released value throughout
   .quiet      = FALSE
 )
 
-tab_win <- ent_table_window(.sweep = tab_sweep, .counts = tab_counts)
-
-ent_report_window_table(.tab = tab_win)
+ent_report_window_table(.tab = ent_table_window(.sweep = tab_sweep, .doc = tab_doc))
 ```
 
-## The window against document length
-
-```{r}
-#| label: table-length
-
-tab_length <- ent_table_length(.sweep = tab_sweep)
-
-ent_report_length(.tab = tab_length)
-```
+**Three widths and not five.** The released value is bracketed rather than surveyed: a sweep is
+worth its render time only while the answer is in question, and one width either side is enough to
+show the count is not sitting on a cliff.
 
 ## What the grouping is worth
 
 ```{r}
 #| label: sweep-rule
 
-tab_sweep_rule <- ent_sweep_rule(
-  .spans = tab_spans,
-  .keys  = tab_keys,
-  .lens  = tab_lens,
-  .base  = .lP$Params$Rule,    # the released rule
-  .spec  = .lP$Params$Spec,    # the window held at the released value
-  .quiet = FALSE
+ent_report_sweep_rule(
+  .tab = ent_sweep_rule(
+    .spans = tab_spans,
+    .keys  = tab_keys,
+    .lens  = tab_lens,
+    .base   = .lP$Params$Rule,  # the released rule
+    .spec   = .lP$Params$Spec,  # the window held at the released value
+    .filers = tab_filers,       # held constant, so only the grouping differs between the arms
+    .quiet  = FALSE
+  )
 )
-
-ent_report_sweep_rule(.tab = tab_sweep_rule)
 ```
 
-**Two rows, and they are the only decision left.** Whether single-word fragments merge is the last
-thing in this rule a reader could disagree with: the comparison itself carries no threshold, and the
-window is one number whose alternatives are printed above.
-
 # Results
+
+## The naive ladder
+
+```{r}
+#| label: table-naive
+
+tab_naive <- ent_table_naive(.doc = tab_doc)
+
+ent_report_naive(.tab = tab_naive)
+```
+
+**Each column assumes one more thing the rule can do and a reader cannot**, so a reader who rejects
+the grouping takes the spellings column and one who rejects the window takes the naive column.
+Every one of them is a group-by over the released file, so neither has to re-run anything.
 
 ## Where the party was found
 
 ```{r}
 #| label: table-where
 
-tab_where <- ent_table_where(.counts = tab_counts)
-
-ent_report_where(.tab = tab_where)
+ent_report_where(.tab = ent_table_where(.doc = tab_doc))
 ```
-
-## The rule against the naive count
-
-```{r}
-#| label: table-naive
-
-tab_naive <- ent_table_naive(.counts = tab_counts)
-
-ent_report_naive(.tab = tab_naive)
-```
-
-**This is the table the document exists to produce.** `Naive` is what a reader gets by counting every
-distinct party a contract names and subtracting one for the registrant. `Count` is what the window
-kept. `PctRemove` is the share of the naive total the rule discarded: too low and the rule is doing
-nothing, too high and it is cutting parties rather than noise.
-
-**`PctZero` must be read against the contract type, not on its own.** Two-thirds of employment
-agreements end with no counterparty because an employment agreement's counterparty is a *person*, and
-no organisation extractor can find one. The zero rate tracking contract type in exactly that direction
-is the rule working, not failing.
 
 ## What the signature block adds
 
 ```{r}
 #| label: table-tail
 
-tab_tail <- ent_table_tail(.counts = tab_counts)
+tab_tail <- ent_table_tail(.doc = tab_doc)
 
 ent_report_tail(.tab = tab_tail)
 ```
-
-**The two counts are released apart because their ratio is not constant.** A credit agreement names its
-lending syndicate in the signature block and nowhere near the preamble; an employment agreement names
-nobody there. Pooling them would make one column mean different things by contract type, so the file
-carries the role and the reader decides.
 
 ## The commonest counterparty names
 
 ```{r}
 #| label: inspect-terms
 
-tab_terms <- ent_window_terms(
-  .roles  = tab_roles,
-  .n_docs = nrow(tab_keys)   # the sample, so the share is over every document rather than over hits
+ent_report_terms(
+  .tab = ent_window_terms(.roles = tab_roles, .n_docs = nrow(tab_keys)),
+  .n   = .lP$Params$TermsN
 )
-
-ent_report_terms(.tab = tab_terms, .n = .lP$Params$TermsN)
 ```
 
 # Validation
@@ -575,20 +391,24 @@ ent_report_terms(.tab = tab_terms, .n = .lP$Params$TermsN)
 ```{r}
 #| label: validate-offsets
 
-# AN EQUALITY, NOT A CONTAINMENT. Asking whether the span appears somewhere inside the slice is
-# answered YES more easily the wider the slice runs. The slice must BE the span.
+# CHECKED ON THE RELEASED FILE AND NOT ON AN INTERMEDIATE, and the difference is the whole point.
+# ent_party_names() names a party after its BEST member -- matched, then most mentioned -- while its
+# offsets are the EARLIEST member's, which is exactly what the dictionary documents. Those are two
+# different mentions on purpose, so slicing one's offsets never returns the other's text and a check
+# comparing them fails on every party whose best name is not its first. On the mention file the span
+# and its offsets are one row by construction, so the contract is testable rather than only asserted.
 tab_verify <- ent_verify_span(
-  .tab       = tab_party,          # the chosen party, whose offsets the window is cut from
+  .tab       = dplyr::filter(tab_release, !is.na(.data$MentionStart)),
   .path_text = .lP$Input$Text,
-  .col_start = "PartyStart",
-  .col_stop  = "PartyStop",
-  .col_span  = "PartySpan",
+  .col_start = "MentionStart",
+  .col_stop  = "MentionStop",
+  .col_span  = "SpanText",
   .n         = .lP$Params$CheckN,  # drawn rather than exhaustive; the text read is the cost
   .seed      = .lP$Params$Seed
 )
 
 tibble::tibble(
-  Item = c("Party spans checked", "Sliced text equals the stored span"),
+  Item = c("Mention spans checked", "Sliced text equals the stored span"),
   N    = c(nrow(tab_verify), sum(tab_verify$Exact))
 ) |>
   dplyr::mutate(Share = tbl_pct(.data$N / pmax(nrow(tab_verify), 1L))) |>
@@ -601,30 +421,31 @@ cli::cli_alert_info(
 )
 ```
 
-## Two identities the counts cannot violate
+## Three identities the file cannot violate
 
 ```{r}
 #| label: validate-counts
 
-# Every party is exactly one of four roles, so the four counts plus the registrant must equal the
-# party total in every document. A shortfall is a role that failed to assign; an excess is a party
-# counted twice by the grouping.
 tibble::tibble(
   Item = c("Documents",
-           "Where registrant + counterparty + signatory + other equals the party count",
-           "Where the naive count is below the rule's count"),
-  N    = c(nrow(tab_counts),
-           sum(tab_counts$NCounter + tab_counts$NTailNew + tab_counts$NOther +
-                 as.integer(tab_counts$Status != "no entity") == tab_counts$NParties),
-           sum(tab_counts$NNaive < tab_counts$NCounter))
+           "Where the five roles sum to the party count",
+           "Where the naive count is below the rule's count",
+           "Where a co-filer was found but the document has one filer"),
+  N    = c(nrow(tab_doc),
+           sum(tab_doc$NCounter + tab_doc$NCoFiler + tab_doc$NTailNew + tab_doc$NOther +
+                 as.integer(tab_doc$Status != "no entity") == tab_doc$NParties),
+           sum(tab_doc$NaiveCounter < tab_doc$NCounter),
+           sum(tab_doc$NCoFiler > 0L & dplyr::coalesce(tab_doc$NFilers, 1L) <= 1L))
 ) |>
-  dplyr::mutate(Share = tbl_pct(.data$N / nrow(tab_counts))) |>
-  tbl_say(.title = "Two identities the counts cannot violate")
+  dplyr::mutate(Share = tbl_pct(.data$N / nrow(tab_doc))) |>
+  tbl_say(.title = "Three identities the counts cannot violate")
 
 cli::cli_alert_info(
-  "The second row must be every document. The third must be ZERO: the window is a subset of the \\
-   parties, so the rule can never count more counterparties than the naive baseline does. A nonzero \\
-   third row is a grouping defect, not a window one."
+  "The second row must be every document. The third and fourth must be ZERO. A nonzero THIRD is a \\
+   grouping defect and not a window one, because the window is a subset of the parties and can \\
+   never keep more than the naive baseline. A nonzero FOURTH means the filer join fanned out: a \\
+   document with one registrant has no other filer to match against, so a co-filer there is a join \\
+   producing rows rather than a rule finding parties."
 )
 ```
 
@@ -635,57 +456,29 @@ cli::cli_alert_info(
 ```{r}
 #| label: read-merged
 
-tab_merged <- ent_read_merged(
-  .roles = tab_roles,
-  .n     = .lP$Params$ReadMerge   # the documents where grouping did the most work
-)
-
-ent_report_merged(.tab = tab_merged)
+ent_report_merged(.tab = ent_read_merged(.roles = tab_roles, .n = .lP$Params$ReadMerge))
 ```
-
-**A wrong merge puts two companies under one name and no count would reveal it**, which is why this
-block reads rather than counts. The rows to check are the ones where the chosen name looks like a
-heading glued to a company: that is the case the naming rule exists for, and it should have been
-resolved in favour of the clean name.
 
 ## Whole documents, read in order
 
 ```{r}
 #| label: read-documents
 
-tab_read <- ent_read_entities(
-  .roles = tab_roles,
-  .keys  = tab_keys,
-  .docs  = NULL,                  # drawn at random rather than chosen
-  .n     = .lP$Params$ReadDocs,
-  .max   = .lP$Params$ReadMax,
-  .seed  = .lP$Params$Seed
-)
-
-ent_report_entities(.tab = tab_read, .counts = tab_counts)
-```
-
-## The fallback documents
-
-```{r}
-#| label: read-fallback
-
-# The documents where nothing matched, so the first party named was taken. This is the block that
-# says how much the fallback can be trusted, and it cannot be settled by a count.
-ent_read_entities(
-  .roles = dplyr::semi_join(
-    tab_roles,
-    dplyr::filter(tab_counts, .data$Status == "first"),
-    by = dplyr::join_by(DocID)
+ent_report_entities(
+  .tab  = ent_read_entities(
+    .roles = tab_roles,
+    .keys  = tab_keys,
+    .docs  = NULL,               # drawn at random rather than chosen
+    .n     = .lP$Params$ReadDocs,
+    .max   = .lP$Params$ReadMax,
+    .seed  = .lP$Params$Seed
   ),
-  .keys  = tab_keys,
-  .docs  = NULL,
-  .n     = .lP$Params$ReadDocs,
-  .max   = .lP$Params$ReadMax,
-  .seed  = .lP$Params$Seed
-) |>
-  ent_report_entities(.counts = tab_counts, .title = "Fallback documents, read in order")
+  .doc = tab_doc
+)
 ```
+
+**The block that would show a wrong rule.** A fallback document, a merge that should not have
+happened and a window that cut a real party all look the same in a table and different on the page.
 
 # Deployment
 
@@ -694,91 +487,40 @@ ent_read_entities(
 ```{r}
 #| label: write-artifact
 
-tab_release <- ent_release_parties(
-  .roles = tab_roles,   # every party with its role and offsets
-  .party = tab_party    # supplies every document, including those with no party at all
-)
+arrow::write_parquet(tab_release, .lP$Output$Mentions)
 
-arrow::write_parquet(tab_release, .lP$Output$Parties)
-arrow::write_parquet(tab_mentions, .lP$Output$Mentions)
-
-ent_report_release(.tab = tab_release)
+ent_report_release(.tab = tab_release, .party = tab_party_facts)
 ```
-
-```{r}
-#| label: report-mentions
-
-ent_report_mentions(.tab = tab_mentions, .release = tab_release)
-```
-
-**The index is not a second release.** `parties_org.parquet` is the file: one row per contract per
-party, everything a reader analyses. `mentions_org.parquet` is four columns saying where else each of
-those parties was named, and it exists because a rule measuring what sits *beside* a party needs every
-occurrence rather than the first. 04B2 reads it to reach the addresses written in signature blocks;
-filtering it to `IsFirst` reproduces the release's own offsets exactly.
-
-**`other` is the largest role, and that is the design.** Those are the parties the window excluded,
-kept in the file so a reader can recompute the naive count or re-cut the window from the release
-rather than from this render. They are the control group, not discarded data.
 
 ## The released file, read
 
 ```{r}
 #| label: read-release
 
-tab_sample <- ent_release_sample(
-  .tab  = tab_release,
-  .n    = 4L,                  # one of them is a sentinel, drawn deliberately
-  .seed = .lP$Params$Seed
-)
-
 ent_report_release_sample(
-  .tab  = tab_sample,
-  .keys = tab_keys     # CompanyName, joined for reading; it is not a column of the file
+  .tab  = ent_release_sample(.tab = tab_release, .n = 4L, .seed = .lP$Params$Seed),
+  .keys = tab_keys     # CompanyName and Class, joined for reading; neither is a column of the file
 )
 ```
 
-**This is the file.** Everything else in this document describes it; the block above shows it. Read
-one contract's rows top to bottom: one `registrant`, the parties the window kept beside it, and the
-`other` rows it excluded.
+**A registrant that is not the filer is the fallback, not a defect.** Where a contract names nothing
+resembling the company EDGAR recorded, the first party named is taken and `MatchKind` says
+`fallback`. That is 22.4% of contracts, so a drawn handful will usually contain one: a factoring
+agreement filed by a borrower names the lender first, and the rule has no basis for preferring
+either. The alternative is a null registrant on more than a fifth of the sample, which loses the
+party the window is measured from and with it every counterparty count on those documents.
 
-**`Matched` is read against the first table.** A registrant marked `FALSE` is the fallback -- nothing
-in that contract resembled the name EDGAR records, so the first party found was taken. Seeing the two
-strings side by side is the only way to tell a comparison that failed from a contract that genuinely
-never names its filer.
+**Read `MatchKind` before reading `PartyRole`.** `exact` and `prefix` mean the registrant is the
+filer; `fallback` means it is the first organisation the contract named. Anyone conditioning on the
+registrant being the filing company should filter on the first two.
 
 ## What every column means
 
 ```{r}
 #| label: report-dictionary
 
-tab_dict <- ent_dictionary_parties(.tab = tab_release)
-
-ent_report_dictionary(.tab = tab_dict)
+ent_report_dictionary(.tab = ent_dictionary_mentions(.tab = tab_release))
 ```
-
-**The dictionary is checked against the file rather than written beside it.** A column added or
-renamed without a matching entry aborts this chunk, which is the only way a dictionary stays true to
-the thing it documents.
-
-**A contract in which nothing was found still gets a row.** LexNLP proposed no organisation at all in
-116 of the 4,398 contracts. Without a sentinel those documents have no rows, so a mean computed over
-the file divides by 4,282 -- about 2.6% too high, with nothing to notice.
-
-**Every contract-level variable is one `summarise`:**
-
-```r
-tab_release |>
-  dplyr::summarise(
-    PartyStatus     = dplyr::if_else(any(.data$Matched), "matched", "fallback"),
-    NParties        = sum(.data$PartyRole != "none"),
-    NCounterparties = sum(.data$PartyRole == "counterparty"),
-    NSignatories    = sum(.data$PartyRole == "signatory"),
-    .by = c(DocID, Class, AmendType)
-  )
-```
-
-The naive baseline is `NParties - 1`, computed wherever it is used and stored nowhere.
 
 # Overview
 
@@ -787,17 +529,15 @@ The naive baseline is `NParties - 1`, computed wherever it is used and stored no
 ```{r}
 #| label: report-headline
 
-ent_report_headline(.counts = tab_counts, .release = tab_release)
+ent_report_headline(.doc = tab_doc, .release = tab_release)
 ```
 
 ## What the rule removed
 
 ```{r}
 #| label: fig-naive
-#| fig-cap: "Mean counterparties per contract by type, as the rule counts them and as a naive count
-#|   would. Both bars exclude the registrant; the gap between each pair is what the grouping and the
-#|   window removed."
-#| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_naive$Class))
+#| fig-height: !expr plot_height(dplyr::n_distinct(tab_naive$Class))
+#| fig-cap: "Counterparties per contract without a rule and with one, by contract type. The gap is the rule."
 
 ent_plot_naive(.tab = tab_naive)
 ```
@@ -806,10 +546,8 @@ ent_plot_naive(.tab = tab_naive)
 
 ```{r}
 #| label: fig-tail
-#| fig-cap: "The two released counts, stacked, neither including the registrant. Signatories are a
-#|   rounding error on employment agreements and a lending syndicate on credit agreements, which is
-#|   why they are counted apart rather than pooled."
-#| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_tail$Class))
+#| fig-height: !expr plot_height(dplyr::n_distinct(tab_tail$Class))
+#| fig-cap: "What the window kept and what the signature block adds, by contract type."
 
 ent_plot_tail(.tab = tab_tail)
 ```
@@ -818,39 +556,24 @@ ent_plot_tail(.tab = tab_tail)
 
 ```{r}
 #| label: fig-party-status
-#| fig-cap: "How each document's contracting party was found, by contract type. The flagged share is
-#|   the fallback, where no party agreed with the EDGAR name."
-#| fig-height: !expr plot_height(.n_rows = dplyr::n_distinct(tab_counts$Class))
+#| fig-height: !expr plot_height(dplyr::n_distinct(tab_doc$Class))
+#| fig-cap: "Matched, fallback or nothing found, by contract type."
 
-ent_plot_status(.tab = tab_counts)
+ent_plot_status(.tab = tab_doc)
 ```
 
 ## How many spellings each party had
 
 ```{r}
 #| label: fig-group
-#| fig-cap: "What grouping did to every party found, the registrant included: merged as the
-#|   beginning of a longer name, merged as a single word taken from one, or reached by nothing."
 #| fig-height: 2.4
+#| fig-cap: "Share of parties by how the grouping merged them. Alone is a party the grouping never touched."
 
-ent_plot_group(.tab = tab_roles)
-```
-
-## Where the names sit in the document
-
-```{r}
-#| label: fig-density
-#| fig-cap: "Where organisation spans sit in the document, weighted by spans and by documents. The
-#|   two ends are the preamble and the signature block, and the contrast between them and the middle
-#|   is what makes position a usable instrument."
-#| fig-height: 3.4
-
-ent_plot_density(.tab = tab_density)
+ent_plot_group(.tab = tab_party_facts)
 ```
 
 # Next
 
-04B2 reads `parties_org.parquet` and attaches a place to every party this document found, using the
-same anchor: a place is a party's when the party is named within 200 characters before it. It excludes
-places sitting inside a governing-law clause, which name the applicable law rather than any party's
-address.
+**04B2** reads this file and attaches a place to each party, using the mention offsets rather than
+the party's first mention alone. It writes the geography beside these columns; nothing here is
+recomputed there.

@@ -1,61 +1,50 @@
-# 04D-EntityApply: apply the 04B rules to the corpus 04C extracted -------------------------------------------------------
+# 04D-EntityApply: the five rules at corpus scale --------------------------------------------------------------------
 #
-# WHAT THIS FILE DOES, IN ONE PARAGRAPH
-# Every rule has been settled. 04A extracted a sample and measured which family to trust, 04B built
-# and scored a rule per entity against facts EDGAR recorded, 04C extracted the whole corpus. This
-# stage decides nothing. It reads the rules as parameters, applies them to 1.19 million attachments
-# in chunks, and writes the same four files 04B released -- identical columns, identical order,
-# identical meaning -- with the corpus in them instead of 4,398 documents.
+# WHAT THIS FILE DOES
+# 04A measured which family to trust, 04B built and scored a rule per entity, 04C extracted the
+# corpus. This decides nothing. It reads the rules as parameters, applies them one ENTITY AT A TIME,
+# and writes the same eight long files 04B released with the corpus in them.
 #
-# WHY AN APPLY STAGE HAS ALMOST NO DECISIONS OF ITS OWN
-# An apply stage free to choose its own family or its own window is one whose output depends on which
-# version of it last ran, and a released dataset cannot be defended on those terms. Everything that
-# could vary is declared in the runbook's Configuration, printed in the render, and hashed into the
-# chunk directory so a changed rule cannot be served from a stale cache.
+# THE UNIT OF WORK IS ONE DOCUMENT
+# A worker is handed one document's spans and returns that document's rows. Nothing else can be
+# affected by it: a contract with an impossible offset, a name the grouping cannot reduce, a date
+# outside every range costs exactly that document and no other. There is no batch to lose and no
+# partial state to reason about.
 #
-# THE RULE FUNCTIONS ARE 04B'S, CALLED RATHER THAN COPIED
-# Not one rule is reimplemented here. The five 04B libraries are sourced and their apply functions
-# called on chunks of the corpus instead of on the sample. That is the project's own instruction --
-# shared tooling lives upstream and later scripts source it -- and it is the mistake this family
-# already made twice: dte_term() re-implemented dateregex-v3's TERM in R and red_words() recounted
-# what the register held. Both worked. Both could only ever work on the sample.
+# It is also the only unit that is provably safe. Every 04B rule reads one document -- grouping
+# compares names within a document, the window measures from a party in the same document, the
+# ambiguous city takes a state the same contract names -- so a rule applied per document cannot be
+# reading a quantity computed over the group it happened to be handed. An earlier version needed a
+# whole Validation section to establish that; here it is true by construction.
 #
-# THREE THINGS THAT WERE TRUE OF THE PREVIOUS VERSION AND ARE NOT TRUE NOW
+# THE READ IS PER WINDOW AND THE WORK IS PER DOCUMENT
+# One DuckDB query loads WindowSize documents' spans, the parent splits them by DocID, and the
+# workers take one each. The database is asked a few hundred times rather than a million, and the
+# rules still see one contract at a time.
 #
-#   NO CHAIN OPENS A DOCUMENT. dte_describe() cut a cue window out of the canonical text, geo_law()
-#   scanned whole documents for governing-law language, and mny_load() read sixty characters before
-#   every amount. All three now read CueBefore and CueAfter, stored at extraction. The text staging
-#   this file used to do -- read a chunk's parquets, write one staged file, hand it to three chains
-#   -- is gone entirely, and with it the Cues dial that existed to switch those reads off and whose
-#   only effect was to delete the governing-law columns from the corpus release.
+# RESUMPTION IS BY DOCUMENT, NOT BY POSITION
+# A pass asks which documents the ledger has and which are already written; the difference is the
+# work. Nothing is named for a position, so a window size changed between renders costs nothing and a
+# population that grew -- a family still finishing extraction -- simply adds to the queue.
 #
-#   THE PARTY CHAIN IS CHUNKABLE. ent_rule()'s family-frequency gate admitted a shared leading token
-#   as evidence of a corporate family when that token opened at most a given share of DOCUMENTS, and
-#   ent_apply() computed the share from the spans it was handed -- so under chunking the denominator
-#   became the chunk. Measured, 176 leading tokens fell on opposite sides of the threshold at 2,546
-#   documents per chunk. The gate is gone: grouping is now word-prefix comparison WITHIN a document,
-#   which needs no denominator at all. So ORG chunks with everything else and the whole-corpus pass
-#   this file used to make has no reason to exist.
+# A WINDOW COMMITS AS A DIRECTORY. Outputs and a _done.parquet are written into a hidden name and the
+# whole directory is renamed into place. A rename within one filesystem is atomic, so a killed
+# process leaves a dotfile no glob sees and no reader counts.
 #
-#   EVERY RULE IS PER DOCUMENT, WHICH IS WHAT MAKES CHUNKING SAFE. Grouping, party identification,
-#   the window, place attachment, the ambiguous-city resolution, the date cascade, the money filters
-#   and the marker counts all read one document's spans and nothing else. The gazetteer is global and
-#   read-only. That is an argument rather than a proof, so Validation runs the same documents as one
-#   chunk and as several and compares the four releases row for row.
+# _done.parquet NAMES EVERY DOCUMENT PROCESSED, not every document that produced a row. Seven of the
+# eight releases carry a row only where the extractor found something -- redact_spans reaches 14% of
+# documents -- so resuming on the outputs would reprocess the other 86% on every render, forever.
 #
-# WHAT COMES OUT: THE SAME FOUR FILES 04B WROTE
-#   parties_geo.parquet     one row per contract per party  -- 04B1's release, widened by 04B2
-#   contracts_date.parquet  one row per contract            -- 04B3
-#   contracts_money.parquet one row per contract            -- 04B4
-#   contracts_redact.parquet one row per contract           -- 04B5
-# Each is written by the same 04B function that wrote the sample's, so a column that changed there
-# changes here and a dictionary check that passes there passes here.
+# FIVE HASHES. ORG folds in lexnlp's spec hashes; GPE folds in matcon's AND ORG's, because it reads
+# ORG's mention file; DATE, MONEY and REDACT fold in matcon's. REDACT reads matcon's money spans to
+# find the ones the filer emptied, but "emptied" is a moneyregex PATTERN NAME rather than a filtered
+# result, so it depends on the extractor and not on 04B4. The window size and the worker count are in
+# no hash: nothing depends on how the remaining work is divided.
 #
-# THE CHUNK CACHE IS KEYED ON A POLICY HASH, AND THE HASH INCLUDES THE EXTRACTOR
-# A rule changed without a new chunk directory would be served from the old one. The hash therefore
-# folds in every parameter AND the per-family spec hashes 04C recorded, because a re-extraction that
-# moved a model's rules leaves the parameters untouched while every span underneath them changes.
-# That was a live defect: apl_policy_hash() hashed .lP$Params alone.
+# NO COLLAPSE IS WRITTEN. The long files are the release; the EXPORT calls ent_party_facts(),
+# geo_collapse(), dte_collapse(), mny_collapse() and red_collapse().
+#
+# NOTHING OPENS A DOCUMENT. Every cue window was cut at extraction and stored.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new columns; if (FALSE) dev blocks;
@@ -66,240 +55,267 @@ if (FALSE) {
 }
 
 
-# 1. Policy --------------------------------------------------------------------------------------------------------------
+# 1. What each pass is ---------------------------------------------------------------------------------------------------
 
-#' One hash standing for every choice this pass makes
-#'
-#' THE CHUNK DIRECTORY IS NAMED FOR IT, so a changed rule cannot be served from a stale cache. The
-#' cache is worth days on a corpus this size and worth nothing at all if it can return the output of
-#' a rule that no longer exists.
-#'
-#' THE EXTRACTOR IS PART OF THE POLICY, and leaving it out was a defect. Every span this pass reads
-#' was produced by a model whose spec hash 04C recorded; re-extracting with a changed gazetteer or a
-#' changed money grammar leaves .lP$Params byte-identical while the input underneath it is different.
-#' Hashing the parameters alone would then serve chunks computed from spans that no longer exist.
-#'
-#' @param .params The runbook's .lP$Params.
-#' @param .describe Output of ner_describe(), carrying one spec hash per model and entity.
-#' @return Character. A twelve-character hash.
-apl_policy_hash <- function(.params, .describe) {
-  if (FALSE) {
-    .params   <- .lP$Params
-    .describe <- tab_describe
+#: Family is whose ledger defines the population and whose spans the chain reads. Needs is what a
+#: document must have finished. Writes is the file stem each pass produces, and Depends is the pass
+#: whose output it reads. Declared rather than inferred, because a pass reading an entity its family
+#: never ran comes back empty and reports it as a corpus holding none of that entity.
+.apl_passes <- tibble::tribble(
+  ~Pass,     ~Family,  ~Needs,                  ~Writes,                        ~Depends,
+  "ORG",     "lexnlp", c("ORG"),                c("org_mentions"),              NA_character_,
+  "GPE",     "matcon", c("GPE", "LAW"),         c("places_geo", "law_clauses"), "ORG",
+  "DATE",    "matcon", c("DATE", "TERM"),       c("date_spans", "term_spans"),  NA_character_,
+  "MONEY",   "matcon", c("MONEY"),              c("money_spans"),               NA_character_,
+  "REDACT",  "matcon", c("REDACT", "MONEY"),    c("redact_spans"),              NA_character_
+)
+
+
+
+# 2. Policy --------------------------------------------------------------------------------------------------------------
+
+#' What one pass is, as a list
+#' @param .pass Character. ORG, GPE, DATE, MONEY or REDACT.
+#' @return A one-row list: Pass, Family, Needs, Writes, Depends.
+apl_pass_spec <- function(.pass) {
+  if (FALSE) .pass <- "GPE"
+
+  row_ <- dplyr::filter(.apl_passes, .data$Pass == .pass)
+  if (nrow(row_) != 1L) {
+    cli::cli_abort(c(
+      "{(.pass)} is not one of the five passes.",
+      "i" = "They are: {paste(.apl_passes$Pass, collapse = ', ')}."
+    ))
   }
-
-  spec_ <- .describe |>
-    dplyr::filter(.data$Ready) |>
-    dplyr::arrange(.data$Family, .data$Model, .data$Entity) |>
-    dplyr::transmute(Row = paste(.data$Family, .data$Model, .data$Entity, .data$SpecHash))
-
-  # stri_sub AND NOT substr, which is the house rule and is load-bearing here for a different reason
-  # than usual: a hash is ASCII so the two agree, but a file that reaches for substr once teaches the
-  # next reader that substr is allowed, and everywhere else in this project it silently indexes bytes
-  # where the offsets are code points.
-  stringi::stri_sub(digest::digest(list(.params, spec_$Row), algo = "xxhash64"), to = 12L)
+  list(
+    Pass    = row_$Pass[[1L]],
+    Family  = row_$Family[[1L]],
+    Needs   = row_$Needs[[1L]],
+    Writes  = row_$Writes[[1L]],
+    Depends = row_$Depends[[1L]]
+  )
 }
 
 
-#' Every choice this pass makes, as a table
+#' One hash per pass, standing for every choice that pass makes
+#'
+#' THE OUTPUT DIRECTORY IS NAMED FOR IT, so a changed rule cannot be served output produced by a
+#' rule that no longer exists. Everything already written is worth days on a corpus this size and
+#' worth nothing at all if it can answer for the wrong policy.
+#'
+#' THE EXTRACTOR IS PART OF THE POLICY. Every span this pass reads was produced by a model whose spec
+#' hash 04C recorded; re-extracting with a changed gazetteer or a changed money grammar leaves the
+#' parameters byte-identical while the input underneath them is different.
+#'
+#' AND SO IS THE PASS IT DEPENDS ON. GPE reads ORG's mention file, so geography built on parties
+#' that have since been regrouped is exactly what this hash exists to prevent being served.
+#'
+#' THE SCHEDULE IS NOT IN IT. Window size and worker count decide how long a pass takes, not what it
+#' answers -- and nothing here depends on how the remaining work is divided.
+#'
+#' @param .pass Character. Which pass.
+#' @param .params The runbook's .lP$Params.
+#' @param .describe Output of ner_describe(), carrying one spec hash per model and entity.
+#' @param .depends Named character of hashes this pass depends on; NULL where it depends on none.
+#' @return Character. A twelve-character hash.
+apl_policy_hash <- function(.pass, .params, .describe, .depends = NULL) {
+  if (FALSE) {
+    .pass     <- "GPE"
+    .params   <- .lP$Params
+    .describe <- tab_describe
+    .depends  <- c(ORG = "abc123")
+  }
+
+  spec_ <- apl_pass_spec(.pass = .pass)
+
+  # ONLY THIS PASS'S FAMILY AND ONLY THIS PASS'S ENTITIES. Folding in every model's hash would make a
+  # spaCy re-run invalidate the date cache, which is the coarseness this file exists to remove.
+  fam_ <- .describe |>
+    dplyr::filter(.data$Ready, .data$Family == spec_$Family, .data$Entity %in% spec_$Needs) |>
+    dplyr::arrange(.data$Model, .data$Entity) |>
+    dplyr::transmute(Row = paste(.data$Model, .data$Entity, .data$SpecHash))
+
+  if (nrow(fam_) == 0L) {
+    cli::cli_abort(c(
+      "No READY extractor answers for {(.pass)}.",
+      "x" = "{(spec_$Family)} / {paste(spec_$Needs, collapse = ', ')}.",
+      "i" = "ner_describe() marks a family unready when its dependency is absent -- Docker not
+             running, a gazetteer missing. Hashing without it would let two different extractions
+             share a cache directory."
+    ))
+  }
+
+  # THE RULE PARAMETERS THIS PASS ACTUALLY READS, and nothing else. Naming them per pass is what
+  # keeps a money filter out of the party hash.
+  rule_ <- switch(
+    .pass,
+    ORG    = list(.params$Rule$Org, .params$Spec$Org, .params$Extras$ORG),
+    GPE    = list(.params$Spec$Geo),
+    DATE   = list(.params$Spec$Date, .params$CueWin$Date),
+    MONEY  = list(.params$Spec$Money),
+    REDACT = list(.params$Spec$Redact)
+  )
+
+  stringi::stri_sub(
+    digest::digest(list(.pass, rule_, fam_$Row, .depends), algo = "xxhash64"), to = 12L
+  )
+}
+
+
+#' Every choice this document makes, as a table
 #'
 #' PRINTED RATHER THAN DESCRIBED. A parameter a reader cannot see is a parameter nobody reviewed, and
 #' the render is where this pass is defended.
 #'
 #' @param .params The runbook's .lP$Params.
-#' @return Tibble: Stage, Setting, Value, From.
+#' @return Tibble: Pass, Setting, Value, From.
 apl_policy_table <- function(.params) {
   if (FALSE) .params <- .lP$Params
 
   tibble::tribble(
-    ~Stage,   ~Setting,        ~Value,                                          ~From,
-    "ORG",    "family",        .params$Family$ORG,                              "04B1",
-    "ORG",    "key",           .params$Rule$Org$Key,                            "04B1",
-    "ORG",    "merge",         as.character(.params$Rule$Org$MergeFragments),   "04B1",
-    "ORG",    "window",        format(.params$Spec$Org$Par, big.mark = ","),    "04B1",
-    "ORG",    "tail share",    format(.params$Spec$Org$TailShare),              "04B1",
-    "GPE",    "family",        .params$Family$GPE,                              "04B2",
-    "GPE",    "reach",         format(.params$Spec$Geo$Reach, big.mark = ","),  "04B2",
-    "DATE",   "family",        .params$Family$DATE,                             "04B3",
-    "DATE",   "start",         .params$Spec$Date$Start,                         "04B3",
-    "DATE",   "end",           .params$Spec$Date$End,                           "04B3",
-    "DATE",   "cap, years",    format(.params$Spec$Date$CapYears),              "04B3",
-    "DATE",   "cue window",    format(.params$CueWin$Date),                     "04B3",
-    "MONEY",  "family",        .params$Family$MONEY,                            "04B4",
-    "MONEY",  "filter",        .params$Spec$Money$Filter,                       "04B4",
-    "MONEY",  "cue window",    format(.params$Spec$Money$CueWin),               "04B4",
-    "REDACT", "family",        .params$Family$REDACT,                           "04B5",
-    "REDACT", "words from",    "register",                                      "04B5",
-    "PASS",   "chunk size",    format(.params$ChunkSize, big.mark = ","),       "04D"
+    ~Pass,    ~Setting,      ~Value,                                          ~From,
+    "ORG",    "family",      "lexnlp",                                        "04A",
+    "ORG",    "key",         .params$Rule$Org$Key,                            "04B1",
+    "ORG",    "merge",       as.character(.params$Rule$Org$MergeFragments),    "04B1",
+    "ORG",    "window",      format(.params$Spec$Org$Par, big.mark = ","),    "04B1",
+    "ORG",    "tail share",  format(.params$Spec$Org$TailShare),              "04B1",
+    "GPE",    "family",      "matcon",                                        "04B2",
+    "GPE",    "reach",       format(.params$Spec$Geo$Reach),                  "04B2",
+    "DATE",   "start",       .params$Spec$Date$Start,                         "04B3",
+    "DATE",   "end",         .params$Spec$Date$End,                           "04B3",
+    "DATE",   "cap, years",  format(.params$Spec$Date$CapYears),              "04B3",
+    "DATE",   "cue window",  format(.params$CueWin$Date),                     "04B3",
+    "MONEY",  "filter",      .params$Spec$Money$Filter,                       "04B4",
+    "MONEY",  "cue window",  format(.params$Spec$Money$CueWin),               "04B4",
+    "REDACT", "tolerance",   format(.params$Spec$Redact$Tol),                 "04B5",
+    "PASS",   "chunk size",  format(.params$ChunkSize, big.mark = ","),       "04D",
+    "PASS",   "workers",     format(.params$Workers),                         "04D",
+    "PASS",   "limit",       if (is.null(.params$Limit)) "none" else
+                               format(.params$Limit, big.mark = ","),         "04D"
   )
 }
 
 
-#' What this pass will do, before it does any of it
+#' The policy and the five hashes
 #' @param .tab Tibble from apl_policy_table().
-#' @param .hash Character from apl_policy_hash().
+#' @param .hashes Named character from apl_policy_hash(), one per pass.
+#' @param .limit Integer or NULL.
 #' @return Invisibly .tab.
-apl_report_policy <- function(.tab, .hash) {
+apl_report_policy <- function(.tab, .hashes, .limit = NULL) {
   if (FALSE) {
-    .tab  <- tab_policy
-    .hash <- .lP$Params$Hash
+    .tab    <- tab_policy
+    .hashes <- .lP$Params$Hash
+    .limit  <- .lP$Params$Limit
   }
 
   cli::cli_h2("The policy")
-  tbl_say(.tab = .tab, .title = "Every choice this pass makes, and which document made it")
+  tbl_say(.tab = .tab, .title = "Every choice this document makes, and which document made it")
+
+  tibble::tibble(
+    Pass    = names(.hashes),
+    Hash    = unname(.hashes),
+    Depends = purrr::map_chr(names(.hashes),
+                             \(.p) dplyr::coalesce(apl_pass_spec(.p)$Depends, "-"))
+  ) |>
+    tbl_say(.title = "One hash per pass, and what each folds in")
 
   cli::cli_alert_info(
-    "POLICY HASH {(.hash)}. The chunk directory is named for it, so a changed rule cannot be served \\
-     from a stale cache. It folds in the per-family SPEC HASHES 04C recorded as well as these \\
-     settings, because a re-extraction that moved a model's rules leaves every value above \\
-     unchanged while every span underneath them is different."
+    "FIVE HASHES AND NOT ONE. Each covers its own rule parameters, its own family's extractor spec \\
+     hashes, and the hash of any pass it reads -- so a changed date cap re-runs DATE alone, and a \\
+     changed party rule re-runs ORG and GPE because GPE reads ORG's file."
   )
+  cli::cli_alert_info(
+    "THE CHUNK SIZE AND THE WORKER COUNT ARE NOT IN ANY HASH. They decide how long a pass takes and \\
+     not what it answers, and Validation proves that rather than asserting it. Hashing them would \\
+     mean re-running a corpus to change a worker count."
+  )
+
+  if (!is.null(.limit)) {
+    cli::cli_alert_warning(
+      "THIS IS A LIMITED RUN OF {format(.limit, big.mark = ',')} \\
+       {cli::qty(.limit)}document{?s} PER PASS, and it writes into its own directory. It neither \\
+       reads nor invalidates the full pass, and the two can sit on disk together -- but nothing \\
+       below describes the corpus."
+    )
+  }
   invisible(.tab)
 }
 
 
-# 2. Input ---------------------------------------------------------------------------------------------------------------
+# 3. Input ---------------------------------------------------------------------------------------------------------------
 
-#' Every document 04C finished, from the ledger
+#' Every document one family finished, from its ledger
 #'
 #' THE LEDGER AND NOT THE ENTITY TABLES. A document processed and found to hold no date has no row in
 #' the date table and is not missing -- it is a contract with no date in it, which is a measurement.
-#' Taking the population from the tables would silently drop exactly those documents and inflate
-#' every rate this pass reports.
+#' Taking the population from the tables would silently drop exactly those documents.
 #'
-#' FINISHED MEANS A ROW FOR EVERY PAIR. A document part-way through 04C's plan would be applied on the
-#' entities it has and would carry zeros for the rest, which is indistinguishable in the output from a
-#' contract that named none of them.
+#' FINISHED MEANS A ROW FOR EVERY ENTITY THE PASS NEEDS. A document part-way through 04C's plan would
+#' be applied on the entities it has and carry nothing for the rest, which is indistinguishable in
+#' the output from a contract that named none of them.
+#'
+#' THE POPULATION IS PER FAMILY AND NOT PER ENTITY. The preflight measured it: every matcon entity
+#' finished the same 1,189,069 documents and every lexnlp entity the same 1,099,419. So this asks the
+#' family's ledger for the entities the pass names, and the count is a property of the family.
 #'
 #' @param .dir_store Directory holding the family databases.
-#' @param .family Character. Family whose ledger defines the population.
-#' @param .entity Character. Entities a finished document must carry.
+#' @param .pass Character. Which pass.
+#' @param .limit Integer or NULL. Take the first N documents, for a test run.
 #' @return Tibble: DocID.
-apl_corpus_index <- function(.dir_store, .family, .entity) {
+apl_corpus_index <- function(.dir_store, .pass, .limit = NULL) {
   if (FALSE) {
     .dir_store <- .lP$Input$Store
-    .family    <- "matcon"
-    .entity    <- c("GPE", "DATE", "TERM", "MONEY", "REDACT", "LAW")
+    .pass      <- "GPE"
+    .limit     <- 2000L
   }
 
+  spec_ <- apl_pass_spec(.pass = .pass)
+
   con_ <- ner_db_connect(
-    .db_path = ner_db_path(.dir = .dir_store, .family = .family), .read_only = TRUE
+    .db_path = ner_db_path(.dir = .dir_store, .family = spec_$Family), .read_only = TRUE
   )
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
-  in_ <- paste0("'", .entity, "'", collapse = ", ")
+  in_  <- paste0("'", spec_$Needs, "'", collapse = ", ")
+  lim_ <- if (is.null(.limit)) "" else paste0(" LIMIT ", as.integer(.limit))
 
+  # ORDERED BY DocID AND THEN LIMITED, so a limited run is the SAME first N documents for every pass
+  # and the five test releases describe one overlapping set rather than five arbitrary draws.
   DBI::dbGetQuery(con_, glue::glue(
     "SELECT DocID FROM runs
       WHERE Entity IN ({in_}) AND Status <> 'error'
       GROUP BY DocID
-     HAVING COUNT(DISTINCT Entity) = {length(.entity)}
-      ORDER BY DocID"
+     HAVING COUNT(DISTINCT Entity) = {length(spec_$Needs)}
+      ORDER BY DocID{lim_}"
   )) |>
     tibble::as_tibble()
 }
 
 
-#' Resolve 03F's corpus label release to one file
+#' The anchor for every document a pass will reach
 #'
-#' A DIRECTORY, NOT A FILE, AND THE NAME CARRIES STATE. app_write_release() writes
-#' contract_labels_L<max_len>[_partial].parquet into a release directory, with a manifest beside each
-#' one -- so the name depends on the token limit that produced it and on whether every classification
-#' run had finished. Naming a fixed file here would break the moment the limit changed, and it did:
-#' this document first pointed at labels.parquet, which no version of 03F has ever written.
+#' THE REGISTER AND NOTHING ELSE. No release function reads Class: it appears only in the collapses
+#' and in reports, both of which join it at their own time. So this document needs no label release,
+#' no partial-release check and no dependency on the classification stage at all -- which is three
+#' failure modes removed rather than handled.
 #'
-#' A PARTIAL RELEASE IS REFUSED RATHER THAN READ. 03F stamps _partial where any run is incomplete,
-#' and a label file missing a slice of the corpus would silently shrink the population this pass
-#' applies to -- reported as a smaller corpus rather than as a missing input, which is the shape of
-#' error nobody catches.
+#' nWords IS CARRIED BECAUSE REDACT DIVIDES BY IT. It is the register's count, which is the only one
+#' that reaches the corpus: there is no corpus text file to recount from.
 #'
-#' THE NEWEST COMPLETE ONE WINS where several exist. A re-run at a different token limit leaves both
-#' on disk, and the later file is the one 03F meant.
-#'
-#' @param .dir 03F's release directory.
-#' @param .stem Character. The stem app_write_release() stamps.
-#' @return Character. One path.
-apl_labels_path <- function(.dir, .stem = "contract_labels") {
-  if (FALSE) {
-    .dir   <- .lP$Input$Labels
-    .stem  <- "contract_labels"
-  }
-
-  if (!fs::dir_exists(.dir)) {
-    cli::cli_abort(c(
-      "No label release directory at {.path {(.dir)}}.",
-      "i" = "03F-ClassifyApply writes it. Its Output$Release is a DIRECTORY, not a file."
-    ))
-  }
-
-  all_ <- fs::dir_ls(.dir, regexp = paste0(.stem, ".*\\.parquet$"), recurse = FALSE)
-  # The manifest sits beside every release and matches the same stem, so it is excluded by name
-  # rather than by hoping the ordering below never reaches it.
-  all_ <- all_[!stringi::stri_detect_fixed(fs::path_file(all_), "_manifest")]
-  ok_  <- all_[!stringi::stri_detect_fixed(fs::path_file(all_), "_partial")]
-
-  if (length(ok_) == 0L) {
-    cli::cli_abort(c(
-      "No complete label release in {.path {(.dir)}}.",
-      "x" = "{length(all_)} file{?s} found, {?all/all} marked partial.",
-      "i" = "A partial release would shrink the population this pass applies to and report it as a
-             smaller corpus rather than as a missing input. Finish 03F first."
-    ))
-  }
-
-  out_ <- ok_[[which.max(fs::file_info(ok_)$modification_time)]]
-  cli::cli_alert_info("Labels from {.path {fs::path_file(out_)}}.")
-  out_
-}
-
-
-#' The anchor for every document in the corpus
-#'
-#' THE SAME FUNCTION 04B CALLS, on the register rather than on the sample. ent_anchor_keys() reads
-#' 03A's labels, 02B's register and optionally 01C's addresses; the corpus has the second and the
-#' third, and the first only where 03F classified. A document with no label carries NA in Class,
-#' which every rule tolerates because Class is carried and never conditioned on.
-#'
-#' THE LABEL COLUMNS ARE NAMED, because 03F's release does not use 03A's names. The prepared sample
-#' carries ClassDetailed and AmendType; the corpus release carries BertClassDetailed and
-#' BertAmendType, one pair per engine, and no Fold at all -- a fold is a cross-validation artifact of
-#' the sample. Naming them here is what lets one anchor function serve both files.
-#'
-#' THE TRANSFORMER'S LABEL AND NOT THE KEYWORD ARM'S. 03E measured the routing question and returned a
-#' strong null: nested cross-validated policy selection did not improve on the transformer, and the
-#' oracle ceiling equalled BERT-everywhere at 0.882 macro-F1. So the released label is BERT's, and the
-#' keyword columns beside it are a confirmation flag rather than a second opinion to reconcile.
-#'
-#' THE SEMI-JOIN IS DOING MORE THAN IT LOOKS. 03F's release is fanned out to one row per REGISTRANT
-#' COPY, while 04C extracted one row per ATTACHMENT -- the primary copy. Restricting to the index
-#' therefore keeps exactly the primaries, which is the population this pass applies to, and drops the
-#' repeat copies rather than multiplying every document by its number of filers.
-#'
-#' @param .path_labels 03F's corpus label release, resolved by apl_labels_path().
 #' @param .path_register 02B's register.
-#' @param .path_landing 01C's landing pages, for 04B2's precision flag.
 #' @param .index Tibble from apl_corpus_index().
-#' @param .labels Named character. Which columns of the label file hold Class and AmendType.
-#' @param .quiet Logical.
-#' @return Tibble: one row per document in .index.
-apl_keys <- function(.path_labels, .path_register, .path_landing, .index,
-                     .labels = c(Class = "BertClassDetailed", AmendType = "BertAmendType"),
-                     .quiet = FALSE) {
+#' @return Tibble: one row per document in .index that has a register row.
+apl_keys <- function(.path_register, .index) {
   if (FALSE) {
-    .path_labels   <- apl_labels_path(.dir = .lP$Input$Labels)
     .path_register <- .lP$Input$Register
-    .path_landing  <- .lP$Input$Landing
-    .index         <- tab_index
-    .labels        <- c(Class = "BertClassDetailed", AmendType = "BertAmendType")
-    .quiet         <- FALSE
+    .index         <- tab_index$ORG
   }
 
-  out_ <- ent_anchor_keys(
-    .path_prepared = .path_labels,
+  out_ <- ent_corpus_keys(
     .path_register = .path_register,
-    .path_landing  = .path_landing,
-    .labels        = .labels,
-    .quiet         = .quiet
+    .path_release  = NA_character_,   # no label release; Class reaches no release function
+    .doc_ids       = .index$DocID,
+    .quiet         = TRUE
   ) |>
     dplyr::semi_join(.index, by = dplyr::join_by(DocID))
 
@@ -307,7 +323,7 @@ apl_keys <- function(.path_labels, .path_register, .path_landing, .index,
   if (miss_ > 0L && !.quiet) {
     cli::cli_alert_warning(
       "{format(miss_, big.mark = ',')} {cli::qty(miss_)}document{?s} 04C finished {?has/have} no \\
-       anchor row, so {?it is/they are} not applied. An anchor is the filing date and the filer's \\
+       register row, so {?it is/they are} not applied. An anchor is the filing date and the filer's \\
        name; a rule cannot measure a start or match a registrant without one."
     )
   }
@@ -315,794 +331,729 @@ apl_keys <- function(.path_labels, .path_register, .path_landing, .index,
 }
 
 
-# 3. Chunking ------------------------------------------------------------------------------------------------------------
+# 4. What is already written ---------------------------------------------------------------------------------------------
 
-#' Cut the corpus into chunks of documents
+#' The windows a pass has committed
 #'
-#' @param .index Tibble from apl_corpus_index().
-#' @param .size Integer. Documents per chunk.
-#' @return List of character vectors.
-apl_chunks <- function(.index, .size) {
-  if (FALSE) {
-    .index <- tab_index
-    .size  <- .lP$Params$ChunkSize
-  }
+#' A WINDOW IS A DIRECTORY AND ITS PRESENCE IS ITS COMPLETENESS. Everything a window produces goes
+#' into a hidden working directory which is then renamed into place, so a killed process leaves a
+#' name beginning with a dot that this does not match. There is no state to read and nothing that
+#' can be half true.
+#'
+#' @param .dir Directory named for a pass's policy hash.
+#' @return Character vector of directory paths, possibly empty.
+apl_batches <- function(.dir) {
+  if (FALSE) .dir <- .lP$Output$Store[["ORG"]]
 
-  ids_ <- .index$DocID
-  if (length(ids_) == 0L) return(list())
-  split(ids_, ceiling(seq_along(ids_) / .size))
+  if (!fs::dir_exists(.dir)) return(character(0))
+  fs::dir_ls(.dir, regexp = "/window-[^/]+$", type = "directory", recurse = FALSE)
 }
 
 
-#' The keys and lengths for one chunk, cut together
+#' Which documents a pass has already processed
 #'
-#' ONE PLACE DEFINES A CHUNK, and that is the point of the function. Every 04B apply runs FROM THE KEY
-#' SIDE so that a document in which nothing was found still gets a row -- correct, and it means the
-#' output is one row per KEY. Handed the corpus keys with a two-thousand-document lens, a chain builds
-#' 1.19 million rows to describe two thousand documents. Cutting both here means the two cannot drift.
+#' THE DONE FILE AND NOT THE OUTPUT'S DocID COLUMN. Seven of the eight releases carry a row only
+#' where the extractor found something -- redact_spans reaches 14% of documents -- so resuming on
+#' what the outputs contain would reprocess the other 86% on every render, forever. This names every
+#' document a batch PROCESSED, whatever that document produced.
 #'
-#' @param .keys Tibble from apl_keys().
-#' @param .doc_ids Character. The chunk's documents.
-#' @return A list: Keys and Lens, both restricted to .doc_ids.
-apl_chunk_frame <- function(.keys, .doc_ids) {
-  if (FALSE) {
-    .keys    <- tab_keys
-    .doc_ids <- chunks_[[1L]]
-  }
+#' ONE COLUMN OVER A FEW HUNDRED SMALL FILES, so it is seconds even at corpus scale.
+#'
+#' @param .dir Directory named for a pass's policy hash.
+#' @return Character vector of DocIDs.
+apl_done_ids <- function(.dir) {
+  if (FALSE) .dir <- .lP$Output$Store[["ORG"]]
 
-  keys_ <- dplyr::filter(.keys, .data$DocID %in% .doc_ids)
+  files_ <- fs::path(apl_batches(.dir = .dir), "_done.parquet")
+  files_ <- files_[fs::file_exists(files_)]
+  if (length(files_) == 0L) return(character(0))
 
-  lens_ <- keys_ |>
-    dplyr::transmute(DocID, DocLen = as.integer(.data$nChars)) |>
-    dplyr::filter(!is.na(.data$DocLen), .data$DocLen > 0L)
-
-  list(Keys = keys_, Lens = lens_)
+  arrow::open_dataset(sources = files_) |>
+    dplyr::select("DocID") |>
+    dplyr::collect() |>
+    dplyr::pull("DocID") |>
+    unique()
 }
 
 
-# 4. One chunk, five chains, four files -----------------------------------------------------------------------------------
-
-#' Apply all five rules to one chunk
+#' One released file, as an arrow dataset
 #'
-#' EVERY CALL HERE IS 04B'S OWN, with the arguments the runbook declared. Nothing is reimplemented and
-#' nothing is adapted: if a chain works on 4,398 documents it works on a chunk of the corpus, because
-#' a chunk IS a small sample as far as the rule is concerned.
+#' THE DIRECTORY IS THE RELEASE. A directory of parquets already is a dataset, so there is no final
+#' bind and no moment where a partial pass could be assembled into something that looks finished.
 #'
-#' THE ORDER IS A DEPENDENCY, NOT A PREFERENCE. 04B2 attaches places to the parties 04B1 found and to
-#' the MENTIONS index it writes, so ORG runs first and hands both on in memory rather than through a
-#' file. The other three are independent of both and of each other.
-#'
-#' NOTHING OPENS A DOCUMENT. Three of these chains used to; all three now read CueBefore and CueAfter,
-#' which the store carries. That is why this function takes no staging path and why the pass loop has
-#' no read step.
-#'
-#' @param .frame List from apl_chunk_frame().
-#' @param .params The runbook's .lP$Params.
-#' @param .dir_store Directory holding the family databases.
-#' @param .geo List: the gazetteer lookup and candidate list, read once.
-#' @return A list of four tibbles, each the shape its 04B document released.
-apl_chunk_apply <- function(.frame, .params, .dir_store, .geo) {
+#' @param .dir Directory named for a pass's policy hash.
+#' @param .stem Character. The file stem.
+#' @return An arrow Dataset, or NULL where no window has been committed.
+apl_dataset <- function(.dir, .stem) {
   if (FALSE) {
-    .frame     <- frame_
-    .params    <- .lP$Params
-    .dir_store <- .lP$Input$Store
-    .geo       <- geo_once
+    .dir  <- .lP$Output$Store[["ORG"]]
+    .stem <- "org_mentions"
   }
 
-  keys_ <- .frame$Keys
-  lens_ <- .frame$Lens
-
-  # ORG -- 04B1. Grouping, party identification, the window and the tail, then the release and the
-  # mention index 04B2 needs.
-  # ent_load_org() AND NOT ent_load_entity(). ent_apply() reads SpanKey and CoreKey, which are the
-  # reduction and not the store's columns; 04B1 builds them in the loader so that this document calls
-  # one function rather than copying a mutate out of a runbook.
-  res_org_ <- ent_apply(
-    .spans = ent_load_org(
-      .dir_store = .dir_store, .lens = lens_, .family = .params$Family$ORG,
-      .extras = .params$Extras$ORG, .quiet = TRUE
-    ),
-    .keys = keys_, .lens = lens_,
-    .rule = .params$Rule$Org, .spec = .params$Spec$Org
-  )
-  parties_ <- ent_release_parties(.roles = res_org_$Roles, .party = res_org_$Party)
-
-  # GPE -- 04B2. The governing-law exclusion, the attachment, and the roll-up onto 04B1's rows.
-  res_geo_ <- geo_apply(
-    .spans = ent_load_entity(
-      .dir_store = .dir_store, .family = .params$Family$GPE, .entity = "GPE",
-      .lens = lens_, .extras = ent_extras(.params$Family$GPE, "GPE"), .quiet = TRUE
-    ),
-    .law = ent_load_entity(
-      .dir_store = .dir_store, .family = .params$Family$GPE, .entity = "LAW",
-      .lens = lens_, .extras = ent_extras(.params$Family$GPE, "LAW"), .quiet = TRUE
-    ),
-    .party    = parties_,
-    .mentions = res_org_$Mentions,
-    .keys     = keys_,
-    .geo      = .geo,
-    .spec     = .params$Spec$Geo
-  )
-
-  # DATE -- 04B3. The cue is a column read; .win narrows the stored window and opens nothing.
-  res_dte_ <- dte_apply(
-    .dates = dte_describe(
-      .dates = dplyr::filter(
-        dte_load(.dir_store = .dir_store, .lens = lens_, .family = .params$Family$DATE,
-                 .quiet = TRUE),
-        .data$Parsed
-      ),
-      .keys = keys_, .win = .params$CueWin$Date
-    ),
-    .terms = dte_load_terms(.dir_store = .dir_store, .lens = lens_, .quiet = TRUE),
-    .keys  = keys_,
-    .spec  = .params$Spec$Date
-  )
-
-  # MONEY -- 04B4. The par cue is read from both sides, from the stored columns.
-  res_mny_ <- mny_apply(
-    .money = mny_load(.dir_store = .dir_store, .lens = lens_, .family = .params$Family$MONEY,
-                      .quiet = TRUE),
-    .keys  = keys_,
-    .spec  = .params$Spec$Money
-  )
-
-  # REDACT -- 04B5. NULL for the text path: the word count is the register's, and there is no corpus
-  # text file to recount from.
-  out_red_ <- red_release(
-    .marks = red_load(.dir_store = .dir_store, .lens = lens_, .family = .params$Family$REDACT,
-                      .quiet = TRUE),
-    .words = red_words(.keys = keys_, .path_text = NULL, .quiet = TRUE),
-    .keys  = keys_
-  )
-
-  list(
-    Parties = res_geo_$Release,
-    Date    = res_dte_$Release,
-    Money   = res_mny_$Release,
-    Redact  = out_red_
-  )
-}
-
-
-#' Apply one chunk, write its four files, return a summary and not the data
-#'
-#' THE UNIT BOTH PATHS SHARE. The serial loop and the parallel map call this and nothing else, so a
-#' change to what a chunk does cannot apply to one and not the other -- which is the failure mode of
-#' having written the work twice.
-#'
-#' IT RETURNS A SUMMARY, NEVER THE TABLES. A chunk of 20,000 documents produces roughly 160,000 party
-#' rows; handing those back from a daemon would serialise them across a process boundary and rebuild
-#' them in the parent, which is more work than computing them. The worker writes its own parquets --
-#' the names differ by chunk index so two workers never contend -- and returns nine numbers.
-#'
-#' FOUR FILES OR NONE. A chunk directory holding three of four reads as complete on the next render
-#' and leaves one entity short for that chunk, silently.
-#'
-#' @param .frame List from apl_chunk_frame().
-#' @param .index Integer or character. The chunk's index, which names its files.
-#' @param .dir_chunks Directory named for the policy hash.
-#' @param .params The runbook's .lP$Params.
-#' @param .dir_store Directory holding the family databases.
-#' @param .geo List: the gazetteer lookup and candidate list.
-#' @return One-row tibble.
-apl_chunk_run <- function(.frame, .index, .dir_chunks, .params, .dir_store, .geo) {
-  if (FALSE) {
-    .frame      <- frame_
-    .index      <- 1L
-    .dir_chunks <- .lP$Output$Chunks
-    .params     <- .lP$Params
-    .dir_store  <- .lP$Input$Store
-    .geo        <- geo_once
-  }
-
-  names_ <- c("Parties", "Date", "Money", "Redact")
-  paths_ <- purrr::set_names(
-    fs::path(.dir_chunks, paste0(names_, "-", .index, ".parquet")), names_
-  )
-  n_doc_ <- nrow(.frame$Keys)
-
-  if (all(fs::file_exists(paths_))) {
-    return(tibble::tibble(Chunk = as.integer(.index), Docs = n_doc_, Rows = NA_integer_,
-                          Seconds = 0, Status = "cached"))
-  }
-
-  tic_ <- Sys.time()
-  res_ <- try(
-    apl_chunk_apply(.frame = .frame, .params = .params, .dir_store = .dir_store, .geo = .geo),
-    silent = TRUE
-  )
-
-  if (inherits(res_, "try-error")) {
-    return(tibble::tibble(
-      Chunk = as.integer(.index), Docs = n_doc_, Rows = NA_integer_,
-      Seconds = as.numeric(difftime(Sys.time(), tic_, units = "secs")),
-      Status = paste0("error: ", conditionMessage(attr(res_, "condition")))
-    ))
-  }
-
-  purrr::iwalk(res_, \(.t, .n) arrow::write_parquet(.t, paths_[[.n]]))
-
-  tibble::tibble(
-    Chunk = as.integer(.index), Docs = n_doc_, Rows = as.integer(nrow(res_$Parties)),
-    Seconds = as.numeric(difftime(Sys.time(), tic_, units = "secs")), Status = "ran"
-  )
-}
-
-
-#' Run the pass, chunk by chunk, resuming where it stopped
-#'
-#' RESUMPTION IS A PROPERTY, NOT A FEATURE. Each chunk writes four parquets into a directory named
-#' for the policy hash; a chunk whose four files exist is skipped. There is no state to remember
-#' between renders and nothing that could be wrong about itself.
-#'
-#' A CHUNK THAT FAILS IS RECORDED AND THE PASS CONTINUES. One document with an impossible offset
-#' should not cost the other million, and a chunk that errored wrote no file so the next render
-#' retries it.
-#'
-#' ONE WORKER IS THE SERIAL PATH, and it is the same function either way: apl_chunk_run() does the
-#' work and the only difference is what calls it. Writing the loop twice would let the two drift.
-#'
-#' WHY PARALLELISM HELPS HERE AND OFTEN DOES NOT. The rules are dplyr over data already in memory,
-#' which is single-threaded R; the LOAD is DuckDB, which already uses every core. So workers help in
-#' proportion to how much of a chunk is rule rather than read, and the split is reported below rather
-#' than assumed. Oversubscribing costs more than it buys.
-#'
-#' BATCHED RATHER THAN SUBMITTED ALL AT ONCE, for memory. A chunk holds roughly 1.5 million spans
-#' each carrying 320 characters of stored context, which is around half a gigabyte before anything
-#' else; running every chunk at once would put all of them in flight together. A batch is bounded by
-#' the worker count, and it is also what makes progress reportable at all.
-#'
-#' @param .chunks List from apl_chunks().
-#' @param .keys Tibble from apl_keys().
-#' @param .dir_chunks Directory named for the policy hash.
-#' @param .params The runbook's .lP$Params.
-#' @param .dir_store Directory holding the family databases.
-#' @param .geo List: the gazetteer lookup and candidate list. Used by the serial path only; a daemon
-#'   builds its own from .path_lookup, because shipping 181,810 rows to every worker per chunk is
-#'   slower than reading the file once per worker.
-#' @param .workers Integer. 1 runs serially in this process.
-#' @param .path_lookup The gazetteer parquet, for the daemons to read.
-#' @param .path_fun Character. Library files every daemon must source.
-#' @return Tibble: one row per chunk.
-apl_pass <- function(.chunks, .keys, .dir_chunks, .params, .dir_store, .geo,
-                     .workers = 1L, .path_lookup = NULL, .path_fun = character()) {
-  if (FALSE) {
-    .chunks      <- chunks_
-    .keys        <- tab_keys
-    .dir_chunks  <- .lP$Output$Chunks
-    .params      <- .lP$Params
-    .dir_store   <- .lP$Input$Store
-    .geo         <- geo_once
-    .workers     <- 6L
-    .path_lookup <- .lP$Input$Lookup
-    .path_fun    <- .lP$Params$Sources
-  }
-
-  fs::dir_create(.dir_chunks)
-  if (length(.chunks) == 0L) {
-    cli::cli_alert_info("Nothing outstanding.")
-    return(tibble::tibble())
-  }
-
-  # THE FRAMES ARE CUT IN THE PARENT, and that is what keeps the payload small. .keys is 1.19 million
-  # rows; a daemon needs the twenty thousand belonging to its chunk. Sending the whole table to every
-  # worker would serialise the corpus once per chunk.
-  frames_ <- purrr::imap(.chunks, \(.ids, .i) apl_chunk_frame(.keys = .keys, .doc_ids = .ids))
-  idx_    <- names(.chunks)
-  t0_     <- Sys.time()
-  done_   <- 0L
-
-  say_ <- function(.k) {
-    el_ <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
-    cli::cli_alert_info(
-      "  {(.k)}/{length(.chunks)} chunks | {format(done_, big.mark = ',')} docs | \\
-       {round(done_ / max(el_, 1e-9), 1)}/s"
-    )
-  }
-
-  if (.workers <= 1L) {
-    out_ <- purrr::imap(frames_, function(.f, .i) {
-      r_ <- apl_chunk_run(.frame = .f, .index = .i, .dir_chunks = .dir_chunks,
-                          .params = .params, .dir_store = .dir_store, .geo = .geo)
-      done_ <<- done_ + nrow(.f$Keys)
-      say_(.k = which(idx_ == .i))
-      r_
-    }) |>
-      purrr::list_rbind()
-    return(apl_pass_check(.tab = out_))
-  }
-
-  # EVERY DAEMON SOURCES THE LIBRARIES BY PATH. A closure does not cross a process boundary with its
-  # environment, so a worker handed a function that calls ent_apply() finds no ent_apply(); the files
-  # have to be named and sourced there. This project has been caught by that before.
-  mirai::daemons(.workers)
-  on.exit(mirai::daemons(0L), add = TRUE)   # SAFE ONLY INSIDE A FUNCTION BODY, which this is
-
-  # ASSIGNED INTO THE DAEMON'S GLOBAL ENVIRONMENT EXPLICITLY, and the difference is not cosmetic.
-  # everywhere() with .args evaluates its expression in an environment carrying those arguments,
-  # whose parent is the daemon's global -- so `geo_once <- ...` binds THERE and is gone the moment
-  # the call returns. source() has local = FALSE and writes to the global regardless, which is why
-  # the probe found apl_chunk_run and not the gazetteer: the two were landing in different places.
-  mirai::everywhere(
-    {
-      purrr::walk(.files, \(.f) source(.f, encoding = "UTF-8"))
-      assign(
-        x     = "geo_once",
-        value = list(
-          Lookup = geo_lookup(.path_lookup = .lookup),
-          Cand   = geo_candidates(.path_lookup = .lookup)
-        ),
-        envir = globalenv()
-      )
-    },
-    .args = list(.files = .path_fun, .lookup = .path_lookup)
-  )
-
-  # A DAEMON IS CHECKED BEFORE A HUNDRED MINUTES ARE SPENT ON IT. everywhere() reports nothing about
-  # whether the sourcing worked, so a path that resolved in this process and not in a worker would
-  # fail on every chunk and be discovered at the end. One tiny job settles it.
-  probe_ <- mirai::mirai_map(
-    .x = list(1L),
-    .f = function(.x) c(Fun = exists("apl_chunk_run"), Geo = exists("geo_once"))
-  )[][[1L]]
-
-  # THE PROBE CAN ITSELF COME BACK AS AN ERROR, and a miraiError is a VALUE rather than a condition
-  # -- so all() on it does not do what it looks like. Checked by class before it is read as a result,
-  # which is the same discipline every chunk's return needs.
-  if (inherits(probe_, "miraiError")) {
-    cli::cli_abort(c(
-      "A daemon could not be started or could not source the libraries.",
-      "x" = "{as.character(probe_)}",
-      "i" = "everywhere() sources .path_fun by path, so a path that resolves in this process and
-             not in a worker fails here rather than on every chunk."
-    ))
-  }
-
-  has_fun_ <- isTRUE(probe_[["Fun"]])
-  has_geo_ <- isTRUE(probe_[["Geo"]])
-
-  if (!has_fun_ || !has_geo_) {
-    cli::cli_abort(c(
-      "A daemon is missing what it needs to run a chunk.",
-      "x" = "apl_chunk_run found: {(has_fun_)}. Gazetteer built: {(has_geo_)}.",
-      "i" = "A missing FUNCTION means a file absent from .path_fun. A missing GAZETTEER means the
-             assignment did not reach the daemon's global environment, which is what everywhere()
-             does to a bare `<-` when .args are supplied."
-    ))
-  }
-  cli::cli_alert_success(
-    "{(.workers)} {cli::qty(.workers)}daemon{?s} started, {?has/have} sourced \\
-     {length(.path_fun)} librar{?y/ies} and built the gazetteer."
-  )
-
-  # THE INDEX TRAVELS INSIDE THE ELEMENT, and that is the whole of the fix. mirai_map() maps each
-  # element of .x onto the FIRST argument of .f and nothing else -- the names of .x name the results,
-  # they are not passed as a second argument. A two-argument .f therefore ran with .i missing on
-  # every chunk, ten times, and the error handling reported it ten times exactly as designed.
-  jobs_ <- purrr::imap(frames_, \(.f, .i) list(Frame = .f, Index = .i))
-
-  batches_ <- split(seq_along(frames_), ceiling(seq_along(frames_) / .workers))
-
-  out_ <- purrr::map(batches_, function(.b) {
-    m_ <- mirai::mirai_map(
-      .x = purrr::set_names(jobs_[.b], idx_[.b]),
-      .f = function(.job, .dir, .par, .store) {
-        apl_chunk_run(.frame = .job$Frame, .index = .job$Index, .dir_chunks = .dir,
-                      .params = .par, .dir_store = .store, .geo = geo_once)
-      },
-      .args = list(.dir = .dir_chunks, .par = .params, .store = .dir_store)
-    )
-    res_ <- m_[]
-
-    # ERRORS COME BACK AS VALUES, NOT AS CONDITIONS. An unchecked miraiError is an element of the
-    # list that looks like a result, and list_rbind() on it fails somewhere far from the cause.
-    bad_ <- purrr::map_lgl(res_, \(.r) inherits(.r, "miraiError"))
-    res_[bad_] <- purrr::map2(idx_[.b][bad_], res_[bad_], \(.i, .e) tibble::tibble(
-      Chunk = as.integer(.i), Docs = NA_integer_, Rows = NA_integer_, Seconds = NA_real_,
-      Status = paste0("error: ", as.character(.e))
-    ))
-
-    done_ <<- done_ + sum(purrr::map_int(frames_[.b], \(.f) nrow(.f$Keys)))
-    say_(.k = max(.b))
-    purrr::list_rbind(res_)
-  }) |>
-    purrr::list_rbind()
-
-  apl_pass_check(.tab = out_)
-}
-
-
-#' Say plainly whether any chunk failed
-#'
-#' A FAILURE REPORTED AS A ROW IN A TABLE IS A FAILURE NOBODY READS. The status column carries the
-#' condition message, and a pass with one bad chunk in fifty otherwise looks like a pass.
-#'
-#' @param .tab Tibble from the pass.
-#' @return .tab, invisibly warned about.
-apl_pass_check <- function(.tab) {
-  if (FALSE) .tab <- tab_pass
-
-  bad_ <- dplyr::filter(.tab, stringi::stri_startswith_fixed(.data$Status, "error"))
-  if (nrow(bad_) > 0L) {
-    cli::cli_alert_danger(
-      "{nrow(bad_)} {cli::qty(nrow(bad_))}chunk{?s} failed and wrote no file, so {?it is/they are} \\
-       retried on the next render."
-    )
-    purrr::walk2(bad_$Chunk, bad_$Status, \(.c, .s) cli::cli_bullets(c("x" = "chunk {(.c)}: {(.s)}")))
-  }
-  .tab
-}
-
-
-#' Where one chunk's time goes: reading spans against applying rules
-#'
-#' THE MEASUREMENT THAT DECIDES THE WORKER COUNT. Loading is DuckDB, which already uses every core;
-#' the rules are dplyr over data in memory, which is single-threaded R. Workers therefore help in
-#' proportion to how much of a chunk is APPLY, and oversubscribing a load that is already parallel
-#' costs more than it buys.
-#'
-#' RUN ON ONE CHUNK AND REPORTED, not assumed. The split differs by corpus and by machine, and this
-#' project has enough evidence-free parameters without adding one to the top of a hundred-minute run.
-#'
-#' @param .frame List from apl_chunk_frame().
-#' @param .params The runbook's .lP$Params.
-#' @param .dir_store Directory holding the family databases.
-#' @return Tibble: one row per phase.
-apl_time_split <- function(.frame, .params, .dir_store) {
-  if (FALSE) {
-    .frame     <- frame_
-    .params    <- .lP$Params
-    .dir_store <- .lP$Input$Store
-  }
-
-  lens_ <- .frame$Lens
-  keys_ <- .frame$Keys
-
-  # TIMED BY BRACKETING AND NOT BY A HELPER, and the helper is why. A one-line timer taking the work
-  # as an argument has to get the result back out, and the obvious way -- t_(x <<- expr) -- does not
-  # work: the promise evaluates in the frame that CREATED it, and <<- then starts its search in that
-  # frame's PARENT. So the assignment lands in the global environment and the local stays NULL, which
-  # surfaces three lines later as mutate() applied to NULL rather than as a scoping error.
-  tic_   <- Sys.time()
-  org_   <- ent_load_org(.dir_store = .dir_store, .lens = lens_, .family = .params$Family$ORG,
-                         .extras = .params$Extras$ORG, .quiet = TRUE)
-  t_org_ <- as.numeric(difftime(Sys.time(), tic_, units = "secs"))
-
-  tic_   <- Sys.time()
-  res_   <- ent_apply(.spans = org_, .keys = keys_, .lens = lens_,
-                      .rule = .params$Rule$Org, .spec = .params$Spec$Org)
-  t_app_ <- as.numeric(difftime(Sys.time(), tic_, units = "secs"))
-
-  tibble::tibble(
-    Phase   = c("Load spans (DuckDB, already parallel)", "Apply rule (dplyr, single-threaded)"),
-    Seconds = c(t_org_, t_app_),
-    N       = c(nrow(org_), nrow(res_$Roles))
-  ) |>
-    dplyr::mutate(Share = .data$Seconds / sum(.data$Seconds))
-}
-
-
-#' The timing split, and what it implies for the worker count
-#' @param .tab Tibble from apl_time_split().
-#' @param .workers Integer. The worker count the runbook set.
-#' @return Invisibly .tab.
-apl_report_time_split <- function(.tab, .workers) {
-  if (FALSE) {
-    .tab     <- tab_split
-    .workers <- 6L
-  }
-
-  cli::cli_h2("Where a chunk's time goes")
-  .tab |>
-    dplyr::mutate(
-      Seconds = tbl_num(.data$Seconds),
-      N       = format(.data$N, big.mark = ","),
-      Share   = tbl_pct(.data$Share)
-    ) |>
-    tbl_say(.title = "The ORG chain on one chunk, split into its read and its rule")
-
-  app_ <- .tab$Share[[2L]]
-  cli::cli_alert_info(
-    "ORG IS THE PROBE AND NOT THE WHOLE CHUNK -- it is 362,000 spans of roughly 1.5 million, and the \\
-     heaviest single rule of the five. Read the split rather than the seconds."
-  )
-  cli::cli_alert_info(
-    "APPLY IS {tbl_pct(app_)} OF THIS CHAIN, and that is roughly the share workers can speed up. \\
-     Amdahl bounds the rest: with {(.workers)} workers the ceiling is about \\
-     {tbl_num(1 / ((1 - app_) + app_ / .workers))}x, before any cost of moving data to them. A low \\
-     share here means the pass is waiting on DuckDB, which is already using every core, and adding R \\
-     workers would oversubscribe rather than help."
-  )
-  invisible(.tab)
-}
-
-
-#' Read every chunk of one output back as a dataset
-#'
-#' ARROW RATHER THAN A BIND. The parties file is one row per contract per party over 1.19 million
-#' contracts, which is tens of millions of rows; open_dataset() reads the schema and defers the rest,
-#' so a summary is a query and never a copy in memory.
-#'
-#' @param .dir_chunks Directory named for the policy hash.
-#' @param .name Character. Parties, Date, Money or Redact.
-#' @return An arrow Dataset, or NULL where no chunk was written.
-apl_dataset <- function(.dir_chunks, .name) {
-  if (FALSE) {
-    .dir_chunks <- .lP$Output$Chunks
-    .name       <- "Parties"
-  }
-
-  # REGEXP RATHER THAN GLOB. fs::dir_ls() matches a glob against the whole path, so "*/Parties-*"
-  # would require a directory level that is not there and return nothing at all -- silently, as an
-  # empty dataset rather than an error.
-  files_ <- fs::dir_ls(.dir_chunks, regexp = paste0(.name, "-\\d+\\.parquet$"), recurse = FALSE)
+  files_ <- fs::path(apl_batches(.dir = .dir), paste0(.stem, ".parquet"))
+  files_ <- files_[fs::file_exists(files_)]
   if (length(files_) == 0L) return(NULL)
   arrow::open_dataset(sources = files_)
 }
 
 
-# 5. Chunk invariance ------------------------------------------------------------------------------------------------
-
-#' The same documents, applied as one chunk and as several
+#' The DocID range of every file the dependency wrote
 #'
-#' THE ONE THING THIS FILE ASSUMES, CHECKED RATHER THAN ARGUED. Every rule reads one document's spans:
-#' grouping compares names within a document, the window measures from a party in the same document,
-#' the ambiguous city takes a state the same contract names, the date cascade reads that contract's
-#' dates. So a partition cannot change an answer.
+#' BUILT ONCE IN THE PARENT AND HANDED TO EVERY CHUNK, and the alternative was catastrophic. Without
+#' it, apl_read_dep() opened the WHOLE dependency -- at corpus scale roughly 220 files and 22 million
+#' mention rows, one of whose columns is raw span text -- and trusted arrow to push a range filter
+#' down far enough to skip most of it. It does not, or not reliably: every worker materialised a
+#' large share of the entire ORG release, and eight of them at once took 250 GB.
 #'
-#' THE FAMILY HAS BROKEN THAT ASSUMPTION BEFORE. ent_rule()'s family-frequency gate computed a share
-#' of documents from the spans it was handed, so the denominator became the chunk and 176 leading
-#' tokens fell on opposite sides of the threshold at 2,546 documents per chunk. The gate is gone, and
-#' the way to know it is gone is to partition the same documents two ways and compare.
+#' A CHUNK OVERLAPS ONE OR TWO FILES, NEVER TWO HUNDRED. Both passes cut sorted DocID lists, so a
+#' chunk's [lo, hi] meets a contiguous run of the dependency's files. Knowing each file's range turns
+#' the read from a scan of everything into opening exactly what is needed.
 #'
-#' COMPARED AS SORTED FRAMES, not as objects. Chunking changes the ORDER rows arrive in and nothing
-#' else, so the comparison sorts both sides on their own key columns first; a difference that survives
-#' that is a difference in a value.
+#' ONLY THE DocID COLUMN IS READ. min() and max() over one column of each file is seconds for the
+#' whole release, and it happens once per pass rather than once per chunk.
 #'
-#' @param .keys Tibble from apl_keys().
-#' @param .doc_ids Character. Documents to test on.
-#' @param .params The runbook's .lP$Params.
-#' @param .dir_store Directory holding the family databases.
-#' @param .geo List: the gazetteer lookup and candidate list.
-#' @param .parts Integer. How many chunks the split arm uses.
-#' @return Tibble: one row per output.
-apl_check_invariance <- function(.keys, .doc_ids, .params, .dir_store, .geo, .parts = 4L) {
+#' @param .dir Directory holding the dependency's chunk files.
+#' @param .stem Character. The file stem.
+#' @return Tibble: File, Lo, Hi. Empty where the directory holds nothing.
+apl_dep_index <- function(.dir, .stem) {
   if (FALSE) {
-    .keys      <- tab_keys
-    .doc_ids   <- tab_index$DocID[1:2000]
-    .params    <- .lP$Params
-    .dir_store <- .lP$Input$Store
-    .geo       <- geo_once
-    .parts     <- 4L
+    .dir  <- .lP$Output$Store[["ORG"]]
+    .stem <- "org_mentions"
   }
 
-  one_ <- apl_chunk_apply(
-    .frame = apl_chunk_frame(.keys = .keys, .doc_ids = .doc_ids),
-    .params = .params, .dir_store = .dir_store, .geo = .geo
+  if (is.null(.dir)) return(tibble::tibble())
+  files_ <- fs::path(apl_batches(.dir = .dir), paste0(.stem, ".parquet"))
+  files_ <- files_[fs::file_exists(files_)]
+  if (length(files_) == 0L) return(tibble::tibble())
+
+  purrr::map(files_, function(.f) {
+    r_ <- arrow::open_dataset(sources = .f) |>
+      dplyr::summarise(Lo = min(.data$DocID), Hi = max(.data$DocID)) |>
+      dplyr::collect()
+    tibble::tibble(File = as.character(.f), Lo = r_$Lo[[1L]], Hi = r_$Hi[[1L]])
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::arrange(.data$Lo)
+}
+
+
+#' One window's worth of another pass's output
+#'
+#' THE CHUNK DIRECTORY IS AN ARROW DATASET, so this is a filtered read rather than a bind. GPE reads
+#' ORG's mentions this way, and it has to: the two passes run on different populations -- lexnlp's
+#' 1,099,419 documents against matcon's 1,189,069 -- so chunk seven of one is not chunk seven of the
+#' other and matching by index would silently pair the wrong documents.
+#'
+#' THE RANGE FILTER IS WHAT MAKES IT CHEAP. A chunk is a contiguous run of sorted DocIDs, so bounding
+#' on the range pushes into the parquet reader and skips whole files; the exact membership test then
+#' runs on what survives. A bare %in% over thirty million rows would scan every file for every chunk.
+#'
+#' @param .dir Directory holding the other pass's chunk files.
+#' @param .stem Character. The file stem to read.
+#' @param .doc_ids Character. This chunk's documents.
+#' @return Tibble, empty where the directory holds nothing yet.
+apl_read_dep <- function(.stem, .doc_ids, .index) {
+  if (FALSE) {
+    .stem    <- "org_mentions"
+    .doc_ids <- todo_[1:5000]
+    .index   <- tab_dep
+  }
+
+  if (is.null(.index) || nrow(.index) == 0L) {
+    cli::cli_abort(c(
+      "The pass that writes {(.stem)} has committed nothing.",
+      "i" = "Running this one anyway would attach every span to nothing and record that as a
+             finding about the corpus."
+    ))
+  }
+
+  files_ <- {
+    lo0_ <- min(.doc_ids)
+    hi0_ <- max(.doc_ids)
+    # OVERLAP AND NOT CONTAINMENT. Two intervals meet when each starts before the other ends, and a
+    # chunk of one population straddles a file boundary of the other whenever the two populations
+    # differ -- which they do, by about ninety thousand documents.
+    .index$File[.index$Lo <= hi0_ & lo0_ <= .index$Hi]
+  }
+
+  # AN EMPTY DIRECTORY AND AN EMPTY RESULT ARE OPPOSITE FINDINGS, and returning a bare tibble for
+  # both was a defect. A directory with no files means the pass this one depends on has not run: the
+  # chain would then attach every place to nothing and write a corpus in which no place sits near a
+  # party, which is indistinguishable in the output from a corpus where none does. A filter that
+  # returns no rows is ordinary -- ORG runs on lexnlp's population and GPE on matcon's, so a chunk
+  # can legitimately hold documents ORG has not reached.
+  # AN INDEX THAT MATCHES NOTHING IS NOT AN EMPTY DIRECTORY. Where the index has rows but none of
+  # them overlap, the dependency simply never reached these documents -- which is ordinary, because
+  # ORG runs on lexnlp's population and GPE on matcon's.
+  if (length(files_) == 0L) {
+    return(dplyr::filter(arrow::read_parquet(.index$File[[1L]]), FALSE))
+  }
+
+  lo_ <- min(.doc_ids)
+  hi_ <- max(.doc_ids)
+
+  # THE RANGE FILTER PUSHES INTO THE READER AND THE MEMBERSHIP TEST DOES NOT, so the order matters:
+  # bounding first skips whole files, and the exact test then runs on what survives. A zero-row
+  # result still carries the file's own columns, which is what the chains downstream need.
+  arrow::open_dataset(sources = files_) |>
+    dplyr::filter(.data$DocID >= lo_, .data$DocID <= hi_) |>
+    dplyr::collect() |>
+    dplyr::filter(.data$DocID %in% .doc_ids)
+}
+
+
+# 5. One window of documents ---------------------------------------------------------------------------------------------
+
+#' Every span one pass needs, for one window of documents
+#'
+#' ONE QUERY PER ENTITY PER WINDOW, and that is the whole reason a window exists. The rules run per
+#' document; the DATABASE does not want to be asked per document. Loading twenty thousand documents'
+#' spans in one query and then splitting them in memory asks DuckDB a few hundred times over a corpus
+#' rather than a million.
+#'
+#' THE LOADERS ARE 04B'S OWN. ent_load_org() adds the two candidate keys the reduction reads;
+#' dte_describe() cuts the cue window and computes the gap to the filing date. Nothing is
+#' reimplemented here.
+#'
+#' @param .pass Character. Which pass.
+#' @param .keys Tibble. The window's anchor rows.
+#' @param .lens Tibble. The window's document lengths.
+#' @param .params The runbook's .lP$Params.
+#' @param .dir_store Directory holding the family databases.
+#' @param .dep_index Tibble from apl_dep_index(). GPE only.
+#' @return A named list of tibbles, one per input the chain reads.
+apl_load_window <- function(.pass, .keys, .lens, .params, .dir_store, .dep_index = NULL) {
+  if (FALSE) {
+    .pass      <- "GPE"
+    .keys      <- keys_
+    .lens      <- lens_
+    .params    <- .lP$Params
+    .dir_store <- .lP$Input$Store
+    .dep_index <- tab_dep
+  }
+
+  switch(
+    .pass,
+    ORG = list(
+      Spans  = ent_load_org(.dir_store = .dir_store, .lens = .lens, .family = "lexnlp",
+                            .extras = .params$Extras$ORG, .quiet = TRUE),
+      Filers = ent_filer_keys(.path_register = .params$PathRegister,
+                              .doc_ids = .keys$DocID, .quiet = TRUE)
+    ),
+    GPE = list(
+      Spans    = ent_load_entity(.dir_store = .dir_store, .family = "matcon", .entity = "GPE",
+                                 .lens = .lens, .extras = ent_extras("matcon", "GPE"),
+                                 .quiet = TRUE),
+      Law      = ent_load_entity(.dir_store = .dir_store, .family = "matcon", .entity = "LAW",
+                                 .lens = .lens, .extras = ent_extras("matcon", "LAW"),
+                                 .quiet = TRUE),
+      Mentions = apl_read_dep(.stem = "org_mentions", .doc_ids = .keys$DocID, .index = .dep_index)
+    ),
+    DATE = list(
+      Spans = dte_describe(
+        .dates = dplyr::filter(
+          dte_load(.dir_store = .dir_store, .lens = .lens, .family = "matcon", .quiet = TRUE),
+          .data$Parsed
+        ),
+        .keys = .keys, .win = .params$CueWin$Date
+      ),
+      Terms = dte_load_terms(.dir_store = .dir_store, .lens = .lens, .quiet = TRUE)
+    ),
+    MONEY = list(
+      Spans = mny_load(.dir_store = .dir_store, .lens = .lens, .family = "matcon", .quiet = TRUE)
+    ),
+    REDACT = list(
+      Spans = red_load(.dir_store = .dir_store, .lens = .lens, .family = "matcon", .quiet = TRUE),
+      Money = mny_load(.dir_store = .dir_store, .lens = .lens, .family = "matcon", .quiet = TRUE),
+      Words = red_words(.keys = .keys, .path_text = NULL, .quiet = TRUE)
+    )
+  )
+}
+
+
+#' Split a table into one element per document, empties included
+#'
+#' A DOCUMENT WITH NO SPANS STILL GETS A JOB, and split() alone will not give one. Every 04B apply
+#' runs FROM THE KEY SIDE so that a contract in which nothing was found still produces a row -- the
+#' sentinel in org_mentions is exactly that -- so a document absent from the spans must arrive at its
+#' worker as an EMPTY FRAME WITH THE RIGHT COLUMNS rather than not arrive at all.
+#'
+#' @param .tab Tibble carrying DocID.
+#' @param .doc_ids Character. Every document the window covers.
+#' @return A list the length of .doc_ids, aligned with it by POSITION and deliberately unnamed.
+apl_split_docs <- function(.tab, .doc_ids) {
+  if (FALSE) {
+    .tab     <- win_$Spans
+    .doc_ids <- keys_$DocID
+  }
+
+  empty_ <- .tab[0L, , drop = FALSE]
+  if (nrow(.tab) == 0L) return(rep(list(empty_), length(.doc_ids)))
+
+  # ONE VECTORISED match() AND THEN POSITIONAL INDEXING. by_[[.d]] with a CHARACTER key looks like a
+  # lookup and is a linear scan: R does not hash list names. Doing that once per document over a
+  # window of twenty thousand is twenty thousand scans of a twenty-thousand-element list per table --
+  # hundreds of millions of string comparisons, single-threaded, in the parent, while every worker
+  # waits. match() is one pass; everything after it is by position.
+  #
+  # RETURNED UNNAMED, deliberately. A name on this list invites the same lookup back.
+  by_  <- split(.tab, .tab$DocID)
+  idx_ <- match(.doc_ids, names(by_))
+  out_ <- vector("list", length(.doc_ids))
+  hit_ <- !is.na(idx_)
+  out_[hit_]  <- by_[idx_[hit_]]
+  out_[!hit_] <- list(empty_)
+  out_
+}
+
+
+#' Apply one entity's rule to ONE document
+#'
+#' THE UNIT OF WORK, AND THE REASON NOTHING CAN BREAK. Every call here is 04B's own, given one
+#' document's spans and one row of keys. A contract that fails costs exactly that contract: its
+#' neighbours are in other calls, in other processes, and cannot be touched by it.
+#'
+#' IT IS ALSO WHAT MAKES THE PARTITION IRRELEVANT. Every 04B rule reads one document, so a rule
+#' applied per document cannot be computing a quantity over the group it was handed. An earlier
+#' version needed a whole Validation section to establish that; here there is no group to compute
+#' over.
+#'
+#' REDACT USES THE MONEY SPANS IT WAS GIVEN, not MONEY's released file. It needs the ones the filer
+#' emptied, and that is a moneyregex pattern name rather than a filtered result.
+#'
+#' @param .pass Character. Which pass.
+#' @param .job A list carrying this document's slice of every input.
+#' @param .params The runbook's .lP$Params.
+#' @param .geo List: the gazetteer. GPE only.
+#' @return A named list of tibbles, one per file this pass writes.
+apl_doc_apply <- function(.pass, .job, .params, .geo = NULL) {
+  if (FALSE) {
+    .pass   <- "ORG"
+    .job    <- jobs_[[1L]]
+    .params <- .lP$Params
+    .geo    <- geo_once
+  }
+
+  keys_ <- .job$Keys
+  lens_ <- .job$Lens
+
+  if (.pass == "ORG") {
+    res_ <- ent_apply(
+      .spans  = .job$Spans, .keys = keys_, .lens = lens_,
+      .rule   = .params$Rule$Org, .spec = .params$Spec$Org, .filers = .job$Filers
+    )
+    return(list(org_mentions = res_$Release))
+  }
+
+  if (.pass == "GPE") {
+    res_ <- geo_apply(
+      .spans = .job$Spans, .law = .job$Law, .mentions = .job$Mentions,
+      .geo   = .geo, .spec = .params$Spec$Geo
+    )
+    return(list(places_geo = res_$Release, law_clauses = res_$Law))
+  }
+
+  if (.pass == "DATE") {
+    res_ <- dte_apply(
+      .dates = .job$Spans, .terms = .job$Terms, .keys = keys_, .spec = .params$Spec$Date
+    )
+    return(list(date_spans = res_$Dates, term_spans = res_$Terms))
+  }
+
+  if (.pass == "MONEY") {
+    res_ <- mny_apply(.money = .job$Spans, .keys = keys_, .spec = .params$Spec$Money)
+    return(list(money_spans = res_$Release))
+  }
+
+  if (.pass == "REDACT") {
+    res_ <- red_apply(
+      .marks = .job$Spans, .money = .job$Money, .words = .job$Words,
+      .keys  = keys_, .spec = .params$Spec$Redact
+    )
+    return(list(redact_spans = res_$Release))
+  }
+
+  cli::cli_abort("{(.pass)} is not one of the five passes.")
+}
+
+
+#' Cut a window's inputs into one job per document
+#' @param .pass Character. Which pass.
+#' @param .win List from apl_load_window().
+#' @param .keys Tibble. The window's anchor rows.
+#' @param .lens Tibble. The window's document lengths.
+#' @return A list the length of the window, named by DocID.
+apl_window_jobs <- function(.pass, .win, .keys, .lens) {
+  if (FALSE) {
+    .pass <- "GPE"
+    .win  <- win_
+    .keys <- keys_
+    .lens <- lens_
+  }
+
+  ids_   <- .keys$DocID
+  nms_   <- names(.win)
+  parts_ <- purrr::map(.win, \(.t) apl_split_docs(.tab = .t, .doc_ids = ids_))
+  keys1_ <- apl_split_docs(.tab = .keys, .doc_ids = ids_)
+  lens1_ <- apl_split_docs(.tab = .lens, .doc_ids = ids_)
+
+  # EVERY INDEX HERE IS AN INTEGER. The lists came back aligned with ids_ by position, so assembling
+  # the jobs is one pass rather than one linear scan per document per table.
+  purrr::set_names(
+    purrr::map(seq_along(ids_), function(.i) {
+      c(list(DocID = ids_[[.i]], Keys = keys1_[[.i]], Lens = lens1_[[.i]]),
+        purrr::set_names(purrr::map(parts_, \(.p) .p[[.i]]), nms_))
+    }),
+    ids_
+  )
+}
+
+
+# 6. One entity, end to end ----------------------------------------------------------------------------------------------
+
+#' Run one pass over whatever is not already written
+#'
+#' READ PER WINDOW, WORK PER DOCUMENT, COMMIT PER WINDOW. The database is asked once per window, the
+#' rules see one contract at a time, and the outputs land as one atomic directory.
+#'
+#' EVERY DAEMON SOURCES THE LIBRARIES BY PATH, and receives the parameters and the gazetteer once
+#' rather than once per document. A closure does not cross a process boundary with its environment,
+#' so a worker handed a function that calls ent_apply() finds no ent_apply(); and sending 181,810
+#' gazetteer rows with every document would cost more than the rule.
+#'
+#' A DOCUMENT THAT FAILS IS RECORDED AND EXCLUDED FROM _done, so the window still commits and that one
+#' contract is retried on the next render. Nothing else is affected by it, which is the point of
+#' making the document the unit.
+#'
+#' @param .pass Character. Which pass.
+#' @param .keys Tibble from apl_keys().
+#' @param .todo Character. Documents not yet written.
+#' @param .dir_out Directory named for this pass's policy hash.
+#' @param .params The runbook's .lP$Params.
+#' @param .dir_store Directory holding the family databases.
+#' @param .geo List: the gazetteer, for the serial path. A daemon builds its own.
+#' @param .dep_index Tibble from apl_dep_index(). GPE only.
+#' @param .path_lookup The gazetteer parquet, for the daemons to read.
+#' @param .path_fun Character. Library files every daemon sources.
+#' @return Tibble: one row per window.
+apl_entity_run <- function(.pass, .keys, .todo, .dir_out, .params, .dir_store,
+                           .geo = NULL, .dep_index = NULL, .path_lookup = NULL,
+                           .path_fun = character()) {
+  if (FALSE) {
+    .pass      <- "ORG"
+    .keys      <- tab_keys$ORG
+    .todo      <- todo_
+    .dir_out   <- .lP$Output$Store[["ORG"]]
+    .params    <- .lP$Params
+    .dir_store <- .lP$Input$Store
+  }
+
+  fs::dir_create(.dir_out)
+  cli::cli_h3("{(.pass)}")
+
+  if (length(.todo) == 0L) {
+    cli::cli_alert_success("Nothing outstanding.")
+    return(tibble::tibble())
+  }
+
+  stems_   <- apl_pass_spec(.pass = .pass)$Writes
+  windows_ <- split(.todo, ceiling(seq_along(.todo) / .params$WindowSize))
+  run_     <- format(Sys.time(), "%Y%m%dT%H%M%S")
+  n_work_  <- max(as.integer(.params$Workers), 1L)
+
+  cli::cli_alert_info(
+    "{format(length(.todo), big.mark = ',')} outstanding, in {length(windows_)} \\
+     {cli::qty(length(windows_))}window{?s} of {format(.params$WindowSize, big.mark = ',')}, one \\
+     document per worker."
   )
 
-  split_ <- split(.doc_ids, ceiling(seq_along(.doc_ids) / ceiling(length(.doc_ids) / .parts)))
+  if (n_work_ > 1L) {
+    mirai::daemons(n_work_)
+    on.exit(mirai::daemons(0L), add = TRUE)   # SAFE ONLY INSIDE A FUNCTION BODY, which this is
 
-  many_ <- purrr::map(split_, function(.ids) {
-    apl_chunk_apply(
-      .frame = apl_chunk_frame(.keys = .keys, .doc_ids = .ids),
-      .params = .params, .dir_store = .dir_store, .geo = .geo
+    # SENT ONCE PER DAEMON AND NOT ONCE PER DOCUMENT. everywhere() with .args evaluates its
+    # expression in an environment carrying those arguments, whose parent is the daemon's global --
+    # so a plain assignment binds THERE and is gone when the call returns. assign() into globalenv()
+    # is what makes these survive to the next task.
+    mirai::everywhere(
+      {
+        purrr::walk(.files, \(.f) source(.f, encoding = "UTF-8"))
+        assign("apl_params", .par, envir = globalenv())
+        assign(
+          x     = "geo_once",
+          value = if (is.null(.lookup)) NULL else list(
+            Lookup = geo_lookup(.path_lookup = .lookup),
+            Cand   = geo_candidates(.path_lookup = .lookup)
+          ),
+          envir = globalenv()
+        )
+      },
+      .args = list(.files = .path_fun, .par = .params,
+                   .lookup = if (.pass == "GPE") .path_lookup else NULL)
     )
-  })
+  }
 
-  bind_ <- purrr::map(names(one_), function(.n) {
-    purrr::map(many_, \(.m) .m[[.n]]) |> purrr::list_rbind()
-  }) |>
-    purrr::set_names(names(one_))
+  t0_   <- Sys.time()
+  seen_ <- 0L
 
-  key_ <- list(Parties = c("DocID", "PartyKey"), Date = "DocID", Money = "DocID",
-               Redact = "DocID")
+  out_ <- purrr::imap(windows_, function(.ids, .w) {
+    keys_ <- dplyr::filter(.keys, .data$DocID %in% .ids)
+    lens_ <- keys_ |>
+      dplyr::transmute(DocID, DocLen = as.integer(.data$nChars)) |>
+      dplyr::filter(!is.na(.data$DocLen), .data$DocLen > 0L)
 
-  purrr::map(names(one_), function(.n) {
-    a_ <- dplyr::arrange(one_[[.n]], dplyr::across(dplyr::all_of(key_[[.n]])))
-    b_ <- dplyr::arrange(bind_[[.n]], dplyr::across(dplyr::all_of(key_[[.n]])))
+    tic_ <- Sys.time()
+    win_ <- apl_load_window(.pass = .pass, .keys = keys_, .lens = lens_, .params = .params,
+                            .dir_store = .dir_store, .dep_index = .dep_index)
+    load_ <- as.numeric(difftime(Sys.time(), tic_, units = "secs"))
+
+    jobs_ <- apl_window_jobs(.pass = .pass, .win = win_, .keys = keys_, .lens = lens_)
+    rm(win_)
+
+    tic_ <- Sys.time()
+    res_ <- if (n_work_ <= 1L) {
+      purrr::map(jobs_, \(.j) try(
+        apl_doc_apply(.pass = .pass, .job = .j, .params = .params, .geo = .geo), silent = TRUE
+      ))
+    } else {
+      mirai::mirai_map(
+        .x = jobs_,
+        .f = function(.job, .pass) {
+          try(apl_doc_apply(.pass = .pass, .job = .job, .params = apl_params, .geo = geo_once),
+              silent = TRUE)
+        },
+        .args = list(.pass = .pass)
+      )[]
+    }
+    work_ <- as.numeric(difftime(Sys.time(), tic_, units = "secs"))
+
+    # A FAILURE IS A VALUE HERE, TWICE OVER: try() returns its condition and mirai returns a
+    # miraiError, and neither throws. Both are checked by class before anything is read as a result.
+    bad_ <- purrr::map_lgl(res_, \(.r) inherits(.r, c("try-error", "miraiError")))
+    ok_  <- res_[!bad_]
+
+    tabs_ <- purrr::set_names(
+      purrr::map(stems_, \(.s) purrr::list_rbind(purrr::map(ok_, \(.r) .r[[.s]]))), stems_
+    )
+
+    id_   <- paste0(run_, "-", formatC(as.integer(.w), width = 4L, flag = "0"))
+    work_dir_ <- fs::path(.dir_out, paste0(".window-", id_, ".part"))
+    if (fs::dir_exists(work_dir_)) fs::dir_delete(work_dir_)
+    fs::dir_create(work_dir_)
+
+    purrr::iwalk(tabs_, \(.t, .n) arrow::write_parquet(.t, fs::path(work_dir_,
+                                                                    paste0(.n, ".parquet"))))
+    # ONLY THE DOCUMENTS THAT SUCCEEDED, so a failure is retried rather than recorded as done. And
+    # every document that succeeded, whether or not it produced a row -- which is what makes
+    # resumption stable for a release most documents contribute nothing to.
+    arrow::write_parquet(
+      tibble::tibble(DocID = names(ok_)), fs::path(work_dir_, "_done.parquet")
+    )
+    fs::file_move(work_dir_, fs::path(.dir_out, paste0("window-", id_)))
+
+    seen_ <<- seen_ + length(.ids)
+    el_   <- as.numeric(difftime(Sys.time(), t0_, units = "secs"))
+    cli::cli_alert_info(
+      "  {(.w)}/{length(windows_)} | {format(seen_, big.mark = ',')} docs | \\
+       {round(seen_ / max(el_, 1e-9), 1)}/s | read {round(load_)}s, rules {round(work_)}s"
+    )
+
     tibble::tibble(
-      Output   = .n,
-      RowsOne  = nrow(a_),
-      RowsMany = nrow(b_),
-      Same     = isTRUE(all.equal(as.data.frame(a_), as.data.frame(b_),
-                                  check.attributes = FALSE))
+      Pass = .pass, Window = id_, Docs = length(.ids), Failed = sum(bad_),
+      Rows = as.integer(sum(purrr::map_int(tabs_, nrow))),
+      LoadSecs = load_, WorkSecs = work_
     )
   }) |>
     purrr::list_rbind()
+
+  fail_ <- sum(out_$Failed)
+  if (fail_ > 0L) {
+    cli::cli_alert_danger(
+      "{format(fail_, big.mark = ',')} {cli::qty(fail_)}document{?s} failed and {?was/were} left \\
+       out of _done, so {?it is/they are} retried on the next render. Nothing else was affected: \\
+       the unit of work is one document."
+    )
+  }
+  out_
 }
 
 
-#' The invariance check, reported
-#' @param .tab Tibble from apl_check_invariance().
-#' @param .n_doc Integer. Documents the check ran on.
-#' @param .parts Integer. Chunks the split arm used.
-#' @return Invisibly .tab.
-apl_report_invariance <- function(.tab, .n_doc, .parts) {
+#' What every pass did, and what is left
+#' @param .tab Tibble from the entity runs, bound together.
+#' @param .index Named list of tibbles from apl_corpus_index().
+#' @param .dirs Named character of output directories.
+#' @return Invisibly the summary.
+apl_report_pass <- function(.tab, .index, .dirs) {
   if (FALSE) {
-    .tab   <- tab_invar
-    .n_doc <- 2000L
-    .parts <- 4L
+    .tab   <- tab_pass
+    .index <- tab_index
+    .dirs  <- .lP$Output$Store
   }
 
-  cli::cli_h2("Chunking changes nothing")
-  tbl_say(
-    .tab   = .tab,
-    .title = paste0(format(.n_doc, big.mark = ","), " documents, as one chunk and as ", .parts)
+  cli::cli_h2("What this render's passes did")
+
+  out_ <- purrr::map(names(.dirs), function(.p) {
+    p_    <- dplyr::filter(.tab, .data$Pass == .p)
+    done_ <- length(apl_done_ids(.dir = .dirs[[.p]]))
+    pop_  <- nrow(.index[[.p]])
+    tibble::tibble(
+      Pass = .p, Windows = nrow(p_), DocsRun = sum(p_$Docs), Failed = sum(p_$Failed),
+      LoadSecs = sum(p_$LoadSecs), WorkSecs = sum(p_$WorkSecs),
+      Done = done_, Population = pop_, Left = max(pop_ - done_, 0L)
+    )
+  }) |>
+    purrr::list_rbind() |>
+    dplyr::mutate(
+      PerSecond = .data$DocsRun / pmax(.data$LoadSecs + .data$WorkSecs, 1e-9),
+      LoadShare = .data$LoadSecs / pmax(.data$LoadSecs + .data$WorkSecs, 1e-9)
+    )
+
+  out_ |>
+    dplyr::mutate(
+      dplyr::across(c(DocsRun, Done, Population, Left), \(.x) format(.x, big.mark = ",")),
+      dplyr::across(c(LoadSecs, WorkSecs, PerSecond), \(.x) tbl_num(.x)),
+      LoadShare = tbl_pct(.data$LoadShare)
+    ) |>
+    tbl_say(.title = "One row per pass")
+
+  cli::cli_alert_info(
+    "LoadShare IS THE READ AGAINST THE RULES. Loading is DuckDB and already uses every core; the \\
+     rules are single-threaded R, one document at a time. A high share means the window is too small \\
+     -- the database is being asked too often -- and a low one means workers are what help."
   )
 
-  if (all(.tab$Same)) {
-    cli::cli_alert_success(
-      "Every output is identical under both partitions, so the chunk size is a memory and time \\
-       decision and not a decision about the answer."
+  left_ <- sum(out_$Left)
+  if (left_ > 0L) {
+    cli::cli_alert_info(
+      "{format(left_, big.mark = ',')} {cli::qty(left_)}document{?s} outstanding. Re-render to \\
+       continue: each pass asks the ledger what it has and the directory what is written."
     )
   } else {
-    cli::cli_abort(c(
-      "{sum(!.tab$Same)} output{?s} {?differs/differ} under chunking.",
-      "x" = "{paste(.tab$Output[!.tab$Same], collapse = ', ')}.",
-      "i" = "A rule is reading a quantity computed over the spans it was handed rather than over one
-             document, which is the defect ent_rule()'s family-frequency gate had. The corpus pass
-             cannot be trusted until it is found."
-    ))
-  }
-  invisible(.tab)
-}
-
-
-# 6. Report --------------------------------------------------------------------------------------------------------------
-
-#' What the pass did
-#' @param .tab Tibble from apl_pass().
-#' @param .n_index Integer. Documents in the corpus index.
-#' @return Invisibly the summary.
-apl_report_pass <- function(.tab, .n_index) {
-  if (FALSE) {
-    .tab     <- tab_pass
-    .n_index <- nrow(tab_index)
-  }
-
-  cli::cli_h2("What this render's pass did")
-
-  if (nrow(.tab) == 0L) {
-    cli::cli_alert_info("No chunk ran.")
-    return(invisible(tibble::tibble()))
-  }
-
-  # THE STATUS CARRIES THE CONDITION MESSAGE, so a failure is "error: <what went wrong>" and never
-  # the bare word. Testing equality against "error" would count none of them and report a clean pass
-  # over a run that failed -- which is the one outcome this table exists to prevent.
-  ran_ <- dplyr::filter(.tab, .data$Status == "ran")
-  bad_ <- stringi::stri_startswith_fixed(.tab$Status, "error")
-
-  out_ <- tibble::tibble(
-    Item = c("Chunks in the pass",
-             "Ran this render",
-             "Served from the cache",
-             "Failed",
-             "Documents applied this render"),
-    N    = c(nrow(.tab),
-             nrow(ran_),
-             sum(.tab$Status == "cached"),
-             sum(bad_),
-             sum(ran_$Docs, na.rm = TRUE))
-  )
-
-  tbl_say(.tab = out_, .title = "Chunks, and what became of them")
-
-  if (nrow(ran_) > 0L) {
-    rate_ <- sum(ran_$Docs) / max(sum(ran_$Seconds), 1e-9)
-    cli::cli_alert_info(
-      "{round(rate_, 1)} documents a second over the chunks that ran, which projects \\
-       {round(.n_index / rate_ / 3600, 1)} hours for all \\
-       {format(.n_index, big.mark = ',')} in the index. A cached chunk costs nothing and is \\
-       excluded from the rate."
-    )
-  }
-
-  if (any(bad_)) {
-    cli::cli_alert_warning(
-      "{sum(bad_)} {cli::qty(sum(bad_))}chunk{?s} failed and wrote no file, so {?it is/they are} \\
-       retried on the next render. The pass continued: one bad chunk should not cost the other \\
-       million documents."
-    )
+    cli::cli_alert_success("Every document in every population has been written.")
   }
   invisible(out_)
 }
 
 
-#' What each output holds, at corpus scale
-#'
-#' COUNTED THROUGH ARROW rather than in memory. The parties file is tens of millions of rows, and a
-#' summary that had to materialise it would need more memory than the pass that produced it.
-#'
-#' @param .dir_chunks Directory named for the policy hash.
-#' @param .n_index Integer. Documents in the corpus index.
-#' @return Tibble: one row per output.
-apl_table_outputs <- function(.dir_chunks, .n_index) {
+# 7. The released files --------------------------------------------------------------------------------------------------
+
+#' What every released file holds
+#' @param .dirs Named character of output directories.
+#' @param .index Named list of tibbles from apl_corpus_index().
+#' @return Tibble: one row per file.
+apl_table_outputs <- function(.dirs, .index) {
   if (FALSE) {
-    .dir_chunks <- .lP$Output$Chunks
-    .n_index    <- nrow(tab_index)
+    .dirs  <- .lP$Output$Store
+    .index <- tab_index
   }
 
-  purrr::map(c("Parties", "Date", "Money", "Redact"), function(.n) {
-    ds_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = .n)
-    if (is.null(ds_)) {
-      return(tibble::tibble(Output = .n, Rows = 0L, Docs = 0L, Cols = 0L, PctIndex = 0))
-    }
-    n_ <- ds_ |> dplyr::summarise(N = dplyr::n(), D = dplyr::n_distinct(.data$DocID)) |>
-      dplyr::collect()
-    tibble::tibble(
-      Output   = .n,
-      Rows     = as.integer(n_$N[[1L]]),
-      Docs     = as.integer(n_$D[[1L]]),
-      Cols     = length(names(ds_)),
-      PctIndex = n_$D[[1L]] / pmax(.n_index, 1L)
-    )
+  purrr::map(names(.dirs), function(.p) {
+    stems_ <- apl_pass_spec(.pass = .p)$Writes
+    purrr::map(stems_, function(.s) {
+      ds_ <- apl_dataset(.dir = .dirs[[.p]], .stem = .s)
+      if (is.null(ds_)) {
+        return(tibble::tibble(Pass = .p, File = .s, Rows = 0L, Docs = 0L, Cols = 0L, PctPop = 0))
+      }
+      n_ <- ds_ |>
+        dplyr::summarise(N = dplyr::n(), D = dplyr::n_distinct(.data$DocID)) |>
+        dplyr::collect()
+      tibble::tibble(
+        Pass = .p, File = .s,
+        Rows = as.integer(n_$N[[1L]]), Docs = as.integer(n_$D[[1L]]),
+        Cols = length(names(ds_)),
+        PctPop = n_$D[[1L]] / pmax(nrow(.index[[.p]]), 1L)
+      )
+    }) |>
+      purrr::list_rbind()
   }) |>
     purrr::list_rbind()
 }
 
 
-#' What each output holds
+#' What every released file holds, reported
 #' @param .tab Tibble from apl_table_outputs().
 #' @return Invisibly .tab.
 apl_report_outputs <- function(.tab) {
-  if (FALSE) .tab <- tab_out
+  if (FALSE) {
+    .tab <- tab_out
+  }
 
-  cli::cli_h2("What the corpus pass produced")
+  cli::cli_h2("The eight released files")
   .tab |>
     dplyr::mutate(
       dplyr::across(c(Rows, Docs), \(.x) format(.x, big.mark = ",")),
-      PctIndex = tbl_pct(.data$PctIndex)
+      PctPop = tbl_pct(.data$PctPop)
     ) |>
-    tbl_say(.title = "One row per output, over every chunk written so far")
+    tbl_say(.title = "One row per file, over every chunk written so far")
 
   cli::cli_alert_info(
-    "PctIndex MUST BE THE SAME ON ALL FOUR ROWS. Every chain ran on one chunk frame and every 04B \\
-     apply runs from the key side, so a document reaches all four outputs or none -- a row that \\
-     differs is a chain dropping documents rather than a population difference. Parties carries more \\
-     ROWS than the other three because it is one row per party and they are one row per contract."
+    "ONLY org_mentions IS BUILT FROM THE KEY SIDE, so it alone must read 100%: 04B1 writes a sentinel \\
+     row for a contract in which no organisation was found, which is what makes n_distinct(DocID) \\
+     over that file the whole population. The other seven are SPAN files -- a row exists where the \\
+     extractor found something -- so PctPop below 100% there is a measurement about the corpus and \\
+     not a gap in the pass."
   )
+  cli::cli_alert_info(
+    "THE DENOMINATOR FOR A RATE IS THEREFORE THE PASS'S POPULATION AND NEVER THE FILE'S DocID COUNT. \\
+     A contract with no redaction marker has no row in redact_spans and still redacted nothing, \\
+     which is a finding; counting only the documents present would report every contract as having \\
+     redacted something."
+  )
+  cli::cli_alert_info(
+    "THE DIRECTORY IS THE RELEASE. There is no bind and no single file, so nothing here can be \\
+     assembled from a partial pass into an artifact that looks finished."
+  )
+
   invisible(.tab)
 }
 
 
-#' The four column dictionaries, checked against the corpus files
+#' Every released file against the dictionary its 04B document declared
 #'
 #' THE SAME CHECK 04B RUNS, ON THE CORPUS RATHER THAN THE SAMPLE. Each 04B document builds a
-#' dictionary from a declared list and aborts where it disagrees with the file it just wrote; running
-#' the same functions here is what says the corpus release has the same shape as the sample release,
-#' which is the whole claim this document makes.
+#' dictionary from a declared list and aborts where it disagrees with the file it wrote; running the
+#' same functions here is what says the corpus release has the same shape as the sample release, which
+#' is the whole claim this document makes.
 #'
 #' SCHEMA FROM ARROW, NEVER INFERRED. names(open_dataset()) reads the parquet's own schema, so a
 #' column added or renamed by a chain is seen as the file has it rather than as this document expects.
 #'
-#' @param .dir_chunks Directory named for the policy hash.
-#' @return Tibble: one row per output.
-apl_check_schema <- function(.dir_chunks) {
-  if (FALSE) .dir_chunks <- .lP$Output$Chunks
+#' @param .dirs Named character of output directories.
+#' @return Tibble: one row per file.
+apl_check_schema <- function(.dirs) {
+  if (FALSE) .dirs <- .lP$Output$Store
 
   spec_ <- list(
-    Parties = list(Fun = geo_dictionary_parties, Doc = "04B2"),
-    Date    = list(Fun = dte_dictionary,         Doc = "04B3"),
-    Money   = list(Fun = mny_dictionary,         Doc = "04B4"),
-    Redact  = list(Fun = red_dictionary,         Doc = "04B5")
+    org_mentions = list(Fun = ent_dictionary_mentions, Doc = "04B1"),
+    places_geo   = list(Fun = geo_dictionary_places,   Doc = "04B2"),
+    law_clauses  = list(Fun = geo_dictionary_law,      Doc = "04B2"),
+    date_spans   = list(Fun = dte_dictionary_dates,    Doc = "04B3"),
+    term_spans   = list(Fun = dte_dictionary_terms,    Doc = "04B3"),
+    money_spans  = list(Fun = mny_dictionary_spans,    Doc = "04B4"),
+    redact_spans = list(Fun = red_dictionary_spans,    Doc = "04B5")
   )
 
-  purrr::map(names(spec_), function(.n) {
-    ds_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = .n)
-    if (is.null(ds_)) {
-      return(tibble::tibble(Output = .n, From = spec_[[.n]]$Doc, Cols = 0L, Agrees = NA))
-    }
-    # An empty frame with the file's own column names is enough: the dictionary functions compare
-    # names() and nothing else, so no row has to be read to run the check.
-    empty_ <- ds_ |> dplyr::filter(FALSE) |> dplyr::collect()
-    ok_    <- try(spec_[[.n]]$Fun(empty_), silent = TRUE)
-    tibble::tibble(
-      Output = .n, From = spec_[[.n]]$Doc, Cols = length(names(ds_)),
-      Agrees = !inherits(ok_, "try-error")
-    )
+  purrr::map(names(.dirs), function(.p) {
+    purrr::map(apl_pass_spec(.pass = .p)$Writes, function(.s) {
+      ds_ <- apl_dataset(.dir = .dirs[[.p]], .stem = .s)
+      if (is.null(ds_)) {
+        return(tibble::tibble(File = .s, From = spec_[[.s]]$Doc, Cols = 0L, Agrees = NA))
+      }
+      # BUILT FROM THE SCHEMA AND NOT QUERIED. The dictionary functions compare names() and nothing
+      # else, so no row has to be read -- and arrow refuses filter(FALSE) anyway, because it wants a
+      # column expression rather than a literal. Constructing the frame from names() is both correct
+      # and free.
+      empty_ <- purrr::set_names(
+        purrr::map(names(ds_), \(.x) logical(0)), names(ds_)
+      ) |>
+        tibble::as_tibble()
+      ok_    <- try(spec_[[.s]]$Fun(empty_), silent = TRUE)
+      tibble::tibble(
+        File = .s, From = spec_[[.s]]$Doc, Cols = length(names(ds_)),
+        Agrees = !inherits(ok_, "try-error")
+      )
+    }) |>
+      purrr::list_rbind()
   }) |>
     purrr::list_rbind()
 }
@@ -1115,14 +1066,14 @@ apl_report_schema <- function(.tab) {
   if (FALSE) .tab <- tab_schema
 
   cli::cli_h2("The corpus files have the shape 04B released")
-  tbl_say(.tab = .tab, .title = "Each output, against the dictionary its 04B document declared")
+  tbl_say(.tab = .tab, .title = "Each file, against the dictionary its 04B document declared")
 
   bad_ <- dplyr::filter(.tab, !is.na(.data$Agrees), !.data$Agrees)
   if (nrow(bad_) > 0L) {
     cli::cli_abort(c(
-      "{nrow(bad_)} corpus output{?s} {?does/do} not match the dictionary {?its/their} 04B document
+      "{nrow(bad_)} corpus file{?s} {?does/do} not match the dictionary {?its/their} 04B document
        declared.",
-      "x" = "{paste(bad_$Output, collapse = ', ')}.",
+      "x" = "{paste(bad_$File, collapse = ', ')}.",
       "i" = "The rule that wrote it changed without the dictionary following, or this pass is
              calling a version of it the runbook does not name."
     ))
@@ -1135,287 +1086,243 @@ apl_report_schema <- function(.tab) {
 }
 
 
-# 7. The corpus statistics -------------------------------------------------------------------------------------------
+# 8. The rule against the naive ladder -----------------------------------------------------------------------------------
 
-#' The headline numbers of every entity, at corpus scale
+#' Every entity's naive ladder, computed batch by batch over the corpus
 #'
-#' THE SAME QUANTITIES 04B PUT IN ITS OWN HEADLINE TABLE, so a reader can set the two side by side and
-#' see whether the corpus behaves like the sample. That comparison is the point of having run 04A at
-#' all: a corpus rate far from the sample rate is either a finding about representativeness or a
-#' defect in this pass, and both are worth having before anyone regresses on these columns.
+#' THE COLLAPSE FUNCTIONS AND NOT A SECOND IMPLEMENTATION. Each rung below comes from the same
+#' ent_doc_facts(), geo_doc_facts(), dte_collapse(), mny_collapse() or red_collapse() that 04B
+#' reports from, so a corpus number and a sample number are the same query on different data. Writing
+#' the arithmetic again in arrow would be faster and would let the two disagree at the third decimal.
 #'
-#' COMPUTED THROUGH ARROW. Every figure below is a group-by pushed into the parquet reader, so nothing
-#' larger than the result is ever in memory.
+#' CHUNK BY CHUNK, AND ONLY THE DOCUMENT-LEVEL RESULT IS KEPT. Every collapse is per document, so a
+#' chunk's collapse is exact; binding the document rows gives a table of about a million rows and a
+#' dozen columns, which is small. Collecting the long files themselves would not be.
 #'
-#' @param .dir_chunks Directory named for the policy hash.
-#' @return Tibble: Entity, Item, Value.
-apl_table_stats <- function(.dir_chunks) {
-  if (FALSE) .dir_chunks <- .lP$Output$Chunks
+#' NOTHING IS WRITTEN. These are report artifacts. The export materialises the collapses properly.
+#'
+#' @param .pass Character. Which pass.
+#' @param .dir Directory named for that pass's policy hash.
+#' @param .dep_index Tibble from apl_dep_index(). GPE only.
+#' @param .keys Tibble from apl_keys().
+#' @param .params The runbook's .lP$Params.
+#' @return Tibble: one row per document, with the entity's ladder columns.
+apl_facts <- function(.pass, .dir, .keys, .params, .dep_index = NULL) {
+  if (FALSE) {
+    .pass    <- "DATE"
+    .dir     <- .lP$Output$Store[["DATE"]]
+    .keys    <- tab_keys$DATE
+    .params  <- .lP$Params
+  }
 
-  say_ <- function(.x) format(round(.x), big.mark = ",")
-  pct_ <- function(.x) tbl_pct(.x)
-  row_ <- function(.e, .i, .v) tibble::tibble(Entity = .e, Item = .i, Value = .v)
+  stems_ <- apl_pass_spec(.pass = .pass)$Writes
+  dirs_  <- apl_batches(.dir = .dir)
+  if (length(dirs_) == 0L) return(tibble::tibble())
 
+  purrr::map(dirs_, function(.b) {
+    read_ <- function(.s) {
+      p_ <- fs::path(.b, paste0(.s, ".parquet"))
+      if (fs::file_exists(p_)) arrow::read_parquet(p_) else tibble::tibble()
+    }
+    done_  <- arrow::read_parquet(fs::path(.b, "_done.parquet"))$DocID
+    first_ <- read_(stems_[[1L]])
+
+    # THE DENOMINATOR IS _done.parquet AND NOT THE OUTPUT. Seven of the eight releases carry a row
+    # only where the extractor found something, so restricting the keys to the documents PRESENT
+    # would compute every rate over the documents that HAD the thing -- "contracts carrying a
+    # marker" came out at 100% because the denominator was contracts carrying a marker.
+    keys_ <- dplyr::filter(.keys, .data$DocID %in% done_)
+    if (nrow(keys_) == 0L) return(tibble::tibble())
+
+    switch(
+      .pass,
+      ORG    = ent_doc_facts(
+        .release = first_,
+        .lens    = dplyr::transmute(keys_, DocID, DocLen = as.integer(.data$nChars)),
+        .spec    = .params$Spec$Org
+      ),
+      GPE    = geo_doc_facts(
+        .release = first_,
+        .party   = ent_party_facts(
+          .release = apl_read_dep(.stem = "org_mentions", .doc_ids = done_,
+                                  .index = .dep_index)
+        ),
+        .keys    = keys_
+      ),
+      DATE   = dte_collapse(.dates = first_, .terms = read_("term_spans"),
+                            .keys = keys_, .spec = .params$Spec$Date),
+      MONEY  = mny_collapse(.release = first_, .keys = keys_, .spec = .params$Spec$Money),
+      REDACT = red_collapse(.release = first_,
+                            .words = red_words(.keys = keys_, .path_text = NULL, .quiet = TRUE),
+                            .keys = keys_)
+    )
+  }, .progress = TRUE) |>
+    purrr::list_rbind()
+}
+
+
+#' The rule against the naive definition, one row per entity
+#'
+#' EVERY ROW IS A LADDER RUNG AND THE PAIR IS THE RESULT. What a reader gets without the rule, and
+#' what the rule gives. Each pair is the corpus version of a number 04B already reported on 4,398
+#' documents, and the comparison is the point of having run 04A at all: a corpus figure far from the
+#' sample figure is either a finding about representativeness or a defect in this pass.
+#'
+#' @param .facts Named list of tibbles from apl_facts().
+#' @return Tibble: Entity, Measure, Naive, Rule, Change.
+apl_table_naive <- function(.facts) {
+  if (FALSE) .facts <- tab_facts
+
+  say_ <- function(.e, .m, .n, .r) {
+    tibble::tibble(Entity = .e, Measure = .m, Naive = .n, Rule = .r)
+  }
   out_ <- list()
 
-  ds_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = "Parties")
-  if (!is.null(ds_)) {
-    p_ <- ds_ |>
-      dplyr::summarise(
-        Docs   = dplyr::n_distinct(.data$DocID),
-        Rows   = dplyr::n(),
-        NReg   = sum(.data$PartyRole == "registrant", na.rm = TRUE),
-        NMatch = sum(.data$PartyRole == "registrant" & .data$Matched, na.rm = TRUE),
-        NCount = sum(.data$PartyRole == "counterparty", na.rm = TRUE),
-        NState = sum(!is.na(.data$GeoState), na.rm = TRUE),
-        NLaw   = sum(.data$LawSpecified == "named", na.rm = TRUE)
-      ) |>
-      dplyr::collect()
+  f_ <- .facts$ORG
+  if (!is.null(f_) && nrow(f_) > 0L) {
     out_ <- c(out_, list(
-      row_("ORG", "Contracts",                     say_(p_$Docs)),
-      row_("ORG", "Parties",                       say_(p_$Rows)),
-      row_("ORG", "Registrant matched to EDGAR",   pct_(p_$NMatch / pmax(p_$NReg, 1))),
-      row_("ORG", "Counterparties per contract",   tbl_num(p_$NCount / pmax(p_$Docs, 1))),
-      row_("GPE", "Parties given a state",         pct_(p_$NState / pmax(p_$Rows, 1))),
-      row_("GPE", "Rows naming a governing law",   pct_(p_$NLaw / pmax(p_$Rows, 1)))
+      say_("ORG", "Distinct spellings vs parties",
+           mean(f_$NaiveSpans), mean(f_$NaiveParties)),
+      say_("ORG", "Counterparties per contract",
+           mean(f_$NaiveCounter), mean(f_$NCounter))
     ))
   }
 
-  ds_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = "Date")
-  if (!is.null(ds_)) {
-    d_ <- ds_ |>
-      dplyr::summarise(
-        Docs  = dplyr::n(),
-        NTerm = sum(.data$DurationSource == "term", na.rm = TRUE),
-        NMax  = sum(.data$DurationSource == "maxdate", na.rm = TRUE),
-        NKept = sum(!is.na(.data$DurationYears), na.rm = TRUE),
-        SumY  = sum(.data$DurationYears, na.rm = TRUE)
-      ) |>
-      dplyr::collect()
+  f_ <- .facts$GPE
+  if (!is.null(f_) && nrow(f_) > 0L) {
     out_ <- c(out_, list(
-      row_("DATE", "End from a stated term",       pct_(d_$NTerm / pmax(d_$Docs, 1))),
-      row_("DATE", "End from the farthest date",   pct_(d_$NMax / pmax(d_$Docs, 1))),
-      row_("DATE", "Duration reported",            pct_(d_$NKept / pmax(d_$Docs, 1))),
-      row_("DATE", "Mean duration, years",         tbl_num(d_$SumY / pmax(d_$NKept, 1)))
+      say_("GPE", "Distinct states per contract",
+           mean(f_$NaiveStates), mean(f_$RuleStates)),
+      say_("GPE", "Distinct countries per contract",
+           mean(f_$NaiveCountries), mean(f_$RuleCountries))
     ))
   }
 
-  ds_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = "Money")
-  if (!is.null(ds_)) {
-    m_ <- ds_ |>
-      dplyr::summarise(
-        Docs  = dplyr::n(),
-        NUSD  = sum(!is.na(.data$MoneyMaxUSD), na.rm = TRUE),
-        NRaw  = sum(.data$NAmountsRaw, na.rm = TRUE),
-        NKept = sum(.data$NAmounts, na.rm = TRUE),
-        NHeld = sum(.data$NWithheldUSD + .data$NWithheldOther, na.rm = TRUE),
-        NAnyH = sum((.data$NWithheldUSD + .data$NWithheldOther) > 0L, na.rm = TRUE)
-      ) |>
-      dplyr::collect()
+  f_ <- .facts$DATE
+  if (!is.null(f_) && nrow(f_) > 0L) {
     out_ <- c(out_, list(
-      row_("MONEY", "Naming a USD amount",         pct_(m_$NUSD / pmax(m_$Docs, 1))),
-      row_("MONEY", "Amounts kept of amounts read", pct_(m_$NKept / pmax(m_$NRaw, 1))),
-      row_("MONEY", "Prices the contract withheld", say_(m_$NHeld)),
-      row_("MONEY", "Contracts withholding one",   pct_(m_$NAnyH / pmax(m_$Docs, 1)))
+      say_("DATE", "Mean duration, years",
+           mean(f_$NaiveYears, na.rm = TRUE), mean(f_$DurationYears, na.rm = TRUE)),
+      say_("DATE", "Standard deviation, years",
+           stats::sd(f_$NaiveYears, na.rm = TRUE), stats::sd(f_$DurationYears, na.rm = TRUE))
     ))
   }
 
-  ds_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = "Redact")
-  if (!is.null(ds_)) {
-    r_ <- ds_ |>
-      dplyr::summarise(
-        Docs   = dplyr::n(),
-        NAny   = sum(.data$NBracketed > 0L, na.rm = TRUE),
-        NBare  = sum(.data$NRedactBare > 0L, na.rm = TRUE),
-        NBrack = sum(.data$NBracketed, na.rm = TRUE),
-        NAll   = sum(.data$NRedact, na.rm = TRUE)
-      ) |>
-      dplyr::collect()
+  f_ <- .facts$MONEY
+  if (!is.null(f_) && nrow(f_) > 0L) {
     out_ <- c(out_, list(
-      row_("REDACT", "Carrying a bracketed marker", pct_(r_$NAny / pmax(r_$Docs, 1))),
-      row_("REDACT", "Carrying a bare run",         pct_(r_$NBare / pmax(r_$Docs, 1))),
-      row_("REDACT", "Bracketed markers",           say_(r_$NBrack)),
-      row_("REDACT", "Markers of every class",      say_(r_$NAll))
+      say_("MONEY", "Amounts per contract",
+           mean(f_$NAmountsRaw), mean(f_$NAmounts)),
+      # BOTH OVER THE SAME CONTRACTS, and this is the error 04B4's own prose warns about. Computing
+      # each median over its own non-missing rows compares a set INCLUDING the contracts whose every
+      # figure was boilerplate against one excluding them, and then reports the filters as having
+      # RAISED contract value. Restricting to where the rule kept an amount is what makes it a
+      # comparison at all.
+      say_("MONEY", "Median largest USD amount",
+           stats::median(f_$NaiveMaxUSD[!is.na(f_$MoneyMaxUSD)], na.rm = TRUE),
+           stats::median(f_$MoneyMaxUSD, na.rm = TRUE))
     ))
   }
 
-  purrr::list_rbind(out_)
+  f_ <- .facts$REDACT
+  if (!is.null(f_) && nrow(f_) > 0L) {
+    out_ <- c(out_, list(
+      say_("REDACT", "Markers per contract",
+           mean(f_$NRedact), mean(f_$NBracketed)),
+      say_("REDACT", "Contracts carrying one",
+           mean(f_$NRedact > 0L), mean(f_$NBracketed > 0L))
+    ))
+  }
+
+  purrr::list_rbind(out_) |>
+    dplyr::mutate(Change = .data$Rule / dplyr::if_else(.data$Naive == 0, NA_real_, .data$Naive) - 1)
 }
 
 
-#' The corpus statistics, reported
-#' @param .tab Tibble from apl_table_stats().
+#' The rule against the naive definition, reported
+#' @param .tab Tibble from apl_table_naive().
+#' @param .limit Integer or NULL.
 #' @return Invisibly .tab.
-apl_report_stats <- function(.tab) {
-  if (FALSE) .tab <- tab_stats
+apl_report_naive <- function(.tab, .limit = NULL) {
+  if (FALSE) {
+    .tab   <- tab_naive
+    .limit <- .lP$Params$Limit
+  }
 
-  cli::cli_h2("The corpus, entity by entity")
+  cli::cli_h2("The rule against the naive definition, at corpus scale")
 
   if (nrow(.tab) == 0L) {
-    cli::cli_alert_info("No chunk has been written, so there is nothing to summarise.")
-    return(invisible(.tab))
-  }
-
-  tbl_say(.tab = .tab, .title = "The same quantities each 04B document put in its headline table")
-
-  cli::cli_alert_info(
-    "READ THESE AGAINST 04B'S OWN HEADLINE TABLES. Each row is the corpus version of a number the \\
-     sample already reported, and the comparison is the point of having run 04A: a corpus rate far \\
-     from the sample rate is either a finding about representativeness or a defect in this pass, and \\
-     the two are told apart by reading spans rather than by reading this table."
-  )
-  cli::cli_alert_info(
-    "EVERY FIGURE IS A GROUP-BY PUSHED INTO THE PARQUET READER, so nothing larger than the result was \\
-     ever in memory -- which is what lets a table of tens of millions of party rows be summarised by \\
-     the same render that wrote it."
-  )
-  invisible(.tab)
-}
-
-
-#' Coverage by contract type, for one output
-#'
-#' THE CLASS SPINE REACHES ONLY WHERE 03F CLASSIFIED, and that is a smaller population than this pass
-#' applies to. Reported as its own row rather than dropped, because a contract with no label is a gap
-#' in the classification and not a gap in the entity.
-#'
-#' @param .dir_chunks Directory named for the policy hash.
-#' @return Tibble: one row per contract type.
-apl_table_class <- function(.dir_chunks) {
-  if (FALSE) .dir_chunks <- .lP$Output$Chunks
-
-  ds_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = "Date")
-  if (is.null(ds_)) return(tibble::tibble())
-
-  dte_ <- ds_ |>
-    dplyr::summarise(
-      Docs    = dplyr::n(),
-      PctTerm = sum(.data$DurationSource == "term", na.rm = TRUE) / dplyr::n(),
-      .by = Class
-    ) |>
-    dplyr::collect()
-
-  mny_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = "Money")
-  mny_ <- if (is.null(mny_)) tibble::tibble(Class = character(0), PctUSD = numeric(0)) else {
-    mny_ |>
-      dplyr::summarise(
-        PctUSD = sum(!is.na(.data$MoneyMaxUSD), na.rm = TRUE) / dplyr::n(), .by = Class
-      ) |>
-      dplyr::collect()
-  }
-
-  red_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = "Redact")
-  red_ <- if (is.null(red_)) tibble::tibble(Class = character(0), PctRedact = numeric(0)) else {
-    red_ |>
-      dplyr::summarise(
-        PctRedact = sum(.data$NBracketed > 0L, na.rm = TRUE) / dplyr::n(), .by = Class
-      ) |>
-      dplyr::collect()
-  }
-
-  dte_ |>
-    dplyr::left_join(mny_, by = dplyr::join_by(Class)) |>
-    dplyr::left_join(red_, by = dplyr::join_by(Class)) |>
-    dplyr::mutate(Class = dplyr::coalesce(.data$Class, "unclassified")) |>
-    dplyr::arrange(dplyr::desc(.data$Docs))
-}
-
-
-#' Coverage by contract type, reported
-#' @param .tab Tibble from apl_table_class().
-#' @return Invisibly .tab.
-apl_report_class <- function(.tab) {
-  if (FALSE) .tab <- tab_class
-
-  cli::cli_h2("The corpus by contract type")
-
-  if (nrow(.tab) == 0L) {
-    cli::cli_alert_info("No chunk has been written.")
+    cli::cli_alert_info("No pass has written a file, so there is nothing to compare.")
     return(invisible(.tab))
   }
 
   .tab |>
     dplyr::mutate(
-      Docs = format(.data$Docs, big.mark = ","),
-      dplyr::across(dplyr::starts_with("Pct"), \(.x) tbl_pct_safe(.x))
+      dplyr::across(c(Naive, Rule), \(.x) tbl_num(.x)),
+      Change = tbl_pct_safe(.data$Change)
     ) |>
-    tbl_say(.title = "One row per contract type, over every chunk written so far")
+    tbl_say(.title = "One row per measure, over every document written so far")
 
   cli::cli_alert_info(
-    "UNCLASSIFIED IS A ROW AND NOT A GAP. 03F's spine reaches the documents it classified and this \\
-     pass reaches every document 04C finished, which is the larger set; a contract with no label is \\
-     a gap in the CLASSIFICATION and its entity variables are as good as any other's."
+    "NAIVE IS WHAT A READER GETS WITHOUT THE RULE and RULE is what this pipeline gives. Every pair \\
+     comes from the SAME collapse function 04B reports from, so a corpus figure and a sample figure \\
+     are one query on different data rather than two implementations that could disagree."
   )
-  invisible(.tab)
-}
+  cli::cli_alert_info(
+    "READ THESE AGAINST 04B'S OWN HEADLINE TABLES. A corpus rate far from the sample rate is either \\
+     a finding about representativeness or a defect in this pass, and the two are told apart by \\
+     reading spans rather than by reading this table."
+  )
+  cli::cli_alert_info(
+    "DATE'S SECOND ROW IS THE ONE TO SHOW A REFEREE. A duration capped at thirty years cannot have a \\
+     standard deviation above fifteen, and the naive column is where a published figure of 40.78 \\
+     comes from."
+  )
 
-
-# 8. Deployment ----------------------------------------------------------------------------------------------------------
-
-#' Bind every chunk into the four released files
-#'
-#' WRITTEN ONCE, FROM THE CHUNKS, AND ONLY WHEN THE PASS IS COMPLETE. A release assembled from a
-#' partial pass is a file that looks finished and is not, and nothing in it says so.
-#'
-#' THE PARTIES FILE IS WRITTEN THROUGH ARROW rather than collected first. It is one row per contract
-#' per party over 1.19 million contracts; write_dataset() streams it.
-#'
-#' @param .dir_chunks Directory named for the policy hash.
-#' @param .paths Named list of output paths.
-#' @param .complete Logical. Whether every chunk in the index has been written.
-#' @return Tibble: one row per file.
-apl_write <- function(.dir_chunks, .paths, .complete) {
-  if (FALSE) {
-    .dir_chunks <- .lP$Output$Chunks
-    .paths      <- .lP$Output$Release
-    .complete   <- TRUE
-  }
-
-  if (!isTRUE(.complete)) {
+  if (!is.null(.limit)) {
     cli::cli_alert_warning(
-      "The pass is not complete, so no release is written. A file assembled from a partial pass \\
-       looks finished and is not, and nothing in it would say so. Re-render to continue; the chunk \\
-       cache resumes where this stopped."
+      "THIS IS A LIMITED RUN. Nothing above describes the corpus; it describes the first \\
+       {format(.limit, big.mark = ',')} documents of each population."
     )
-    return(tibble::tibble())
   }
-
-  purrr::map(names(.paths), function(.n) {
-    ds_ <- apl_dataset(.dir_chunks = .dir_chunks, .name = .n)
-    if (is.null(ds_)) return(tibble::tibble(Output = .n, Rows = 0L, MB = 0))
-    fs::dir_create(fs::path_dir(.paths[[.n]]))
-    arrow::write_parquet(dplyr::collect(ds_), .paths[[.n]])
-    tibble::tibble(
-      Output = .n,
-      Rows   = as.integer(dplyr::collect(dplyr::summarise(ds_, N = dplyr::n()))$N[[1L]]),
-      MB     = round(as.numeric(fs::file_size(.paths[[.n]])) / 1024^2, 1)
-    )
-  }) |>
-    purrr::list_rbind()
-}
-
-
-#' The release, reported
-#' @param .tab Tibble from apl_write().
-#' @return Invisibly .tab.
-apl_report_write <- function(.tab) {
-  if (FALSE) .tab <- tab_write
-
-  cli::cli_h2("The release")
-
-  if (nrow(.tab) == 0L) {
-    cli::cli_alert_info("Nothing written.")
-    return(invisible(.tab))
-  }
-
-  .tab |>
-    dplyr::mutate(Rows = format(.data$Rows, big.mark = ",")) |>
-    tbl_say(.title = "Four files, the same four 04B released")
-
-  cli::cli_alert_info(
-    "THE SAME COLUMNS IN THE SAME ORDER AS THE SAMPLE'S, written by the same 04B functions. A reader \\
-     who knows one knows the other, and the dictionary check above is what says so rather than this \\
-     sentence."
-  )
   invisible(.tab)
 }
+
+
+#' Everything this document did, in one table
+#' @param .out Tibble from apl_table_outputs().
+#' @param .hashes Named character of policy hashes.
+#' @param .index Named list of tibbles from apl_corpus_index().
+#' @return Invisibly the table.
+apl_report_headline <- function(.out, .hashes, .index) {
+  if (FALSE) {
+    .out    <- tab_out
+    .hashes <- .lP$Params$Hash
+    .index  <- tab_index
+  }
+
+  cli::cli_h2("The five passes in one table")
+
+  tibble::tibble(
+    Pass       = names(.hashes),
+    Hash       = unname(.hashes),
+    Population = purrr::map_chr(names(.hashes),
+                                \(.p) format(nrow(.index[[.p]]), big.mark = ",")),
+    Files      = purrr::map_chr(names(.hashes),
+                                \(.p) paste(apl_pass_spec(.p)$Writes, collapse = ", ")),
+    Rows       = purrr::map_chr(names(.hashes), function(.p) {
+      format(sum(.out$Rows[.out$Pass == .p]), big.mark = ",")
+    })
+  ) |>
+    tbl_say(.title = "One row per pass")
+
+  cli::cli_alert_info(
+    "THE HASHES ARE THE ONE THING TO RECORD. Each names its pass's chunk directory and stands for \\
+     every rule parameter, every extractor spec hash and every dependency that pass used -- so two \\
+     releases carrying the same hash were produced by the same pipeline and two carrying different \\
+     ones were not."
+  )
+  invisible(.out)
+}
+
+
