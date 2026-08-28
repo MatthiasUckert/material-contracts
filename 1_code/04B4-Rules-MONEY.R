@@ -379,7 +379,7 @@ mny_collapse <- function(.release, .keys, .spec) {
     dplyr::filter(!(.spec$Filter == "par" & .data$IsPar))
 
   agg_ <- function(.d, .suffix) {
-    .d |>
+    out_ <- .d |>
       dplyr::summarise(
         N        = dplyr::n(),
         NDistinct = dplyr::n_distinct(.data$Amount),
@@ -393,6 +393,24 @@ mny_collapse <- function(.release, .keys, .spec) {
         values_from = c("N", "NDistinct", "Max", "Sum", "Median"),
         names_glue  = paste0("{.value}{Block}", .suffix)
       )
+
+    # A CURRENCY BLOCK THESE DOCUMENTS NEVER NAMED STILL GETS ITS COLUMNS. pivot_wider() names
+    # columns after the values it FINDS, so a set of contracts in which none states a non-USD figure
+    # produces no non-USD column at all -- and the arithmetic below then fails on a subset while
+    # working perfectly on the corpus, because a large enough set always contains one. It is the
+    # defect 04B5 already fixed for redaction kinds, and the fix is the same: take the shape from the
+    # registered vocabulary, so it is a property of the taxonomy rather than of the input.
+    #
+    # COUNTS ARE FILLED WITH NA AND NOT ZERO, because the across() below already decides that a
+    # missing count means none was found. Two places deciding it is how the two come to disagree.
+    blocks_ <- plot_levels(.key = "MoneyBlock")
+    count_  <- paste0(rep(c("N", "NDistinct"), each = length(blocks_)), blocks_, .suffix)
+    amount_ <- paste0(rep(c("Max", "Sum", "Median"), each = length(blocks_)), blocks_, .suffix)
+
+    for (nm_ in setdiff(count_,  names(out_))) out_[[nm_]] <- rep(NA_integer_, nrow(out_))
+    for (nm_ in setdiff(amount_, names(out_))) out_[[nm_]] <- rep(NA_real_, nrow(out_))
+
+    out_
   }
 
   rule_  <- agg_(.d = keep_, .suffix = "")

@@ -73,7 +73,7 @@ cat("Function File:  ")
 
 source(file = .path_fun, encoding = "UTF-8")
 
-# APPENDED LAST, because a daemon calls apl_doc_apply() and it is defined in this file. Appended
+# APPENDED LAST, because a daemon calls apl_chunk_run() and it is defined in this file. Appended
 # rather than named again, so the list a worker sources is exactly the list this process sourced.
 .path_libs <- c(.path_libs, .path_fun)
 ```
@@ -87,7 +87,7 @@ files 04B released**, with 1.19 million contracts in them instead of 4,398.
 
 04A measured which family to trust. 04B built and scored a rule per entity. 04C extracted the corpus.
 Everything that could vary is declared in Configuration, printed in the render, and hashed into a
-chunk directory so a changed rule cannot be served from a stale cache.
+directory name, so a changed rule cannot be served output produced by a rule that no longer exists.
 
 ## Five passes, five hashes
 
@@ -103,46 +103,65 @@ GPE folds in ORG's hash because it reads ORG's file. **REDACT depends on the ext
 04B4** -- it reads matcon's money spans to find the ones the filer emptied, and "emptied" is a
 pattern name rather than a filtered result.
 
-## The unit of work is one document
+## The unit of work is a chunk, and the worker reads its own
 
-A worker is handed **one document's spans** and returns that document's rows. Nothing else can be
-affected by it: a contract with an impossible offset, a name the grouping cannot reduce, a date
-outside every range costs exactly that contract and no other.
+Every 04B chain is a vectorised `dplyr` pipeline over a whole table. Nothing in any of them loops
+over documents: `ent_apply()` is six calls, `geo_apply()` is five, and each one groups and joins on
+keys that always include `DocID`. Applying such a chain one document at a time does not isolate
+anything -- it replaces one grouped `summarise()` over half a million rows with twenty-five thousand
+`summarise()` calls over twenty, and pays `dplyr`'s fixed dispatch cost for every one of them.
 
-It is also the only unit that is provably safe. Every 04B rule reads one document -- grouping
-compares names within a document, the window measures from a party in the same document, the
-ambiguous city takes a state the same contract names. So a rule applied per document cannot be
-computing a quantity over the group it happened to be handed. An earlier version needed a whole
-Validation section to establish that; here there is no group to compute over.
+So the unit is a **chunk of documents**, and Validation establishes that the choice of chunk cannot
+change an answer rather than arguing it from the code.
 
-**The read is per window and the work is per document.** One DuckDB query loads `WindowSize`
-documents' spans, the parent splits them by `DocID`, and the workers take one each. The database is
-asked a few hundred times over a corpus rather than a million.
+**The worker reads its own data.** It is handed a list of `DocID`s and opens its own database
+connection, its own anchors and its own spans. Nothing span-grain crosses a process boundary in
+either direction: the parent splits a character vector and collects a row of numbers. The reverse
+arrangement -- the parent reads and ships to workers -- makes the parent the bottleneck and
+serialisation the dominant cost, whatever the unit of work happens to be.
+
+Anchors cost about a fifth of a second for twenty-five thousand documents and a chunk's spans are one
+range-bounded query, so a worker reading for itself is cheaper than a parent sending it the answer.
+
+## Failure costs one document
+
+A chunk that throws is retried in groups of `RetryFloor`, and a group that throws again one document
+at a time. A single unparseable contract therefore costs itself and nothing else, and a healthy
+corpus never pays for the machinery. That is the isolation a per-document unit would buy, kept as an
+exception path instead of as the design.
 
 ## Resumption is by document
 
 A pass asks which documents the ledger has and which are already written; the difference is the work.
-Nothing is named for a position, so the window size can change between renders at no cost and a
-population that grew -- a family still finishing extraction -- simply adds to the queue.
+Nothing is named for a position, so the chunk size can change between renders at no cost and a
+population that grew simply adds to the queue.
 
-**A window commits as a directory.** Outputs and a `_done.parquet` go into a hidden name which is
-then renamed into place. A rename within one filesystem is atomic, so a killed process leaves a
+**A chunk commits as a directory.** Everything it produces goes into a hidden name which is then
+renamed into place. A rename within one filesystem is atomic, so a process killed mid-write leaves a
 dotfile no glob sees.
 
 **`_done.parquet` names every document processed**, not every document that produced a row. Seven of
-the eight releases carry a row only where the extractor found something -- `redact_spans` reaches 14%
-of documents -- so resuming on the outputs would reprocess the other 86% on every render, forever. A
+the eight releases carry a row only where the extractor found something -- `redact_spans` reaches 19%
+of documents -- so resuming on the outputs would reprocess the other 81% on every render, forever. A
 document that *failed* is left out of it and retried.
 
-## The output directory is the release
+## The release is eight long files
 
-A directory of parquets already *is* an arrow dataset, so there is no final bind. **No collapse is
-written** -- the export calls `geo_collapse()`, `dte_collapse()`, `mny_collapse()` and
-`red_collapse()`.
+A directory of parquets already *is* an arrow dataset, so there is no final bind and no moment where
+a partial pass could be assembled into something that looks finished.
+
+Two underscore-prefixed files sit beside them and are **not part of the release**: `_done.parquet`
+says which documents a chunk processed, and `_facts.parquet` carries the document-grain collapse this
+document reports from. The collapse is written because the call that produced the release computed it
+already -- `dte_apply()`, `mny_apply()` and `red_apply()` each return it -- so discarding it here and
+rebuilding it in Results would be the same arithmetic twice, with two chances to disagree. **The
+export reads neither**: it calls `ent_party_facts()`, `geo_collapse()`, `dte_collapse()`,
+`mny_collapse()` and `red_collapse()` over the long files itself.
 
 ## Testing before committing
 
-`Limit` takes the first N documents of every population and writes into its own directory.
+`Limit` takes the first N documents of every population and writes into its own directory, so a
+rehearsal and a full run can sit on disk together without either reading the other.
 
 # Configuration
 
@@ -151,7 +170,7 @@ written** -- the export calls `geo_collapse()`, `dte_collapse()`, `mny_collapse(
 
 .lP <- list(
   Input = list(
-    # 04C's corpus stores, one per family.
+    # 04C's corpus stores, one DuckDB file per family.
     Store = fs::path(
       init_create_script_dir(.dir_here = here::here(), .name_script = "04C-EntityCorpus"),
       "Output"
@@ -160,7 +179,17 @@ written** -- the export calls `geo_collapse()`, `dte_collapse()`, `mny_collapse(
       init_create_script_dir(.dir_here = here::here(), .name_script = "02B-Register"),
       "Output", "Documents.parquet"
     ),
-    Lookup = here::here("contracts-extract", "src", "matcon_extract", "data", "geo_lookup.parquet")
+    Lookup = here::here("contracts-extract", "src", "matcon_extract", "data", "geo_lookup.parquet"),
+    # THE CORPUS LABEL SPINE, AND IT IS A DIRECTORY. 03F writes contract_labels_L<max_len>.parquet,
+    # so the file name depends on the token limit that produced it and ent_release_path() resolves
+    # it. READ BY THE OVERVIEW AND BY NOTHING ELSE: the five passes take their anchors from the
+    # register alone, so no released file carries a class column and no pass can fail for want of
+    # one. Every headline figure below is split by contract type, and a type is a label rather than
+    # an extraction result.
+    Labels = fs::path(
+      init_create_script_dir(.dir_here = here::here(), .name_script = "03F-ClassifyApply"),
+      "release"
+    )
   ),
   Params = list(
     # THE FIVE PASSES IN DEPENDENCY ORDER. GPE reads ORG's file, so ORG runs first; the other three
@@ -171,38 +200,40 @@ written** -- the export calls `geo_collapse()`, `dte_collapse()`, `mny_collapse(
     # ent_load_org() aborts on a missing one and the abort should name a choice this document made.
     Extras = list(ORG = c("NameCore", "LegalForm", "Description")),
 
-    # DOCUMENTS READ AT ONCE. The window is how many documents' spans one DuckDB query loads; the
-    # unit of WORK below it is one document. It is in no hash and names no directory, so it can
-    # change between renders freely.
-    #
-    # SMALLER THAN IT LOOKS LIKE IT SHOULD BE, and the reason is the split rather than the read. A
-    # window becomes one R object per document per input table, each carrying its own class, names
-    # and row-names attributes -- so twenty thousand documents across four tables is eighty thousand
-    # tibbles live in the parent at once, which is gigabytes of overhead for a few hundred thousand
-    # rows of data. Five thousand keeps that bounded while still asking DuckDB only a few hundred
-    # times over the corpus.
-    WindowSize = 5000L,
+    # DOCUMENTS PER CHUNK. A memory dial, not a correctness one: Validation shows the answer does not
+    # depend on it. Measured on this corpus, twenty-five thousand documents is about 650,000 GPE
+    # spans, which is a quarter of a gigabyte in and roughly a gigabyte through the chain.
+    ChunkSize = 2500,
 
-    # WORKERS. Each takes one document at a time. The rules are single-threaded R, so this is where
-    # the parallelism is; the LOADS are DuckDB and already use every core, which is why they happen
-    # once per window in the parent rather than per document in a worker. 1 runs serially.
-    Workers = 24L,
+    # WORKERS. The chains are single-threaded R, so this is where the parallelism is. Twelve rather
+    # than twenty-four because each worker holds a whole chunk and opens its own database; the reads
+    # are one to two seconds against a chain of two to sixty, so contention buys nothing.
+    Workers = 12L,
 
-    # NULL IS THE FULL CORPUS. Set this to a number to test: a limited run takes the first N
+    # THREADS PER WORKER CONNECTION. Twelve DuckDB connections each helping themselves to every core
+    # is 288 threads on a 24-core machine. Read by ner_db_connect() from an option, so nothing
+    # outside this document's daemons is affected.
+    DuckThreads = 2L,
+
+    # DOCUMENTS PER RETRY GROUP. A chunk that throws is split into groups of this size, and a group
+    # that throws again into single documents. Never reached on a healthy corpus.
+    RetryFloor = 500L,
+
+    # NULL IS THE FULL CORPUS. Set this to a number to rehearse: a limited run takes the first N
     # documents of every population -- the same first N, because every index is ordered by DocID --
     # and writes into its own directory.
     Limit = NULL,
+
+    # WHICH ENGINE'S LABEL THE OVERVIEW SPLITS BY. 03F's release carries every engine side by side
+    # and no single Class column, because which one is authoritative is a decision. 03B crowned
+    # legal-bert, so Bert it is -- and nothing but the figures reads this.
+    Engine = "Bert",
 
     # The cue window DATE narrows the stored 160 characters to. MONEY's lives in its own
     # specification because it is swept there.
     CueWin = list(Date = 120L)
   )
 )
-
-# ent_filer_keys() TAKES A PATH AND A WINDOW LOAD RUNS IN THE PARENT, so the register's location travels
-# inside the parameter list rather than through a closure that would not survive the process
-# boundary.
-.lP$Params$PathRegister <- .lP$Input$Register
 
 # THE RULES THEMSELVES, each constructed by the 04B function that defined it, with every argument
 # named at the value 04B released. A dial not named here is a decision nobody reviewed.
@@ -215,11 +246,11 @@ written** -- the export calls `geo_collapse()`, `dte_collapse()`, `mny_collapse(
 
 .lP$Params$Spec <- list(
   Org = ent_window_spec(
-    .par        = 2000,   # 04B1: characters either side of the registrant
-    .tail_share = 0.10    # 04B1: the final tenth, counted as signatories
+    .par        = 2000,    # 04B1: characters either side of the registrant
+    .tail_share = 0.10     # 04B1: the final tenth, counted as signatories
   ),
   Geo = geo_spec(
-    .reach = 200          # 04B2: furthest a party may be and still claim a place
+    .reach = 200           # 04B2: furthest a party may be and still claim a place
   ),
   Date = dte_spec(
     .start     = "latest", # 04B3: the latest date at or before the filing
@@ -227,11 +258,11 @@ written** -- the export calls `geo_collapse()`, `dte_collapse()`, `mny_collapse(
     .cap_years = 30        # 04B3: dropped above this, not winsorised
   ),
   Money = mny_spec(
-    .filter  = "par",     # 04B4: drops a zero, and a figure with par-value language beside it
-    .cue_win = 60L        # 04B4: characters read EITHER SIDE
+    .filter  = "par",      # 04B4: drops a zero, and a figure with par-value language beside it
+    .cue_win = 60L         # 04B4: characters read EITHER SIDE
   ),
   Redact = red_spec(
-    .tol = 10L            # 04B5: slack between a marker and a withheld price that do not overlap
+    .tol = 10L             # 04B5: slack between a marker and a withheld price that do not overlap
   )
 )
 
@@ -252,6 +283,11 @@ if (any(!tab_inputs$Exists)) {
 }
 ```
 
+The loader `ent_load_entity()` bounds its SQL on the `DocID` range the chunk covers. That bound
+cannot change an answer -- the `inner_join` beneath it is the membership test and always was -- but
+without it every chunk reads the whole entity table and discards 98% of it, which on matcon's GPE
+table is 27.6 million rows carrying two 160-character cue columns, once per chunk.
+
 ## The five policies, and the directories they name
 
 ```{r}
@@ -265,11 +301,11 @@ tab_describe <- ner_describe(
   .lexnlp_image = "contracts-lexnlp"
 )
 
-# THE HASHES ARE BUILT IN DEPENDENCY ORDER, because GPE's folds in ORG's. Computing them in a loop
+# THE HASHES ARE BUILT IN DEPENDENCY ORDER, because GPE's folds in ORG's. Computing them in a fold
 # rather than by hand is what keeps that true when a sixth pass arrives.
 .lP$Params$Hash <- purrr::reduce(
-  .x    = .lP$Params$Passes,
-  .f    = function(.acc, .p) {
+  .x = .lP$Params$Passes,
+  .f = function(.acc, .p) {
     dep_ <- apl_pass_spec(.pass = .p)$Depends
     c(.acc, purrr::set_names(
       apl_policy_hash(
@@ -284,7 +320,7 @@ tab_describe <- ner_describe(
   .init = character(0)
 )
 
-# THE LIMIT NAMES THE DIRECTORY AND THE BATCH SIZE DOES NOT. A test run and a full run must never
+# THE LIMIT NAMES THE DIRECTORY AND THE CHUNK SIZE DOES NOT. A rehearsal and a full run must never
 # share output; how the work was divided is nobody's business once it is written.
 .suffix <- if (is.null(.lP$Params$Limit)) "" else paste0("-limit", .lP$Params$Limit)
 
@@ -320,9 +356,9 @@ tab_index <- purrr::set_names(
   purrr::map(
     .lP$Params$Passes,
     \(.p) apl_corpus_index(
-      .dir_store = .lP$Input$Store,
-      .pass      = .p,
-      .limit     = .lP$Params$Limit
+      .dir_store = .lP$Input$Store,     # 04C's stores, one per family
+      .pass      = .p,                  # which family's ledger and which entities
+      .limit     = .lP$Params$Limit     # NULL is the full population
     )
   ),
   .lP$Params$Passes
@@ -330,65 +366,61 @@ tab_index <- purrr::set_names(
 
 tibble::tibble(
   Pass       = names(tab_index),
-  Family     = purrr::map_chr(names(tab_index), \(.p) apl_pass_spec(.p)$Family),
-  Needs      = purrr::map_chr(names(tab_index), \(.p) paste(apl_pass_spec(.p)$Needs,
-                                                            collapse = ", ")),
+  Family     = purrr::map_chr(names(tab_index), \(.p) apl_pass_spec(.pass = .p)$Family),
+  Needs      = purrr::map_chr(names(tab_index),
+                              \(.p) paste(apl_pass_spec(.pass = .p)$Needs, collapse = ", ")),
   Population = purrr::map_int(tab_index, nrow)
 ) |>
   dplyr::mutate(Population = format(.data$Population, big.mark = ",")) |>
   tbl_say(.title = "What each pass will reach")
 ```
 
-**The population is per family, not per entity.** The preflight measured it: every matcon entity
-finished the same documents and every lexnlp entity the same. So ORG runs on lexnlp's population and
-the other four on matcon's, and the gap between them is documents where places exist and parties do
-not yet.
+**The population is per family, not per entity.** Every matcon entity finished the same documents and
+every lexnlp entity the same, so ORG runs on lexnlp's population and the other four on matcon's. Where
+the two differ, a place in a document ORG has not reached carries `Attached = FALSE` and a null
+`PartyKey` -- a refusal recorded in the file rather than a row missing from it -- and any attachment
+rate is therefore reported over the documents `org_mentions` actually names.
 
-**That gap is correct behaviour rather than a defect.** The long file keeps refusals: a place with no
-party to attach to carries `Attached = FALSE` and a null `PartyKey`, which is a measurement. The gap
-closes on its own as LexNLP finishes.
+**The ledger and not the entity tables.** A document processed and found to hold no date has no row in
+the date table and is not missing: it is a contract with no date in it, which is a measurement. Taking
+the population from the tables would silently drop exactly those documents.
 
-## The anchors and the gazetteer
+## Output from an earlier design
 
 ```{r}
-#| label: build-keys
+#| label: check-legacy
 
-tab_keys <- purrr::set_names(
-  purrr::map(
-    .lP$Params$Passes,
-    \(.p) apl_keys(
-      .path_register = .lP$Input$Register,  # 02B: CIK, CompanyName, DateFiled, nWords, nChars, nCIK
-      .index         = tab_index[[.p]]
-    )
-  ),
-  .lP$Params$Passes
-)
+apl_check_legacy(.dirs = .lP$Output$Store)
+```
 
+An earlier version of this document named its committed directories `window-*`; this one names them
+`chunk-*`. Nothing here reads the old name, so an interrupted run under the old design would sit in a
+release directory being neither read nor counted. It is reported rather than removed, because a
+superseded output is renamed out of the way and kept as a record of what was previously concluded.
+
+## The gazetteer
+
+```{r}
+#| label: build-gazetteer
+
+# THE SERIAL PATH'S COPY. Each daemon builds its own, once, because 181,810 rows sent with every
+# chunk would cost more than the rule that reads them.
 geo_once <- list(
   Lookup = geo_lookup(.path_lookup = .lP$Input$Lookup),
   Cand   = geo_candidates(.path_lookup = .lP$Input$Lookup)
 )
-
 ```
-
-**The register and nothing else.** No release function reads `Class` -- it appears only in the
-collapses and in reports, both of which join it at their own time. So this document needs no label
-release, no partial-release check and no dependency on the classification stage, which is three
-failure modes removed rather than handled.
-
-**The gazetteer is read once for the whole render**, and each daemon reads it once for itself. It is
-181,810 rows and read-only, so it is the one thing every GPE chunk shares.
 
 # Apply
 
-Each section reads what its ledger has, subtracts what is written, and runs the rest. **ORG first**,
+Each pass reads what its ledger has, subtracts what is written, and runs the rest. **ORG first**,
 because GPE reads its file; the other three are independent of both and of each other.
 
 ```{r}
 #| label: apply-setup
 
 # ASKED FRESH IN EVERY SECTION rather than once here, because a pass that just ran has changed its
-# own done set and a family still extracting has a larger population than it did a minute ago.
+# own done set.
 apl_todo <- function(.pass) {
   setdiff(tab_index[[.pass]]$DocID, apl_done_ids(.dir = .lP$Output$Store[[.pass]]))
 }
@@ -399,14 +431,14 @@ apl_todo <- function(.pass) {
 ```{r}
 #| label: run-org
 
-res_org <- apl_entity_run(
-  .pass        = "ORG",
-  .keys        = tab_keys$ORG,
-  .todo        = apl_todo(.pass = "ORG"),
-  .dir_out     = .lP$Output$Store[["ORG"]],
-  .params      = .lP$Params,
-  .dir_store   = .lP$Input$Store,
-  .path_fun    = .path_libs          # a daemon has none of this loaded; it sources by path
+res_org <- apl_pass_run(
+  .pass     = "ORG",
+  .todo     = apl_todo(.pass = "ORG"),          # population minus what is already written
+  .dir_out  = .lP$Output$Store[["ORG"]],
+  .paths    = .lP$Input,                        # a worker resolves its own reads from these
+  .params   = .lP$Params,
+  .geo      = NULL,                             # ORG reads no gazetteer
+  .path_fun = .path_libs                        # a daemon has none of this loaded; it sources by path
 )
 ```
 
@@ -415,21 +447,19 @@ res_org <- apl_entity_run(
 ```{r}
 #| label: run-gpe
 
-# THE ONE CROSS-PASS READ. Built here rather than inside a window, because it scans one column of
-# each of ORG's files and would otherwise do so once per window.
+# THE ONE CROSS-PASS READ. Built here rather than inside a chunk, because it scans one column of each
+# of ORG's files and would otherwise do so once per chunk.
 tab_dep_org <- apl_dep_index(.dir = .lP$Output$Store[["ORG"]], .stem = "org_mentions")
 
-res_gpe <- apl_entity_run(
-  .pass        = "GPE",
-  .keys        = tab_keys$GPE,
-  .todo        = apl_todo(.pass = "GPE"),
-  .dir_out     = .lP$Output$Store[["GPE"]],
-  .params      = .lP$Params,
-  .dir_store   = .lP$Input$Store,
-  .geo         = geo_once,           # the serial path's copy; a daemon builds its own
-  .dep_index   = tab_dep_org,        # which of ORG's files each window overlaps
-  .path_lookup = .lP$Input$Lookup,   # each daemon reads the gazetteer once, not once per document
-  .path_fun    = .path_libs
+res_gpe <- apl_pass_run(
+  .pass      = "GPE",
+  .todo      = apl_todo(.pass = "GPE"),
+  .dir_out   = .lP$Output$Store[["GPE"]],
+  .paths     = .lP$Input,
+  .params    = .lP$Params,
+  .geo       = geo_once,                        # the serial path's copy; a daemon builds its own
+  .dep_index = tab_dep_org,                     # which of ORG's files each chunk overlaps
+  .path_fun  = .path_libs
 )
 ```
 
@@ -438,14 +468,13 @@ res_gpe <- apl_entity_run(
 ```{r}
 #| label: run-date
 
-res_date <- apl_entity_run(
-  .pass      = "DATE",
-  .keys      = tab_keys$DATE,
-  .todo      = apl_todo(.pass = "DATE"),
-  .dir_out   = .lP$Output$Store[["DATE"]],
-  .params    = .lP$Params,
-  .dir_store = .lP$Input$Store,
-  .path_fun  = .path_libs
+res_date <- apl_pass_run(
+  .pass     = "DATE",
+  .todo     = apl_todo(.pass = "DATE"),
+  .dir_out  = .lP$Output$Store[["DATE"]],
+  .paths    = .lP$Input,
+  .params   = .lP$Params,
+  .path_fun = .path_libs
 )
 ```
 
@@ -454,14 +483,13 @@ res_date <- apl_entity_run(
 ```{r}
 #| label: run-money
 
-res_money <- apl_entity_run(
-  .pass      = "MONEY",
-  .keys      = tab_keys$MONEY,
-  .todo      = apl_todo(.pass = "MONEY"),
-  .dir_out   = .lP$Output$Store[["MONEY"]],
-  .params    = .lP$Params,
-  .dir_store = .lP$Input$Store,
-  .path_fun  = .path_libs
+res_money <- apl_pass_run(
+  .pass     = "MONEY",
+  .todo     = apl_todo(.pass = "MONEY"),
+  .dir_out  = .lP$Output$Store[["MONEY"]],
+  .paths    = .lP$Input,
+  .params   = .lP$Params,
+  .path_fun = .path_libs
 )
 ```
 
@@ -470,14 +498,13 @@ res_money <- apl_entity_run(
 ```{r}
 #| label: run-redact
 
-res_redact <- apl_entity_run(
-  .pass      = "REDACT",
-  .keys      = tab_keys$REDACT,
-  .todo      = apl_todo(.pass = "REDACT"),
-  .dir_out   = .lP$Output$Store[["REDACT"]],
-  .params    = .lP$Params,
-  .dir_store = .lP$Input$Store,
-  .path_fun  = .path_libs
+res_redact <- apl_pass_run(
+  .pass     = "REDACT",
+  .todo     = apl_todo(.pass = "REDACT"),
+  .dir_out  = .lP$Output$Store[["REDACT"]],
+  .paths    = .lP$Input,
+  .params   = .lP$Params,
+  .path_fun = .path_libs
 )
 ```
 
@@ -491,9 +518,10 @@ tab_pass <- purrr::list_rbind(list(res_org, res_gpe, res_date, res_money, res_re
 apl_report_pass(.tab = tab_pass, .index = tab_index, .dirs = .lP$Output$Store)
 ```
 
-**`LoadShare` is the read against the rules.** Loading is DuckDB and already uses every core; the
-rules are single-threaded R, one document at a time. A high share means the window is too small and
-the database is being asked too often; a low one means workers are what help.
+`Secs` is worker time summed rather than wall clock, so the elapsed figure is roughly that divided by
+the worker count. On a first render `Left` falls to zero across all five passes; on any later one
+every pass reports nothing outstanding and the whole section takes seconds, which is what makes an
+always-executed document affordable.
 
 # Results
 
@@ -507,22 +535,22 @@ tab_out <- apl_table_outputs(.dirs = .lP$Output$Store, .index = tab_index)
 apl_report_outputs(.tab = tab_out)
 ```
 
+**Only `org_mentions` is built from the key side**, so it alone must read 100%: 04B1 writes a sentinel
+row for a contract in which no organisation was found. The other seven are span files, and a
+percentage below 100 there is a measurement about the corpus rather than a gap in the pass.
+
+The denominator for any rate is therefore the pass's population and never the file's own `DocID`
+count. A contract with no redaction marker has no row in `redact_spans` and still redacted nothing;
+counting only the documents present would report every contract in the corpus as having redacted
+something.
+
 ## The rule against the naive definition
 
 ```{r}
 #| label: report-naive
 
 tab_facts <- purrr::set_names(
-  purrr::map(.lP$Params$Passes, function(.p) {
-    dep_ <- apl_pass_spec(.pass = .p)$Depends
-    apl_facts(
-      .pass      = .p,
-      .dir       = .lP$Output$Store[[.p]],
-      .keys      = tab_keys[[.p]],
-      .params    = .lP$Params,
-      .dep_index = if (.p == "GPE") tab_dep_org else NULL
-    )
-  }),
+  purrr::map(.lP$Params$Passes, \(.p) apl_facts(.dir = .lP$Output$Store[[.p]])),
   .lP$Params$Passes
 )
 
@@ -532,18 +560,74 @@ apl_report_naive(.tab = tab_naive, .limit = .lP$Params$Limit)
 ```
 
 **Every pair comes from the same collapse function 04B reports from.** `ent_doc_facts()`,
-`geo_doc_facts()`, `dte_collapse()`, `mny_collapse()` and `red_collapse()` run here chunk by chunk,
-so a corpus figure and a sample figure are one query on different data rather than two
-implementations free to disagree at the third decimal.
+`geo_doc_facts()`, `dte_collapse()`, `mny_collapse()` and `red_collapse()` ran inside the chunk that
+produced the release, so a corpus figure and a sample figure are one query on different data rather
+than two implementations free to disagree at the third decimal.
 
-**Only the document-level result is kept.** Each collapse is per document, so a chunk's collapse is
-exact; binding the document rows gives about a million rows and a dozen columns. Collecting the long
-files themselves would not fit that description.
+**Read these against 04B's own headline tables.** A corpus rate far from the sample rate is either a
+finding about representativeness or a defect in this pass, and the two are told apart by reading spans
+rather than by reading this table.
 
-**The denominator is the chunk's document list and never the file's.** Seven of the eight releases
-carry a row only where the extractor found something, so a rate computed over the documents present
-would report every contract as having redacted something, named a place, or stated a term. What the
-chunk was *asked* about is the only honest denominator.
+# Validation
+
+## The partition cannot change an answer
+
+```{r}
+#| label: check-split
+
+# THE SAME DOCUMENTS, CUT TWO WAYS. Four hundred is enough for every chain to exercise its grouping:
+# ORG merges spellings within a contract, GPE resolves an ambiguous city against a state the same
+# contract names, REDACT matches a marker to a price by offset. If any of those ever reached outside
+# the document it was handed, the halves would disagree here.
+#
+# TAKEN FROM THE MIDDLE AND NOT THE HEAD. A DocID begins with an accession number, which begins with
+# the filer's CIK, so the first four hundred documents of a sorted population are the oldest
+# registrants rather than a fair draw of contracts.
+.n_split <- 400L
+
+apl_split_ids <- function(.pass) {
+  ids_  <- tab_index[[.pass]]$DocID
+  from_ <- max(1L, floor(length(ids_) / 2L))
+  ids_[seq.int(from_, min(length(ids_), from_ + .n_split - 1L))]
+}
+
+tab_split <- purrr::map(.lP$Params$Passes, function(.p) {
+  apl_check_split(
+    .pass      = .p,
+    .doc_ids   = apl_split_ids(.pass = .p),
+    .paths     = .lP$Input,
+    .params    = .lP$Params,
+    .geo       = geo_once,
+    .dep_index = if (.p == "GPE") tab_dep_org else NULL
+  )
+}) |>
+  purrr::list_rbind()
+
+apl_report_split(.tab = tab_split, .n = .n_split)
+```
+
+This is the claim the whole design rests on, and it is checked rather than argued. Every grouping and
+every join key in all five chains carries `DocID`, so a rule applied to a chunk cannot be reading a
+quantity computed over the group it happened to be handed -- but that is a property of code as it
+stands today, and a rule that grew a corpus-wide denominator tomorrow would make the released numbers
+depend on the chunk size with nothing to notice. 04B1's family-frequency gate was removed for exactly
+that reason; this is what would catch its return.
+
+A failure here means the release is not reproducible and should not be published, which is why it
+aborts rather than warns.
+
+## The done set and the release agree
+
+```{r}
+#| label: check-done
+
+apl_report_done(.tab = apl_check_done(.dirs = .lP$Output$Store, .index = tab_index))
+```
+
+Three ways for the partition to have leaked, all of them silent in the output. A document named in two
+`_done` files was processed twice and its rows are in the release twice. A document processed that the
+ledger does not name came from somewhere this document cannot account for. A file holding rows for a
+document no chunk recorded processing means a chunk wrote about something it was not asked about.
 
 # Robustness
 
@@ -556,13 +640,209 @@ apl_report_schema(.tab = apl_check_schema(.dirs = .lP$Output$Store))
 ```
 
 **The same check 04B runs, on the corpus rather than the sample.** Each 04B document builds a
-dictionary from a declared list and aborts where it disagrees with the file it wrote; running the
-same functions here is what says the corpus release has the same shape as the sample release.
+dictionary from a declared list and aborts where it disagrees with the file it wrote; running the same
+functions here is what says the corpus release has the same shape as the sample release, so a reader
+who knows one knows the other.
 
 Schema from Arrow, never inferred -- `names(open_dataset())` reads the parquet's own schema, so a
-column added or renamed by a chain is seen as the file has it rather than as this document expects.
+column added or renamed by a chain is seen as the file has it rather than as this document expects it.
+
+# Deployment
+
+```{r}
+#| label: report-release
+
+tibble::tibble(
+  Pass = .lP$Params$Passes,
+  Path = purrr::map_chr(.lP$Params$Passes,
+                        \(.p) fs::path_rel(.lP$Output$Store[[.p]], start = here::here())),
+  Chunks = purrr::map_int(.lP$Params$Passes,
+                          \(.p) length(apl_chunk_dirs(.dir = .lP$Output$Store[[.p]])))
+) |>
+  tbl_say(.title = "Where each pass's release is, and how many chunks it holds")
+```
+
+Each path is a directory of chunk directories, and each chunk directory holds that pass's release
+files plus `_done.parquet` and `_facts.parquet`. A consumer opens the release with
+`arrow::open_dataset()` over the matching stem across all chunks; the two underscore-prefixed files
+are this document's bookkeeping and belong to no downstream reader.
 
 # Overview
+
+Everything below is a corpus version of a figure one of the five 04B documents already produced on
+4,398 documents. Nothing here is new: it is the same rule, the same function and the same argument,
+read against 1.19 million contracts instead of a sample, so the question each figure answers is
+whether the sample was telling the truth.
+
+## The label spine the figures split by
+
+```{r}
+#| label: overview-labels
+
+# 03F STAMPS THE TOKEN LIMIT INTO THE FILE NAME, so the release is found rather than named.
+path_labels <- ent_release_path(.dir_release = .lP$Input$Labels)
+
+tab_class <- apl_class(
+  .path_release = path_labels,                    # NA aborts, naming 03F
+  .engine       = .lP$Params$Engine,              # which engine's label is authoritative
+  .doc_ids      = unique(unlist(purrr::map(tab_index, \(.t) .t$DocID), use.names = FALSE))
+)
+
+# THE FACTS AGAIN, RESTRICTED TO THE DOCUMENTS THAT CARRY A TYPE. Read once in Results and joined
+# here; the by-type figures therefore describe a smaller population than the tables above, and the
+# coverage line says how much smaller.
+tab_facts_class <- apl_label_facts(.facts = tab_facts, .class = tab_class)
+```
+
+**No released file carries a class column and no pass reads one.** The five passes take their anchors
+from the register alone, which is why nothing in Apply, Results or Validation can fail for want of a
+label. The figures are the exception, and they are the only one.
+
+## The tables the figures are drawn from
+
+```{r}
+#| label: overview-tables
+
+# THE 04B TABLE FUNCTIONS, CALLED ON CORPUS INPUT. Not one of these is reimplemented here: a figure
+# that looked like 04B's but was computed differently would be the worst of both.
+tab_org_naive <- ent_table_naive(.doc = tab_facts_class$ORG)
+tab_gpe_naive <- geo_table_naive(.doc = tab_facts_class$GPE)
+
+tab_gpe_law <- geo_table_law_top(
+  .law = apl_law(.dir = .lP$Output$Store[["GPE"]]),   # Jurisdiction and its level, nothing else
+  .n   = 15L                                          # the tail is long and uninformative
+)
+
+# THE DENOMINATOR IS THE WHOLE POPULATION AND NOT THE LABELLED PART. PctDocs is the share of
+# contracts carrying a marker of each kind, and restricting it to labelled documents would report a
+# rate about 03F's coverage rather than about redaction.
+tab_red_kind <- red_table_kind(
+  .marks   = apl_marks(.dir = .lP$Output$Store[["REDACT"]]),
+  .release = tab_facts$REDACT
+)
+
+# ROW COUNTS FOR THE FIGURE LADDER, taken once here so no chunk option has to compute one. Height is
+# the only dimension that varies; width is global and set in _quarto.yml.
+.fig_n <- list(
+  Class  = dplyr::n_distinct(tab_class$Class),
+  Law    = nrow(tab_gpe_law),
+  Source = dplyr::n_distinct(
+    dplyr::filter(tab_facts$DATE, !is.na(.data$DurationYears),
+                  .data$DurationSource != "none")$DurationSource
+  ),
+  Kind   = nrow(tab_red_kind)
+)
+```
+
+## Parties
+
+```{r}
+#| label: fig-org-naive
+#| fig-height: !expr plot_height(.fig_n$Class)
+#| fig-cap: "Mean counterparties per contract by type: every distinct organisation the
+#|   extractor proposed, against only those the rule keeps."
+
+ent_plot_naive(.tab = tab_org_naive)
+```
+
+The naive bar is what a reader gets by counting distinct organisation names in a contract. The rule
+bar is what survives grouping spellings into parties, matching the registrant and its co-filers
+against EDGAR, and keeping only what sits inside the window around the contracting party. The gap
+between the two is the rule, read directly, and it is largest exactly where it should be: on the
+agreement types whose exhibit lists and cross-references name companies that are not parties to
+anything.
+
+## Geography
+
+```{r}
+#| label: fig-gpe-naive
+#| fig-height: !expr plot_height(.fig_n$Class)
+#| fig-cap: "Distinct states per contract by type, at three rungs: every place resolved,
+#|   those outside a governing-law clause, and those the rule attaches to a counterparty."
+
+geo_plot_naive(.tab = tab_gpe_naive)
+```
+
+Each rung is one filter further than the last, so a reader who rejects a step takes the bar above it.
+The step from naive to law-free removes the states named only because a contract says which law
+governs it; the step to the rule removes every remaining place that sits too far from any party to be
+that party's address.
+
+```{r}
+#| label: fig-gpe-law
+#| fig-height: !expr plot_height(.fig_n$Law)
+#| fig-cap: "The fifteen commonest governing-law jurisdictions, as a share of the clauses
+#|   that name one."
+
+geo_plot_law(.tab = tab_gpe_law)
+```
+
+The jurisdiction is not extracted as such: `lawregex` locates the clause and the jurisdiction is the
+place span sitting inside it, resolved by the same gazetteer that resolves every other place. The
+concentration this figure shows is the check on that -- a governing-law rule that were picking up
+noise would not produce this distribution.
+
+## Dates
+
+```{r}
+#| label: fig-date-source
+#| fig-height: !expr plot_height(.fig_n$Class)
+#| fig-cap: "Where each contract's duration came from, by type, as a share of contracts."
+
+dte_plot_source(.dur = tab_facts_class$DATE)
+```
+
+The cascade tries a stated term first, then a cued end date, then any future date, and records which
+rung answered. A type dominated by the stated-term rung is one whose drafters write the duration
+down; a type dominated by the later rungs is one where the duration is inferred, and every figure
+resting on it inherits that.
+
+```{r}
+#| label: fig-date-spread
+#| fig-height: !expr plot_height(.fig_n$Source)
+#| fig-cap: "Contract duration in years, by the rung that produced it. Read the spread across
+#|   rungs rather than the medians."
+
+dte_plot_spread(.dur = tab_facts$DATE)
+```
+
+This is the figure the duration argument rests on. The naive definition -- the furthest future date
+anywhere in the document -- has a standard deviation the Results table puts in the hundreds of years,
+because a contract mentioning a patent expiry or a perpetual licence gets that date as its term. Under
+the cascade and the thirty-year cap the spread is a few years, and this figure shows where the
+remaining variation actually sits.
+
+## Money
+
+```{r}
+#| label: fig-money-max
+#| fig-height: !expr plot_height(.fig_n$Class)
+#| fig-cap: "The largest USD amount per contract by type, on a log scale, after the zero and
+#|   par-value filters."
+
+mny_plot_max(.release = tab_facts_class$MONEY)
+```
+
+Contract value is the quantity most likely to be read straight out of this pipeline, and the ordering
+across types is the sanity check on it. The filters remove a par value of $0.0001 per share and every
+zero; what remains is the largest figure the contract actually names, which is not the same thing as
+its value and should not be reported as if it were.
+
+## Redactions
+
+```{r}
+#| label: fig-redact-kind
+#| fig-height: !expr plot_height(.fig_n$Kind)
+#| fig-cap: "Each marker kind as a share of all markers, and as the share of contracts
+#|   carrying at least one."
+
+red_plot_kind(.tab = tab_red_kind)
+```
+
+The two bars answer different questions and disagree for a reason. A handful of contracts carry
+thousands of markers, so the span-weighted share describes those documents; the document-weighted
+share describes the corpus. Where a kind is large on the first bar and small on the second, it is a
+property of a few filings rather than of redaction practice.
 
 ## The five passes in one table
 

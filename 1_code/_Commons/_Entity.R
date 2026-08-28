@@ -682,9 +682,28 @@ ent_load_entity <- function(.dir_store, .family, .entity, .lens, .extras = chara
     glue::glue(" AND Model = '{.model}'")
   }
 
+  # THE RANGE COMES FROM .lens AND CANNOT CHANGE AN ANSWER. The inner_join below is the membership
+  # test and it always was; bounding the READ on the same column only declines to fetch rows that
+  # join could not have kept. A caller passing a scattered .lens still gets exactly its rows -- it
+  # just also reads the gaps, which is the behaviour this function had for every caller before.
+  #
+  # THIS IS THE WHOLE OF 04D'S CORPUS PROBLEM. On 04A's sample store the bound spans the table and
+  # this is a no-op. On 04C's corpus store the unbounded read materialised every span of every
+  # document -- for matcon GPE, thirty million rows carrying two 160-character cue columns -- and it
+  # did that ONCE PER WINDOW, PER INPUT TABLE. Three 04D designs were rewritten to fix a parent that
+  # was never the problem.
+  bound_ <- if (nrow(.lens) == 0L) {
+    " AND FALSE"
+  } else {
+    paste0(
+      " AND DocID BETWEEN ", DBI::dbQuoteString(con_, min(.lens$DocID)),
+      " AND ", DBI::dbQuoteString(con_, max(.lens$DocID))
+    )
+  }
+
   raw_ <- DBI::dbGetQuery(con_, glue::glue(
     "SELECT {paste(sel_, collapse = ', ')} FROM {tbl_}
-      WHERE Start IS NOT NULL{scope_}"
+      WHERE Start IS NOT NULL{scope_}{bound_}"
   )) |>
     tibble::as_tibble()
 

@@ -1008,7 +1008,16 @@ ner_db_connect <- function(.db_path, .read_only = FALSE) {
     .read_only <- TRUE
   }
   fs::dir_create(fs::path_dir(.db_path))
-  DBI::dbConnect(duckdb::duckdb(dbdir = as.character(.db_path), read_only = .read_only))
+  con_ <- DBI::dbConnect(duckdb::duckdb(dbdir = as.character(.db_path), read_only = .read_only))
+
+  # THREADS FROM AN OPTION, NOT AN ARGUMENT. Every caller of this function would otherwise have to
+  # carry a dial that concerns exactly one of them. 04D's daemons set mc.duckdb_threads; nowhere else
+  # does, so nowhere else changes. A dozen workers each opening a connection that helps itself to
+  # every core is 288 threads on a 24-core machine, and the contention costs more than the read.
+  thr_ <- getOption("mc.duckdb_threads", NULL)
+  if (!is.null(thr_)) DBI::dbExecute(con_, paste0("SET threads TO ", as.integer(thr_)))
+
+  con_
 }
 
 #' Create the three fixed tables
