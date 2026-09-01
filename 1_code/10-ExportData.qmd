@@ -1,0 +1,757 @@
+---
+title: "Export Data -- One File per Task (10)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
+```
+
+```{r}
+#| label: load-libraries
+#| echo: false
+
+# ONE ORDERED LIST, AND ORDER IS LOAD-BEARING. _Plots.R rebuilds its level registry empty every time
+# it is sourced, so every library that registers a vocabulary must follow it -- _Entity.R and the
+# five 04B files all do.
+#
+# THE COMMONS FIRST, AND init_create_script_fun() COMES FROM THEM. Naming the numbered scripts by
+# that function before it exists is a bootstrap the render cannot survive, so the list is built in
+# two steps: source what defines the resolver, then use it.
+.path_libs <- purrr::map_chr(
+  c("_Initialize", "_Utils", "_NER", "_Plots", "_Tables", "_Entity"),
+  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
+)
+purrr::walk(.x = .path_libs, .f = \(.p) source(file = .p, encoding = "UTF-8"))
+
+# THE FIVE RULE LIBRARIES AND 04D. 04B3's dte_collapse() is the only collapse this export calls
+# rather than re-derives, and 04B2, 04B4 and 04B5 supply the vocabularies the pivots take their shape
+# from. 04D supplies apl_dataset(), which is how a release directory is opened without picking up its
+# own bookkeeping files.
+.path_libs <- c(
+  .path_libs,
+  purrr::map_chr(
+    c(
+      "04B1-Rules-ORG", "04B2-Rules-GPE", "04B3-Rules-DATE", "04B4-Rules-MONEY",
+      "04B5-Rules-REDACT", "04D-EntityApply"
+    ),
+    \(.s) init_create_script_fun(.dir_here = here::here(), .name_script = .s)
+  )
+)
+purrr::walk(
+  .x = utils::tail(.path_libs, 6L),
+  .f = \(.p) source(file = .p, encoding = "UTF-8")
+)
+
+.name_script <- "10-ExportData"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(.dir_here = here::here(), .name_script = .name_script))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+04D released eight long files holding 93.7 million spans. 02B holds the register and 03F the labels.
+This turns them into **eight contract-level caches and one joined file** -- the file the Stata
+analysis reads.
+
+| Chunk | Cache | Reads | Holds |
+|:--|:--|:--|:--|
+| Sample | `Sample` | 02B register | one row per registrant copy; the spine |
+| Classification | `Classification` | 03F release | both engines, all three tasks |
+| Parties | `EntityORG` | `org_mentions` | distinct parties by role, and the naive rung |
+| Geography | `EntityGPE` | `places_geo`, `org_mentions` | distinct states and countries, by role |
+| Governing law | `EntityLAW` | `law_clauses` | every jurisdiction named, pipe-separated |
+| Dates | `EntityDATE` | `date_spans`, `term_spans` | start, end, duration, and which rung decided |
+| Money | `EntityMONEY` | `money_spans` | how many amounts, and how large |
+| Redactions | `EntityREDACT` | `redact_spans` | markers by kind |
+| Contracts | `Contracts` | the eight above | the join, as parquet and Stata |
+
+**One function per cache, and each takes paths.** Nothing is built in a chunk and passed to a
+function: each export opens its own input, names the columns it reads at the call site, does its own
+work and writes one parquet. Running one chunk on its own does exactly what a full render does.
+
+**Each returns the table it wrote**, so `tab_EntityORG` is the party file exactly as it went to disk.
+
+**Cached on modification time, not on existence.** A cache is used only where every input it reads is
+older than it; an input that moved rebuilds it and says which one. `.rerun = TRUE` forces it. That is
+the whole reason for eight files rather than one: a changed counterparty rule rebuilds the party file
+and the join, and touches nothing else.
+
+Existence alone was the earlier rule and it was wrong. Rebuilding the sample with two new columns left
+the joined file holding the old one -- the row count had not changed, so every identity check passed
+against a file that no longer matched its own spine, and nothing in the render said so.
+
+**Every diagnostic reads a returned table, not the file being written.** An export that reported on
+itself would print on a cold render and say nothing on a warm one, and the rendered document is the
+artifact a reader opens. So each task has a report chunk beneath its export chunk, driven off
+`tab_EntityORG` and its siblings, and a cached render says exactly what a cold one does.
+
+## What the export decides, and what it does not
+
+The counts are re-derived here rather than taken from 04B's collapse functions, because a count of
+distinct parties by role is six lines of dplyr and reading them at the call site is worth more than
+the indirection. **Dates are the exception**: duration is a four-rung cascade with a term parser in
+it, so `dte_collapse()` is called rather than reimplemented.
+
+Two decisions are deliberately *not* made:
+
+**Governing law is not picked.** A contract naming several jurisdictions gets all of them,
+pipe-separated, aligned with the `LawKind` that named each. The cue regexes are unanchored, so
+"organized under the laws of the State of Delaware" produces a `LawsOfState` clause indistinguishable
+from a governing-law clause -- and it is always earlier in the document. Any first-wins rule would
+substitute the incorporation state systematically. `LawKind` is what lets a reader tell them apart.
+
+**Party and place names are not exported.** Only counts. A contract can name several registrants and
+several counterparties, so a single name column would need a pick rule of the same kind.
+
+## Grain, and where the fan-out happens
+
+Every cache is at **attachment grain** -- one row per primary copy, which is what 04D extracted. The
+sample is at **registrant-copy grain**: a filing naming several registrants lists the same attachment
+under each of them, and the register has a row for each.
+
+`export_final()` fans the entity caches out on `HashDocument`, so every copy carries the values of
+its attachment. That is 03F's own decision -- its release is already at copy grain -- applied to the
+entity blocks too. Two things follow:
+
+- entity values **repeat** across copies, so a corpus mean over the raw file double-counts and wants
+  `PrimaryFiler == 1`
+- a row still empty after the join means 04D did not reach that attachment, **not** that it is a
+  co-filer copy
+
+## Nothing opens a document
+
+No export reads contract text. Every word count comes from the register. The text seam 04A
+established holds through to the released file.
+
+# Configuration
+
+```{r}
+#| label: configure
+
+.lP <- list(
+  Input = list(
+    FilSample         = "2_output/02B-Register/Output/Documents.parquet",
+    # WHY A DOCUMENT WAS FLAGGED lives here and not in the register: 02B relocates RemClass without
+    # ever having joined it, so Removed says which documents were caught and nothing says why.
+    FilRemoved        = "2_output/01C-EdgarMetaData/Output/RemovedDocs.parquet",
+    FilClassification = "2_output/03F-ClassifyApply/release/contract_labels_L256.parquet",
+    # THE POLICY HASH IS IN THE PATH. 04D names each directory for a hash folding in its rules and
+    # the extractor's own spec hashes, so pinning it here is what says which release this reads --
+    # and a rehearsal directory sitting beside the full one cannot be picked up by accident.
+    DirEntityORG      = "2_output/04D-EntityApply/Store/ORG/812b63f438c5/",
+    DirEntityGPE      = "2_output/04D-EntityApply/Store/GPE/2374951841a7/",
+    DirEntityDATE     = "2_output/04D-EntityApply/Store/DATE/79c379586f6a/",
+    DirEntityMONEY    = "2_output/04D-EntityApply/Store/MONEY/58e9be52f1b9/",
+    DirEntityREDACT   = "2_output/04D-EntityApply/Store/REDACT/7b84db9925eb/"
+  ),
+  # THE CACHES ARE INTERMEDIATE. Each is one task's contract-level table, rebuilt on its own by
+  # passing .rerun = TRUE to that chunk.
+  Cache = list(
+    CacheSample         = utils_file_path(.dir_main, "Cache", "Sample.parquet"),
+    CacheClassification = utils_file_path(.dir_main, "Cache", "Classification.parquet"),
+    CacheEntityORG      = utils_file_path(.dir_main, "Cache", "EntityORG.parquet"),
+    CacheEntityGPE      = utils_file_path(.dir_main, "Cache", "EntityGPE.parquet"),
+    CacheEntityLAW      = utils_file_path(.dir_main, "Cache", "EntityLAW.parquet"),
+    CacheEntityDATE     = utils_file_path(.dir_main, "Cache", "EntityDATE.parquet"),
+    CacheEntityMONEY    = utils_file_path(.dir_main, "Cache", "EntityMONEY.parquet"),
+    CacheEntityREDACT   = utils_file_path(.dir_main, "Cache", "EntityREDACT.parquet")
+  ),
+  # THE DELIVERABLE. The dta and the codebook are written beside the parquet.
+  Output = list(
+    FilContracts = utils_file_path(.dir_main, "Output", "Contracts.parquet")
+  )
+)
+
+tibble::tibble(
+  Input  = names(.lP$Input),
+  Path   = purrr::map_chr(.lP$Input, \(.p) fs::path_rel(.p, start = here::here())),
+  Exists = purrr::map_lgl(.lP$Input, \(.p) fs::file_exists(.p) || fs::dir_exists(.p))
+) |>
+  tbl_say(.title = "Every input resolves before anything is read")
+```
+
+The five hashes above should reproduce what 04D reported when it wrote the release. Where one
+differs, a dial moved since the corpus pass ran, and the export would read a directory that no longer
+answers to the rules in 04B.
+
+# Sample
+
+The register cut to Exhibit 10, with the columns worth releasing named and `DateFiled` coerced once.
+**Nothing is filtered out**: 02B removes no document ever, and a sample that quietly excluded the
+malformed ones would leave every later study unable to see what was lost. `Removed` says which they
+are, `RemClass` says why -- too short, not prose, mostly digits -- and `UrlDocument` is the link back
+to EDGAR.
+
+**`RemClass` is joined from 01C**, because the register does not carry it: `reg_shape()` relocates
+the name without ever having joined the column. Referee 1 asked whether the malformed contracts are
+noted anywhere in the data, and without this they are flagged but unexplained.
+
+01D's three columns -- `Items`, `HasItem101`, `Item101Outcome` -- are deliberately **not** exported.
+They are joined onto the register by `DocID` from a table of 8-K reports, so on an Exhibit 10 row
+`HasItem101` is identically zero and the other two identically missing. A contract reaches its own
+8-K through `HashIndex`, which is the filing and is exported.
+
+The report below lists every register column the selection leaves behind, so anything that ought to
+be in the release surfaces there rather than being missed.
+
+```{r}
+#| label: export-sample
+
+tab_Sample <- export_sample(
+  .path_in      = .lP$Input$FilSample,
+  .path_removed = .lP$Input$FilRemoved,   # RemClass: why a document was flagged
+  .path_out     = .lP$Cache$CacheSample,
+  .doc_type     = "Exhibit10",            # the register also holds 8-K reports and CT orders
+  .rerun        = FALSE                   # the cache check below rebuilds when an input has moved
+)
+```
+
+```{r}
+#| label: report-sample
+
+exp_report_columns(
+  .tab = exp_table_columns(.tab = tab_Sample, .path_register = .lP$Input$FilSample)
+)
+
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_Sample),
+  .title = "The sample, column by column"
+)
+
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_Sample, .col = "SampleStepDesc"),
+  .title = "Where each contract sits on the sample ladder"
+)
+```
+
+`PrimaryFiler` and `MultFiler` read as means, which are the shares: how much of the file is the copy
+04D actually extracted, and how much is a second registrant listing the same attachment. `Removed`
+reads the same way, and `RemClass` beside it is non-missing on exactly those rows.
+
+The `Min` and `Max` on the date columns are the fastest sanity check in this document.
+`CtoReleaseFirst` and `CtoReleaseLast` currently run to **3036-08-03**, which is a parse error in
+01E's release dates rather than anything this export does -- it reaches 1.2% of rows and is worth
+fixing upstream.
+
+# Classification
+
+03F's release as it wrote it: both engines, all three tasks, every probability and every agreement
+flag. Five columns are dropped because the sample already carries them and Stata's `merge` fails
+rather than choosing when two files define a variable.
+
+`Class`, `ClassBroad` and `AmendType` are **added as copies** of the crowned engine's, so no
+downstream script has to know which engine won. The originals stay, because the agreement flags refer
+to them by name.
+
+**This is already one row per registrant copy** -- 03F fans out on `HashDocument` before it writes --
+so a co-filer copy carries the label computed from its attachment's primary.
+
+```{r}
+#| label: export-classification
+
+tab_Classification <- export_classification(
+  .path_in  = .lP$Input$FilClassification,
+  .path_out = .lP$Cache$CacheClassification,
+  .engine   = "Bert",                  # 03B crowned legal-bert; the keyword arm stays in the file
+  .rerun    = FALSE
+)
+```
+
+```{r}
+#| label: report-classification
+
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_Classification, .col = "Class"),
+  .title = "Contract type, the crowned engine",
+  .notes = c(Pct = "Share of the classified copies, not of the sample.")
+)
+
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_Classification, .col = "ClassDetailedFlag"),
+  .title = "Where the keyword arm agrees with Bert"
+)
+```
+
+The flag is the two engines differenced, not a validation: the keyword arm has no claim to be right
+where they part. It is the cheapest signal available for which contracts are hard.
+
+# Parties
+
+Distinct parties per contract, by role, plus the rung above them.
+
+`nUniSpellingsNaive` is the number of distinct names the extractor proposed **before** grouping merged
+them into parties -- 8.18 per contract at corpus scale against 7.28 parties. It is stored because it
+cannot be recovered from the role counts; the other naive rungs can be, and are not.
+
+`HasNoParty` marks the sentinel row 04B1 writes for a contract in which no organisation was found at
+all. Every count is zero there, but nothing else in the file would say why.
+
+```{r}
+#| label: export-org
+
+tab_EntityORG <- export_ORG(
+  .dir_in   = .lP$Input$DirEntityORG,
+  .path_out = .lP$Cache$CacheEntityORG,
+  .rerun    = FALSE
+)
+```
+
+```{r}
+#| label: report-org
+
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_EntityORG),
+  .title = "Parties per contract",
+  .notes = c(Mean = "nUniSpellingsNaive against nUniRegistrant + nUniCounterparty + the rest is the
+                     rung: distinct spellings before grouping, against parties after it.")
+)
+```
+
+`HasNoParty` reads as a mean, which is the share of contracts in which the extractor found no
+organisation at all. Every count is zero on those rows, so the mean of `nUniRegistrant` is bounded
+above by one minus that share.
+
+# Geography
+
+Distinct states and countries, naive and split by role.
+
+The naive rung counts every place outside a governing-law clause; the role columns count those the
+extractor attached to a party. **The join is the attachment filter**: `geo_attach()` nulls `PartyKey`
+on any place it did not offer to a party, and a SQL join never matches a null.
+
+**Law-clause places are excluded everywhere, including the naive rung.** "The laws of the State of
+Delaware" is a jurisdiction rather than a location and belongs to the law file. That moves the naive
+number below the published 2.56 states and 1.81 countries, which count them in.
+
+This task reads `org_mentions` as well, because a role is a property of the party and `places_geo`
+carries only the key. That is 04D's own dependency: its GPE pass folds ORG's hash into its own.
+
+```{r}
+#| label: export-gpe
+
+tab_EntityGPE <- export_GPE(
+  .dir_in   = .lP$Input$DirEntityGPE,
+  .dir_org  = .lP$Input$DirEntityORG,   # roles live in the mention file
+  .path_out = .lP$Cache$CacheEntityGPE,
+  .rerun    = FALSE
+)
+```
+
+```{r}
+#| label: report-gpe
+
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_EntityGPE),
+  .title = "States and countries per contract",
+  .notes = c(Mean = "The naive pair against the four role columns is the ladder. Naive counts every
+                     place outside a law clause; the role columns count those attached to a party.")
+)
+```
+
+`nUniStateRegistrant` above one does not mean two registrants -- there is one registrant party per
+contract. It means two distinct states were attached to that one party, which measures ambiguity as
+much as location.
+
+# Governing law
+
+Every jurisdiction the contract's law clauses named, pipe-separated in document order, with
+`LawJurisdictionLevel` and `LawKind` aligned element for element.
+
+Nothing is picked, and that is deliberate -- see Purpose. `nUniJurisdiction > 1` is the honesty
+column: it says the contract named more than one place and the reader has to choose.
+
+`law_clauses` is released beside `places_geo` because one 04D pass wrote both, which is why this
+chunk points at the GPE directory.
+
+```{r}
+#| label: export-law
+
+tab_EntityLAW <- export_LAW(
+  .dir_in   = .lP$Input$DirEntityGPE,   # law_clauses sits beside places_geo
+  .path_out = .lP$Cache$CacheEntityLAW,
+  .rerun    = FALSE
+)
+```
+
+```{r}
+#| label: report-law
+
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_EntityLAW),
+  .title = "Clauses and jurisdictions per contract",
+  .notes = c(Max = "nUniJurisdiction above one is a contract naming several places. Its mean is how
+                    often the pick this file refuses to make would have had to be made.")
+)
+
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_EntityLAW, .col = "LawJurisdiction", .top = 15L),
+  .title = "The commonest jurisdiction strings",
+  .notes = c(Level = "A pipe means the contract named more than one; read LawKind beside it.")
+)
+```
+
+A single `Delaware` and a `Delaware|New York` are different levels here, deliberately. The pipe is
+the signal.
+
+# Dates
+
+The one export that does not count anything. Duration is a cascade, and `DurationSource` says which
+rung answered:
+
+- **term** -- the contract states its own length. Outranks everything.
+- **open** -- it states that it has no length. A finding, not a gap.
+- **cue** -- a future date with an end cue beside it: MATURIT, THROUGH, EXPIR.
+- **maxdate** -- the farthest future date, for no stated reason.
+
+`DateEndNaive` is that last rung on its own, and `NaiveYears` measures it from the **same**
+`DateStart`, so the naive and rule durations differ in one decision rather than two. It is missing
+wherever the contract names no future date -- which is the coverage argument for the cascade, not a
+fault: a contract stating "a term of two years" and mentioning only past dates has a duration under
+the term rung and none at all under the naive definition.
+
+The register supplies the filing date, because `DateStart` falls back to it where no date sits at or
+before filing.
+
+```{r}
+#| label: export-date
+
+tab_EntityDATE <- export_DATE(
+  .dir_in        = .lP$Input$DirEntityDATE,
+  .path_register = .lP$Input$FilSample,   # DateStart falls back to the filing date
+  .path_out      = .lP$Cache$CacheEntityDATE,
+  .spec          = dte_spec(
+    .start     = "latest",   # 04B3: the latest date at or before filing, else the filing date
+    .end       = "term",     # 04B3: the full four-rung cascade
+    .cap_years = 30          # 04B3: a longer duration is dropped, not winsorised
+  ),
+  .rerun         = FALSE
+)
+```
+
+```{r}
+#| label: report-date
+
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_EntityDATE, .col = "DurationSource"),
+  .title = "Which rung decided the duration",
+  .notes = c(Level = "term outranks open outranks cue outranks maxdate. none is a contract that says
+                      nothing about when it ends, which is a finding rather than a failure.")
+)
+
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_EntityDATE, .col = "DurationDropped"),
+  .title = "Why a duration is missing where it is"
+)
+
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_EntityDATE),
+  .title = "Dates and durations",
+  .notes = c(Median = "DurationYears against NaiveYears is the comparison: 2.80 against 11.75 at
+                       corpus scale, and a naive standard deviation that moves with the sample.")
+)
+```
+
+`NaiveYears` reaching fewer contracts than `DurationYears` is the coverage argument for the cascade,
+not a defect: a contract stating a two-year term and naming only past dates has a duration under the
+term rung and none at all under the naive definition.
+
+**Only `DurationYears` is capped.** It tops out at exactly 30 and `DurationDropped` says how many
+were dropped for it. `DateStart`, `DateEnd`, `DateEndNaive`, `TermYears` and `NaiveYears` are as the
+extractor found them, so their extremes -- a start in 1415, an end in 9999, a stated term of 999
+years -- are real spans in real documents rather than failures of this export. That is the house
+position: the span stays as found and the rule column is the clean one.
+
+# Money
+
+How many amounts a contract names and how large they are, split by currency because there is no FX
+conversion anywhere in this pipeline. The naive rung is every parsed, non-withheld figure; the rule
+additionally drops a zero and a figure with par-value language beside it.
+
+**A known defect travels in this file.** `MoneyMaxUSD` and `MoneyMaxOther` inherit 04B4's digit-run
+concatenation: HTML flattening removed table cell boundaries and the money regex read the run as one
+number, so `$ 201620172018201...` is four fiscal years glued together. Roughly 1,200 contracts of the
+844,931 carrying money are affected. **The medians are far less affected, which is not the same as
+immune**: a single glued run cannot move a median, but a contract whose figures are mostly glued runs
+has a glued median, and 118 contracts carry one above 1e11 against roughly 1,500 for the maximum. The
+tail is not the problem either way -- two glued four-digit cells give `20162017`, twenty million
+dollars, plausible and undetectable by magnitude. The report below counts what exceeds 1e11 in every
+column.
+
+```{r}
+#| label: export-money
+
+tab_EntityMONEY <- export_MONEY(
+  .dir_in   = .lP$Input$DirEntityMONEY,
+  .path_out = .lP$Cache$CacheEntityMONEY,
+  .rerun    = FALSE
+)
+```
+
+```{r}
+#| label: report-money
+
+exp_report_numeric(
+  .tab    = exp_table_numeric(.tab = tab_EntityMONEY, .ceiling = 1e11),
+  .title  = "Amounts per contract",
+  .notes  = c(NAbove = "Contracts whose figure exceeds 1e11, the ceiling 04B4 would declare. That is
+                        the visible tail of the digit-run concatenation; the glued four-digit pairs
+                        beneath it cannot be found by magnitude.")
+)
+```
+
+Read `Max` on `MoneyMaxUSD` before anything else. It is the defect in one number, and the distance
+between it and `Median` is why the medians are the columns to use -- but read `NAbove` on
+`MoneyMedUSD` too, because it is not zero.
+
+Anything at or above 1e15 prints in scientific notation. That is the point past which a double stops
+holding consecutive integers, so the digits beyond it are the representation rather than the
+measurement.
+
+# Redactions
+
+Six marker counts and nothing else, because every aggregate anyone wants is a sum of them:
+
+- **every marker** -- all six
+- **bracketed only** -- the first five; `RedactBare` is the only unbracketed kind
+- **text actually withheld** -- the four `Redact` kinds; the two `Omit` kinds are a section left out,
+  not text taken from a reader
+
+The two splits cut across each other, so **no single total is "redactions"**. Storing one would be
+choosing a denominator on the reader's behalf. `nRedactMoney` is the exception -- it comes from
+matching a marker to a withheld price beside it and is not a sum of the others.
+
+`Bracketed` and `Withheld` are not read: 04B5 declares both as functions of `Kind`.
+
+```{r}
+#| label: export-redact
+
+tab_EntityREDACT <- export_REDACT(
+  .dir_in   = .lP$Input$DirEntityREDACT,
+  .path_out = .lP$Cache$CacheEntityREDACT,
+  .rerun    = FALSE
+)
+```
+
+```{r}
+#| label: report-redact
+
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_EntityREDACT),
+  .title = "Redaction markers per contract",
+  .notes = c(Mean = "Sum the first three and nRedactBare for text withheld; sum the first five for
+                     brackets, which is the published measure. Neither is 'redactions' on its own.")
+)
+```
+
+The two `Omit` means are the size of the difference between those definitions: markers that are
+inside brackets and withhold nothing.
+
+# Contracts
+
+The join, and the only place a `.dta` is written.
+
+The sample is the spine and every join is a left join, so the row count is the register's and no
+contract disappears because one pass could not read it. The classification joins on `DocID`; the six
+entity caches are re-keyed from their primary `DocID` onto `HashDocument` and joined many-to-one, so
+every registrant copy carries the values of its attachment.
+
+Both `relationship =` arguments are checks as much as hints: a duplicate key on either side stops the
+render rather than silently multiplying the sample. Every join is tested for name collisions first,
+because dplyr suffixes `Column.x` and `Column.y` in silence and a file this wide is where that would
+go unnoticed.
+
+**This chunk reads all eight caches, so it rebuilds whenever any of them does.** The row count cannot
+catch a stale join -- it is the sample's either way -- so the check has to be on the inputs rather
+than on the output.
+
+```{r}
+#| label: export-final
+
+tab_Contracts <- export_final(
+  .path_sample  = .lP$Cache$CacheSample,
+  .path_class   = .lP$Cache$CacheClassification,
+  .paths_entity = .lP$Cache[c(
+    "CacheEntityORG", "CacheEntityGPE", "CacheEntityLAW",
+    "CacheEntityDATE", "CacheEntityMONEY", "CacheEntityREDACT"
+  )],
+  .path_out     = .lP$Output$FilContracts,
+  .rerun        = FALSE,
+  .dta          = TRUE                  # writes Contracts.dta and Contracts_Codebook.csv beside it
+)
+```
+
+```{r}
+#| label: report-final
+
+# BUILT ONCE AND HANDED TO BOTH CHECKS. The reconciliation needs it for the row counts and the
+# identity check needs it for the column names, and two lists would be two things to keep in step.
+lst_Caches <- list(
+  Sample         = tab_Sample,
+  Classification = tab_Classification,
+  ORG            = tab_EntityORG,
+  GPE            = tab_EntityGPE,
+  LAW            = tab_EntityLAW,
+  DATE           = tab_EntityDATE,
+  MONEY          = tab_EntityMONEY,
+  REDACT         = tab_EntityREDACT
+)
+
+exp_report_final(
+  .tab = exp_check_final(
+    .tab      = tab_Contracts,
+    .tabs     = lst_Caches,        # every column these hold must be in the join
+    .n_sample = nrow(tab_Sample)
+  )
+)
+
+exp_report_files(
+  .tab = exp_table_files(.tabs = lst_Caches, .final = tab_Contracts)
+)
+```
+
+`InFinal` exceeding `Rows` on an entity cache is the fan-out working: an attachment filed by three
+registrants contributes one cache row and three rows of the joined file. That is also why a corpus
+mean over this file double-counts and wants `PrimaryFiler == 1`.
+
+**`Cache columns missing from the join` is the check that catches a stale join**, and it is the only
+one that can. The row counts are the sample's whether the join is current or a year old, so a file
+built from an earlier sample passes every count above it. Differencing the caches' column names
+against the joined file's does not.
+
+The codebook written here is **mechanical**: which cache each column came from, its type, and the
+name Stata will see. What each column means is the separate document below.
+
+# Column dictionary
+
+One row per column of `Contracts`, in eight sections rather than tabsets: Quarto's tabset filter
+intercepts `panel-tabset` divs and empties them when the content is R-generated HTML, which every
+table below is.
+
+**`Missing` is the column nobody can reconstruct from the data.** In the joined file an `NA` means
+two different things -- the contract is not in that block's cache at all, or it is and this
+particular value does not exist -- and nothing in the file distinguishes them. `Marker` in the table
+below is how: where it is missing the whole block is absent, and every other `NA` in the block is the
+second kind.
+
+`structural` in `Missing` means the column is never missing where its block reached the row. A count
+of zero is then a measurement -- the extractor looked and found none -- rather than an absence.
+
+```{r}
+#| label: report-grain
+
+exp_report_grain()
+```
+
+```{r}
+#| label: build-dictionary
+
+# THE DECLARATION IS DIFFERENCED AGAINST THE FILE, BOTH WAYS, and aborts on either. A column in the
+# file and not the dictionary is undocumented; a column in the dictionary and not the file describes
+# something that no longer exists. Type and the Stata name are read off the data rather than
+# declared, so the dictionary cannot claim a type the file does not have.
+tab_Dictionary <- exp_table_dictionary(.tab = tab_Contracts)
+```
+
+## Sample
+
+The register as 02B holds it, restricted to Exhibit 10. One row per registrant copy, nothing
+excluded.
+
+```{r}
+#| label: dict-sample
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Sample")
+```
+
+## Classification
+
+Both engines side by side. The keyword arm is an independent measurement rather than a validation --
+it has no claim to be right where the two differ, which is what the `Flag` columns record.
+
+```{r}
+#| label: dict-classification
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Classification")
+```
+
+## Parties
+
+```{r}
+#| label: dict-parties
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Parties")
+```
+
+## Geography
+
+```{r}
+#| label: dict-geography
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Geography")
+```
+
+## Law
+
+```{r}
+#| label: dict-law
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Law")
+```
+
+## Dates
+
+```{r}
+#| label: dict-dates
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Dates")
+```
+
+## Money
+
+```{r}
+#| label: dict-money
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Money")
+```
+
+## Redactions
+
+```{r}
+#| label: dict-redactions
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Redactions")
+```
+
+# Next
+
+`Contracts_Codebook.csv` now carries both halves: `Source`, `Type` and `StataName` derived from the
+file, `Block`, `Meaning` and `Missing` declared above. It is written whenever the join is, so the
+archive never holds a codebook describing a different file.
+
+Two items are known and outstanding, and both are upstream of this document. `MoneyMaxUSD` and
+`MoneyMaxOther` carry 04B4's digit-run concatenation until a ceiling is declared in `mny_spec()`,
+which re-runs the MONEY pass alone. And the entity variables have not been checked against a
+document-level gold set.
+
+Three smaller things this document surfaced and does not fix: `CtoReleaseFirst` and `CtoReleaseLast`
+run to 3036 on a few rows, which is a parse error in 01E; `nUniCountryNaive` reaches 224, more
+countries than exist; and the released date columns other than `DurationYears` are uncapped, so a
+start in 1415 and an end in 9999 are spans the extractor really found rather than failures here.
