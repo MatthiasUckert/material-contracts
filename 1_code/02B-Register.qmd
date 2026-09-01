@@ -75,8 +75,25 @@ source(file = .path_fun, encoding = "UTF-8")
 One row per document, every decision recorded as a column, nothing removed. This is the table every downstream script
 reads: 03 to classify, 04 to extract entities, and any analysis to define its sample.
 
-It joins the corpus to Compustat, applies the sample ladder, and attaches what 01D found in the 8-K reports and what
-01E found in the confidential-treatment orders.
+It joins the corpus to Compustat, applies the sample ladder, and attaches what 01D recovered from each 8-K report.
+
+## What belongs here, and what does not
+
+The register carries a fact about a document that is not already in 01C's metadata, plus the ladder. It carries a fact
+about something **larger** than a document -- a filing, a firm-quarter -- only where the ladder had to compute it
+anyway.
+
+Compustat qualifies, and it is the only thing that does. Ladder steps 03, 04 and 05 *are* the match outcomes, so
+`gvkey`, `datadate`, `fyear` and `fqtr` are a by-product of work already done; making a downstream script redo an
+interval join over the whole corpus to recover them would be effort for nothing.
+
+Two things used to be here and are not. The filing's 8-K item list arrived through a document-level join, so it was
+missing on every row that was not an Item 1.01 candidate -- which is every contract. The confidential-treatment
+linkage was a clean join on `DocID`, but nothing here needs it: 03 and 04 read twelve named columns and it is none of
+them, and the export is the only consumer. Both are now joined where they are used, on `HashIndex` and `DocID`
+respectively, which is one line in each case and puts them on rows where they mean something.
+
+The register lost a column doing this rather than gaining one.
 
 ## Nothing is removed
 
@@ -153,8 +170,7 @@ pipeline -- alongside the figures, the styled tables and the Stata export. Nothi
 .lP <- list(
   Input = list(
     MetaData     = fs::path(.dir_meta, "Output", "FullMetaData.parquet"),                            # 01C
-    Item101      = here::here("2_output", "01D-Item101", "Output", "Item101.parquet"),               # 01D
-    CtoExhibits  = here::here("2_output", "01E-CtoExhibits", "Output", "CtoExhibits.parquet"),       # 01E
+    Item101      = here::here("2_output", "01D-GetItems", "Output", "Item101.parquet"),              # 01D
     QuarterRange = here::here("2_output", "02A-Compustat", "Output", "QuarterRange.parquet")         # 02A
   ),
   Cache = list(
@@ -261,32 +277,26 @@ The ceiling matches the acquisition frame closed in 01A, so the two cannot drift
 
 # Attaching
 
-`HasItem101` is zero rather than missing for a document that was never a candidate. A candidate is an 8-K whose filing
+`HasSummary` is zero rather than missing for a document that was never a candidate. A candidate is an 8-K whose filing
 reports the item, so a contract having no summary is not an absence of information -- it is the wrong kind of document
 to have one.
+
+The name matters. `HasSummary` says 01D recovered a narrative from **this document**, which is a fact about our
+extractor. Whether the parent filing **reports** Item 1.01 is a different fact, it lives in 01D's per-filing table, and
+until now the two shared the name `HasItem101` -- one name carrying two meanings that disagree wherever both are
+defined, because a filing can report the item while the extraction fails.
 
 ```{r}
 #| label: attach-item101
 tab_flagged <- reg_attach_item101(.tab = tab_flagged, .path_item = .lP$Input$Item101)
 
-c(candidates = sum(!is.na(tab_flagged$Item101Outcome)), extracted = sum(tab_flagged$HasItem101))
-```
-
-One order can cover several exhibits and one contract can be covered by several orders, most often because a grant was
-later extended. Both release dates are kept: the earliest is when any part of the redaction becomes releasable, the
-latest when all of it does, and which matters depends on the question.
-
-```{r}
-#| label: attach-cto
-tab_flagged <- reg_attach_cto(.tab = tab_flagged, .path_cto = .lP$Input$CtoExhibits)
-
-c(covered = sum(tab_flagged$HasCto), withExtension = sum(tab_flagged$CtoIsExtension))
+c(candidates = sum(!is.na(tab_flagged$Item101Outcome)), extracted = sum(tab_flagged$HasSummary))
 ```
 
 # The register
 
 `reg_shape()` drops the path columns, orders the rest into identity, location, content, quality, filer, sample and
-attachment blocks, and sorts by group.
+extraction blocks, and sorts by group.
 
 ```{r}
 #| label: shape-register
@@ -399,7 +409,7 @@ utils_doc_path(
 ```{r}
 #| label: deploy-register
 stamp_register <- utils_dir_stamp(
-  .dirs  = unlist(.lP$Input),   # the corpus, the matching frame, and what 01D and 01E found
+  .dirs  = unlist(.lP$Input),   # the corpus, the matching frame, and what 01D recovered
   .extra = .lP$Param            # and the window and ladder parameters
 )
 

@@ -1,0 +1,777 @@
+---
+title: "8-K Items and Item 1.01 Summaries (01D)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+# TABLE MODE IS DECLARED, NOT DEFAULTED. tbl_out() reads this option and falls back to "console"
+# when nothing sets it, so a document that says nothing still renders console blocks -- but says
+# nothing about whether that was chosen. It is chosen: see "How results are reported" below. Setting
+# this to "kable" previews the styled path, and every chunk producing a table then needs
+# `#| results: asis` or knitr wraps the markup in a code block.
+options(
+  cli.num_colors = 1,          # plain ASCII; ANSI codes paste as garbage
+  cli.width      = 120,        # matches the 125-column source margin
+  mc.table_mode  = "console"   # "console" or "kable"
+)
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+```
+
+```{r}
+#| label: setup-sources
+#| echo: false
+source("1_code/_Commons/_Initialize.R", encoding = "UTF-8")
+source("1_code/_Commons/_Utils.R", encoding = "UTF-8")
+source("1_code/_Commons/_Plots.R", encoding = "UTF-8")
+source("1_code/_Commons/_Tables.R", encoding = "UTF-8")
+
+# 01C owns the corpus traversal this document reuses, and the group vocabulary. Sourcing the chain
+# rather than reimplementing either is what keeps one definition of how the corpus is walked.
+purrr::walk(
+  .x = c("01A-EdgarIndex", "01B-EdgarDocuments", "01C-EdgarMetaData"),
+  .f = function(.s) {
+    source(
+      file     = init_create_script_fun(.dir_here = here::here(), .name_script = .s),
+      encoding = "UTF-8"
+    )
+  }
+)
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # this document's name; the output directory is derived from it
+))
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),    # project root
+  .name_script = .name_script     # resolves to 1_code/01D-Item101.R
+))
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+Two things, because they are the same fact read at two depths. Every 8-K declares which items it reports; that list is
+parsed here into one row per filing and item, classified into voluntary, mandatory and exhibits, and published. An 8-K
+reporting Item 1.01 also carries the filer's own summary of the agreement it has just entered into; that section is
+located inside the filing's HTML and its text extracted.
+
+The list is what decides which documents the extraction is attempted on, so the two were never separable. Before this
+document owned both, the parse existed twice -- once here as a literal search over a pipe-joined string, once in 05B
+with a real code parser and a different rule for filings whose registrants disagree. Two implementations of *which
+filings report which items* is two answers, and the fact that they happened to agree on this corpus is luck rather
+than design.
+
+Regulation requires the 8-K within four business days of entering the agreement, but leaves the filer discretion over
+whether to attach the contract itself then or defer it to the next periodic report. The summary is therefore the one
+account of the agreement that always exists at the moment of entry, which is what makes it worth extracting separately
+from the contract it describes.
+
+## Why this is a 01-family script
+
+It is a property of a document, derived by opening it, exactly like the word counts in 01C. Nothing about it depends on
+which sample a document ends up in, so running it after sample selection would order it by accident rather than by
+dependency.
+
+That is a deliberate change from the arrangement it replaces, which filtered to the descriptive sample first. The flag
+this produces now means one thing corpus-wide: an 8-K reporting Item 1.01 either has an extracted summary or has a
+recorded reason why not, and never "was never attempted".
+
+## Nothing is pre-filtered
+
+Format is not a filter either. A document that is not markup is attempted with an anchor appropriate to plain text,
+because a heading there is a heading by starting a line rather than by following a tag. Applying the markup anchor to a
+text filing finds one or two boundaries in a document with six, and the first span then runs to the end of the filing.
+
+Every candidate leaves exactly one row carrying one of eight outcomes, which is what makes the failure modes countable.
+
+## Extracted is not the same as correct
+
+Three of those outcomes exist because an earlier version counted their documents as successes.
+
+Some filers set the item list as a table: numbers in one column, bodies in another. The document then reads, in both
+the markup and the rendered text, as *"Item 1.01 Item 3.02 Entry into a Material Definitive Agreement Unregistered
+Sales of Equity Securities"* -- every number, then every title, then the bodies. Slicing between adjacent markers
+returns the few characters between two numbers, which is where thousands of nine-character summaries came from.
+
+Those are now recorded as `heading-only` and not extracted. The test is on what remains after the item code and the
+regulated title are removed, not on total length: the title is a fixed forty characters that says nothing about the
+agreement, and a threshold on the whole string has to be guessed -- guessing it at fifty put two of the three shortest
+extractions in the corpus exactly on the boundary. With the heading subtracted, a bare heading measures zero and a
+one-sentence summary measures eighty-eight.
+
+Taking the following span instead would return this item's body concatenated with the next item's, and for text
+analysis contaminated text is worse than a known gap: a clean exclusion is countable, a silent error is not.
+
+`markers-unparsed` separates a document with no boundaries from one whose boundaries carry no readable item code,
+which happens when a filing agent wraps a heading across nested elements. The two look identical in a coverage
+statistic and need different responses.
+
+## Where the text goes
+
+`Output/Item101.parquet` holds it, keyed on `DocID`. The register in 02 carries a flag and joins to this for the text.
+Roughly a quarter of a million summaries is on the order of a gigabyte, and putting that in the register would make the
+one table nobody can load.
+
+The item tables are the opposite case. `Output/FilingItems.parquet` is one row per filing and item, keyed on
+`HashIndex`; `Output/FilingItemFlags.parquet` is the same information collapsed to one row per filing, with the counts
+and indicators an analysis asks for. Both are small, both are wanted on every row, and 02 joins the second onto the
+register by `HashIndex` -- which is how a contract attachment comes to know what else its parent filing reported.
+
+The item list is read from **01A's** landing table rather than 01C's. 01A holds every filing EDGAR indexed; 01C holds
+only those carrying a retrieved Exhibit 10. The superset costs nothing at four million rows, and restricting it later
+is a join whereas widening it later is a rebuild.
+
+Anything a later script reads goes in `Output/`; anything existing only to make a re-render cheap goes in `Cache/`.
+
+## What is recomputed, and what is not
+
+Three steps take a `.rerun` argument defaulting to `FALSE`, and each fingerprints its inputs before deciding.
+
+**Building the item tables** reads two and a third million landing rows and collapses four million item rows, which is
+minutes rather than seconds. Both are a pure function of the landing table, the vocabulary and the parse rules, and all
+three enter the fingerprint. Unlike the other two steps, this one reads its own output back rather than recomputing it,
+because here the output is the expensive thing rather than a projection of it.
+
+**Building the candidate set** reads 01C's consolidated table and 01B's index in full -- half a gigabyte of parquet --
+to answer a question fixed by those two files, the item list and the item code. All four enter the fingerprint.
+
+**Writing the summaries** is the gigabyte described above, and what it contains is a pure function of the extraction
+cache and the candidate set. Only the write is guarded: the join that produces the table costs seconds and every report
+below reads it, so skipping the computation would save nothing and would leave the reports describing a file rather
+than an object.
+
+The extraction pass itself is 01C's, and carries 01C's contract: it reconciles its cache against the candidate set
+rather than trusting that a cache file exists, and measures whatever is not already covered.
+
+The summary date heuristics are derived from the extraction cache rather than computed inside the worker. The pattern
+that reads a contract date out of a summary is deliberately narrow and will be widened; putting a tunable rule behind a
+corpus pass measured in hours is how a rule stops being tuned.
+
+## How results are reported
+
+Tables print as fixed-width console blocks, and figures are displayed rather than saved. Both are deliberate and both
+are the same decision. A runbook is read while it runs and pasted into discussion, where a monospaced block survives
+being quoted into a mail or a chat window and a styled table does not.
+
+The publication versions are produced once, at the end of the pipeline, by the consolidated release script: styled
+tables from the same `tbl_out()` specifications, figure files from the same plotting functions.
+
+# Configuration
+
+```{r}
+#| label: config
+.dir_indx <- here::here("2_output", "01A-EdgarIndex")
+.dir_meta <- here::here("2_output", "01C-EdgarMetaData")
+.dir_docs <- here::here("2_output", "01B-EdgarDocuments")
+
+.lP <- list(
+  Input = list(
+    LandingAll = fs::path(.dir_indx, "Output", "LandingPageAll.parquet"),  # written by 01A, carries item lists
+    MetaData   = fs::path(.dir_meta, "Output", "FullMetaData.parquet"),    # written by 01C
+    FilePaths  = fs::path(.dir_docs, "Output", "FilePaths.parquet")        # written by 01B
+  ),
+  Cache = list(
+    Candidates  = utils_file_path(.dir_main, "Cache", "Candidates.parquet"),   # the documents to attempt
+    Extracted   = utils_file_path(.dir_main, "Cache", "Extracted.parquet"),    # the pass over the corpus
+    ItemStamp   = utils_file_path(.dir_main, "Cache", "ItemStamp.parquet"),    # guards the two item tables
+    OutputStamp = utils_file_path(.dir_main, "Cache", "OutputStamp.parquet")   # guards the published summaries
+  ),
+  Output = list(
+    FilingItems     = utils_file_path(.dir_main, "Output", "FilingItems.parquet"),      # filing x item
+    FilingItemFlags = utils_file_path(.dir_main, "Output", "FilingItemFlags.parquet"),  # one row per filing
+    Item101         = utils_file_path(.dir_main, "Output", "Item101.parquet")           # spans, outcomes and text
+  ),
+  Param = list(
+    Item     = "1.01",   # the item denoting entry into a material definitive agreement
+    MinChars = 30L,      # body characters, after the heading and title are removed
+    Workers  = 24L       # parallel workers; also the number of chunks the pass is split into
+  )
+)
+
+# Named individually so that a failure says which input is missing rather than that one of them is.
+need_ <- unlist(.lP$Input)
+miss_ <- need_[!fs::file_exists(need_)]
+if (length(miss_) > 0L) {
+  cli::cli_abort("Missing input{?s}: {paste(names(miss_), unname(miss_), sep = ' -> ', collapse = '; ')}")
+}
+
+# Reported relative to the project root. An absolute path is correct on one machine and wrong on
+# every other, and this page is published.
+tibble::tibble(
+  Input = names(need_),
+  Path  = as.character(fs::path_rel(unname(need_), start = here::here()))
+) |>
+  tbl_out(.title = "Inputs")
+```
+
+# Items
+
+Every 8-K declares which items it reports, and EDGAR publishes that list on the filing's landing page. Parsing it is
+the first thing this document does, because the list is what decides which documents the extraction is attempted on,
+and because nothing else in the pipeline holds 8-K items in a form anything can join to.
+
+The vocabulary below is declared rather than derived. Forty-six codes: thirty-three from the form as reformed on 23
+August 2004 and thirteen from the form before it, which is the complete legal vocabulary of each. A corpus-wide count
+returns exactly these and one 1996 stray, and that is the check that the parser is reading codes rather than inventing
+them.
+
+`ItemKind` is the research decision in the file. Three kinds, not two. **Voluntary** is the registrant's choice of
+whether and when: 2.02 and 7.01 are *furnished* rather than filed, which is the Section 18 safe harbour, and 8.01 is
+filed but the rule says the registrant *may, at its option, disclose*. **Exhibits** is not a disclosure event at all --
+it says the filing carries financial statements or exhibits -- and counting it as either of the others makes every
+contract-bearing 8-K look one item busier than it is. **Mandatory** is everything triggered by an event outside the
+registrant's control.
+
+Item 2.02 is the contested one, and `ItemFurnished` exists so the argument can be had with a filter rather than a
+re-read. It is required *once* the registrant announces results, but the announcement is discretionary, which is why
+the bundling literature counts it as voluntary.
+
+```{r}
+#| label: report-vocabulary
+.itm_items |>
+  dplyr::select("ItemCode", "ItemEra", "ItemKind", "ItemFurnished", "ItemSuccessor", "ItemLabelShort") |>
+  tbl_out(
+    .title = "The item vocabulary",
+    .notes = c(
+      ItemKind       = "Voluntary, Mandatory or Exhibits. The pre-reform codes carry the kind of their successor.",
+      ItemFurnished  = "Furnished rather than filed: the Section 18 safe harbour, and the narrower reading of voluntary.",
+      ItemSuccessor  = "What a pre-reform code became in 2004. Item 13 has none; the reform did not carry it forward.",
+      ItemLabelShort = "For tables only. The published data carries EDGAR's own label."
+    )
+  )
+```
+
+`ItemSuccessor` is what makes a count comparable across the reform at all. Four of the mappings decide the voluntary
+measure: 5 becomes 8.01, 9 becomes 7.01, 12 becomes 2.02, and 7 becomes 9.01. Counting only the dotted codes -- which
+is what a literal search for `Item 2.02` does -- returns zero for every filing before 23 August 2004, and an outcome
+that is structurally zero before treatment measures the reform's numbering rather than anyone's behaviour.
+
+## Reading the list
+
+The landing table is keyed on filing **and registrant**, so a filing co-filed by forty-one affiliated entities appears
+forty-one times carrying the same list. Collapsing before unnesting is not optional: skipping it multiplies every item
+count by the number of registrants and reports a maximum of 205 items on a filing where the true maximum is 13.
+
+Where registrants disagree the filing is dropped rather than one version being chosen, because there is no basis for
+choosing and the alternative is a silent coin flip. In practice the rule never fires -- EDGAR generates the list once
+per accession and stamps it on every registrant row, which is the same reason no code carries two label spellings --
+but a guard whose firing count is reported costs nothing, and a guard that was never written costs a silent error.
+
+```{r}
+#| label: build-items
+lst_items <- itm_build_items(
+  .path_landing = .lP$Input$LandingAll,          # 01A, one row per filing and registrant
+  .path_long    = .lP$Output$FilingItems,        # filing x item
+  .path_flags   = .lP$Output$FilingItemFlags,    # one row per filing
+  .path_stamp   = .lP$Cache$ItemStamp,           # fingerprint, and the build counts
+  .rerun        = FALSE                          # TRUE rebuilds regardless of the fingerprint
+)
+
+tab_long  <- lst_items$Long
+tab_flags <- lst_items$Flags
+
+itm_report_build(.stats = lst_items$Stats)
+```
+
+The code is read with the pattern anchored at the head of the string, so whatever follows is the label and no colon is
+ever split on. That matters more than it sounds: Item 5.02's regulated title carries two further colons, and splitting
+on them turns one item into four.
+
+`itm_item_flags()` collapses the long table to one row per filing, and it is where the era rule lives.
+`nItemsVoluntary` counts 2.02, 7.01 and 8.01 on a post-reform filing and 12, 9 and 5 on a pre-reform one, because those
+are the same three items under two numbering schemes. Classification is by code rather than by date: the code is what
+the filer wrote and what EDGAR labelled, and the handful of filings where the two disagree are reported below rather
+than reconciled silently.
+
+It collapses them as run arithmetic rather than as a grouped summarise. Two million groups cost three and a half
+minutes in dplyr, and no reformulation of the expressions moved it -- precomputing the indicators and summing plain
+columns came out slower, because the per-group dispatch is the cost rather than the work. Since the long table is
+sorted, a group is a run and a group sum is one difference of a cumulative sum: eight seconds, for an answer the gate
+suite checks is identical to the version it replaced. `itm_runs()` asserts the contiguity that makes it valid rather
+than assuming it.
+
+Both tables are written here rather than under *Deployment*, and read back where the fingerprint says they are current.
+That is a departure from how the rest of this document works, and the reason is that here the expensive step **is** the
+output: building from the landing file is minutes, reading back is seconds, and a separate cache would be the same four
+million rows stored twice. The vocabulary and the parse rules enter the fingerprint, so reclassifying a code rebuilds
+both without anyone having to remember that no input file changed.
+
+The counts above are stored beside the fingerprint, so the page reports the same numbers whether it built the tables or
+read them. A published document that gets quieter as it gets faster is worse than a slow one.
+
+## What the list says
+
+```{r}
+#| label: report-codes
+tab_codes <- itm_code_table(.long = tab_long)
+
+tab_codes |>
+  tbl_out(
+    .title = "Every code observed, against the vocabulary",
+    .notes = c(
+      pFilings  = "Share of filings carrying an item list, so the column sums above one hundred.",
+      YearFirst = "Measured, not declared. Several codes postdate their own era: 12 arrives in 2003, 1.05 in 2023.",
+      Status    = "unregistered means the vocabulary does not know it; registered, unseen means the corpus does not."
+    )
+  )
+```
+
+The first-seen column is the reason no effective dates are declared in the vocabulary. Item 12 does not exist before
+2003, so even a correct pre-reform mapping gives a voluntary count that rises across 2001 to 2004 as the item itself
+comes into being. Anything reading a pre-post difference off these counts has to answer that first.
+
+```{r}
+#| label: report-era
+itm_era_cross(.long = tab_long) |>
+  tbl_out(
+    .title = "Item era against the side of the reform the filing fell on",
+    .notes = c(
+      FiledSide = "Which side of 23 August 2004 the filing date fell on. The era comes from the code.",
+      nFilings  = "Rows where the two disagree are filers numbering by the wrong form, not a parsing error."
+    )
+  )
+```
+
+```{r}
+#| label: report-per-filing
+itm_items_per_filing(.flags = tab_flags) |>
+  tbl_out(
+    .title = "How many items a filing declares",
+    .notes = c(nItems = "The maximum is what says whether a fixed-width reshape downstream is safe.")
+  )
+```
+
+## Checks
+
+```{r}
+#| label: validate-items
+itm_check_items(.long = tab_long, .flags = tab_flags, .codes = tab_codes) |>
+  itm_report_checks(.title = "Item tables")
+```
+
+Two of these are worth reading rather than skimming. The unregistered-code check is **windowed to the sample period**:
+one filing in 1996 reports `Item 57`, which is a filer error rather than a taxonomy, and stopping a render for it would
+teach everyone to ignore the check that exists to catch the next real item -- Item 1.05 arrived in December 2023 and
+the next one will arrive without warning. The row itself is kept, carries no era and no kind, and appears in the table
+above.
+
+*Every registered code is seen* is expected to pass on the full corpus and to fail on any subset of it, which is the
+point: it is how you find out that a restricted frame is missing a taxonomy rather than missing filings.
+
+# Candidates
+
+Candidates are every 8-K document whose filing reports the item. Because the list is now parsed, the item is matched as
+a **code** rather than as a substring of a joined string. The old rule searched for `1.01` literally; written as a
+regular expression that pattern carries a wildcard in the middle and would also match `1101`, and written literally it
+would match a filing reporting Item 11.01 if one existed. Neither case arises, but a rule that is accidentally right is
+worth replacing with one that is right on purpose, and the parsed table makes it free.
+
+```{r}
+#| label: build-candidates
+tab_candidates <- itm_candidates(
+  .path_meta   = .lP$Input$MetaData,     # 01C's consolidated table
+  .tab_items   = tab_long,               # one row per filing and item
+  .path_index  = .lP$Input$FilePaths,    # DocID to Path, from 01B
+  .item        = .lP$Param$Item,         # "1.01"
+  .path_cache  = .lP$Cache$Candidates,   # candidate set and the fingerprint it was built under
+  .rerun       = FALSE                   # TRUE rebuilds regardless of the fingerprint
+)
+
+nrow(tab_candidates)
+```
+
+# Extraction
+
+The pass reuses 01C's corpus traversal: one function applied to every document, work sent to the workers in chunks
+rather than one file at a time, and the result cached so a completed pass costs one parquet read. The first run opens
+every candidate and is measured in hours.
+
+Each worker is a fresh R session, so it is told to source this document's library before it measures anything, and the
+item code reaches it as data rather than captured in a closure over a configuration list the worker does not have.
+
+For each document: read the HTML with whitespace collapsed and the two entity spellings of a non-breaking space
+replaced, locate every item boundary, take the one that is Item 1.01, and render that span as text.
+
+The anchor depends on the format, because a heading is marked differently in each. In markup a heading follows a
+closing tag, so the pattern is `>\s*ITEM`; without that anchor the word "item" inside a sentence -- and it appears
+inside most agreements -- produces a boundary where there is none. In plain text there are almost no tags, so the same
+anchor finds one or two boundaries in a document with six, and there a heading is a heading by starting a line.
+
+The header window is stripped of tags before the item code is read, and every kind of space is replaced with a plain
+one first. Filing agents set headings with typographic spacing -- thin, hair, en, em, narrow no-break -- written either
+as entities or as the characters themselves, and to a pattern expecting whitespace between "Item" and its number every
+one of them is an ordinary character. A thin space accounts for almost every unparsed heading filed after 2022.
+
+The numeric ranges are enumerated rather than matched loosely, because a pattern wide enough to catch every space
+reference in the U+2000 block also catches the curly quotation marks two positions above it, and those are content.
+
+A signature block is located alongside the items because it terminates the last one; without it the final section would
+run to the end of the document and swallow the exhibit index. Where no signature is found, the last span runs to the end
+regardless: discarding it instead would lose any filing whose only boundary is the item itself, and extracting too much
+is visible in the length distribution whereas extracting nothing leaves no trace.
+
+```{r}
+#| label: extract-items
+tab_extracted <- edg_measure_corpus(
+  .tab_idx  = tab_candidates,                          # the documents to attempt
+  .path_out = .lP$Cache$Extracted,                     # cache; present means finished
+  .fun      = itm_process_doc,                         # locate and render, one document
+  .args     = list(.item = .lP$Param$Item,             # passed as data, not closed over
+                   .min_chars = .lP$Param$MinChars),   # body chars below this: heading, not summary
+  .sources  = .path_fun,                               # workers are fresh sessions; they source this library
+  .workers  = .lP$Param$Workers,                       # parallel workers
+  .label    = "Item 1.01 extraction",                  # shown in progress output
+  .rerun    = FALSE                                    # FALSE measures only what the cache does not cover
+)
+
+nrow(tab_extracted)
+```
+
+```{r}
+#| label: build-output
+tab_item101 <- tab_extracted |>
+  dplyr::left_join(
+    y  = dplyr::select(tab_candidates, "DocID", "HashIndex", "YQ", "DocTypeMod", "Removed", "ItemCodes", "nItems"),
+    by = dplyr::join_by("DocID")
+  ) |>
+  itm_summary_dates() |>
+  dplyr::relocate(
+    "DocID", "HashIndex", "YQ", "DocTypeMod", "DocExt", "Removed", "Outcome", "ItemCodes", "nItems"
+  )
+
+nrow(tab_item101)
+```
+
+`nItems` here is what the parent filing declares and `nCodesRead` is what this document's own headings yielded, which
+are different numbers and used to share a name. `ItemCodes` replaces the pipe-joined label string the table used to
+carry: the labels are a property of the code and live in `FilingItems.parquet`, so repeating them on a quarter of a
+million rows bought nothing.
+
+## How many agreements a summary describes
+
+The paper restricts to *8-K filings containing exactly one contract summary within Item 1.01, excluding cases with
+multiple concurrent agreements*. That restriction was implemented by counting distinct `On <Month> <D>, <YYYY>`
+openings in the summary and keeping the ones with exactly one, because the regulated narrative opens that way.
+
+It is a proxy for the number of agreements described rather than a count of them, and it is stored as a count rather
+than applied as a filter. A filter here would make a summary that was excluded and a summary that was never extracted
+indistinguishable downstream, which is the failure this document exists to avoid. The analysis that wants exactly one
+keeps `SummaryIsSingle`; nothing else has to know.
+
+```{r}
+#| label: report-summary-dates
+itm_summary_date_bands(.tab = tab_item101) |>
+  tbl_out(
+    .title = "Distinct agreement dates named in a recovered summary",
+    .notes = c(
+      nSummaryDates = "Zero means the narrative does not open the regulated way, not that no agreement is described.",
+      pDocs         = "Share of recovered summaries. Failed outcomes carry no text and are excluded."
+    )
+  )
+```
+
+# Results
+
+Six summaries, each computed once here and reused by every report, figure and overview below. The table they are
+computed from carries the text of a quarter of a million summaries, so a summary derived twice is a second traversal of
+a gigabyte to produce numbers that must agree with the first by construction.
+
+```{r}
+#| label: summarise-outcomes
+tab_outcome_summary <- itm_outcome_summary(.tab = tab_item101)   # by HTML against everything else
+tab_format_detail   <- itm_format_detail(.tab = tab_item101, .min = 50L)   # by actual extension
+tab_length_summary  <- itm_length_summary(.tab = tab_item101)    # quartiles, by outcome
+tab_length_bands    <- itm_length_bands(.tab = tab_item101)      # the plausibility bands
+tab_outcome_year    <- itm_outcome_by_year(.tab = tab_item101)   # full breakdown per year
+tab_coverage_year   <- itm_coverage_by_year(.tab = tab_item101)  # extracted share per year
+```
+
+```{r}
+#| label: report-outcomes
+itm_report_all(
+  .tab_out  = tab_outcome_summary,   # summarised above; the Overview restates the same four
+  .tab_fmt  = tab_format_detail,
+  .tab_len  = tab_length_summary,
+  .tab_band = tab_length_bands
+)
+```
+
+The length comparison is the check on the longest-span rule. A filing with a table of contents lists Item 1.01 twice,
+once as a line in the contents and once as the section itself, and an earlier implementation discarded those documents
+entirely for being ambiguous. Taking the longest span keeps them, on the reasoning that a contents entry is a line and a
+section is paragraphs. If that reasoning were wrong the ambiguous group would sit far below the unambiguous one.
+
+## Extracted is not the same as correct
+
+A span that renders is recorded as a success whatever it contains, and two failure modes survive that test. A summary of
+a few dozen characters is a heading whose section is missing, which happens when the next marker sits immediately after
+this one. A summary of a hundred thousand characters is a span that never terminated, which happens when no later
+marker was found and the slice ran to the end of the filing.
+
+Neither is visible in the outcome. The bands below are deliberately coarse -- they are meant to establish whether a
+problem exists, not to fix a threshold -- and the examples show what sits at each end, because a count without an
+example invites a cutoff to be chosen from the number rather than from the documents.
+
+```{r}
+#| label: report-lengths
+tab_length_bands |>
+  tbl_out(
+    .title  = "Plausibility of the extracted lengths",
+    .pct    = "Share",
+    .digits = 1L
+  )
+```
+
+```{r}
+#| label: report-examples
+itm_examples(.tab = tab_item101, .n = 3L, .chars = 160L) |>
+  tbl_out(
+    .title = "The shortest and longest extractions",
+    .notes = c(Preview = "The first 160 characters, whitespace collapsed.")
+  )
+```
+
+## Where the failures are
+
+```{r}
+#| label: report-format-detail
+tab_format_detail |>
+  tbl_out(
+    .title  = "Outcomes by file extension",
+    .pct    = "ShareExtracted",
+    .digits = 1L,
+    .notes  = c(Ext = "Formats below fifty documents are pooled. Attempted, not excluded.")
+  )
+```
+
+```{r}
+#| label: report-outcome-year
+tab_outcome_year |>
+  tbl_out(
+    .title  = "Outcomes by year",
+    .pct    = "ShareExtracted",
+    .digits = 1L,
+    .notes  = c(
+      NoMarkers = "No item boundary found at all: a change in filing format rather than in behaviour.",
+      NotFound  = "Boundaries found but none of them this item: a change in what filers report."
+    )
+  )
+```
+
+A year that falls because documents stopped carrying item markers is a change in filing format; one that falls because
+the markers are present but Item 1.01 is not among them is a change in what filers report. They need different
+responses, and the share alone distinguishes neither.
+
+# Validation
+
+Three checks. Each states its expectation first, so a result that differs is a finding rather than a number to
+interpret afterwards.
+
+```{r}
+#| label: validate-extraction
+# 1. Every candidate should leave exactly one row: the pass is one row in, one row out.
+# 2. DocID identifies a document, so it should be unique.
+# 3. An extracted row must carry text and a span; a failed row must carry neither. A row with an
+#    outcome of extracted and no text would mean the outcome is not describing what happened.
+tibble::tibble(
+  nCandidates    = nrow(tab_candidates),
+  nRows          = nrow(tab_item101),
+  DuplicateDocID = sum(duplicated(tab_item101$DocID)),
+  ExtractedNoText = sum(
+    tab_item101$Outcome %in% c("extracted", "ambiguous-longest") & is.na(tab_item101$ItemText)
+  ),
+  FailedWithText = sum(
+    !tab_item101$Outcome %in% c("extracted", "ambiguous-longest") & !is.na(tab_item101$ItemText)
+  )
+) |>
+  tbl_out(
+    .title = "Extraction consistency",
+    .notes = c(
+      nRows           = "Must equal nCandidates: one row in, one row out, whatever the outcome.",
+      ExtractedNoText = "Nonzero means an outcome claims a success the row does not carry."
+    )
+  )
+```
+
+# Deployment
+
+Three artifacts, of which two are already on disk: `Output/FilingItems.parquet` and
+`Output/FilingItemFlags.parquet` were written under *Items*, for the reason given there.
+`Output/Item101.parquet` is written here, and carries one row per candidate document: the outcome, the span if one was
+found, and the text if it was rendered.
+
+02B reads the flags table by `HashIndex`, which is what puts the parent filing's item counts on every attachment
+including the Exhibit 10s, and it reads the summaries by `DocID` to mark whether one was extracted. Nothing here writes
+into another script's output, and nothing writes back into this one.
+
+The write is guarded and the checks above are not. A gigabyte is not rewritten to produce a file that already holds the
+same rows, but nothing is left unverified on that account: every number on this page was computed from the table in
+memory, and the fingerprint below records what the file on disk was built from.
+
+```{r}
+#| label: deploy-item101
+itm_write_item101(
+  .tab         = tab_item101,           # the joined table, one row per candidate
+  .path_out    = .lP$Output$Item101,    # the published artifact
+  .path_source = .lP$Cache$Extracted,   # the extraction cache it derives from
+  .path_stamp  = .lP$Cache$OutputStamp, # fingerprint the file was last written under
+  .rerun       = FALSE                  # TRUE writes regardless of the fingerprint
+)
+```
+
+Nothing else is written. No figure files, no styled tables: those are the release script's job, for the reason set out
+under *How results are reported*.
+
+```{r}
+#| label: deploy-report
+fs::file_info(path = c(unlist(.lP$Output), unlist(.lP$Cache))) |>
+  dplyr::transmute(
+    Kind    = c(rep("Output", length(.lP$Output)), rep("Cache", length(.lP$Cache))),
+    File    = as.character(fs::path_file(.data$path)),
+    Size    = .data$size,
+    Written = format(.data$modification_time, "%Y-%m-%d %H:%M")
+  ) |>
+  tbl_out(
+    .title = "Written",
+    .notes = c(
+      Kind    = "Only the Output row is read downstream; the rest make a re-render cheap.",
+      Written = "A cache older than this render means that step found its input unchanged."
+    )
+  )
+```
+
+# Overview
+
+```{r}
+#| label: fig-coverage
+#| fig-height: 3.4
+#| fig-cap: "Item 1.01 extraction per calendar year, split into documents whose summary was recovered
+#|   and those where it was not. The early years are thin because the item structure that makes a
+#|   material-agreement report identifiable dates from the 2004 reform."
+itm_plot_coverage(.tab = tab_coverage_year)   # summarised in Results; the release script writes the file
+```
+
+```{r}
+#| label: fig-outcome-share
+#| fig-height: 3.4
+#| fig-cap: "How the outcomes compose each year, as shares. Filing volume varies fourfold across the
+#|   period, so counts would show that rather than what is being asked."
+itm_plot_outcome_share(.tab = tab_outcome_year)   # summarised in Results
+```
+
+```{r}
+#| label: fig-length
+#| fig-height: 3.4
+#| fig-cap: "Distribution of summary length, on a log scale because the range spans four orders of
+#|   magnitude. The mass below a few hundred characters and the tail beyond a hundred thousand are
+#|   the two failure modes that pass the outcome test."
+itm_plot_length(.tab = tab_item101)   # the only figure needing the row-level table
+```
+
+```{r}
+#| label: overview-all
+itm_report_all(
+  .tab_out  = tab_outcome_summary,   # summarised once in Results
+  .tab_fmt  = tab_format_detail,
+  .tab_len  = tab_length_summary,
+  .tab_band = tab_length_bands
+)
+```
+
+# Known limits
+
+The date heuristic is the weakest thing on this page, and it is worth being precise about how weak.
+Of the recovered summaries, roughly one in six names no date the pattern reads. A probe over twenty
+thousand of those measured where the gap is, and the answer splits three ways.
+
+**The narrative opens some other way.** A case-insensitive `on` would catch 37.7% of the bucket on
+its own -- the date arrives mid-sentence, as in *the Company entered into a lease on April 9, 2015*
+-- and `effective`, `dated` or `as of` would catch 48.5%. Those two do almost all of the available
+work: relaxing further, to abbreviated months, ordinal days, day-before-month, numeric dates and
+*the 15th day of July*, adds one percentage point between them.
+
+**The section is a pointer rather than a summary.** Every one of the eight hardest misses sampled
+read some version of *The information set forth in Item 3.02 below is incorporated herein by
+reference*. The filer reported Item 1.01 and put the substance in a different item of the same 8-K.
+That is a third failure mode passing the outcome test, alongside the two under *Extracted is not the
+same as correct*, and no date pattern will ever read it because there is no date to read.
+
+**The summary genuinely names no date.** 68.6% of the bucket contains a four-digit year anywhere in
+the text and 66.7% a month-name date, so about a third of it names nothing datelike at all. The
+relaxations above reach 63.9% against that 66.7% ceiling, which is the useful thing the probe
+established: the pattern is not the binding constraint for most of what is left.
+
+## Why it was not widened
+
+Two reasons, and the second is the stronger one.
+
+The narrow pattern is what the published filter used, so leaving it alone keeps that filter exactly
+reproducible.
+
+More importantly, a broader pattern reads dates that are not the agreement date. One sampled summary
+opens *0.25% Convertible Senior Notes due 2023. On the Closing Date, Zendesk and Wil...* -- the
+narrative gives no date at all, and the only month-name date in the text belongs to the instrument's
+maturity. Since the count is a proxy for how many agreements a summary describes, a match like that
+does not fix a zero; it manufactures a one. And a document can move from one date to two as readily
+as from zero to one, so widening shrinks the sample the published filter keeps at the same time as
+it grows it. Which way the net falls is not knowable without measuring it, and measuring it is not
+what this script is for.
+
+The count is stored rather than applied, so none of this is load-bearing here: an analysis that
+wants a different rule reads `ItemText` and applies it. What would help more than a wider pattern is
+a measured column separating the pointer case from the genuinely dateless one, which is a rule about
+cross-references rather than about dates, and is not built.
+
+## A few, as they are
+
+```{r}
+#| label: report-summary-examples
+itm_summary_examples(.tab = tab_item101, .n = 4L) |>
+  tbl_out(
+    .title = "Summaries at each date count, with what the current pattern matched",
+    .notes = c(
+      Dates   = "Sampled on a fixed seed, so this table is the same on a re-render.",
+      Match   = "Two dashes mean the pattern found nothing; the preview says whether that is fair.",
+      Preview = "The item heading and regulated title are stripped -- every summary carries the same forty characters."
+    )
+  )
+```
+
+# Next
+
+**01E-CtoExhibits** does the equivalent for confidential-treatment orders: extracts the exhibit references each order
+names and links them back to the contracts they cover.
+
+**02-SelectSample** reads both outputs: the flags table by `HashIndex`, so every register row carries what its parent
+filing reported, and the summaries by `DocID`, so every 8-K report row carries whether one was recovered.
+
+**05B-ItemTaxonomy** becomes a consumer of `FilingItems.parquet` rather than a second parser of the same landing table.
+Its argument about what the 2004 reform moved is unchanged; what changes is that the numbers behind it now come from
+the pipeline rather than from a parse that exists only in that document.

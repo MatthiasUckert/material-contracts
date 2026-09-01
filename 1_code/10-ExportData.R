@@ -57,10 +57,16 @@ if (FALSE) {
 #: export_sample() reports every register column this list leaves behind, so a column that belongs in
 #: the release surfaces in that line rather than being missed for a year.
 .exp_sample_cols <- c(
-  # identity, and the link back to EDGAR
-  "DocID", "HashDocument", "HashIndex", "CIK", "CompanyName", "UrlDocument",
-  # what the document is
-  "DocTypeRaw", "DocTypeMod", "FormType", "DocExt", "DateFiled",
+  # identity, and the two links back to EDGAR. Referee 2 asked for an overview file carrying "an
+  # identifiable cik-accession-filename combination (rather than a random hash ID)" and "most
+  # importantly, a link to the actual file location at EDGAR". DocID is the accession and the
+  # accession opens with the CIK, so DocName is the word that was missing. UrlIndexPage is the
+  # filing; UrlDocument is the one attachment, and a reader wants both.
+  "DocID", "HashDocument", "HashIndex", "CIK", "CompanyName",
+  "DocName", "DocSeq", "UrlDocument", "UrlIndexPage",
+  # what the document is. DocDesc is the filer's own description of the exhibit, and the only
+  # human-written label an attachment carries.
+  "DocTypeRaw", "DocTypeMod", "DocDesc", "FormType", "DocExt", "DateFiled",
   # how big, and whether it is usable
   "nWords", "nWordsAdj", "nChars", "nNums", "pStopShort", "Removed", "RemClass",
   # whether it is one of several copies of one attachment
@@ -68,12 +74,13 @@ if (FALSE) {
   # who filed it, and which fiscal quarter it fell in
   "gvkey", "datadate", "cyear", "fyear", "fqtr",
   # which sample it is in
-  "SampleStepCode", "SampleStepDesc", "DescSample", "EstiSample",
-  # what 01E found. 01D's three columns -- Items, HasItem101, Item101Outcome -- are NOT here: they
-  # are joined onto the register by DocID from a table of 8-K reports, so on an Exhibit 10 row
-  # HasItem101 is identically zero and the other two identically missing. A contract reaches its own
-  # 8-K through HashIndex, which is the filing and is exported above.
-  "HasCto", "nCtoOrders", "CtoReleaseFirst", "CtoReleaseLast", "CtoIsExtension"
+  "SampleStepCode", "SampleStepDesc", "DescSample", "EstiSample"
+  # THE ITEM AND ORDER COLUMNS ARE NOT HERE, and they used to be. 02B carried both, which put a
+  # filing-level fact and a firm-level one on a document row for no reason either the ladder or 03
+  # and 04 needed: those read twelve named columns from the register and none of these is among
+  # them. They are joined here instead, from 01D on HashIndex and from 01E on DocID, which is one
+  # line each and puts them where the only consumer is. HasSummary and Item101Outcome stay in the
+  # register because they are properties of an 8-K report document, and this file holds none.
 )
 
 #: What 03F's release carries beside its labels. These are the register's own columns and the sample
@@ -437,6 +444,153 @@ export_classification <- function(.path_in, .path_out, .engine = "Bert", .rerun 
   invisible(out_)
 }
 
+
+# 3b. Items and orders -------------------------------------------------------------------------------------------------
+
+#' The parent filing's 8-K items, one row per filing
+#'
+#' A RESTRICTION AND A SELECT, NOT A COMPUTATION. 01D already collapsed its long item table to one
+#' row per filing, so nothing here derives anything: the era rule, the voluntary count and the
+#' indicators are all its. What this adds is the cut to the filings this sample actually touches --
+#' 01D covers every filing EDGAR indexed, which is four times what the contracts reach, and a cache
+#' larger than anything reading it is a cache nobody trusts.
+#'
+#' FilingDate IS DROPPED. 01D reads it off the landing page; the register carries DateFiled from the
+#' index. They agree, and two dates for one filing in one file is a question waiting to be asked.
+#'
+#' THE JOIN KEY IS HashIndex, WHICH IS NEW HERE. Every other cache is keyed on a document, either
+#' directly or through its attachment. This one is keyed on the filing a document arrived in, so it
+#' is many-to-one against the spine and a contract shares its counts with every other exhibit of the
+#' same 8-K. That is correct and worth stating: the items are a property of the filing, not of the
+#' contract, and two contracts filed together necessarily carry the same ones.
+#'
+#' @param .path_in 01D's FilingItemFlags.parquet, one row per filing.
+#' @param .path_sample The sample cache, read for the HashIndex values to keep.
+#' @param .path_out Destination parquet.
+#' @param .rerun Logical. TRUE rebuilds regardless of the cache check.
+#' @return The written table, invisibly.
+export_items <- function(.path_in, .path_sample, .path_out, .rerun = FALSE) {
+  if (FALSE) {
+    .path_in     <- .lP$Input$FilItemFlags
+    .path_sample <- .lP$Cache$CacheSample
+    .path_out    <- .lP$Cache$CacheItems
+    .rerun       <- FALSE
+  }
+
+  if (exp_cache_hit(.task = "Items", .path_out = .path_out,
+                    .paths_in = c(.path_in, .path_sample), .rerun = .rerun)) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "Items: {.path {as.character(fs::path_file(.path_out))}} already written \\
+       ({format(nrow(out_), big.mark = ',')} rows, {ncol(out_)} columns). Pass .rerun = TRUE to rebuild."
+    )
+    return(invisible(out_))
+  }
+
+  keep_ <- arrow::open_dataset(sources = .path_sample) |>
+    dplyr::select("HashIndex") |>
+    dplyr::collect() |>
+    dplyr::distinct(.data$HashIndex) |>
+    dplyr::pull(.data$HashIndex)
+
+  out_ <- arrow::open_dataset(sources = .path_in) |>
+    dplyr::filter(.data$HashIndex %in% keep_) |>
+    dplyr::select(-dplyr::any_of("FilingDate")) |>
+    dplyr::collect() |>
+    dplyr::arrange(.data$HashIndex)
+
+  if (anyDuplicated(out_$HashIndex)) {
+    cli::cli_abort("01D's per-filing table is not one row per filing; the join would multiply the sample.")
+  }
+
+  fs::dir_create(fs::path_dir(.path_out))
+  arrow::write_parquet(out_, .path_out)
+  cli::cli_alert_success(
+    "Items: {format(nrow(out_), big.mark = ',')} of {format(length(keep_), big.mark = ',')} \\
+     {cli::qty(length(keep_))}filing{?s} the sample reaches."
+  )
+
+  invisible(out_)
+}
+
+#' The confidential-treatment orders naming each contract, one row per contract
+#'
+#' THE ONLY CACHE HERE THAT COLLAPSES ANYTHING. 01E publishes one row per order REFERENCE: an order
+#' can name several exhibits and a contract can be named by several orders, most often because a
+#' grant was later extended. This is the collapse 02B used to do, moved rather than rewritten, and a
+#' probe confirmed the two agree on every row of the previous release before it moved.
+#'
+#' BOTH RELEASE DATES ARE KEPT. Where two orders cover one contract they rarely lapse together, and
+#' which one matters depends on the question: the earliest is when any part becomes releasable, the
+#' latest when all of it does.
+#'
+#' THE GUARD ON THE DATES IS LOAD-BEARING. min() over a set of all-missing release dates returns Inf,
+#' which lands in a date column as a number that looks like data rather than as an absence. 01E
+#' parses no date for some orders, so the case is real rather than defensive.
+#'
+#' TWO PROPERTIES OF 01E'S LINKAGE TRAVEL WITH THIS TABLE, and neither is introduced here. A
+#' reference links only where exactly one Exhibit 10 in the filing carries its exhibit number, which
+#' costs 43 references out of 32,410. And an attachment filed in several filings is covered in the
+#' one the order names and not in the others -- 148 attachments split that way, every one of them
+#' across different filings, which is what an order granting relief for a particular filing means.
+#'
+#' @param .path_in 01E's CtoExhibits.parquet, one row per order reference.
+#' @param .path_out Destination parquet.
+#' @param .rerun Logical. TRUE rebuilds regardless of the cache check.
+#' @return The written table, invisibly.
+export_cto <- function(.path_in, .path_out, .rerun = FALSE) {
+  if (FALSE) {
+    .path_in  <- .lP$Input$FilCtoExhibits
+    .path_out <- .lP$Cache$CacheCto
+    .rerun    <- FALSE
+  }
+
+  if (exp_cache_hit(.task = "Orders", .path_out = .path_out, .paths_in = .path_in,
+                    .rerun = .rerun)) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "Orders: {.path {as.character(fs::path_file(.path_out))}} already written \\
+       ({format(nrow(out_), big.mark = ',')} rows, {ncol(out_)} columns). Pass .rerun = TRUE to rebuild."
+    )
+    return(invisible(out_))
+  }
+
+  ref_ <- arrow::open_dataset(sources = .path_in) |>
+    dplyr::filter(!is.na(.data$DocIDContract)) |>
+    dplyr::select("DocIDContract", "ReleaseDate", "IsExtension") |>
+    dplyr::collect()
+
+  out_ <- ref_ |>
+    dplyr::summarise(
+      nCtoOrders      = dplyr::n(),
+      CtoReleaseFirst = suppressWarnings(min(.data$ReleaseDate, na.rm = TRUE)),
+      CtoReleaseLast  = suppressWarnings(max(.data$ReleaseDate, na.rm = TRUE)),
+      CtoIsExtension  = as.integer(any(.data$IsExtension == 1L)),
+      .by             = "DocIDContract"
+    ) |>
+    dplyr::mutate(
+      dplyr::across(
+        .cols = dplyr::all_of(c("CtoReleaseFirst", "CtoReleaseLast")),
+        .fns  = \(.x) dplyr::if_else(is.finite(.x), .x, as.Date(NA))
+      )
+    ) |>
+    dplyr::rename(DocID = "DocIDContract") |>
+    # THE DATES COME FIRST BECAUSE THE MARKER IS THE FIRST NON-KEY COLUMN. nCtoOrders is coalesced to
+    # zero at the join, so in the released file it is never missing and would report every contract
+    # as carrying this block. CtoReleaseFirst is where the absence actually shows, which is what
+    # .exp_blocks declares, and ordering the cache to agree keeps one rule rather than two.
+    dplyr::relocate("DocID", "CtoReleaseFirst", "CtoReleaseLast", "nCtoOrders", "CtoIsExtension") |>
+    dplyr::arrange(.data$DocID)
+
+  fs::dir_create(fs::path_dir(.path_out))
+  arrow::write_parquet(out_, .path_out)
+  cli::cli_alert_success(
+    "Orders: {format(nrow(out_), big.mark = ',')} contract{?s} named by \\
+     {format(nrow(ref_), big.mark = ',')} linked reference{?s}."
+  )
+
+  invisible(out_)
+}
 
 # 3. Parties ----------------------------------------------------------------------------------------------------------------
 
@@ -1421,10 +1575,12 @@ export_REDACT <- function(.dir_in, .path_out, .rerun = FALSE) {
 #' @param .rerun Logical. FALSE returns the file where it already exists.
 #' @param .dta Logical. Also write the Stata copy and the codebook.
 #' @return Invisibly the written table: one row per registrant copy.
-export_final <- function(.path_sample, .path_class, .paths_entity, .path_out,
-                         .rerun = FALSE, .dta = TRUE) {
+export_final <- function(.path_sample, .path_items, .path_cto, .path_class, .paths_entity,
+                         .path_out, .rerun = FALSE, .dta = TRUE) {
   if (FALSE) {
     .path_sample  <- .lP$Cache$CacheSample
+    .path_items   <- .lP$Cache$CacheItems
+    .path_cto     <- .lP$Cache$CacheCto
     .path_class   <- .lP$Cache$CacheClassification
     .paths_entity <- .lP$Cache[c("CacheEntityORG", "CacheEntityGPE")]
     .path_out     <- .lP$Output$FilContracts
@@ -1432,7 +1588,7 @@ export_final <- function(.path_sample, .path_class, .paths_entity, .path_out,
     .dta          <- TRUE
   }
 
-  in_ <- c(.path_sample, .path_class, unlist(.paths_entity))
+  in_ <- c(.path_sample, .path_items, .path_cto, .path_class, unlist(.paths_entity))
 
   if (exp_cache_hit(.task = "Contracts", .path_out = .path_out, .paths_in = in_,
                     .rerun = .rerun)) {
@@ -1446,18 +1602,59 @@ export_final <- function(.path_sample, .path_class, .paths_entity, .path_out,
 
   out_ <- arrow::read_parquet(file = .path_sample)
 
-  need_ <- c("DocID", "HashDocument", "PrimaryFiler")
+  need_ <- c("DocID", "HashDocument", "HashIndex", "PrimaryFiler")
   miss_ <- setdiff(need_, names(out_))
   if (length(miss_) > 0L) {
     cli::cli_abort(c(
       "The sample cannot act as the spine.",
       "x" = "It is missing {paste(miss_, collapse = ', ')}.",
-      "i" = "DocID keys the classification, HashDocument keys the entity blocks, and PrimaryFiler
-             says which copy was read."
+      "i" = "DocID keys the classification and the orders, HashDocument keys the entity blocks,
+             HashIndex keys the items, and PrimaryFiler says which copy was read."
     ))
   }
 
   book_ <- tibble::tibble(Column = names(out_), Source = "Sample")
+
+  # THE ITEMS ARE A PROPERTY OF THE FILING, so the join is many-to-one on HashIndex and two exhibits
+  # of one 8-K necessarily carry the same counts. NA after this join means the parent filing has no
+  # item list at all -- a 10-K, an S-1 -- which is not the same as an 8-K reporting none, and that
+  # second case cannot happen. Coalescing to zero here would erase the difference; an analysis that
+  # wants it erased can say so in one line.
+  if (!is.na(.path_items)) {
+    itm_ <- arrow::read_parquet(file = .path_items)
+    exp_check_collide(
+      .a = names(out_), .b = names(itm_), .by = "HashIndex", .what = "the items join"
+    )
+    out_ <- dplyr::left_join(
+      out_, itm_, by = dplyr::join_by(HashIndex), relationship = "many-to-one"
+    )
+    book_ <- dplyr::bind_rows(
+      book_, tibble::tibble(Column = setdiff(names(itm_), "HashIndex"), Source = "Items")
+    )
+  }
+
+  # THE ORDERS ARE THE ONE BLOCK WITH NO MISSING MARKER. nCtoOrders and CtoIsExtension become zero
+  # where no order names the contract, because "no order was found" is a measurement over every
+  # contract rather than a block that failed to arrive -- and it is the definition the published
+  # redaction variable is built on. The dates stay missing, which is where the absence shows.
+  if (!is.na(.path_cto)) {
+    cto_ <- arrow::read_parquet(file = .path_cto)
+    exp_check_collide(
+      .a = names(out_), .b = names(cto_), .by = "DocID", .what = "the orders join"
+    )
+    out_ <- out_ |>
+      dplyr::left_join(cto_, by = dplyr::join_by(DocID), relationship = "one-to-one") |>
+      dplyr::mutate(
+        nCtoOrders     = dplyr::coalesce(.data$nCtoOrders, 0L),
+        CtoIsExtension = dplyr::coalesce(.data$CtoIsExtension, 0L),
+        HasCto         = as.integer(.data$nCtoOrders > 0L)
+      ) |>
+      dplyr::relocate("HasCto", "nCtoOrders", "CtoReleaseFirst", "CtoReleaseLast",
+                      "CtoIsExtension", .after = "EstiSample")
+    book_ <- dplyr::bind_rows(
+      book_, tibble::tibble(Column = c("HasCto", setdiff(names(cto_), "DocID")), Source = "Orders")
+    )
+  }
 
   # THE CLASSIFICATION IS ALREADY AT COPY GRAIN. one-to-one is a check as much as a hint: a duplicate
   # DocID on either side stops the render rather than silently multiplying the sample.
@@ -1738,10 +1935,12 @@ exp_table_columns <- function(.tab, .path_register) {
 
 #' What the sample took and what it left, reported
 #'
-#' "left behind" IS A REPORT AND NOT A FAULT. Group is constant once the register is cut to one
-#' document type, and DocType and YQ are components of a machine path. Anything else in that list is
-#' a decision to revisit. "named but absent" IS a fault: .exp_sample_cols names a column the register
-#' does not have.
+#' "left behind" IS A REPORT AND NOT A FAULT, and the report is the point: the list has changed three
+#' times and a prose count of it was wrong within a month of being written. Group is constant once
+#' the register is cut to one document type, DocType and YQ are components of a machine path, and
+#' HasSummary and Item101Outcome describe an 8-K report rather than a contract. Anything else in that
+#' list is a decision to revisit. "named but absent" IS a fault: .exp_sample_cols names a column the
+#' register does not have.
 #'
 #' @param .tab Tibble from exp_table_columns().
 #' @return Invisibly .tab.
@@ -1758,11 +1957,15 @@ exp_report_columns <- function(.tab) {
     tbl_out(
       .title = NULL,
       .notes = c(
-        Which = "Six are left behind on purpose: Group is constant once the register is cut to one
-                 type, DocType and YQ are components of a machine path, and Items, HasItem101 and
-                 Item101Outcome are 8-K columns that are empty on every Exhibit 10 row. Anything
-                 else in that row is a decision to revisit; anything under 'named but absent' is a
-                 fault in .exp_sample_cols."
+        Which = "The count is not asserted here, because it moved once already while a note still
+                 said six. Everything left behind is left for one of three reasons. Group, DocType
+                 and YQ are constant or are components of a machine path. HasSummary and
+                 Item101Outcome are properties of an 8-K report document and this file holds none.
+                 DocSize, UrlFullText, nImgs, nWordsFile, pNums and pStopLong are measurements the
+                 released set already covers in another form -- nChars, nWords, pStopShort -- or,
+                 for UrlFullText, a link to a submission blob that runs to tens of megabytes.
+                 Anything beyond those is a decision to revisit; anything under 'named but absent'
+                 is a fault in .exp_sample_cols."
       )
     )
 
@@ -1796,11 +1999,19 @@ exp_table_files <- function(.tabs, .final) {
     .final <- tab_Contracts
   }
 
-  keys_ <- c("DocID", "HashDocument")
+  # HashIndex IS A KEY TOO, and leaving it out of this list is not cosmetic: the marker is derived
+  # as the first non-key column, so the items cache reported HashIndex as its marker and 100% of the
+  # file as carrying the block. Every row carries a HashIndex; only some carry items.
+  keys_ <- c("DocID", "HashDocument", "HashIndex")
 
   purrr::map(names(.tabs), function(.n) {
-    tab_    <- .tabs[[.n]]
-    marker_ <- setdiff(names(tab_), keys_)[[1L]]
+    tab_ <- .tabs[[.n]]
+
+    # THE MARKER IS DECLARED, AND ONLY GUESSED WHERE NOTHING DECLARES IT. Deriving it as the first
+    # non-key column made this table disagree with the grain table two rows apart, which is the
+    # worst kind of wrong: both are printed in the same document and neither says it is a guess.
+    said_   <- .exp_blocks$Marker[match(.n, .exp_blocks$Cache)]
+    marker_ <- if (!is.na(said_) && said_ %in% names(tab_)) said_ else setdiff(names(tab_), keys_)[[1L]]
     in_     <- if (marker_ %in% names(.final)) sum(!is.na(.final[[marker_]])) else NA_integer_
 
     tibble::tibble(
@@ -1960,42 +2171,58 @@ exp_report_final <- function(.tab) {
 
 #: THE EIGHT BLOCKS, and the three facts that are true of a whole block rather than of one column.
 #:
+#: Cache NAMES THE FILE EACH BLOCK ARRIVES IN, so exp_table_files() can take the marker from here
+#: rather than guessing it. It guessed it as the first non-key column, which disagreed with this
+#: table in two places at once: the orders cache led with nCtoOrders, which the join coalesces to
+#: zero and which therefore reported every contract as carrying the block, and the sample led with
+#: CIK once HashIndex was recognised as a key. One declaration, read by both.
+#:
 #: Marker is the column that says whether the block reached a row at all. In the joined file NA means
 #: two different things and no column distinguishes them: the contract is not in that cache, or it is
 #: and this particular value does not exist. Marker separates them -- where it is missing the whole
 #: block is absent, and every other NA in the block is the second kind.
 .exp_blocks <- tibble::tribble(
-  ~Block, ~Grain, ~Population, ~Marker,
-  "Sample", "registrant copy",
+  ~Block, ~Cache, ~Grain, ~Population, ~Marker,
+  "Sample", "Sample", "registrant copy",
   "Every Exhibit 10 attachment on EDGAR, once per registrant that filed it. Nothing is excluded.",
   "HashIndex",
 
-  "Classification", "registrant copy",
+  "Items", "Items", "parent filing, repeated across its exhibits",
+  "Contracts whose 8-K declares an item list. Filings with no item structure -- a 10-K, an S-1 --
+   reach no row here, which is why the marker is missing rather than zero.",
+  "nItems",
+
+  "Orders", "Orders", "registrant copy",
+  "Every contract: nCtoOrders is a count over all of them, zero where the SEC granted no
+   confidential treatment. The release dates carry the absence instead.",
+  "CtoReleaseFirst",
+
+  "Classification", "Classification", "registrant copy",
   "Attachments 03F could label, fanned out to their copies. 741 copies short of the sample.",
   "BertClassDetailed",
 
-  "Parties", "attachment, repeated across copies",
+  "Parties", "ORG", "attachment, repeated across copies",
   "Every contract 04D read. 04B1 writes a sentinel where no organisation was found, so the block
    reaches all of them.",
   "nUniSpellingsNaive",
 
-  "Geography", "attachment, repeated across copies",
+  "Geography", "GPE", "attachment, repeated across copies",
   "Contracts naming a place outside a governing-law clause. About seven in eight.",
   "nUniStateNaive",
 
-  "Law", "attachment, repeated across copies",
+  "Law", "LAW", "attachment, repeated across copies",
   "Contracts carrying at least one governing-law clause. About three quarters.",
   "nLawClause",
 
-  "Dates", "attachment, repeated across copies",
+  "Dates", "DATE", "attachment, repeated across copies",
   "Contracts naming a parsed date OR a stated term. Either is enough to place them here.",
   "DateStart",
 
-  "Money", "attachment, repeated across copies",
+  "Money", "MONEY", "attachment, repeated across copies",
   "Contracts in which the extractor found any money figure, withheld or not. About seven in ten.",
   "nUniAmountNaive",
 
-  "Redactions", "attachment, repeated across copies",
+  "Redactions", "REDACT", "attachment, repeated across copies",
   "Contracts carrying at least one redaction marker. About one in five; the rest redact nothing.",
   "nRedactExplicit"
 )
@@ -2137,24 +2364,43 @@ exp_report_final <- function(.tab) {
   "1 where the document is in the estimation sample.",
   "never",
 
-  "HasCto", "Sample",
+  "DocName", "Sample",
+  "EDGAR's own filename for the attachment. The third part of the cik-accession-filename
+   combination a referee asked the release to carry.",
+  "never",
+
+  "DocSeq", "Sample",
+  "Where the attachment sits in its filing's exhibit list. Orders exhibits within one 8-K.",
+  "never",
+
+  "UrlIndexPage", "Sample",
+  "Link to the filing's index page on EDGAR, which shows every document it carried. UrlDocument
+   opens this attachment alone.",
+  "never",
+
+  "DocDesc", "Sample",
+  "The filer's own description of the exhibit, and the only human-written label an attachment
+   carries. Free text: filers write what they like.",
+  "where the filer supplied none",
+
+  "HasCto", "Orders",
   "1 where a confidential treatment order names this contract.",
   "never",
 
-  "nCtoOrders", "Sample",
+  "nCtoOrders", "Orders",
   "How many CT orders name it.",
   "never",
 
-  "CtoReleaseFirst", "Sample",
+  "CtoReleaseFirst", "Orders",
   "Earliest release date across those orders. KNOWN DEFECT: a few rows run to 3036, which is a parse
    error in 01E rather than a real date.",
   "no CT order names this contract",
 
-  "CtoReleaseLast", "Sample",
+  "CtoReleaseLast", "Orders",
   "Latest release date across those orders. Same defect as above.",
   "no CT order names this contract",
 
-  "CtoIsExtension", "Sample",
+  "CtoIsExtension", "Orders",
   "1 where any of those orders extends an earlier one.",
   "never",
 
@@ -2171,6 +2417,63 @@ exp_report_final <- function(.tab) {
   "AmendType", "Classification",
   "Original or Amended. A copy of BertAmendType.",
   "03F could not label this attachment",
+
+  # -- Items ----------------------------------------------------------------------------------------
+  "nItems", "Items",
+  "How many items the parent 8-K declares. The block marker: missing means the filing has no item
+   structure at all, which is not the same as an 8-K reporting none.",
+  "where the parent filing declares no items",
+
+  "nItemsDotted", "Items",
+  "How many of them are post-2004 dotted codes. Separates the two taxonomies without a date rule.",
+  "structural",
+
+  "nItemsVoluntary", "Items",
+  "Items the registrant chose to report: 2.02, 7.01 and 8.01 after the 2004 reform, and 12, 9 and 5
+   before it, which are the same three under two numbering schemes. Counting only the dotted codes
+   returns zero for every filing before 23 August 2004.",
+  "structural",
+
+  "nItemsMandatory", "Items",
+  "Items triggered by an event outside the registrant's control, four business days.",
+  "structural",
+
+  "nItemsUnknown", "Items",
+  "Items whose code is not in 01D's registered vocabulary. One 1996 filing, outside this sample.",
+  "structural",
+
+  "ItemEra", "Items",
+  "Which taxonomy the filing numbers by: Post, Pre, or Mixed where it uses both. Assigned from the
+   codes rather than the date; 41 filings in the corpus disagree with their own filing date.",
+  "where no code could be classified",
+
+  "ItemCodes", "Items",
+  "Every item the filing declares, pipe-separated, in the order declared. Nothing is picked, so any
+   other indicator is recomputable from it.",
+  "structural",
+
+  "ReportsItem101", "Items",
+  "1 where the parent filing reports Item 1.01, entry into a material definitive agreement. NOT the
+   same as the register's HasSummary, which says 01D recovered the narrative: a filing can report
+   the item while the extraction fails.",
+  "structural",
+
+  "ReportsItem202", "Items",
+  "1 where the filing reports results of operations: Item 2.02, or Item 12 before the reform.",
+  "structural",
+
+  "ReportsItem701", "Items",
+  "1 where the filing reports a Regulation FD disclosure: Item 7.01, or Item 9 before the reform.",
+  "structural",
+
+  "ReportsItem801", "Items",
+  "1 where the filing reports other events: Item 8.01, or Item 5 before the reform.",
+  "structural",
+
+  "ReportsItem901", "Items",
+  "1 where the filing reports financial statements and exhibits: Item 9.01, or Item 7 before the
+   reform. A contract-bearing 8-K that does not report it is worth a look.",
+  "structural",
 
   "BertClassDetailed", "Classification",
   "The twelve-class label from legal-bert, which 03B crowned at 0.882 macro-F1.",
@@ -2543,9 +2846,11 @@ exp_table_dictionary <- function(.tab, .dict = .exp_dictionary) {
 exp_report_grain <- function(.tab = .exp_blocks) {
   if (FALSE) .tab <- .exp_blocks
 
-  tbl_head(.text = "The eight blocks: what a row is, and who is in it")
+  tbl_head(.text = paste(nrow(.exp_blocks), "blocks: what a row is, and who is in it"))
   tbl_out(
-    .tab   = .tab,
+    # Cache is machinery -- which file on disk the block arrives in -- and belongs to the coverage
+    # table above rather than to a reader asking what a row means.
+    .tab   = dplyr::select(.tab, -dplyr::any_of("Cache")),
     .title = NULL,
     .notes = c(
       Grain  = "An entity value is one attachment's, repeated on every registrant copy of it. A

@@ -176,7 +176,7 @@ firing on none is probably written wrongly, and only the per-term table shows ei
     ),
     # 01D's only artifact, carrying the Item 1.01 summary as its own column.
     Item101 = fs::path(
-      init_create_script_dir(.dir_here = here::here(), .name_script = "01D-Item101"),
+      init_create_script_dir(.dir_here = here::here(), .name_script = "01D-GetItems"),
       "Output", "Item101.parquet"
     ),
     # THE CORPUS LABEL SPINE, AND IT IS A DIRECTORY. 03F writes contract_labels_L<max_len>.parquet,

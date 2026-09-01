@@ -161,6 +161,11 @@ established holds through to the released file.
     # ever having joined it, so Removed says which documents were caught and nothing says why.
     FilRemoved        = "2_output/01C-EdgarMetaData/Output/RemovedDocs.parquet",
     FilClassification = "2_output/03F-ClassifyApply/release/contract_labels_L256.parquet",
+    # THE FILING'S OWN FACTS, joined here rather than through the register. 02B carried both and
+    # stopped: neither feeds the sample ladder, and 03 and 04 read twelve named register columns of
+    # which neither is one, so the only consumer was this file.
+    FilItemFlags      = "2_output/01D-GetItems/Output/FilingItemFlags.parquet",
+    FilCtoExhibits    = "2_output/01E-CtoExhibits/Output/CtoExhibits.parquet",
     # THE POLICY HASH IS IN THE PATH. 04D names each directory for a hash folding in its rules and
     # the extractor's own spec hashes, so pinning it here is what says which release this reads --
     # and a rehearsal directory sitting beside the full one cannot be picked up by accident.
@@ -174,6 +179,8 @@ established holds through to the released file.
   # passing .rerun = TRUE to that chunk.
   Cache = list(
     CacheSample         = utils_file_path(.dir_main, "Cache", "Sample.parquet"),
+    CacheItems          = utils_file_path(.dir_main, "Cache", "Items.parquet"),
+    CacheCto            = utils_file_path(.dir_main, "Cache", "Cto.parquet"),
     CacheClassification = utils_file_path(.dir_main, "Cache", "Classification.parquet"),
     CacheEntityORG      = utils_file_path(.dir_main, "Cache", "EntityORG.parquet"),
     CacheEntityGPE      = utils_file_path(.dir_main, "Cache", "EntityGPE.parquet"),
@@ -212,10 +219,11 @@ to EDGAR.
 the name without ever having joined the column. Referee 1 asked whether the malformed contracts are
 noted anywhere in the data, and without this they are flagged but unexplained.
 
-01D's three columns -- `Items`, `HasItem101`, `Item101Outcome` -- are deliberately **not** exported.
-They are joined onto the register by `DocID` from a table of 8-K reports, so on an Exhibit 10 row
-`HasItem101` is identically zero and the other two identically missing. A contract reaches its own
-8-K through `HashIndex`, which is the filing and is exported.
+01D's document-level columns -- `HasSummary` and `Item101Outcome` -- are deliberately **not** exported.
+Both say whether 01D recovered an Item 1.01 narrative from a given document, and this file holds no
+8-K reports, so on every row here they would be identically zero and identically missing. What a
+contract does want from its 8-K is what the filing reported, and that arrives through `HashIndex` in
+the Items block above.
 
 The report below lists every register column the selection leaves behind, so anything that ought to
 be in the release surfaces there rather than being missed.
@@ -247,6 +255,69 @@ exp_report_numeric(
 exp_report_levels(
   .tab   = exp_table_levels(.tab = tab_Sample, .col = "SampleStepDesc"),
   .title = "Where each contract sits on the sample ladder"
+)
+```
+
+# Items and orders
+
+Two facts about a contract that are not facts about the contract. The 8-K items belong to the filing
+it arrived in, and the confidential-treatment order belongs to the firm that asked for one. Both used
+to reach this file through the register; neither feeds the sample ladder, and 03 and 04 read twelve
+named register columns of which neither is one, so the register was carrying them for this file
+alone. They are joined here instead.
+
+`export_items()` computes nothing. 01D already collapsed its long item table to one row per filing,
+so the era rule, the voluntary count and the indicators are all its. What this adds is the cut to the
+filings the sample reaches -- 01D covers every filing EDGAR indexed, four times what the contracts
+touch -- and it drops `FilingDate`, which the register already carries as `DateFiled` from a
+different source.
+
+```{r}
+#| label: build-items
+tab_Items <- export_items(
+  .path_in     = .lP$Input$FilItemFlags,   # 01D, one row per filing
+  .path_sample = .lP$Cache$CacheSample,    # read for the HashIndex values worth keeping
+  .path_out    = .lP$Cache$CacheItems,
+  .rerun       = FALSE
+)
+```
+
+`export_cto()` is the one cache here that collapses anything. 01E publishes one row per order
+*reference*: an order can name several exhibits and a contract can be named by several orders, most
+often because a grant was later extended. The collapse is 02B's, moved rather than rewritten, and a
+probe confirmed the two agree on every row of the previous release before it moved.
+
+Two properties of 01E's linkage travel with the table and neither is introduced here. A reference
+links only where exactly one Exhibit 10 in the filing carries its exhibit number, which costs 43
+references out of 32,410. And an attachment filed in several filings is covered in the one the order
+names and not in the others: 148 attachments split that way, every one of them across different
+filings, which is what an order granting relief for a particular filing means.
+
+```{r}
+#| label: build-cto
+tab_Cto <- export_cto(
+  .path_in  = .lP$Input$FilCtoExhibits,   # 01E, one row per order reference
+  .path_out = .lP$Cache$CacheCto,
+  .rerun    = FALSE
+)
+```
+
+```{r}
+#| label: report-items
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_Items),
+  .title = "The parent filing's items, per contract",
+  .notes = c(NonMiss = "One row per filing the sample reaches, so this counts filings rather than
+                        contracts. Every column is complete here; the missingness arrives at the
+                        join, where a contract whose filing declares no items finds no row.")
+)
+
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_Cto),
+  .title = "Confidential-treatment orders, per covered contract",
+  .notes = c(NonMiss = "Only covered contracts are in this cache. The zeros that make nCtoOrders a
+                        measurement over every contract are added at the join, not here, which is
+                        why the dates are the block's marker rather than the count.")
 )
 ```
 
@@ -586,7 +657,7 @@ render rather than silently multiplying the sample. Every join is tested for nam
 because dplyr suffixes `Column.x` and `Column.y` in silence and a file this wide is where that would
 go unnoticed.
 
-**This chunk reads all eight caches, so it rebuilds whenever any of them does.** The row count cannot
+**This chunk reads every cache, so it rebuilds whenever any of them does.** The row count cannot
 catch a stale join -- it is the sample's either way -- so the check has to be on the inputs rather
 than on the output.
 
@@ -595,6 +666,8 @@ than on the output.
 
 tab_Contracts <- export_final(
   .path_sample  = .lP$Cache$CacheSample,
+  .path_items   = .lP$Cache$CacheItems,
+  .path_cto     = .lP$Cache$CacheCto,
   .path_class   = .lP$Cache$CacheClassification,
   .paths_entity = .lP$Cache[c(
     "CacheEntityORG", "CacheEntityGPE", "CacheEntityLAW",
@@ -613,6 +686,8 @@ tab_Contracts <- export_final(
 # identity check needs it for the column names, and two lists would be two things to keep in step.
 lst_Caches <- list(
   Sample         = tab_Sample,
+  Items          = tab_Items,
+  Orders         = tab_Cto,
   Classification = tab_Classification,
   ORG            = tab_EntityORG,
   GPE            = tab_EntityGPE,
@@ -649,7 +724,7 @@ name Stata will see. What each column means is the separate document below.
 
 # Column dictionary
 
-One row per column of `Contracts`, in eight sections rather than tabsets: Quarto's tabset filter
+One row per column of `Contracts`, one section per block rather than tabsets: Quarto's tabset filter
 intercepts `panel-tabset` divs and empties them when the content is R-generated HTML, which every
 table below is.
 
@@ -686,6 +761,34 @@ excluded.
 ```{r}
 #| label: dict-sample
 exp_report_dictionary(.tab = tab_Dictionary, .block = "Sample")
+```
+
+## Items
+
+What the 8-K a contract arrived in declared it was reporting. A property of the filing rather than of
+the contract, so two exhibits of one 8-K carry the same values, and missing means the filing has no
+item structure at all -- a 10-K, an S-1 -- rather than an 8-K reporting none.
+
+`nItemsVoluntary` is the column to read carefully. It counts 2.02, 7.01 and 8.01 after the 2004
+reform and 12, 9 and 5 before it, because those are the same three items under two numbering
+schemes. A literal search for `Item 2.02` returns zero for every filing before 23 August 2004, which
+makes any pre/post comparison built on it a measurement of the reform's numbering.
+
+```{r}
+#| label: dict-items
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Items")
+```
+
+## Orders
+
+Whether the SEC granted confidential treatment for this contract, and until when. The only block
+here whose counts are complete: `HasCto` and `nCtoOrders` are zero rather than missing where no order
+names the contract, because "no order was found" is a measurement over every contract. The release
+dates carry the absence instead, which is why `CtoReleaseFirst` is the block's marker.
+
+```{r}
+#| label: dict-orders
+exp_report_dictionary(.tab = tab_Dictionary, .block = "Orders")
 ```
 
 ## Classification

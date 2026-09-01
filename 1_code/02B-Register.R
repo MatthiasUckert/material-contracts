@@ -153,19 +153,30 @@ reg_sample_flags <- function(.tab, .step_final = 6L) {
 
 # 3. Attaching what the other scripts found ------------------------------------------------------------------------------
 
-#' Attach the Item 1.01 outcome from 01D
+#' Attach the Item 1.01 extraction outcome from 01D
 #'
 #' A FLAG, NOT THE TEXT. Roughly a quarter of a million summaries is on the order of a gigabyte, and
 #' putting that in the register would make the one table nobody can load. The register says whether a
 #' summary exists; Item101.parquet holds it, one join away on DocID.
 #'
-#' HasItem101 is zero rather than missing for a document that was never a candidate. A candidate is
-#' an 8-K whose filing reports the item, so a contract having no summary is not an absence of
-#' information -- it is the wrong kind of document to have one.
+#' HasSummary IS ABOUT THIS PIPELINE, NOT ABOUT THE FILING. It says 01D recovered an Item 1.01
+#' narrative from THIS DOCUMENT, which is a property of our extractor. Whether the parent filing
+#' REPORTS Item 1.01 is a different fact living in 01D's FilingItems tables, and it used to share
+#' this column's name -- HasItem101 -- which meant one name carried two meanings that disagree
+#' wherever both are defined: a filing can report the item while the extraction fails.
+#'
+#' It is zero rather than missing for a document that was never a candidate. A candidate is an 8-K
+#' whose filing reports the item, so a contract having no summary is not an absence of information --
+#' it is the wrong kind of document to have one.
+#'
+#' THE FILING'S ITEM LIST IS NO LONGER ATTACHED HERE. It was, as a pipe-joined string, and it was
+#' missing on every row that is not an Item 1.01 candidate -- which is every contract. A filing-level
+#' fact reaching documents through a document-level join is empty exactly where it would be useful,
+#' and 10 now joins 01D's per-filing table on HashIndex instead, where it lands on every row.
 #'
 #' @param .tab The register under construction.
-#' @param .path_item Path to 01D's output.
-#' @return .tab with HasItem101, Item101Outcome and Items added.
+#' @param .path_item Path to 01D's Item101.parquet.
+#' @return .tab with HasSummary and Item101Outcome added.
 reg_attach_item101 <- function(.tab, .path_item) {
   if (FALSE) {
     .tab       <- tab_merged
@@ -173,7 +184,7 @@ reg_attach_item101 <- function(.tab, .path_item) {
   }
 
   itm_ <- arrow::open_dataset(sources = .path_item) |>
-    dplyr::select("DocID", Item101Outcome = "Outcome", "Items") |>
+    dplyr::select("DocID", Item101Outcome = "Outcome") |>
     dplyr::collect()
 
   ok_ <- c("extracted", "ambiguous-longest")
@@ -181,61 +192,13 @@ reg_attach_item101 <- function(.tab, .path_item) {
   .tab |>
     dplyr::left_join(itm_, by = dplyr::join_by("DocID")) |>
     dplyr::mutate(
-      HasItem101 = dplyr::case_when(
-        is.na(.data$Item101Outcome)          ~ 0L,
-        .data$Item101Outcome %in% ok_        ~ 1L,
-        .default                             = 0L
+      HasSummary = dplyr::case_when(
+        is.na(.data$Item101Outcome)   ~ 0L,
+        .data$Item101Outcome %in% ok_ ~ 1L,
+        .default                      = 0L
       )
     )
 }
-
-#' Attach the confidential-treatment linkage from 01E
-#'
-#' One order can cover several exhibits and one contract can be covered by several orders, most often
-#' because a grant was later extended. The register carries the counts and the dates rather than the
-#' references themselves: how many orders name this contract, when the earliest and latest protection
-#' lapse, and whether an extension was among them.
-#'
-#' THE EARLIEST AND LATEST RELEASE DATES ARE BOTH KEPT. Where two orders cover one contract they
-#' rarely expire together, and which one matters depends on the question: the earliest is when any
-#' part becomes releasable, the latest when all of it does.
-#'
-#' @param .tab The register under construction.
-#' @param .path_cto Path to 01E's output.
-#' @return .tab with nCtoOrders, CtoReleaseFirst, CtoReleaseLast and CtoIsExtension added.
-reg_attach_cto <- function(.tab, .path_cto) {
-  if (FALSE) {
-    .tab      <- tab_merged
-    .path_cto <- .lP$Input$CtoExhibits
-  }
-
-  cto_ <- arrow::open_dataset(sources = .path_cto) |>
-    dplyr::filter(!is.na(.data$DocIDContract)) |>
-    dplyr::select("DocIDContract", "ReleaseDate", "IsExtension") |>
-    dplyr::collect() |>
-    dplyr::summarise(
-      nCtoOrders      = dplyr::n(),
-      CtoReleaseFirst = suppressWarnings(min(.data$ReleaseDate, na.rm = TRUE)),
-      CtoReleaseLast  = suppressWarnings(max(.data$ReleaseDate, na.rm = TRUE)),
-      CtoIsExtension  = as.integer(any(.data$IsExtension == 1L)),
-      .by             = "DocIDContract"
-    ) |>
-    dplyr::mutate(
-      dplyr::across(
-        .cols = dplyr::all_of(c("CtoReleaseFirst", "CtoReleaseLast")),
-        .fns  = \(.x) dplyr::if_else(is.finite(.x), .x, as.Date(NA))
-      )
-    )
-
-  .tab |>
-    dplyr::left_join(cto_, by = dplyr::join_by("DocID" == "DocIDContract")) |>
-    dplyr::mutate(
-      nCtoOrders     = dplyr::coalesce(.data$nCtoOrders, 0L),
-      CtoIsExtension = dplyr::coalesce(.data$CtoIsExtension, 0L),
-      HasCto         = as.integer(.data$nCtoOrders > 0L)
-    )
-}
-
 
 #' Derive the columns that are properties of other columns
 #'
@@ -300,9 +263,8 @@ reg_shape <- function(.tab) {
       "gvkey", "datadate", "cyear", "fyear", "fqtr",
       # which sample it is in
       "SampleStepCode", "SampleStepDesc", "DescSample", "EstiSample",
-      # what the other scripts found
-      "Items", "HasItem101", "Item101Outcome",
-      "HasCto", "nCtoOrders", "CtoReleaseFirst", "CtoReleaseLast", "CtoIsExtension"
+      # whether this document's own Item 1.01 summary was recovered
+      "HasSummary", "Item101Outcome"
     ))) |>
     dplyr::arrange(.data$Group, .data$DocID)
 }
@@ -443,8 +405,7 @@ reg_group_summary <- function(.tab) {
       nRemoved     = sum(.data$Removed),
       nDesc        = sum(.data$DescSample),
       nEsti        = sum(.data$EstiSample),
-      nItem101     = sum(.data$HasItem101),
-      nCto         = sum(.data$HasCto),
+      nSummary     = sum(.data$HasSummary),
       .by          = "Group"
     ) |>
     dplyr::arrange(dplyr::desc(.data$nDocs))
@@ -471,7 +432,7 @@ reg_report_all <- function(.tab_grp, .tab_samples) {
     .title = NULL,
     .notes = c(
       nAttachments = "Distinct attachments; a document fetched under several registrants counts once.",
-      nItem101     = "Only 8-K documents are candidates, so zero elsewhere is the right kind of zero."
+      nSummary     = "Only 8-K documents are candidates, so zero elsewhere is the right kind of zero."
     )
   )
 
