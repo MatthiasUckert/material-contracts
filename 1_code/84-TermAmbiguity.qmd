@@ -1,0 +1,553 @@
+---
+title: "Term Ambiguity: Carol's Three Questions"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+# The questions
+
+Carol and Holger (email, 2026-09-02) asked three things about ambiguous term-to-concept mappings:
+
+| | Question | Answered by |
+|---|---|---|
+| **Q1** | After all dictionary steps, can one normalized term still map to more than one final concept? How many, which, with what frequency by concept? | Part 2 |
+| **Q2** | When the dictionary is applied to a report, is one occurrence of such a term counted under **each** of its concepts, or does a further rule assign it to one? | Part 3 |
+| **Q3** | Of the surviving multi-mappings, how many are parent/child or otherwise related taxonomy concepts, versus economically distinct ones? | Part 4 |
+
+`83-TermListConsistency` already carries Q1 and Q3 in referee language. This document sources 83 for
+its loader, term-grain collapse and taxonomy walk, and adds what Carol actually asked for: the
+term × concept table with per-concept counts (Q1), the counting rule verified on the data with an
+exposure measure (Q2, new), and the pair-level classification with the hard cases printed (Q3).
+
+## Two things that must not be mixed
+
+- **Taxonomy.** `CID` is `GAAP:TagMod` and term matching is taxonomy-agnostic, so every term shared
+  by the US GAAP and IFRS lists mechanically has two concepts. That is by design and carried by the
+  `_USGAAP` / `_IFRS` suffixes downstream. Everything here is **within** taxonomy.
+- **`FrqUni` is per term.** `save_dictionary_versions()` joins the term-level corpus frequency onto
+  every row of the term, so a term in three concepts carries it three times. Term grain first,
+  `max()` not `sum()`. This replication in the dictionary file is the same phenomenon Q2 measures in
+  the frequency fact table.
+
+```{r setup, include=FALSE, purl=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(root.dir = here::here())
+
+.name_script <- if (isTRUE(getOption("knitr.in.progress"))) {
+  knitr::current_input()
+} else {
+  rstudioapi::getActiveDocumentContext()[["path"]]
+}
+.name_script <- fs::path_ext_remove(basename(.name_script))
+
+library <- function(...) suppressPackageStartupMessages(base::library(...))
+```
+
+
+# Part 0: SetUp
+
+```{r echo=FALSE}
+source("_source/Initialize.R", encoding = "UTF-8")
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(here::here(), .name_script))
+
+# Console focus makes rstudioapi return "" -> .dir_main collapses to 2_output/. Fail loudly.
+stopifnot(nzchar(.name_script), basename(.dir_main) == .name_script)
+
+cat("Function File: ")
+(.path_fun <- init_create_script_fun(here::here(), .name_script))
+
+cat("DropBox Directory: ")
+(.dir_dropbox <- init_dropbox_path())
+```
+
+```{r}
+library(tidyverse)
+options(scipen = 999)
+options(duckdb.progress_display = FALSE)
+source("_source/Utils.R")
+source("1_code/83-TermListConsistency.R") # substrate: tl_load_dictionary / tl_term_grain / tl_hier_*
+source(.path_fun)                          # this stage
+
+# V2-V4 is the LLM-screen ladder. The summary tables (Q1a, Q2b, Q3a, Q3b) run for all three so Carol
+# can see whether the numbers are an artifact of one version; the long lists (Q1b, Q1c, Q2c, Q2d, Q3c)
+# are printed for .FOCUS only. V3 is the headline dictionary.
+.VERSIONS   <- c("V2", "V3", "V4")
+.FOCUS      <- "V3"
+.RULES      <- c("As shipped", "With disclosure demotion")
+.MEM_LIMIT  <- "160GB"
+.N_EXAMPLES <- 15L   # terms per taxonomy in the Q1 example table
+```
+
+```{r}
+.lP <- list(
+  Input = list(
+    DirDictVersions = "2_output/04-AdjustData/Output/DictionaryVersions",
+    DirFrequency    = "2_output/04-AdjustData/Output/FrequencyVersions",
+    FilTaxUSGAAP    = file.path(.dir_dropbox, "TaxonomiesAndMatching/InputTaxonomies/USGAAPTaxonomy2024.xlsx")
+  ),
+  Temp   = utils_file_path(.dir_main, "Temp"),
+  Output = list(
+    Tables = utils_file_path(.dir_main, "Output", "Tables"),
+    Xlsx   = utils_file_path(.dir_main, "Output", "TermAmbiguity-Q1Q2Q3.xlsx")
+  )
+)
+fs::dir_create(c(.lP$Temp, .lP$Output$Tables))
+
+tibble::tibble(
+  What   = names(.lP$Input),
+  Path   = unlist(.lP$Input),
+  Exists = file.exists(unlist(.lP$Input)) | dir.exists(unlist(.lP$Input))
+) |>
+  tl_tbl(.caption = "Inputs")
+
+stopifnot(dir.exists(.lP$Input$DirDictVersions), dir.exists(.lP$Input$DirFrequency))
+```
+
+
+# Part 1: Load
+
+```{r}
+dict_all <- tl_load_dictionary(.lP$Input$DirDictVersions, .VERSIONS)
+
+dict_all |>
+  dplyr::summarise(
+    Assignments = dplyr::n(),
+    Terms       = dplyr::n_distinct(paste(GAAP, TID)),
+    Concepts    = dplyr::n_distinct(CID),
+    .by         = c(Version, GAAP)
+  ) |>
+  dplyr::arrange(GAAP, Version) |>
+  tl_tbl(.caption = "Dictionary versions as loaded (assignment grain)")
+```
+
+
+# Part 2: Q1 — can a term still map to more than one concept?
+
+**Yes.** The majority vote in `.ad_apply_majority_dedup()` runs **inside** each presentation
+statement (`GAAP × TagStatement × LabelMod`) and keeps the outright winner (`V1 = V0 & Prio == 1`).
+Two consequences:
+
+- A term that wins in two different statements keeps both concepts (**cross-statement**). "Income
+  taxes" naming both the expense and the cash paid is the rule working.
+- Inside one statement, `dense_rank` gives rank 1 to every row that ties on filing count **and**
+  taxonomy depth, so an exact dead heat survives as two concepts (**within-statement**). 83 Table B
+  verifies that every V1+ within-statement case is such a tie.
+
+The disclosure-demotion step (`fM`) is computed but never read downstream, so a term winning in a
+primary statement and again in Disclosures keeps both. That is a known gap (83, Table B) and a
+co-author decision, not a code change.
+
+## Q1a — how many
+
+```{r}
+tab_q1_summary <- ta_q1_summary(dict_all)
+```
+
+```{r, results='asis', echo=FALSE}
+purrr::walk(sort(unique(tab_q1_summary$GAAP)), \(.g) {
+  tab_q1_summary |>
+    dplyr::filter(GAAP == .g) |>
+    dplyr::select(-GAAP) |>
+    tl_tbl(
+      .caption = sprintf("Q1a - Terms mapping to more than one concept (%s)", .g),
+      .pct     = c("ShareMulti", "CorpusShareMulti", "ShareConceptsTouched"),
+      .digits  = 3L
+    ) |>
+    print()
+  cat("\n\n")
+})
+```
+
+**Reading guide.** `ShareMulti` is the term-count share Carol asked for; `CorpusShareMulti` is the
+one to quote next to it (share of matched corpus occurrences that sit on a multi-mapped term).
+`nWithin` is the referee-facing number. `ShareConceptsTouched` is the reach into the concept list.
+
+## Q1b — which terms, with frequency by concept
+
+The only frequency that **can** be split by concept is the label-file count (`nLabelFiles`: how many
+Exhibit 101 / iXBRL label files attach this label to this tag). It is what the vote ranked on.
+`ShareLabelFiles` is its share within the term. The corpus frequency (`CorpusFrq`) is per term and
+cannot be split — that is precisely Q2.
+
+Top `r .N_EXAMPLES` multi-mapped terms per taxonomy by corpus frequency, at `r .FOCUS` (the headline dictionary):
+
+```{r}
+tab_q1_examples <- ta_q1_examples(dict_all, .FOCUS, .n = .N_EXAMPLES, .kind = c("Within", "Cross"))
+```
+
+```{r, results='asis', echo=FALSE}
+purrr::walk(sort(unique(tab_q1_examples$GAAP)), \(.g) {
+  tab_q1_examples |>
+    dplyr::filter(GAAP == .g) |>
+    dplyr::select(-Version, -GAAP, -TagDepth) |>
+    tl_tbl(
+      .caption = sprintf("Q1b - Most frequent multi-mapped terms and their concepts (%s, %s)", .g, .FOCUS),
+      .pct     = "ShareLabelFiles",
+      .digits  = 1L
+    ) |>
+    print()
+  cat("\n\n")
+})
+```
+
+## Q1c — every within-statement case, in full
+
+These are the cases that are not mechanically forced by the per-statement vote. Short enough to read
+line by line.
+
+```{r}
+tab_q1_within <- ta_q1_examples(dict_all, .FOCUS, .n = NULL, .kind = "Within")
+cli::cli_alert_info("{dplyr::n_distinct(paste(tab_q1_within$GAAP, tab_q1_within$Term))} within-statement terms at {(.FOCUS)}")
+```
+
+```{r, results='asis', echo=FALSE}
+tab_q1_within |>
+  dplyr::select(-Version, -Kind) |>
+  tl_tbl(
+    .caption = sprintf("Q1c - Within-statement multi-mappings, all cases (%s)", .FOCUS),
+    .pct     = "ShareLabelFiles",
+    .digits  = 1L
+  )
+```
+
+
+# Part 3: Q2 — how is one occurrence counted?
+
+## The answer, from the code path
+
+There is **no assignment rule at application time**. The concept is not known when the term is
+counted:
+
+1. `03-CountTerms` matches the term list against report tokens and stores positions at **`TID`**
+   grain (`count_positions()`); the term list is `distinct(TID, UID, Term)`, no concept.
+2. `04-AdjustData` summarises to `(DocID, TID) → FrqAll, FrqUni` (`.sf_summarize()`). Still no
+   concept column.
+3. `07B-extStandardization` attaches the concept with
+   `frq_ |> inner_join(dict_, by = join_by(TID))` in `calc_rel_dplyr()`, where `dict_` is
+   `distinct(CID, TID)` for the version.
+
+An inner join on a key that is not unique on the right-hand side **replicates** the left row. A term
+in *k* concepts therefore contributes its **full** `FrqUni` to each of the *k* `(Firm, Year, CID)`
+cells. Nothing is split, nothing is assigned; the same occurrence is counted *k* times.
+
+`FrqUni` itself (the containment flag in `.sf_flag_contained_db()`) is a different mechanism: it
+prevents *nested* strings — "net income" inside "net income attributable to parent" — from being
+counted twice at the **term** level. It does not touch the term → concept fan-out.
+
+The three chunks below verify this on the data rather than asserting it.
+
+## Q2a — fact grain on disk
+
+```{r}
+con <- ta_q2_connect(.MEM_LIMIT, .lP$Temp)
+fil_frq <- ta_frq_path(.lP$Input$DirFrequency, .FOCUS)
+
+tab_q2_grain <- purrr::map(.VERSIONS, \(.v) {
+  ta_q2_fact_grain(con, ta_frq_path(.lP$Input$DirFrequency, .v)) |>
+    dplyr::mutate(Version = .v, .before = 1L)
+}) |>
+  dplyr::bind_rows()
+
+tab_q2_grain |>
+  tl_tbl(.caption = "Q2a - Frequency fact tables (FullRep)")
+```
+
+`GrainIsDocTerm = yes` and `HasConceptCol = no` is the whole argument in two cells.
+
+## Q2b — exposure
+
+Three layers, each one step closer to what the measures consume:
+
+- **Term level** — share of matched occurrences that sit on a multi-mapped term.
+- **Concept level** — the same after the replicating join. `InflationFactor` is concept-level mass
+  over term-level mass: exactly 1 if no term were multi-mapped.
+- **Cell level** — `(Firm, Year, CID)` cells that contain at least one multi-mapped term, and the
+  average share of a cell's `Rel` mass those terms carry. `Rel` is what eCBS and iCBS are built from,
+  so `MeanRelMassMulti` is the closest thing to "how much of the measure is exposed".
+
+For every version, two rows per taxonomy: the dictionary **as shipped**, and the **counterfactual
+with the disclosure demotion applied** (`fM == 0`, the documented second step of the prioritization that
+`create_dictionary_versions()` never reads — 83, Table B). The gap between them is what that one
+switch would buy.
+
+Version x rule grid. Each cell is one pass over that version's frequency file; V2 is the expensive
+one (its dictionary is ~10x V3's) -- budget minutes, not seconds.
+
+```{r}
+grid_q2 <- tidyr::expand_grid(Version = .VERSIONS, Rule = .RULES)
+
+tab_q2_exposure <- purrr::pmap(grid_q2, \(Version, Rule) {
+  ta_q2_exposure(con, ta_frq_path(.lP$Input$DirFrequency, Version), dict_all, Version, .rule = Rule)
+}) |>
+  dplyr::bind_rows() |>
+  dplyr::arrange(GAAP, Version, Rule)
+```
+
+```{r, results='asis', echo=FALSE}
+purrr::walk(sort(unique(tab_q2_exposure$GAAP)), \(.g) {
+  tab_q2_exposure |>
+    dplyr::filter(GAAP == .g) |>
+    dplyr::select(-GAAP) |>
+    tl_tbl(
+      .caption = sprintf("Q2b - Exposure of frequency mass to multi-mapped terms (%s, FullRep)", .g),
+      .pct     = c("ShareDocTermMulti", "ShareTermMassMulti", "ShareConceptMassMulti",
+                   "ShareCellsTouched", "MeanRelMassMulti"),
+      .digits  = 3L
+    ) |>
+    print()
+  cat("\n\n")
+})
+```
+
+## Q2c — which concepts absorb it
+
+One row per concept with any replicated mass; `ShareMassMulti` is the share of the concept's own
+frequency mass that arrives via multi-mapped terms. `DbMatch` is attached where the version file
+carries it, because a contaminated concept only matters for Tables 5–7 if it maps to a database item.
+
+```{r}
+tab_q2_concepts <- ta_q2_concept_exposure(con, fil_frq, dict_all, .FOCUS,
+                                          .dir_dict = .lP$Input$DirDictVersions, .n = 40L)
+```
+
+```{r, results='asis', echo=FALSE}
+purrr::walk(sort(unique(tab_q2_concepts$GAAP)), \(.g) {
+  tab_q2_concepts |>
+    dplyr::filter(GAAP == .g) |>
+    dplyr::select(-GAAP, -CID) |>
+    tl_tbl(
+      .caption = sprintf("Q2c - Concepts most exposed to multi-mapped terms (%s, %s, top 40)", .g, .FOCUS),
+      .pct     = "ShareMassMulti",
+      .digits  = 1L
+    ) |>
+    print()
+  cat("\n\n")
+})
+```
+
+## Q2d — one worked example
+
+The most frequent multi-mapped US GAAP term, in the report where it appears most often: the fact
+row as stored, then the same row after the 07B join. Identical `FrqUni` on every joined line is the
+"counted under each concept" answer, made visible.
+
+```{r}
+lst_q2_example <- ta_q2_worked_example(con, fil_frq, dict_all, .FOCUS, .gaap = "USGAAP")
+
+lst_q2_example$Fact |>
+  tl_tbl(.caption = "Q2d - Fact row as stored (DocID x TID)")
+
+lst_q2_example$Joined |>
+  tl_tbl(.caption = "Q2d - The same row after the 07B join on TID")
+```
+
+```{r}
+DBI::dbDisconnect(con, shutdown = TRUE)
+```
+
+
+# Part 4: Q3 — related or economically distinct?
+
+`Taxonomies.parquet` cannot answer this (83, Part 5: the build drops the abstract scaffolding, so it
+is a forest of orphaned leaves). The source spreadsheet ships the presentation arcs explicitly;
+ancestor sets are walked **within** each presentation network and unioned afterwards.
+
+**US GAAP only.** The IFRS source has no parent column and no hierarchy to test against. IFRS
+multi-mappings appear in Q1 with the within/cross split and nothing more — and saying so beats
+proxying it.
+
+Three relations, in decreasing order of how defensible they are:
+
+- **Nested** — one concept is an ancestor of the other. A total and one of its components.
+- **Sibling** — neither descends from the other, but they share an ancestor (usually an abstract
+  heading): "both of these are revenue lines".
+- **Unrelated** — no shared ancestor in any network. The residual that is hard to defend.
+
+```{r}
+tab_q3_pairs <- tab_q3_summary <- tab_q3_terms <- tab_q3_unrelated <- NULL
+
+if (file.exists(.lP$Input$FilTaxUSGAAP)) {
+  edges_usgaap <- tl_hier_edges(.lP$Input$FilTaxUSGAAP)
+  anc_usgaap   <- tl_hier_ancestors(edges_usgaap)
+
+  tab_q3_pairs     <- purrr::map(.VERSIONS, \(.v) ta_q3_pairs(dict_all, anc_usgaap, .v)) |>
+    dplyr::bind_rows()
+  tab_q3_summary   <- ta_q3_summary(tab_q3_pairs)
+  tab_q3_terms     <- ta_q3_terms(tab_q3_pairs)
+  tab_q3_unrelated <- dplyr::filter(tab_q3_pairs, Version == .FOCUS, Relation == "Unrelated")
+} else {
+  cli::cli_alert_warning("Source taxonomy not reachable - Q3 skipped")
+}
+```
+
+## Q3a — pairs
+
+Three panels in one table: by within/cross kind, pooled, and — the one that carries the finding — by
+**pair type**: whether both concepts sit in primary statements (01–06), one is in Disclosures /
+Deprecated (07–08), or both are. On the first render every `Unrelated` pair had a 07/08 concept on
+at least one side and every primary–primary pair was `Sibling` or `Nested`. If that holds, the
+"economically distinct" residual is the same disclosure copies the `fM` rule would demote, plus
+deprecated tags paired with their successors — not two economic ideas sharing one word.
+
+```{r, results='asis', echo=FALSE}
+if (!is.null(tab_q3_summary)) {
+  purrr::walk(.VERSIONS, \(.v) {
+    tab_q3_summary |>
+      dplyr::filter(Version == .v) |>
+      dplyr::select(-Version) |>
+      tl_tbl(
+        .caption = sprintf("Q3a - Taxonomy relation between the concepts a term straddles (US GAAP, %s)", .v),
+        .pct     = "SharePairs",
+        .digits  = 1L
+      ) |>
+      print()
+    cat("\n\n")
+  })
+} else {
+  cat("\n\n*Q3 not produced: the source taxonomy spreadsheet was not reachable.*\n\n")
+}
+```
+
+## Q3b — terms
+
+A term with three concepts has three pairs that may disagree; here a term is classified by its
+**least defensible** pair. `CorpusShare` is over all multi-mapped US GAAP terms, so it says how much
+of the exposed corpus mass sits in each bucket.
+
+```{r, results='asis', echo=FALSE}
+if (!is.null(tab_q3_terms)) {
+  tab_q3_terms |>
+    tl_tbl(
+      .caption = "Q3b - Multi-mapped terms by least defensible relation (US GAAP, V2-V4)",
+      .pct     = c("ShareTerms", "CorpusShare"),
+      .digits  = 1L
+    ) |>
+    print()
+}
+```
+
+## Q3c — the Unrelated pairs, in full
+
+The number to watch, printed so Carol and Holger can judge each line themselves. Many of these will
+turn out to be the same economic item placed in two presentation networks the walk cannot connect;
+some will be genuine polysemy. That call is a reading exercise, not a computation.
+
+```{r, results='asis', echo=FALSE}
+if (!is.null(tab_q3_unrelated)) {
+  cli::cli_alert_info("{nrow(tab_q3_unrelated)} unrelated pairs over {dplyr::n_distinct(tab_q3_unrelated$TID)} terms")
+  tab_q3_unrelated |>
+    dplyr::select(-Version, -GAAP, -TID, -Relation, -SameStatement) |>
+    tl_tbl(
+      .caption = sprintf("Q3c - Concept pairs with no shared ancestor (US GAAP, %s)", .FOCUS),
+      .digits  = 0L
+    ) |>
+    print()
+}
+```
+
+
+# Part 5: Saved output
+
+Parquet per table under `Output/Tables/`, plus one workbook for Carol with the same sheets.
+
+```{r}
+lst_out <- list(
+  "Q1a-Summary"        = tab_q1_summary,
+  "Q1b-Examples"       = tab_q1_examples,
+  "Q1c-WithinFull"     = tab_q1_within,
+  "Q2a-FactGrain"      = tab_q2_grain,
+  "Q2b-Exposure"       = tab_q2_exposure,
+  "Q2c-ConceptExposure" = tab_q2_concepts,
+  "Q2d-ExampleJoined"  = lst_q2_example$Joined,
+  "Q3a-PairSummary"    = tab_q3_summary,
+  "Q3b-TermSummary"    = tab_q3_terms,
+  "Q3c-UnrelatedPairs" = tab_q3_unrelated,
+  "Q3-AllPairs"        = tab_q3_pairs
+)
+
+ta_export(lst_out, .lP$Output$Tables, .lP$Output$Xlsx)
+```
+
+
+# Part 6: Numbers for the reply
+
+Plain-language sentences with the headline figures filled in, so the email can be written without
+re-reading the tables. Check the wording against the tables before sending; this is a draft, not a
+verdict.
+
+```{r, results='asis', echo=FALSE}
+q1_ <- dplyr::filter(tab_q1_summary, Version == .FOCUS)
+q2_  <- dplyr::filter(tab_q2_exposure, Version == .FOCUS, Rule == "As shipped")
+q2c_ <- dplyr::filter(tab_q2_exposure, Version == .FOCUS, Rule == "With disclosure demotion")
+
+cat(sprintf("\n\n**Q1 (%s).** ", .FOCUS))
+purrr::pwalk(q1_, \(...) {
+  r_ <- list(...)
+  cat(sprintf(
+    "%s: %s of %s terms (%s) map to more than one concept at %s; they carry %s of matched corpus occurrences. %s are within-statement (exact ties), %s cross-statement. %s of %s concepts contain at least one such term. ",
+    r_$GAAP, tl_int(r_$nMulti), tl_int(r_$nTerms), tl_pct(r_$ShareMulti), .FOCUS,
+    tl_pct(r_$CorpusShareMulti), tl_int(r_$nWithin), tl_int(r_$nCross),
+    tl_int(r_$nConceptsTouched), tl_int(r_$nConcepts)
+  ))
+})
+
+cat(sprintf("\n\n**Q2 (%s).** An occurrence of a multi-mapped term is counted in full under each of its concepts; there is no assignment rule at application time (the join in 07B replicates the term row). ", .FOCUS))
+purrr::pwalk(q2_, \(...) {
+  r_ <- list(...)
+  cat(sprintf(
+    "%s: %s of matched occurrences sit on multi-mapped terms; after the join concept-level mass is %.4f times term-level mass; %s of firm-year-concept cells contain such a term, and on average %s of a cell's Rel mass comes from them. ",
+    r_$GAAP, tl_pct(r_$ShareTermMassMulti), r_$InflationFactor,
+    tl_pct(r_$ShareCellsTouched), tl_pct(r_$MeanRelMassMulti)
+  ))
+})
+if (nrow(q2c_) > 0L) {
+  cat("With the disclosure demotion applied (fM == 0), the same figures would be: ")
+  purrr::pwalk(q2c_, \(...) {
+    r_ <- list(...)
+    cat(sprintf(
+      "%s: %s of occurrences on multi-mapped terms, inflation %.4f, %s of cells touched, %s mean Rel mass. ",
+      r_$GAAP, tl_pct(r_$ShareTermMassMulti), r_$InflationFactor,
+      tl_pct(r_$ShareCellsTouched), tl_pct(r_$MeanRelMassMulti)
+    ))
+  })
+}
+
+if (!is.null(tab_q3_terms)) {
+  q3_ <- tab_q3_terms |>
+    dplyr::filter(Version == .FOCUS) |>
+    dplyr::summarise(nTerms = sum(nTerms), CorpusShare = sum(CorpusShare), .by = WorstRelation)
+  cat(sprintf("\n\n**Q3 (US GAAP only, %s).** By least defensible pair: ", .FOCUS))
+  purrr::pwalk(q3_, \(...) {
+    r_ <- list(...)
+    cat(sprintf("%s: %s terms (%s of exposed corpus mass); ", r_$WorstRelation, tl_int(r_$nTerms), tl_pct(r_$CorpusShare)))
+  })
+  unrel_ <- dplyr::filter(tab_q3_pairs, Version == .FOCUS, Relation == "Unrelated")
+  cat(sprintf(
+    "Of the %s Unrelated pairs, %s involve a Disclosures/Deprecated concept and %s are primary-primary. ",
+    tl_int(nrow(unrel_)), tl_int(sum(unrel_$PairType != "Primary - Primary")),
+    tl_int(sum(unrel_$PairType == "Primary - Primary"))
+  ))
+  cat("IFRS has no presentation hierarchy in the source and is reported with the within/cross split only.")
+}
+cat("\n\n")
+```
+
+
+# Still open
+
+- **The `fM` decision is now a measurement decision, not a tidiness one.** Q2b's counterfactual row
+  and Q3a's pair-type panel say what the disclosure demotion buys: it targets exactly the pairs that
+  are `Unrelated` in the taxonomy, and leaves the primary–primary fan-out (all `Sibling` / `Nested`)
+  untouched. It cascades `04 → 07A → 07D` and invalidates 81–83; co-author decision.
+- **Deprecated tags.** The Disc/Dep–Disc/Dep `Unrelated` pairs are mostly a deprecated element next
+  to its successor (`...EstimatedUsefulLives` / `...UsefulLife`). The demotion cannot touch these
+  when no primary copy exists; a deprecation-successor map from the taxonomy would.
+- **The obvious robustness check** Carol will ask for next: drop all multi-mapped terms (or keep the
+  within-statement ties only) and rerun Tables 5–7. `Q2c` says how much of the concept mass that
+  removes; the rerun itself lives in 07B, not here.
+- **Q3 Unrelated pairs** need a reading pass. Two presentation networks the walk cannot connect are
+  not the same thing as two economic ideas.
+- **CURRENT-PROJECT-STATUS-V3.md** — add the Q2 counting rule as a documented design fact once
+  the numbers are confirmed.

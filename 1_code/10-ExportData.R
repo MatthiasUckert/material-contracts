@@ -513,6 +513,86 @@ export_items <- function(.path_in, .path_sample, .path_out, .rerun = FALSE) {
   invisible(out_)
 }
 
+#' The Item 1.01 summary measures, one row per filing
+#'
+#' READS 01D'S PUBLISHED TABLE AND KEEPS THE NUMBERS, NOT THE TEXT. Item101.parquet carries a
+#' gigabyte of narrative; the measures Table 7 needs are ten numbers beside it. Only those travel,
+#' keyed on HashIndex like the items block, and only for summaries 01D recovered.
+#'
+#' ONE SUMMARY PER FILING. 01D attempts every 8-K document in a filing, and a filing can carry more
+#' than one -- an HTML body beside its plain-text rendering, or a body beside an amendment -- so
+#' its table is one row per DOCUMENT. Where two documents in one filing both yielded a summary, the
+#' cleaner outcome wins, then the longer text, then the lower DocID for determinism. The count of
+#' filings this collapsed is reported, because a large number would mean 01D's candidates are wider
+#' than one summary per filing in a way worth knowing about.
+#'
+#' THE ATTACHED FLAG IS ONE ON EVERY ROW HERE AND IS KEPT ANYWAY. Every row of the release is an
+#' Exhibit 10, so a summary that reaches it was attached by construction; the delayed 8-Ks have no
+#' contract row to land on. It travels so the block can be joined back to 01D's full population,
+#' where it is the split.
+#'
+#' @param .path_in Character. 01D's Item101.parquet.
+#' @param .path_sample Character. The sample cache, read for its HashIndex values.
+#' @param .path_out Character. Where to write.
+#' @param .rerun Logical.
+#' @return Tibble, one row per filing with a recovered summary that the sample reaches.
+export_summary <- function(.path_in, .path_sample, .path_out, .rerun = FALSE) {
+  if (FALSE) {
+    .path_in     <- .lP$Input$FilItem101
+    .path_sample <- .lP$Cache$CacheSample
+    .path_out    <- .lP$Cache$CacheSummary
+    .rerun       <- FALSE
+  }
+  if (exp_cache_hit(.task = "Summary", .path_out = .path_out,
+                    .paths_in = c(.path_in, .path_sample), .rerun = .rerun)) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "Summary: {.path {as.character(fs::path_file(.path_out))}} already written \\
+       ({format(nrow(out_), big.mark = ',')} rows, {ncol(out_)} columns). Pass .rerun = TRUE to rebuild."
+    )
+    return(invisible(out_))
+  }
+  keep_ <- arrow::open_dataset(sources = .path_sample) |>
+    dplyr::select("HashIndex") |>
+    dplyr::collect() |>
+    dplyr::distinct(.data$HashIndex) |>
+    dplyr::pull(.data$HashIndex)
+  cols_ <- c("HashIndex", "DocID", "Outcome", "nSummaryDates", "SummaryIsSingle", "nWords", "nSentences",
+             "nComplex", "FogIndex", "nUncertain", "nNumbers", "nDollars", "nPercents", "HasExhibit10")
+  raw_ <- arrow::open_dataset(sources = .path_in) |>
+    dplyr::filter(.data$HashIndex %in% keep_, .data$Outcome %in% c("extracted", "ambiguous-longest")) |>
+    dplyr::select(dplyr::all_of(cols_)) |>
+    dplyr::collect()
+  n_multi_ <- sum(duplicated(raw_$HashIndex))
+  out_ <- raw_ |>
+    dplyr::arrange(.data$HashIndex, .data$Outcome != "extracted", dplyr::desc(.data$nWords), .data$DocID) |>
+    dplyr::distinct(.data$HashIndex, .keep_all = TRUE) |>
+    dplyr::select(-"DocID", -"Outcome") |>
+    dplyr::rename(
+      SumDates = "nSummaryDates", SumIsSingle = "SummaryIsSingle", SumWords = "nWords",
+      SumSentences = "nSentences", SumComplex = "nComplex", SumFog = "FogIndex",
+      SumUncertain = "nUncertain", SumNumbers = "nNumbers", SumDollars = "nDollars",
+      SumPercents = "nPercents", SumAttached = "HasExhibit10"
+    ) |>
+    dplyr::arrange(.data$HashIndex)
+  if (anyDuplicated(out_$HashIndex)) {
+    cli::cli_abort("01D's summary table is not one row per filing; the join would multiply the sample.")
+  }
+  fs::dir_create(fs::path_dir(.path_out))
+  arrow::write_parquet(out_, .path_out)
+  cli::cli_alert_success(
+    "Summary: {format(nrow(out_), big.mark = ',')} of {format(length(keep_), big.mark = ',')} \\
+     {cli::qty(length(keep_))}filing{?s} the sample reaches carry a recovered summary."
+  )
+  if (n_multi_ > 0L) {
+    cli::cli_alert_info(
+      "{format(n_multi_, big.mark = ',')} {cli::qty(n_multi_)}filing{?s} held more than one summarised \\
+       document; one was kept per filing."
+    )
+  }
+  invisible(out_)
+}
+
 #' The confidential-treatment orders naming each contract, one row per contract
 #'
 #' THE ONLY CACHE HERE THAT COLLAPSES ANYTHING. 01E publishes one row per order REFERENCE: an order
@@ -1575,11 +1655,12 @@ export_REDACT <- function(.dir_in, .path_out, .rerun = FALSE) {
 #' @param .rerun Logical. FALSE returns the file where it already exists.
 #' @param .dta Logical. Also write the Stata copy and the codebook.
 #' @return Invisibly the written table: one row per registrant copy.
-export_final <- function(.path_sample, .path_items, .path_cto, .path_class, .paths_entity,
-                         .path_out, .rerun = FALSE, .dta = TRUE) {
+export_final <- function(.path_sample, .path_items, .path_summary, .path_cto, .path_class,
+                         .paths_entity, .path_out, .rerun = FALSE, .dta = TRUE) {
   if (FALSE) {
     .path_sample  <- .lP$Cache$CacheSample
     .path_items   <- .lP$Cache$CacheItems
+    .path_summary <- .lP$Cache$CacheSummary
     .path_cto     <- .lP$Cache$CacheCto
     .path_class   <- .lP$Cache$CacheClassification
     .paths_entity <- .lP$Cache[c("CacheEntityORG", "CacheEntityGPE")]
@@ -1588,7 +1669,7 @@ export_final <- function(.path_sample, .path_items, .path_cto, .path_class, .pat
     .dta          <- TRUE
   }
 
-  in_ <- c(.path_sample, .path_items, .path_cto, .path_class, unlist(.paths_entity))
+  in_ <- c(.path_sample, .path_items, .path_summary, .path_cto, .path_class, unlist(.paths_entity))
 
   if (exp_cache_hit(.task = "Contracts", .path_out = .path_out, .paths_in = in_,
                     .rerun = .rerun)) {
@@ -1630,6 +1711,21 @@ export_final <- function(.path_sample, .path_items, .path_cto, .path_class, .pat
     )
     book_ <- dplyr::bind_rows(
       book_, tibble::tibble(Column = setdiff(names(itm_), "HashIndex"), Source = "Items")
+    )
+  }
+
+  # THE SUMMARY BLOCK REACHES ONLY 8-K CONTRACTS WITH A RECOVERED NARRATIVE, on the same key as the
+  # items. Missing everywhere else: a 10-K, or an 8-K whose Item 1.01 01D could not parse.
+  if (!is.na(.path_summary)) {
+    sum_ <- arrow::read_parquet(file = .path_summary)
+    exp_check_collide(
+      .a = names(out_), .b = names(sum_), .by = "HashIndex", .what = "the summary join"
+    )
+    out_ <- dplyr::left_join(
+      out_, sum_, by = dplyr::join_by(HashIndex), relationship = "many-to-one"
+    )
+    book_ <- dplyr::bind_rows(
+      book_, tibble::tibble(Column = setdiff(names(sum_), "HashIndex"), Source = "Summary")
     )
   }
 
@@ -2192,6 +2288,11 @@ exp_report_final <- function(.tab) {
    reach no row here, which is why the marker is missing rather than zero.",
   "nItems",
 
+  "Summary", "Summary", "parent filing, repeated across its exhibits",
+  "Contracts on an 8-K whose Item 1.01 narrative 01D recovered. Missing on a 10-K, and on an 8-K
+   whose summary could not be parsed; SumWords is the marker.",
+  "SumWords",
+
   "Orders", "Orders", "registrant copy",
   "Every contract: nCtoOrders is a count over all of them, zero where the SEC granted no
    confidential treatment. The release dates carry the absence instead.",
@@ -2426,6 +2527,55 @@ exp_report_final <- function(.tab) {
 
   "nItemsDotted", "Items",
   "How many of them are post-2004 dotted codes. Separates the two taxonomies without a date rule.",
+  "structural",
+
+  "SumWords", "Summary",
+  "Words in the parent 8-K's Item 1.01 narrative, after the item heading and title are removed. The
+   block marker: missing means no summary was recovered for the filing, or the filing is not an 8-K.",
+  "where the parent filing is not an 8-K or its Item 1.01 could not be parsed",
+
+  "SumSentences", "Summary",
+  "Sentences in the narrative, by ICU sentence boundaries.",
+  "structural",
+
+  "SumComplex", "Summary",
+  "Words of three or more syllables, by vowel-group count with a silent trailing e discounted.",
+  "structural",
+
+  "SumFog", "Summary",
+  "Gunning Fog: 0.4 x (words per sentence + 100 x the share of complex words). Years of schooling
+   to read it on first pass.",
+  "structural",
+
+  "SumUncertain", "Summary",
+  "Words in the Loughran-McDonald Uncertainty list. A rate is SumUncertain / SumWords x 1000.",
+  "structural",
+
+  "SumNumbers", "Summary",
+  "Numeric tokens of any kind in the narrative.",
+  "structural",
+
+  "SumDollars", "Summary",
+  "Dollar figures: a currency mark, a number, an optional scale word.",
+  "structural",
+
+  "SumPercents", "Summary",
+  "Percentages: a number and a percent sign.",
+  "structural",
+
+  "SumDates", "Summary",
+  "Distinct agreement dates the narrative opens with. The paper's proxy for how many agreements it
+   describes.",
+  "structural",
+
+  "SumIsSingle", "Summary",
+  "SumDates == 1: the narrative describes one agreement. The paper's Table 7 sample.",
+  "structural",
+
+  "SumAttached", "Summary",
+  "Whether an Exhibit 10 rode on the same filing. One on every row of this release by construction,
+   because every row is such an exhibit; carried so the block joins back to 01D's full population,
+   where it splits attached from delayed.",
   "structural",
 
   "nItemsVoluntary", "Items",

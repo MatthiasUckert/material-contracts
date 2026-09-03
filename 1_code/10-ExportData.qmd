@@ -165,6 +165,8 @@ established holds through to the released file.
     # stopped: neither feeds the sample ladder, and 03 and 04 read twelve named register columns of
     # which neither is one, so the only consumer was this file.
     FilItemFlags      = "2_output/01D-GetItems/Output/FilingItemFlags.parquet",
+    # THE SUMMARY MEASURES ride 01D's text table; only the numbers are taken, never the narrative.
+    FilItem101        = "2_output/01D-GetItems/Output/Item101.parquet",
     FilCtoExhibits    = "2_output/01E-CtoExhibits/Output/CtoExhibits.parquet",
     # THE POLICY HASH IS IN THE PATH. 04D names each directory for a hash folding in its rules and
     # the extractor's own spec hashes, so pinning it here is what says which release this reads --
@@ -180,6 +182,7 @@ established holds through to the released file.
   Cache = list(
     CacheSample         = utils_file_path(.dir_main, "Cache", "Sample.parquet"),
     CacheItems          = utils_file_path(.dir_main, "Cache", "Items.parquet"),
+    CacheSummary        = utils_file_path(.dir_main, "Cache", "Summary.parquet"),
     CacheCto            = utils_file_path(.dir_main, "Cache", "Cto.parquet"),
     CacheClassification = utils_file_path(.dir_main, "Cache", "Classification.parquet"),
     CacheEntityORG      = utils_file_path(.dir_main, "Cache", "EntityORG.parquet"),
@@ -278,6 +281,22 @@ tab_Items <- export_items(
   .path_in     = .lP$Input$FilItemFlags,   # 01D, one row per filing
   .path_sample = .lP$Cache$CacheSample,    # read for the HashIndex values worth keeping
   .path_out    = .lP$Cache$CacheItems,
+  .rerun       = FALSE
+)
+```
+
+`export_summary()` takes the ten numbers 01D computed beside each Item 1.01 narrative -- length,
+readability, uncertain words, and three counts of figures -- and leaves the narrative behind. They
+are Table 7 of the paper, at filing grain like the items, so an 8-K's summary measures land on every
+contract it carried. A 10-K has no summary; an 8-K whose Item 1.01 could not be parsed has none
+either; both are missing here and the marker says which.
+
+```{r}
+#| label: build-summary
+tab_Summary <- export_summary(
+  .path_in     = .lP$Input$FilItem101,     # 01D, one row per candidate 8-K, with text
+  .path_sample = .lP$Cache$CacheSample,    # read for the HashIndex values worth keeping
+  .path_out    = .lP$Cache$CacheSummary,
   .rerun       = FALSE
 )
 ```
@@ -667,6 +686,7 @@ than on the output.
 tab_Contracts <- export_final(
   .path_sample  = .lP$Cache$CacheSample,
   .path_items   = .lP$Cache$CacheItems,
+  .path_summary = .lP$Cache$CacheSummary,
   .path_cto     = .lP$Cache$CacheCto,
   .path_class   = .lP$Cache$CacheClassification,
   .paths_entity = .lP$Cache[c(
@@ -687,6 +707,7 @@ tab_Contracts <- export_final(
 lst_Caches <- list(
   Sample         = tab_Sample,
   Items          = tab_Items,
+  Summary        = tab_Summary,
   Orders         = tab_Cto,
   Classification = tab_Classification,
   ORG            = tab_EntityORG,

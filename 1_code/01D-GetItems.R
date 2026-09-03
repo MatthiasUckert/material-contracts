@@ -235,6 +235,16 @@ if (FALSE) {
   "\\bOn\\s+(", paste(month.name, collapse = "|"), ")\\s+(\\d{1,2}),\\s*(\\d{4})"
 )
 
+# THE NUMBER PATTERNS TABLE 7 COUNTS. Ported from the retired 05-CheckItem101 so the published figures
+# are reproducible from this file. A dollar figure is a currency mark, a number, and an optional scale
+# word; a percent is a number and a sign. Plain numbers count every numeric token, including those.
+.itm_number_regex  <- "\\b(?:\\d{1,3}(?:,\\d{3})*(?:\\.\\d+)?|\\d+\\.\\d+)\\b"
+.itm_dollar_regex  <- paste0(
+  "(?:\\$|USD)\\s*\\d+(?:,\\d{3})*(?:\\.\\d+)?",
+  "(?:\\s*(?:billions?|bils?|bn|millions?|mills?|mn|thousands?|k)\\b)?"
+)
+.itm_percent_regex <- "\\b\\d+(?:\\.\\d+)?%"
+
 
 # 1. Filing items ------------------------------------------------------------------------------------------------------
 
@@ -1269,6 +1279,168 @@ itm_summary_dates <- function(.tab, .regex = .itm_date_regex) {
     )
 }
 
+#' The Loughran-McDonald uncertainty words, from a flat file
+#'
+#' FROM A FILE, NOT A PACKAGE CALL. The retired 05 pulled the list through
+#' tidytext::get_sentiments("loughran"), which goes through textdata, downloads on first use, and is
+#' pinned by nothing. The list is three hundred words. It is written to a file once -- by exactly that
+#' call, see the runbook -- and read from the file ever after, so the lexicon is a versioned input
+#' that ships with the repository and a render never reaches for the network.
+#'
+#' @param .path Character. One word per line, lower case, comments and blanks allowed.
+#' @return Lowercase character vector of words.
+itm_read_lexicon <- function(.path) {
+  if (FALSE) .path <- .lP$Input$Lexicon
+  if (!fs::file_exists(.path)) {
+    cli::cli_abort(c(
+      "No lexicon at {.file {(.path)}}.",
+      i = "Write it once: readr::write_lines(dplyr::filter(tidytext::get_sentiments(\"loughran\"), \\
+           sentiment == \"uncertainty\")$word, {.file {(.path)}})"
+    ))
+  }
+  out_ <- readr::read_lines(.path)
+  out_ <- tolower(trimws(out_[nzchar(out_) & !startsWith(out_, "#")]))
+  cli::cli_alert_info("{length(out_)} uncertainty words read from {.file {fs::path_file(.path)}}")
+  out_
+}
+
+#' Syllables per word, by vowel groups
+#'
+#' THE STANDARD APPROXIMATION, STATED. A syllable is a run of vowels; a trailing silent e is not
+#' one; a word has at least one. This is what every Fog implementation without a pronunciation
+#' dictionary does, and it is written out here rather than imported so the count in the file can be
+#' reproduced without a package renv does not pin.
+#'
+#' @param .words Lowercase character vector.
+#' @return Integer vector.
+itm_syllables <- function(.words) {
+  if (FALSE) .words <- c("agreement", "the", "material", "definitive", "entered")
+  n_ <- stringi::stri_count_regex(.words, "[aeiouy]+")
+  n_ <- n_ - as.integer(stringi::stri_detect_regex(.words, "[^aeiouy]e$") & n_ > 1L)
+  pmax(n_, 1L)
+}
+
+#' Length, readability, uncertainty and numeric intensity of each summary
+#'
+#' TABLE 7 OF THE PAPER, AS COLUMNS. Words, sentences, Fog index, Loughran-McDonald uncertain words,
+#' and three counts of numbers -- all of them, dollar figures, percentages. Computed once here, where
+#' the text already sits in memory, so nothing downstream has to open the gigabyte to compare a
+#' delayed summary with an attached one. Counts are stored, not rates: a rate per thousand words is
+#' one division and storing both would let them disagree.
+#'
+#' THE HEADING IS STRIPPED FIRST. Every summary opens with the item code and the regulated title, forty
+#' characters that carry no information and would put the same six words into every count.
+#'
+#' Sentences are ICU sentence boundaries; words are ICU word boundaries with numeric tokens excluded;
+#' Fog is 0.4 times (words per sentence plus 100 times the share of words with three or more
+#' syllables).
+#'
+#' @param .tab Output of itm_summary_dates(), or anything with ItemText.
+#' @param .lexicon Character vector from itm_read_lexicon().
+#' @return .tab with nWords, nSentences, nComplex, FogIndex, nUncertain, nNumbers, nDollars,
+#'   nPercents added. All missing where ItemText is.
+itm_summary_measures <- function(.tab, .lexicon) {
+  if (FALSE) {
+    .tab     <- tab_item101
+    .lexicon <- itm_read_lexicon(.lP$Input$Lexicon)
+  }
+  txt_ <- itm_strip_heading(.tab$ItemText)
+  has_ <- !is.na(txt_)
+
+  words_ <- stringi::stri_extract_all_words(txt_, omit_no_match = TRUE)
+  words_ <- lapply(words_, function(.w) tolower(.w[!stringi::stri_detect_regex(.w, "^[0-9.,%$]+$")]))
+  n_words_ <- lengths(words_)
+
+  # One long vector, one syllable pass, one re-aggregation: cheaper than a per-document loop over
+  # a hundred and fifty million words.
+  flat_ <- unlist(words_, use.names = FALSE)
+  doc_  <- rep.int(seq_along(words_), n_words_)
+  syl_  <- itm_syllables(flat_)
+  n_complex_   <- tabulate(doc_[syl_ >= 3L], nbins = length(words_))
+  n_uncertain_ <- tabulate(doc_[flat_ %in% .lexicon], nbins = length(words_))
+
+  n_sent_ <- pmax(stringi::stri_count_boundaries(txt_, type = "sentence"), 1L)
+
+  n_dollars_  <- stringi::stri_count_regex(txt_, .itm_dollar_regex, opts_regex = list(case_insensitive = TRUE))
+  n_percents_ <- stringi::stri_count_regex(txt_, .itm_percent_regex)
+  n_numbers_  <- stringi::stri_count_regex(txt_, .itm_number_regex)
+
+  na_int_ <- function(.x) ifelse(has_, as.integer(.x), NA_integer_)
+  .tab |>
+    dplyr::mutate(
+      nWords     = na_int_(n_words_),
+      nSentences = na_int_(n_sent_),
+      nComplex   = na_int_(n_complex_),
+      FogIndex   = ifelse(has_ & n_words_ > 0L,
+                          0.4 * (n_words_ / n_sent_ + 100 * n_complex_ / n_words_), NA_real_),
+      nUncertain = na_int_(n_uncertain_),
+      nNumbers   = na_int_(n_numbers_),
+      nDollars   = na_int_(n_dollars_),
+      nPercents  = na_int_(n_percents_)
+    )
+}
+
+#' Whether an Exhibit 10 rode on the same filing as the summary
+#'
+#' THE SPLIT TABLE 7 IS BUILT ON. An 8-K that announces an agreement either attaches the contract
+#' or leaves it for the next periodic report, and the summary is the reader's only text until it
+#' arrives. The flag is one membership test against the metadata this document already reads:
+#' does any Exhibit 10 carry the summary's HashIndex.
+#'
+#' AT 8-K GRAIN, WHICH IS WHY IT LIVES HERE. An 8-K with no attachment has no row in any
+#' contract-level release, so the comparison cannot be made downstream; it has to be made where
+#' every summary is a row, attached or not.
+#'
+#' @param .tab Tibble with HashIndex.
+#' @param .path_meta Character. 01C's metadata, every document on EDGAR with its HashIndex.
+#' @return .tab with HasExhibit10 added, 1 or 0, never missing.
+itm_summary_attached <- function(.tab, .path_meta) {
+  if (FALSE) {
+    .tab       <- tab_item101
+    .path_meta <- .lP$Input$MetaData
+  }
+  with_ <- arrow::open_dataset(sources = .path_meta) |>
+    dplyr::filter(.data$DocTypeMod == "Exhibit10") |>
+    dplyr::distinct(.data$HashIndex) |>
+    dplyr::collect() |>
+    dplyr::pull(.data$HashIndex)
+  out_ <- dplyr::mutate(.tab, HasExhibit10 = as.integer(.data$HashIndex %in% with_))
+  n_ <- sum(out_$HasExhibit10)
+  cli::cli_alert_info(
+    "{format(n_, big.mark = ',')} of {format(nrow(out_), big.mark = ',')} candidate 8-Ks carry an Exhibit 10"
+  )
+  out_
+}
+
+#' The measures, attached against delayed, on single-agreement summaries
+#'
+#' A CHECK THAT THE COLUMNS LANDED, IN THE SHAPE THE PAPER USES THEM. Table 7 compares the two
+#' groups on these numbers; if the means here are not in the neighbourhood of the published ones --
+#' delayed summaries longer, more uncertain, fewer numbers -- something upstream moved.
+#'
+#' @param .tab Output of itm_summary_attached() after itm_summary_measures().
+#' @return Invisibly, the table printed.
+itm_measures_summary <- function(.tab) {
+  if (FALSE) .tab <- tab_item101
+  tab_ <- .tab |>
+    dplyr::filter(.data$Outcome %in% itm_outcomes_ok(), .data$SummaryIsSingle == 1L) |>
+    dplyr::mutate(Group = dplyr::if_else(.data$HasExhibit10 == 1L, "Attached", "Delayed")) |>
+    dplyr::summarise(
+      N         = dplyr::n(),
+      Words     = mean(.data$nWords),
+      Fog       = mean(.data$FogIndex, na.rm = TRUE),
+      Uncertain = 1000 * sum(.data$nUncertain) / sum(.data$nWords),
+      Numbers   = 1000 * sum(.data$nNumbers) / sum(.data$nWords),
+      Dollars   = 1000 * sum(.data$nDollars) / sum(.data$nWords),
+      Percents  = 1000 * sum(.data$nPercents) / sum(.data$nWords),
+      .by = "Group"
+    ) |>
+    dplyr::arrange(.data$Group)
+  tbl_out(tab_, .title = "Summary measures on single-agreement 8-Ks; rates are per thousand words",
+          .digits = 2L)
+  invisible(tab_)
+}
+
 #' A few summaries at each date count, with what the pattern actually matched
 #'
 #' THE POINT IS THE ZERO BUCKET. A count says sixteen per cent of recovered summaries name no date
@@ -1374,7 +1546,9 @@ itm_write_item101 <- function(.tab, .path_out, .path_source, .path_stamp, .rerun
     .rerun       <- FALSE
   }
 
-  stamp_ <- utils_dir_stamp(.dirs = .path_source, .extra = .tab$DocID)
+  # THE COLUMN NAMES ARE IN THE STAMP. Without them a new measure column is invisible to the guard,
+  # and the file on disk keeps the old schema while every check on this page reports the new one.
+  stamp_ <- utils_dir_stamp(.dirs = .path_source, .extra = c(names(.tab), .tab$DocID))
 
   fresh_ <- !.rerun &&
     fs::file_exists(.path_out) &&

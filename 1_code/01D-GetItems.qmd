@@ -195,7 +195,11 @@ tables from the same `tbl_out()` specifications, figure files from the same plot
   Input = list(
     LandingAll = fs::path(.dir_indx, "Output", "LandingPageAll.parquet"),  # written by 01A, carries item lists
     MetaData   = fs::path(.dir_meta, "Output", "FullMetaData.parquet"),    # written by 01C
-    FilePaths  = fs::path(.dir_docs, "Output", "FilePaths.parquet")        # written by 01B
+    FilePaths  = fs::path(.dir_docs, "Output", "FilePaths.parquet"),       # written by 01B
+    # THE LOUGHRAN-MCDONALD UNCERTAINTY LIST, a versioned file rather than a package download.
+    # Written once from tidytext::get_sentiments("loughran") -- the snippet is under *The summary as
+    # text* -- and committed, so a render never reaches for the network.
+    Lexicon    = "0_data/Lexicons/LM_Uncertainty.txt"
   ),
   Cache = list(
     Candidates  = utils_file_path(.dir_main, "Cache", "Candidates.parquet"),   # the documents to attempt
@@ -462,12 +466,47 @@ tab_item101 <- tab_extracted |>
     by = dplyr::join_by("DocID")
   ) |>
   itm_summary_dates() |>
+  itm_summary_measures(.lexicon = itm_read_lexicon(.path = .lP$Input$Lexicon)) |>
+  itm_summary_attached(.path_meta = .lP$Input$MetaData) |>
   dplyr::relocate(
     "DocID", "HashIndex", "YQ", "DocTypeMod", "DocExt", "Removed", "Outcome", "ItemCodes", "nItems"
   )
 
 nrow(tab_item101)
 ```
+
+## The summary as text
+
+Eight more columns, computed here because the text is in memory here and nowhere else needs to load
+it. They are Table 7 of the paper: how long the summary is, how readable, how hedged, and how many
+figures it carries. Counts are stored; a rate per thousand words is one division downstream.
+
+The uncertainty list is Loughran and McDonald's. It reaches this document as a file of three hundred
+words, written once by the call the old pipeline made at every render and never since:
+
+```r
+fs::dir_create("0_data/Lexicons")
+tidytext::get_sentiments("loughran") |>
+  dplyr::filter(sentiment == "uncertainty") |>
+  dplyr::pull(word) |>
+  readr::write_lines("0_data/Lexicons/LM_Uncertainty.txt")
+```
+
+That call needs `tidytext` and `textdata` and asks to download on first use, which is why it is run
+by hand and its output committed rather than repeated inside a render.
+
+`HasExhibit10` is the split that table is built on. An 8-K that announces an agreement either attaches
+the contract or leaves it for the next periodic report, and only here -- where every summary is a row
+whether or not a contract rode with it -- can the two be compared. A contract-level release sees only
+the attached ones.
+
+```{r}
+#| label: build-measures-check
+itm_measures_summary(.tab = tab_item101)
+```
+
+The published comparison had delayed summaries seventy-six words longer, more uncertain, and carrying
+fewer numbers. If the two rows above do not show that ordering, the measures moved, not the paper.
 
 `nItems` here is what the parent filing declares and `nCodesRead` is what this document's own headings yielded, which
 are different numbers and used to share a name. `ItemCodes` replaces the pipe-joined label string the table used to

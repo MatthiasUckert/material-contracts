@@ -1,0 +1,478 @@
+---
+title: "Regressions -- The Paper's Ten Tables, from One File (20)"
+author: "Matthias Uckert"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
+# messages would discard this document's entire output. comment = "" removes the "##" prefix from
+# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
+# once in _quarto.yml.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
+```
+
+```{r}
+#| label: load-libraries
+#| echo: false
+
+source(here::here("1_code", "_Commons", "_Initialize.R"), encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Utils.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Plots.R"),      encoding = "UTF-8")
+source(here::here("1_code", "_Commons", "_Tables.R"),     encoding = "UTF-8")
+
+
+.name_script <- "20-RunRegression"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # this document's name; the output directory is derived from it
+))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(), # project root
+  .name_script = .name_script  # resolves to 1_code/20-RunRegression.R
+))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+This document estimates the paper's ten regression tables from `Contracts.parquet` and three external
+inputs, and writes each table as a `.tex` file.
+
+## What it replaces
+
+The submitted tables came from seven Stata do-files. The first three of those assembled a contract
+table out of eight pipeline releases, matched it to Compustat, and built the variables; the last
+three estimated on the result. The eight releases are now one file, and the matching happens
+upstream in `02A`, so the assembly step no longer exists. What is left -- three external inputs, two
+panels, ten specifications -- is small enough to be stated in the repo's own language, next to
+everything that produced its inputs.
+
+## Two grains
+
+**The firm-quarter panel** is the one place a non-event exists. Every Compustat firm-quarter appears;
+those with no contract carry a zero count; the filing-decision table is estimated on it.
+
+**The contract panel** is one row per attachment copy, carrying its firm-quarter's variables by a
+many-to-one join. Every other table is estimated on it. Nothing is computed at contract grain that
+the quarter panel does not already hold, so the two grains control for the same numbers.
+
+## Three estimators, and why the firm-effect column is linear
+
+The paper reports each specification pooled and with firm fixed effects, and estimates the latter
+two ways: a conditional logit and a linear model with the firm effect absorbed. Both are here. The
+conditional logit is `survival::clogit()` with the exact conditional likelihood, which is the same
+estimator Stata's `clogit` computes, and it is slow enough on 1.4 million rows that it is opt-in.
+
+What is deliberately **not** here is a logit with the firm effect absorbed by `fixest`. That
+estimator maximises the unconditional likelihood with the firm intercepts concentrated out, which is
+the incidental-parameters-biased estimator conditional logit exists to avoid. It would look like the
+paper's column and would not be it.
+
+## Two departures from the do-files, each a correction rather than a choice
+
+**Quarterly operating cash flow.** The do-file differenced the year-to-date figure and then, on the
+first quarter, replaced the result with itself. A first quarter's quarterly flow is its year-to-date
+flow; that is what is used here. The equity-issuance block in the same file handles the identical
+case correctly, so this is what was intended. The variable is in every table's control set.
+
+**The DiD treatment intensity.** The do-file divided a count grouped on CIK by a count grouped on
+gvkey, and regressed whichever contract row survived a de-duplication rather than the firm-quarter
+average its table notes describe. Both are computed within gvkey here, and the outcome is the mean.
+
+## What is not here
+
+Figures, which are `21-Figures`; and descriptives beyond the control-variable table, which are
+`105` in the Stata folder until they move.
+
+# Configuration
+
+Every path, and every definitional choice the paper leaves open, in one place. **The defaults
+reproduce the submitted tables**: the naive duration, the bracketed redaction count, item counts
+coalesced to zero, and every attachment copy in the contract panel. Switch one at a time.
+
+```{r}
+#| label: config
+
+.lP <- list(
+  Input = list(
+    FilContracts = "2_output/10-ExportData/Output/Contracts.parquet",
+    # THE THREE EXTERNAL INPUTS. WRDS pulls and a Hoberg-Phillips download; not in the repo.
+    FilCompustat = "0_data/External/Compustat_quarterly_data_2024.dta",
+    FilSegments  = "0_data/External/segment_data.dta",
+    FilFluidity  = "0_data/External/FluidityData/FluidityData.txt"
+  ),
+  Params = list(
+    Duration   = "naive",      # "naive" = NaiveYears, the submitted measure; "cascade" = DurationYears
+    Redaction  = "bracketed",  # "bracketed" (published), "withheld", or "money"
+    Items      = "zero",       # "zero" coalesces a filing with no item structure; "missing" leaves it
+    Voluntary  = "era",        # "era" counts 12/9/5 before the reform; "dotted" is the submitted measure
+    Primary    = FALSE,        # TRUE restricts counts and the contract sample to primary copies
+    SameSample = FALSE,        # TRUE estimates pooled Table 7 on the firm-effect sample, as submitted
+    Estimators = c("logit", "lpm")   # add "clogit" for the exact conditional logit; slow
+  ),
+  Output = list(
+    FilQuarter  = utils_file_path(.dir_main, "Output", "PanelQuarter.parquet"),
+    FilContract = utils_file_path(.dir_main, "Output", "PanelContract.parquet"),
+    DirTables   = utils_file_path(.dir_main, "Tables")
+  )
+)
+```
+
+**`fixest` is not in `renv.lock`.** It is installed with `renv::install("fixest")` and recorded with
+`renv::snapshot()` before this document renders.
+
+# Inputs
+
+## The contract table
+
+```{r}
+#| label: input-contracts
+
+contracts <- reg_read_contracts(
+  .path      = .lP$Input$FilContracts,   # 10-ExportData's release
+  .duration  = .lP$Params$Duration,      # which duration column stands in for the paper's
+  .redaction = .lP$Params$Redaction,     # which redaction count feeds Redacted
+  .items     = .lP$Params$Items,         # zero or missing on a filing with no item structure
+  .voluntary = .lP$Params$Voluntary      # era-aware count, or the three post-reform codes only
+)
+```
+
+## The vocabulary covers the data
+
+The twelve contract types are restated in this document's library, ordered so that `Other` is the
+reference level in every table that enters type. The order is this document's; the set is the
+file's. A label in the file that the library does not know would become a missing factor level and
+leave three tables silently, so the set is checked here rather than assumed.
+
+```{r}
+#| label: input-check-vocabulary
+
+in_file_ <- sort(setdiff(unique(contracts$ClassLabel), c("", NA)))
+stopifnot(setequal(in_file_, .reg_class_levels))
+cli::cli_alert_success("{length(in_file_)} contract types in the file, all twelve known to this document")
+```
+
+## The three external inputs
+
+```{r}
+#| label: input-external
+
+compustat <- reg_read_compustat(.path = .lP$Input$FilCompustat)
+segments  <- reg_read_segments(.path = .lP$Input$FilSegments)
+fluidity  <- reg_read_fluidity(.path = .lP$Input$FilFluidity)
+```
+
+# Panels
+
+## Firm-quarter
+
+Counts first, on the full Compustat panel so a non-filing quarter is a zero rather than an absent
+row; then the accounting variables, winsorised once over the whole panel before any sample is drawn.
+
+```{r}
+#| label: panel-quarter
+
+quarter <- reg_build_quarter(
+  .contracts = contracts,             # the contract table
+  .compustat = compustat,             # every Compustat firm-quarter
+  .fluidity  = fluidity,              # Hoberg-Phillips, joined on gvkey-year
+  .primary   = .lP$Params$Primary     # count primary copies only, or every row
+) |>
+  reg_add_firm_vars()
+```
+
+## Contract
+
+```{r}
+#| label: panel-contract
+
+contract <- reg_build_contract(
+  .contracts = contracts,             # the contract table
+  .quarter   = quarter,               # carries the firm-quarter variables onto each
+  .primary   = .lP$Params$Primary     # the same rule the quarter counts used
+)
+```
+
+```{r}
+#| label: panel-report
+
+reg_report_panels(.quarter = quarter, .contract = contract)
+```
+
+# Samples
+
+Two rules the paper applies before any table, made visible because they define what is estimated.
+
+The **filing-decision sample** keeps firm-quarters from 2001 to 2024 with every control present, and
+drops firms that never file within the window: a firm that cannot be observed filing carries no
+information about the decision to file.
+
+The **contract sample** keeps matched, well-formed contracts filed from a start year the table sets,
+with every control present. Delay and contract-type tables start in 2005, redaction in 2008 when
+orders became observable, bundling in 2004 when the item taxonomy that defines it appeared.
+
+```{r}
+#| label: sample-quarter
+
+sample_quarter <- reg_sample_quarter(
+  .quarter     = quarter,                 # the full firm-quarter panel
+  .years       = c(2001L, 2024L),         # calendar window on datadate
+  .same_sample = .lP$Params$SameSample    # drop non-varying firms before the pooled columns too
+)
+
+reg_report_controls(.quarter = sample_quarter, .vars = .reg_controls$Quarter)
+```
+
+```{r}
+#| label: sample-contract
+
+sample_delay <- reg_sample_contract(
+  .contract = contract,              # the contract panel
+  .min_year = 2005L,                 # first filing year in the delay tables
+  .controls = .reg_controls$Full,    # the long control set must be complete
+  .primary  = .lP$Params$Primary     # every copy, or primary copies only
+)
+
+sample_type <- reg_sample_contract(
+  .contract = contract,
+  .min_year = 2005L,
+  .controls = .reg_controls$Contract,   # Table E1 uses the shorter set
+  .primary  = .lP$Params$Primary
+)
+
+sample_redact <- reg_sample_contract(
+  .contract = contract,
+  .min_year = 2008L,                 # orders are observable from 2008
+  .controls = .reg_controls$Full,
+  .primary  = .lP$Params$Primary
+)
+
+sample_bundle <- reg_sample_contract(
+  .contract = contract,
+  .min_year = 2004L,                 # the dotted item taxonomy dates from August 2004
+  .controls = .reg_controls$Full,
+  .primary  = .lP$Params$Primary
+)
+```
+
+# Results
+
+Console output only; every table is written to disk under Deployment.
+
+## Table 7: the decision to file
+
+```{r}
+#| label: results-filed
+
+tab_filed <- reg_table_filed(
+  .sample     = sample_quarter,          # firm-quarters
+  .estimators = .lP$Params$Estimators    # pooled logit plus the firm-effect columns
+)
+reg_report_models(.models = tab_filed, .title = "Table 7: Filing decision")
+```
+
+## Table E1: which contract types are disclosed late
+
+```{r}
+#| label: results-contract-type
+
+tab_type <- reg_table_contract_type(.sample = sample_type)
+reg_report_models(.models = tab_type, .title = "Table E1: Contract type and delayed filing", .keep = "^Class")
+```
+
+## Table 9: delayed filing
+
+Competition enters two ways, product-market fluidity and a two-digit sales Herfindahl, on the
+paper's grounds that the two disagree about which firms face rivals and a result that holds under
+both is the one worth reporting.
+
+```{r}
+#| label: results-delay
+
+tab_delay_fluid <- reg_table_outcome(
+  .sample      = sample_delay,
+  .dv          = "Delayed",
+  .competition = "Fluidity",             # primary measure
+  .estimators  = .lP$Params$Estimators
+)
+tab_delay_hhi <- reg_table_outcome(
+  .sample      = sample_delay,
+  .dv          = "Delayed",
+  .competition = "HhiSic2Win",           # robustness measure
+  .estimators  = .lP$Params$Estimators
+)
+reg_report_models(.models = tab_delay_fluid, .title = "Table 9: Delayed filing, fluidity")
+```
+
+## Table 10: redaction
+
+```{r}
+#| label: results-redaction
+
+tab_redact_fluid <- reg_table_outcome(
+  .sample      = sample_redact,
+  .dv          = "Redacted",
+  .competition = "Fluidity",
+  .estimators  = .lP$Params$Estimators
+)
+tab_redact_hhi <- reg_table_outcome(
+  .sample      = sample_redact,
+  .dv          = "Redacted",
+  .competition = "HhiSic2Win",
+  .estimators  = .lP$Params$Estimators
+)
+reg_report_models(.models = tab_redact_fluid, .title = "Table 10: Redaction, fluidity")
+```
+
+## Appendix D1: bundling with voluntary items
+
+```{r}
+#| label: results-bundling
+
+tab_bundle <- reg_table_bundling(
+  .sample     = sample_bundle,
+  .estimators = .lP$Params$Estimators
+)
+reg_report_models(.models = tab_bundle, .title = "Appendix D1: Bundling", .keep = "^(Size|Loss|Class)")
+```
+
+## Table 8: the 2004 reform, both ways
+
+The outcome is the number of voluntary items on the parent 8-K. Counting only the three post-reform
+codes returns zero on every filing before 23 August 2004, because those items were then numbered 12,
+9 and 5; the submitted table was built that way, and its `Post` coefficient is the rise from a
+pre-period that was zero by construction. The era-aware count measures the pre-period. Both are
+estimated so the difference is on the page with its cause.
+
+```{r}
+#| label: results-did
+
+tab_did <- reg_table_did(.contract = contract)
+reg_report_models(.models = tab_did, .title = "Table 8: 2004 reform, era-aware count",
+                  .keep = "^(Share|Post|Trend)")
+
+contract_dotted <- reg_read_contracts(
+  .path      = .lP$Input$FilContracts,
+  .duration  = .lP$Params$Duration,
+  .redaction = .lP$Params$Redaction,
+  .items     = .lP$Params$Items,
+  .voluntary = "dotted"                  # the submitted measure: post-reform codes only
+) |>
+  reg_build_contract(.quarter = quarter, .primary = .lP$Params$Primary)
+
+tab_did_dotted <- reg_table_did(.contract = contract_dotted)
+reg_report_models(.models = tab_did_dotted, .title = "Table 8: 2004 reform, post-reform codes only",
+                  .keep = "^(Share|Post|Trend)")
+```
+
+# Validation
+
+Three checks between the panels, each stated before it is read.
+
+**Every contract sits on a firm-quarter the quarter panel counts as filing.** Both panels take
+their rows from one filter, `reg_rows_counted()`, so this holds by construction. A violation means
+the two builders were given different arguments, which is the one way the shared filter can be
+defeated.
+
+**The reverse is not expected to hold exactly.** A firm-quarter counted as filing can carry no
+contract in the contract panel where its only contracts failed the many-to-one join, so the count of
+such quarters is reported rather than asserted.
+
+**The year-to-date correction leaves Q1 operating cash flow equal to the year-to-date figure.** This
+is the departure from the do-file, so it is checked rather than assumed.
+
+```{r}
+#| label: validation-panels
+
+keys_q_ <- quarter |> dplyr::filter(.data$Filed == 1L) |> dplyr::distinct(.data$gvkey, .data$fyear, .data$fqtr)
+keys_c_ <- contract |> dplyr::distinct(.data$gvkey, .data$fyear, .data$fqtr)
+
+stopifnot(nrow(dplyr::anti_join(keys_c_, keys_q_, by = c("gvkey", "fyear", "fqtr"))) == 0L)
+cli::cli_alert_success("every contract firm-quarter is in the quarter panel")
+
+n_only_q_ <- nrow(dplyr::anti_join(keys_q_, keys_c_, by = c("gvkey", "fyear", "fqtr")))
+cli::cli_alert_info("{n_only_q_} filing firm-quarters carry no contract in the contract panel")
+
+q1_ <- quarter |> dplyr::filter(.data$fqtr == 1L, !is.na(.data$Ocf))
+stopifnot(all(q1_$Ocf == q1_$oancfy))
+cli::cli_alert_success("Q1 operating cash flow equals the year-to-date figure on {format(nrow(q1_), big.mark = ',')} rows")
+```
+
+# Deployment
+
+The two panels, and every table as `.tex`. The panels are what a reader re-estimates from; the
+tables are what the manuscript includes.
+
+```{r}
+#| label: deploy-panels
+
+fs::dir_create(fs::path_dir(.lP$Output$FilQuarter))
+arrow::write_parquet(quarter,  .lP$Output$FilQuarter)
+arrow::write_parquet(contract, .lP$Output$FilContract)
+cli::cli_alert_success("wrote {.file {fs::path_file(.lP$Output$FilQuarter)}}")
+cli::cli_alert_success("wrote {.file {fs::path_file(.lP$Output$FilContract)}}")
+```
+
+```{r}
+#| label: deploy-tables
+
+tex_ <- function(.name) fs::path(.lP$Output$DirTables, paste0(.name, ".tex"))
+
+reg_tex(.models = tab_filed,        .path = tex_("filed"),           .title = "Filing decision")
+reg_tex(.models = tab_type,         .path = tex_("contract_type"),   .title = "Contract type and delayed filing",
+        .keep = "^Class")
+reg_tex(.models = tab_delay_fluid,  .path = tex_("delay_fluidity"),  .title = "Delayed filing, fluidity")
+reg_tex(.models = tab_delay_hhi,    .path = tex_("delay_hhi"),       .title = "Delayed filing, HHI")
+reg_tex(.models = tab_redact_fluid, .path = tex_("redaction_fluidity"), .title = "Redaction, fluidity")
+reg_tex(.models = tab_redact_hhi,   .path = tex_("redaction_hhi"),   .title = "Redaction, HHI")
+reg_tex(.models = tab_bundle,       .path = tex_("bundling"),        .title = "Bundling with voluntary items")
+reg_tex(.models = tab_did,          .path = tex_("did_2004"),        .title = "The 2004 reform, era-aware count")
+reg_tex(.models = tab_did_dotted,   .path = tex_("did_2004_dotted"), .title = "The 2004 reform, post-reform codes only")
+```
+
+# Overview
+
+```{r}
+#| label: overview-panels
+
+reg_report_panels(.quarter = quarter, .contract = contract)
+```
+
+```{r}
+#| label: overview-config
+
+tibble::tibble(
+  Parameter = c("Duration", "Redaction", "Items", "Voluntary items", "Primary copies", "Same sample",
+                "Estimators"),
+  Value     = c(.lP$Params$Duration, .lP$Params$Redaction, .lP$Params$Items, .lP$Params$Voluntary,
+                as.character(.lP$Params$Primary), as.character(.lP$Params$SameSample),
+                paste(.lP$Params$Estimators, collapse = ", "))
+) |>
+  tbl_out(.title = "The choices this render made")
+```
+
+# Next
+
+`21-Figures` draws the paper's figures from `PanelContract.parquet` and `PanelQuarter.parquet`. The
+geographic-diversity figure waits on a place-level release from the GPE store, which `10-ExportData`
+does not yet write.
