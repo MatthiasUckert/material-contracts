@@ -558,7 +558,8 @@ export_summary <- function(.path_in, .path_sample, .path_out, .rerun = FALSE) {
     dplyr::distinct(.data$HashIndex) |>
     dplyr::pull(.data$HashIndex)
   cols_ <- c("HashIndex", "DocID", "Outcome", "nSummaryDates", "SummaryIsSingle", "nWords", "nSentences",
-             "nComplex", "FogIndex", "nUncertain", "nNumbers", "nDollars", "nPercents", "HasExhibit10")
+             "nComplex", "FogIndex", "nUncertain", "nNumbers", "nDollars", "nPercents", "HasExhibit10",
+             "BoilerplateShare", "AnnounceLagDays")
   raw_ <- arrow::open_dataset(sources = .path_in) |>
     dplyr::filter(.data$HashIndex %in% keep_, .data$Outcome %in% c("extracted", "ambiguous-longest")) |>
     dplyr::select(dplyr::all_of(cols_)) |>
@@ -572,7 +573,8 @@ export_summary <- function(.path_in, .path_sample, .path_out, .rerun = FALSE) {
       SumDates = "nSummaryDates", SumIsSingle = "SummaryIsSingle", SumWords = "nWords",
       SumSentences = "nSentences", SumComplex = "nComplex", SumFog = "FogIndex",
       SumUncertain = "nUncertain", SumNumbers = "nNumbers", SumDollars = "nDollars",
-      SumPercents = "nPercents", SumAttached = "HasExhibit10"
+      SumPercents = "nPercents", SumAttached = "HasExhibit10", SumBoiler = "BoilerplateShare",
+      SumLagDays = "AnnounceLagDays"
     ) |>
     dplyr::arrange(.data$HashIndex)
   if (anyDuplicated(out_$HashIndex)) {
@@ -591,6 +593,187 @@ export_summary <- function(.path_in, .path_sample, .path_out, .rerun = FALSE) {
     )
   }
   invisible(out_)
+}
+
+# THE SECOND RELEASE FILE'S DICTIONARY. Summaries.dta is one row per Item 1.01 8-K, attached or
+# not, and is what Tables 3 and 5 of the paper are estimated on. Same layout as .exp_dictionary so
+# the two codebooks read alike.
+.exp_dictionary_summaries <- tibble::tribble(
+  ~Column, ~Meaning, ~Missing,
+  "HashIndex", "The filing. Joins to Contracts on HashIndex where a contract was attached.", "never",
+  "DocID", "The 8-K document the summary was read from.", "never",
+  "CIK", "The filer. The key to Compustat, with DateFiled, as her 102 always did it.", "never",
+  "DateFiled", "The 8-K's filing date.", "never",
+  "FormType", "8-K or 8-K/A.", "never",
+  "SumAttached",
+  "Whether an Exhibit 10 rode on this 8-K. Zero is the delayed-or-omitted half of every announcement,
+   which no contract-level file can see.", "never",
+  "SumDates", "Distinct agreement dates the narrative opens with.", "structural",
+  "SumDateFirst", "The first of them: the agreement date.", "where the narrative names none",
+  "SumIsSingle", "SumDates == 1. The paper's Table 7 sample.", "structural",
+  "SumLagDays",
+  "DateFiled less SumDateFirst, calendar days, signed. Four business days is at most six calendar.",
+  "where SumDateFirst is",
+  "SumWords", "Words after the heading is removed.", "never",
+  "SumSentences", "ICU sentence boundaries.", "never",
+  "SumComplex", "Words of three or more syllables.", "never",
+  "SumFog", "Gunning Fog.", "never",
+  "SumUncertain", "Loughran-McDonald Uncertainty words.", "never",
+  "SumNumbers", "Numeric tokens.", "never",
+  "SumDollars", "Dollar figures.", "never",
+  "SumPercents", "Percentages.", "never",
+  "SumBoiler", "Share of four-word phrases in at least one in a hundred distinct filers.", "never"
+)
+
+#' The summaries as their own release: one row per Item 1.01 8-K, attached or not
+#'
+#' WHY A SECOND FILE. Contracts.dta is one row per Exhibit 10. An 8-K that announced an agreement
+#' and attached nothing has no row there, and that is the half of every summary comparison the paper
+#' makes: delayed against attached, late against on time. Those tables need every announcement as a
+#' row, and this file is that. It is 01D's Item101.parquet with the narrative left behind, one row
+#' per filing, and the names the Contracts block uses so a column means the same thing in both.
+#'
+#' NO SAMPLE LADDER. The ladder is a property of exhibits; an announcement is in this file if 01D
+#' recovered its narrative, whether or not any exhibit followed. Restricting to single-agreement
+#' announcements (SumIsSingle) is the paper's choice and is left to the paper.
+#'
+#' @param .path_in Character. 01D's Item101.parquet.
+#' @param .path_out Character. Where to write the parquet; the dta and codebook sit beside it.
+#' @param .rerun Logical.
+#' @param .dta Logical. Also write Summaries.dta and Summaries_Codebook.csv.
+#' @return Tibble, one row per filing with a recovered summary.
+export_summaries <- function(.path_in, .path_out, .rerun = FALSE, .dta = TRUE) {
+  if (FALSE) {
+    .path_in  <- .lP$Input$FilItem101
+    .path_out <- .lP$Output$FilSummaries
+    .rerun    <- FALSE
+    .dta      <- TRUE
+  }
+  if (exp_cache_hit(.task = "Summaries", .path_out = .path_out, .paths_in = .path_in, .rerun = .rerun)) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "Summaries: {.path {as.character(fs::path_file(.path_out))}} already written \\
+       ({format(nrow(out_), big.mark = ',')} rows, {ncol(out_)} columns). Pass .rerun = TRUE to rebuild."
+    )
+    return(invisible(out_))
+  }
+  cols_ <- c("HashIndex", "DocID", "CIK", "DateFiled", "FormType", "Outcome", "HasExhibit10",
+             "nSummaryDates", "SummaryDateFirst", "SummaryIsSingle", "AnnounceLagDays", "nWords",
+             "nSentences", "nComplex", "FogIndex", "nUncertain", "nNumbers", "nDollars", "nPercents",
+             "BoilerplateShare")
+  raw_ <- arrow::open_dataset(sources = .path_in) |>
+    dplyr::filter(.data$Outcome %in% c("extracted", "ambiguous-longest")) |>
+    dplyr::select(dplyr::all_of(cols_)) |>
+    dplyr::collect()
+  n_multi_ <- sum(duplicated(raw_$HashIndex))
+  out_ <- raw_ |>
+    dplyr::arrange(.data$HashIndex, .data$Outcome != "extracted", dplyr::desc(.data$nWords), .data$DocID) |>
+    dplyr::distinct(.data$HashIndex, .keep_all = TRUE) |>
+    dplyr::select(-"Outcome") |>
+    dplyr::rename(
+      SumAttached = "HasExhibit10", SumDates = "nSummaryDates", SumDateFirst = "SummaryDateFirst",
+      SumIsSingle = "SummaryIsSingle", SumLagDays = "AnnounceLagDays", SumWords = "nWords",
+      SumSentences = "nSentences", SumComplex = "nComplex", SumFog = "FogIndex",
+      SumUncertain = "nUncertain", SumNumbers = "nNumbers", SumDollars = "nDollars",
+      SumPercents = "nPercents", SumBoiler = "BoilerplateShare"
+    ) |>
+    dplyr::arrange(.data$HashIndex)
+  if (anyDuplicated(out_$HashIndex)) {
+    cli::cli_abort("The summaries file is not one row per filing after the collapse.")
+  }
+  missing_ <- setdiff(names(out_), .exp_dictionary_summaries$Column)
+  if (length(missing_) > 0L) {
+    cli::cli_abort("Summaries.parquet would carry undocumented {cli::qty(length(missing_))}column{?s}: {.val {missing_}}")
+  }
+
+  fs::dir_create(fs::path_dir(.path_out))
+  arrow::write_parquet(out_, .path_out)
+  if (.dta) {
+    sta_ <- exp_stata_ready(.tab = out_)
+    haven::write_dta(sta_$Tab, fs::path_ext_set(.path_out, "dta"))
+    tibble::tibble(Column = names(out_), StataName = sta_$Names$Stata) |>
+      dplyr::left_join(.exp_dictionary_summaries, by = dplyr::join_by(Column)) |>
+      readr::write_csv(fs::path_ext_set(paste0(fs::path_ext_remove(.path_out), "_Codebook"), "csv"))
+  }
+  n_att_ <- sum(out_$SumAttached)
+  cli::cli_alert_success(
+    "Summaries: {format(nrow(out_), big.mark = ',')} announcements, {format(n_att_, big.mark = ',')} with a contract \\
+     attached, {format(nrow(out_) - n_att_, big.mark = ',')} without."
+  )
+  if (n_multi_ > 0L) {
+    cli::cli_alert_info(
+      "{format(n_multi_, big.mark = ',')} {cli::qty(n_multi_)}filing{?s} held more than one summarised \\
+       document; one was kept per filing."
+    )
+  }
+  invisible(out_)
+}
+
+#' Put the release where Ann-Kristin reads it, and keep what was there
+#'
+#' THE PREVIOUS RELEASE IS ARCHIVED BEFORE IT IS OVERWRITTEN, under a timestamp, so a table she ran
+#' last month can be traced to the file it ran on. Nothing is archived when nothing changed: a file
+#' in Dropbox that is the same size as the one here and no older than it is left alone, and if every
+#' file is, the function reports that and stops. 7-Zip is used when it is on the PATH, because a
+#' 3 GB .dta shrinks by a factor of ten under it; zip is the fallback.
+#'
+#' ONLY THE RELEASE FILES ARE TOUCHED. Sub-directories in the Dropbox folder -- _archive, anything
+#' she keeps beside the release -- are hers and are not read or written.
+#'
+#' @param .dir_out Character. This document's Output directory.
+#' @param .dir_dropbox Character. The folder she reads from.
+#' @param .files Character. File names to deploy, all expected in .dir_out.
+#' @return Invisibly, a tibble of what was done per file.
+export_deploy <- function(.dir_out, .dir_dropbox, .files) {
+  if (FALSE) {
+    .dir_out     <- fs::path_dir(.lP$Output$FilContracts)
+    .dir_dropbox <- .lP$Output$DirDropbox
+    .files       <- c("Contracts.parquet", "Contracts.dta", "Contracts_Codebook.csv",
+                      "Summaries.parquet", "Summaries.dta", "Summaries_Codebook.csv")
+  }
+  if (!fs::dir_exists(.dir_dropbox)) {
+    cli::cli_alert_warning("Dropbox folder not found at {.path {(.dir_dropbox)}}; nothing deployed.")
+    return(invisible(NULL))
+  }
+  src_ <- fs::path(.dir_out, .files)
+  dst_ <- fs::path(.dir_dropbox, .files)
+  if (!all(fs::file_exists(src_))) {
+    cli::cli_abort("Not every release file is in Output: {.file {(.files[!fs::file_exists(src_)])}}")
+  }
+  info_src_ <- fs::file_info(src_)
+  info_dst_ <- fs::file_info(dst_)
+  same_ <- !is.na(info_dst_$size) & info_dst_$size == info_src_$size &
+    info_dst_$modification_time >= info_src_$modification_time
+  if (all(same_)) {
+    cli::cli_alert_info("Dropbox already holds this release; nothing archived, nothing copied.")
+    return(invisible(tibble::tibble(File = .files, Action = "unchanged")))
+  }
+
+  # Archive whatever release files are there now, before any of them is overwritten.
+  present_ <- dst_[fs::file_exists(dst_)]
+  if (length(present_) > 0L) {
+    dir_arch_ <- fs::path(.dir_dropbox, "_archive")
+    fs::dir_create(dir_arch_)
+    stamp_ <- format(Sys.time(), "%Y-%m-%d_%H%M")
+    seven_ <- Sys.which(c("7zz", "7z", "7za"))
+    seven_ <- seven_[nzchar(seven_)][1]
+    if (!is.na(seven_)) {
+      arch_ <- fs::path(dir_arch_, paste0(stamp_, ".7z"))
+      system2(seven_, c("a", "-mx=5", shQuote(arch_), shQuote(present_)), stdout = FALSE, stderr = FALSE)
+    } else {
+      arch_ <- fs::path(dir_arch_, paste0(stamp_, ".zip"))
+      utils::zip(zipfile = arch_, files = present_, flags = "-j -q")
+    }
+    cli::cli_alert_success(
+      "Archived {length(present_)} previous {cli::qty(length(present_))}file{?s} to {.file {fs::path_file(arch_)}}"
+    )
+  }
+
+  fs::file_copy(src_[!same_], dst_[!same_], overwrite = TRUE)
+  cli::cli_alert_success(
+    "Copied {sum(!same_)} {cli::qty(sum(!same_))}file{?s} to Dropbox: {.file {.files[!same_]}}"
+  )
+  invisible(tibble::tibble(File = .files, Action = ifelse(same_, "unchanged", "copied")))
 }
 
 #' The confidential-treatment orders naming each contract, one row per contract
@@ -1544,12 +1727,42 @@ export_REDACT <- function(.dir_in, .path_out, .rerun = FALSE) {
   con_ <- DBI::dbConnect(duckdb::duckdb())
   on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
 
-  # THREE OF redact_spans' TEN COLUMNS. MarkText and the two offsets locate the marker, RedactedRef
-  # and RedactedText carry the price it was matched to, and Bracketed and Withheld are restatements
-  # of Kind.
+  # FOUR OF redact_spans' TEN COLUMNS. MarkText is read to refuse a marker; the two offsets locate
+  # it, RedactedRef and RedactedText carry the price it was matched to, and Bracketed and Withheld
+  # are restatements of Kind.
+  #
+  # AN EMPTY BRACKET IS NOT A MARKER, AND THE EXTRACTOR EMITTED 478,771 OF THEM. redaction.py's
+  # RedactSymbol pattern read ^[*\\s]+$, which a lone space satisfies, so every "[ ]" on EDGAR --
+  # checkboxes, form fields, blanks in schedules -- was stored as a symbol marker: 63,270 contracts
+  # with nothing but these, at a pre-FAST CTO precision of 0.011. The same defect sits in the blank
+  # and bullet patterns. The pattern is fixed at the source; until the REDACT pass is re-run, this
+  # is the guard: a marker whose text is nothing but brackets and whitespace is refused here, on
+  # the same rule the fixed classify() applies, so the counts are the ones the fixed extractor
+  # would have written. The refused count is reported, and a release built on the re-run store
+  # should report zero.
+  n_all_ <- ds_ |>
+    dplyr::summarise(N = dplyr::n()) |>
+    dplyr::collect() |>
+    dplyr::pull(.data$N)
   src_ <- ds_ |>
+    dplyr::select("DocID", "Kind", "RedactedEntity", "MarkText") |>
+    # RE2, not Python: \\s here is ASCII whitespace, so the next-line and no-break-space characters
+    # that Python's \\s covers -- both present in the store -- are named. This is the same set the
+    # fixed classify() strips.
+    dplyr::filter(!grepl("^\\[[\\s\\x85\\xA0]*\\]$", .data$MarkText)) |>
     dplyr::select("DocID", "Kind", "RedactedEntity") |>
     arrow::to_duckdb(con = con_, auto_disconnect = FALSE)
+  n_kept_ <- src_ |>
+    dplyr::summarise(N = dplyr::n()) |>
+    dplyr::collect() |>
+    dplyr::pull(.data$N)
+  n_refused_ <- as.integer(n_all_ - n_kept_)
+  if (n_refused_ > 0L) {
+    cli::cli_alert_warning(
+      "REDACT: {format(n_refused_, big.mark = ',')} empty-bracket {cli::qty(n_refused_)}marker{?s} refused \\
+       (the [ ] defect in redaction.py). Zero here means the store was built with the fixed extractor."
+    )
+  }
 
   bykind_ <- src_ |>
     dplyr::group_by(.data$DocID, .data$Kind) |>
@@ -2571,6 +2784,17 @@ exp_report_final <- function(.tab) {
   "SumIsSingle", "Summary",
   "SumDates == 1: the narrative describes one agreement. The paper's Table 7 sample.",
   "structural",
+
+  "SumBoiler", "Summary",
+  "Share of the narrative's four-word phrases that appear in at least one in a hundred distinct
+   filers, after Lang and Stice-Lawrence (2015). House style is not boilerplate; the form is.",
+  "structural",
+
+  "SumLagDays", "Summary",
+  "Filing date less the agreement date the narrative opens with, in calendar days, signed. Item 1.01
+   allows four business days, which is at most six calendar days; a negative lag is a firm announcing
+   before it signed.",
+  "where the narrative names no agreement date",
 
   "SumAttached", "Summary",
   "Whether an Exhibit 10 rode on the same filing. One on every row of this release by construction,

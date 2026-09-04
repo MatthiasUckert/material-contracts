@@ -1412,13 +1412,120 @@ itm_summary_attached <- function(.tab, .path_meta) {
   out_
 }
 
+#' The filing behind each summary, and how long the firm took to announce
+#'
+#' THE FOUR-BUSINESS-DAY RULE, MEASURED. Item 1.01 requires an 8-K within four business days of the
+#' agreement. The summary opens with the agreement date -- SummaryDateFirst, from itm_summary_dates()
+#' -- and the metadata carries the filing date, so the lag is one subtraction. It is stored in
+#' calendar days and left signed: a negative lag is a firm announcing before it signed, which is
+#' real and belongs in the data. Four business days is at most six calendar days across a weekend,
+#' so a threshold of six is the strict bound; an exact business-day count needs a holiday calendar
+#' and is a downstream choice.
+#'
+#' CIK and FormType come along because a release at 8-K grain needs them as keys, and this is the
+#' one pass that reads the metadata with the summaries in hand.
+#'
+#' @param .tab Tibble with DocID and SummaryDateFirst.
+#' @param .path_meta Character. 01C's metadata.
+#' @return .tab with CIK, DateFiled, FormType and AnnounceLagDays added.
+itm_summary_filing <- function(.tab, .path_meta) {
+  if (FALSE) {
+    .tab       <- tab_item101
+    .path_meta <- .lP$Input$MetaData
+  }
+  meta_ <- arrow::open_dataset(sources = .path_meta) |>
+    dplyr::filter(.data$DocID %in% .tab$DocID) |>
+    dplyr::select("DocID", "CIK", "DateFiled", "FormType") |>
+    dplyr::collect()
+  out_ <- .tab |>
+    dplyr::left_join(meta_, by = dplyr::join_by("DocID"), relationship = "one-to-one") |>
+    dplyr::mutate(
+      AnnounceLagDays = as.integer(.data$DateFiled - .data$SummaryDateFirst)
+    )
+  lag_ <- out_$AnnounceLagDays[!is.na(out_$AnnounceLagDays)]
+  cli::cli_alert_info(
+    "announcement lag known on {format(length(lag_), big.mark = ',')} summaries; median {stats::median(lag_)} days, \\
+     {tbl_pct(mean(lag_ > 6L))} beyond six calendar days"
+  )
+  out_
+}
+
+#' Four-word phrases per summary, in document order
+#'
+#' @param .words List of lowercase word vectors.
+#' @return List of character vectors, one tetragram per position; empty where fewer than four words.
+itm_tetragrams <- function(.words) {
+  if (FALSE) .words <- list(c("the", "company", "entered", "into", "an", "agreement"))
+  lapply(.words, function(.w) {
+    n_ <- length(.w)
+    if (n_ < 4L) return(character(0))
+    paste(.w[1:(n_ - 3L)], .w[2:(n_ - 2L)], .w[3:(n_ - 1L)], .w[4:n_])
+  })
+}
+
+#' Share of each summary that is phrasing shared across filers
+#'
+#' BOILERPLATE AFTER LANG AND STICE-LAWRENCE (2015): a four-word phrase is boilerplate when it
+#' appears in at least a stated share of DISTINCT FILERS, and a summary's boilerplate share is the
+#' fraction of its phrases that are. Distinct filers is the point. A phrase one firm repeats across
+#' its own 8-Ks is house style; a phrase a thousand firms use is the form.
+#'
+#' THE COUNT IS PRUNED BEFORE IT IS TAKEN. A hundred million phrases against a cutoff of a few
+#' hundred filers: a phrase cannot appear in more filers than it appears at all, so total frequency
+#' is counted first, cheaply, and distinct filers only for the phrases that clear the bar on total.
+#'
+#' @param .tab Tibble with ItemText and CIK.
+#' @param .min_share Numeric. Share of distinct filers a phrase must appear in. 0.01 is one in a
+#'   hundred, which on ~20,000 filers is ~200 firms.
+#' @return .tab with nTetragrams and BoilerplateShare added.
+itm_summary_boilerplate <- function(.tab, .min_share = 0.01) {
+  if (FALSE) {
+    .tab       <- tab_item101
+    .min_share <- 0.01
+  }
+  txt_   <- itm_strip_heading(.tab$ItemText)
+  words_ <- stringi::stri_extract_all_words(tolower(txt_), omit_no_match = TRUE)
+  tets_  <- itm_tetragrams(words_)
+  n_tet_ <- lengths(tets_)
+
+  flat_ <- unlist(tets_, use.names = FALSE)
+  doc_  <- rep.int(seq_along(tets_), n_tet_)
+  cik_  <- .tab$CIK[doc_]
+
+  n_filers_   <- dplyr::n_distinct(.tab$CIK[!is.na(.tab$ItemText)])
+  min_filers_ <- max(2L, ceiling(.min_share * n_filers_))
+
+  # First pass: total frequency, which bounds distinct filers from above.
+  freq_ <- vctrs::vec_count(flat_, sort = "none")
+  cand_ <- freq_$key[freq_$count >= min_filers_]
+
+  # Second pass, on the candidates only: how many distinct filers.
+  in_cand_ <- flat_ %in% cand_
+  by_filer_ <- tibble::tibble(Tet = flat_[in_cand_], CIK = cik_[in_cand_]) |>
+    dplyr::distinct() |>
+    dplyr::count(.data$Tet, name = "nFilers")
+  boiler_ <- by_filer_$Tet[by_filer_$nFilers >= min_filers_]
+
+  hit_ <- tabulate(doc_[flat_ %in% boiler_], nbins = length(tets_))
+  has_ <- !is.na(txt_)
+
+  n_boiler_ <- format(length(boiler_), big.mark = ",")
+  n_filers_fmt_ <- format(n_filers_, big.mark = ",")
+  cli::cli_alert_info("{n_boiler_} boilerplate phrases: in {min_filers_}+ of {n_filers_fmt_} filers")
+  .tab |>
+    dplyr::mutate(
+      nTetragrams      = ifelse(has_, as.integer(n_tet_), NA_integer_),
+      BoilerplateShare = ifelse(has_ & n_tet_ > 0L, hit_ / n_tet_, NA_real_)
+    )
+}
+
 #' The measures, attached against delayed, on single-agreement summaries
 #'
 #' A CHECK THAT THE COLUMNS LANDED, IN THE SHAPE THE PAPER USES THEM. Table 7 compares the two
 #' groups on these numbers; if the means here are not in the neighbourhood of the published ones --
 #' delayed summaries longer, more uncertain, fewer numbers -- something upstream moved.
 #'
-#' @param .tab Output of itm_summary_attached() after itm_summary_measures().
+#' @param .tab The summary table after measures, filing, attachment and boilerplate are on it.
 #' @return Invisibly, the table printed.
 itm_measures_summary <- function(.tab) {
   if (FALSE) .tab <- tab_item101
@@ -1433,10 +1540,13 @@ itm_measures_summary <- function(.tab) {
       Numbers   = 1000 * sum(.data$nNumbers) / sum(.data$nWords),
       Dollars   = 1000 * sum(.data$nDollars) / sum(.data$nWords),
       Percents  = 1000 * sum(.data$nPercents) / sum(.data$nWords),
+      Boiler    = mean(.data$BoilerplateShare, na.rm = TRUE),
+      LagMedian = stats::median(.data$AnnounceLagDays, na.rm = TRUE),
+      LateShare = mean(.data$AnnounceLagDays > 6L, na.rm = TRUE),
       .by = "Group"
     ) |>
     dplyr::arrange(.data$Group)
-  tbl_out(tab_, .title = "Summary measures on single-agreement 8-Ks; rates are per thousand words",
+  tbl_out(tab_, .title = "Summary measures on single-agreement 8-Ks; rates per thousand words; lag in days",
           .digits = 2L)
   invisible(tab_)
 }

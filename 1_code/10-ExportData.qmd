@@ -194,7 +194,12 @@ established holds through to the released file.
   ),
   # THE DELIVERABLE. The dta and the codebook are written beside the parquet.
   Output = list(
-    FilContracts = utils_file_path(.dir_main, "Output", "Contracts.parquet")
+    FilContracts = utils_file_path(.dir_main, "Output", "Contracts.parquet"),
+    # THE SECOND RELEASE: every Item 1.01 announcement as a row, attached or not. Tables 3 and 5.
+    FilSummaries = utils_file_path(.dir_main, "Output", "Summaries.parquet"),
+    # WHERE ANN-KRISTIN READS. The previous release is archived under a timestamp before being
+    # overwritten; nothing happens if the files there already match.
+    DirDropbox   = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline/100_Data_Export"
   )
 )
 
@@ -696,6 +701,61 @@ tab_Contracts <- export_final(
   .path_out     = .lP$Output$FilContracts,
   .rerun        = FALSE,
   .dta          = TRUE                  # writes Contracts.dta and Contracts_Codebook.csv beside it
+)
+```
+
+## The second file
+
+`Contracts` is one row per exhibit. An 8-K that announced an agreement and attached nothing has no
+row in it, and that is half of every comparison the paper makes on the summaries: delayed against
+attached, late against on time. `Summaries` is every Item 1.01 announcement as a row, whether or not
+a contract followed -- 01D's table with the narrative left behind, one row per filing, under the same
+`Sum*` names the Contracts block uses. It carries no sample ladder, because the ladder is a property
+of exhibits; the paper's restriction to single-agreement announcements is `SumIsSingle == 1`.
+
+```{r}
+#| label: export-summaries
+
+tab_Summaries <- export_summaries(
+  .path_in  = .lP$Input$FilItem101,       # 01D, every candidate 8-K with its measures
+  .path_out = .lP$Output$FilSummaries,    # Summaries.parquet; dta and codebook beside it
+  .rerun    = FALSE,
+  .dta      = TRUE
+)
+```
+
+```{r}
+#| label: report-summaries
+
+# THE TWO FILES AGREE WHERE THEY OVERLAP. Every Contracts row on an 8-K with a recovered summary has
+# a Summaries row with the same HashIndex, and its SumWords is the same number. Stated before it is
+# read: zero mismatches, or the two files were built from different renders of 01D.
+ovl_ <- tab_Contracts |>
+  dplyr::filter(!is.na(.data$SumWords)) |>
+  dplyr::distinct(.data$HashIndex, .data$SumWords) |>
+  dplyr::inner_join(dplyr::select(tab_Summaries, "HashIndex", SumWordsS = "SumWords"),
+                    by = dplyr::join_by(HashIndex))
+stopifnot(all(ovl_$SumWords == ovl_$SumWordsS))
+cli::cli_alert_success(
+  "{format(nrow(ovl_), big.mark = ',')} filings appear in both files with identical summary measures"
+)
+```
+
+## To Dropbox
+
+The two files, their two codebooks, and the parquets go to the folder Ann-Kristin reads from.
+Whatever release is there now is zipped into `_archive/` under today's date and time before it is
+overwritten, so any table she has run can be traced to the exact file it ran on. If the release
+there already matches this one, nothing is archived and nothing is copied.
+
+```{r}
+#| label: deploy-dropbox
+
+export_deploy(
+  .dir_out     = fs::path_dir(.lP$Output$FilContracts),   # this document's Output
+  .dir_dropbox = .lP$Output$DirDropbox,                    # her folder
+  .files       = c("Contracts.parquet", "Contracts.dta", "Contracts_Codebook.csv",
+                   "Summaries.parquet", "Summaries.dta", "Summaries_Codebook.csv")
 )
 ```
 

@@ -36,6 +36,7 @@ _2_output/
 # Superseded code and rendered output.
 _BackUps/
 _rendered/
+_stata/
 
 # In-repo archives. Present on disk as a working reference during the rewrite; moved to
 # ContractsBackUp/ at release. Tracked once, then untracked -- git history holds them.

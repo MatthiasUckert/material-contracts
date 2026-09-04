@@ -467,7 +467,9 @@ tab_item101 <- tab_extracted |>
   ) |>
   itm_summary_dates() |>
   itm_summary_measures(.lexicon = itm_read_lexicon(.path = .lP$Input$Lexicon)) |>
+  itm_summary_filing(.path_meta = .lP$Input$MetaData) |>
   itm_summary_attached(.path_meta = .lP$Input$MetaData) |>
+  itm_summary_boilerplate(.min_share = 0.01) |>
   dplyr::relocate(
     "DocID", "HashIndex", "YQ", "DocTypeMod", "DocExt", "Removed", "Outcome", "ItemCodes", "nItems"
   )
@@ -495,6 +497,12 @@ tidytext::get_sentiments("loughran") |>
 That call needs `tidytext` and `textdata` and asks to download on first use, which is why it is run
 by hand and its output committed rather than repeated inside a render.
 
+Two more come from the same pass. `AnnounceLagDays` is the filing date less the agreement date the
+summary opens with -- the four-business-day rule, measured, and stored signed because a firm that
+announces before it signs is a fact and not an error. `BoilerplateShare` is the fraction of a
+summary's four-word phrases that appear in at least one in a hundred distinct filers, after Lang and
+Stice-Lawrence: a phrase one firm repeats is house style, a phrase two hundred firms use is the form.
+
 `HasExhibit10` is the split that table is built on. An 8-K that announces an agreement either attaches
 the contract or leaves it for the next periodic report, and only here -- where every summary is a row
 whether or not a contract rode with it -- can the two be compared. A contract-level release sees only
@@ -506,7 +514,11 @@ itm_measures_summary(.tab = tab_item101)
 ```
 
 The published comparison had delayed summaries seventy-six words longer, more uncertain, and carrying
-fewer numbers. If the two rows above do not show that ordering, the measures moved, not the paper.
+fewer numbers. On this extraction the delayed ones are shorter, and more uncertain and less numeric
+as before; the word-count reversal is the extraction, not the paper, and is documented in the
+reconciliation. The two new columns have no published counterpart. If delayed summaries are more
+boilerplate, that is a second, independent reading of "less information". If the late share differs
+between the groups, delay of the text and delay of the announcement travel together.
 
 `nItems` here is what the parent filing declares and `nCodesRead` is what this document's own headings yielded, which
 are different numbers and used to share a name. `ItemCodes` replaces the pipe-joined label string the table used to
