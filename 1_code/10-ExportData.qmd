@@ -308,14 +308,20 @@ tab_Summary <- export_summary(
 
 `export_cto()` is the one cache here that collapses anything. 01E publishes one row per order
 *reference*: an order can name several exhibits and a contract can be named by several orders, most
-often because a grant was later extended. The collapse is 02B's, moved rather than rewritten, and a
-probe confirmed the two agree on every row of the previous release before it moved.
+often because a grant was later extended.
+
+One thing is decided here rather than upstream: `HasCto` means treatment *granted*. 01E parses and
+links every order whatever its outcome, so that the ten denials and one revocation in the corpus can
+be counted; the paper's variable is the permission to redact, and a denial is its opposite. The
+filter keeps orders whose title says `GRANTING` -- extensions are grants of more time and stay --
+and sets aside the four linked references that come from denied orders, three contracts. The count
+of what was set aside is printed so that a change upstream shows here.
 
 Two properties of 01E's linkage travel with the table and neither is introduced here. A reference
-links only where exactly one Exhibit 10 in the filing carries its exhibit number, which costs 43
+links only where exactly one Exhibit 10 in the filing carries its exhibit number, which costs 44
 references out of 32,410. And an attachment filed in several filings is covered in the one the order
-names and not in the others: 148 attachments split that way, every one of them across different
-filings, which is what an order granting relief for a particular filing means.
+names and not in the others: 148 attachments split that way at the last count, every one of them
+across different filings, which is what an order granting relief for a particular filing means.
 
 ```{r}
 #| label: build-cto
@@ -350,9 +356,9 @@ exp_report_numeric(
 reads the same way, and `RemClass` beside it is non-missing on exactly those rows.
 
 The `Min` and `Max` on the date columns are the fastest sanity check in this document.
-`CtoReleaseFirst` and `CtoReleaseLast` currently run to **3036-08-03**, which is a parse error in
-01E's release dates rather than anything this export does -- it reaches 1.2% of rows and is worth
-fixing upstream.
+`CtoReleaseFirst` and `CtoReleaseLast` should top out in the 2030s: a release date thirty years past
+its order is set aside in 01E as a typo in the letter, and the one such case in the corpus -- `3036`
+where the sibling exhibits say `2026` -- no longer reaches this file.
 
 # Classification
 
@@ -862,10 +868,12 @@ exp_report_dictionary(.tab = tab_Dictionary, .block = "Items")
 
 ## Orders
 
-Whether the SEC granted confidential treatment for this contract, and until when. The only block
-here whose counts are complete: `HasCto` and `nCtoOrders` are zero rather than missing where no order
-names the contract, because "no order was found" is a measurement over every contract. The release
-dates carry the absence instead, which is why `CtoReleaseFirst` is the block's marker.
+Whether the SEC granted confidential treatment for this contract, and until when. Granted, not
+merely applied for: orders that denied or revoked treatment are in 01E's table with their status and
+are left out here. The only block whose counts are complete: `HasCto` and `nCtoOrders` are zero
+rather than missing where no order names the contract, because "no order was found" is a
+measurement over every contract. The release dates carry the absence instead, which is why
+`CtoReleaseFirst` is the block's marker.
 
 ```{r}
 #| label: dict-orders
@@ -935,7 +943,6 @@ Two items are known and outstanding, and both are upstream of this document. `Mo
 which re-runs the MONEY pass alone. And the entity variables have not been checked against a
 document-level gold set.
 
-Three smaller things this document surfaced and does not fix: `CtoReleaseFirst` and `CtoReleaseLast`
-run to 3036 on a few rows, which is a parse error in 01E; `nUniCountryNaive` reaches 224, more
+Two smaller things this document surfaced and does not fix: `nUniCountryNaive` reaches 224, more
 countries than exist; and the released date columns other than `DurationYears` are uncapped, so a
 start in 1415 and an end in 9999 are spans the extractor really found rather than failures here.

@@ -343,9 +343,10 @@ cto_refs_plain <- function(.text) {
 #' information excluded from Exhibit 4.1 to the Form 8-K filed on December 11, 2007" -- exhibit and
 #' filing both named, in a sentence, with no release date because nothing was granted.
 #'
-#' There are ten denials and one revocation in sixteen years, and one of them links to a contract.
-#' That is too few to support the question they raise -- whether a refused application led to
-#' disclosure -- so they are parsed and counted here, and the export keeps only what was granted.
+#' There are ten denials and one revocation in sixteen years; four of their references link, to
+#' three contracts. That is too few to support the question they raise -- whether a refused
+#' application led to disclosure -- so they are parsed and counted here, and the export keeps only
+#' what was granted.
 #'
 #' @param .text Character. One order, whitespace normalised.
 #' @return A tibble: ExhibitNo, RefForm, RefFiledOn, ReleaseDate.

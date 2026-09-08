@@ -118,9 +118,10 @@ that produces a confident and wrong link rather than a visible failure.
 instead finds `to a Form 10-K filed on August 23, 2018, as amended`, which describes the source filing; on this corpus
 that mistake marks a fifth of plain grants as amendments. The two are recorded separately.
 
-Denials are rare: ten in sixteen thousand orders, plus one revocation, and one of them links to a contract. That is too
-few to support the question they raise -- whether a refused application led to disclosure -- so they are parsed and
-counted here and not pursued. The export applies the paper's definition and keeps only what was granted. Eight further
+Denials are rare: ten in sixteen thousand orders, plus one revocation, and four of their references link, to three
+contracts. That is too few to support the question they raise -- whether a refused application led to disclosure -- so
+they are parsed and counted here and not pursued. The export applies the paper's definition and keeps only what was
+granted. Eight further
 orders carry no status at all because 01B extracted no text from the PDF; they are kept, with no reference, so that
 every order is accounted for.
 

@@ -771,7 +771,7 @@ export_deploy <- function(.dir_out, .dir_dropbox, .files) {
 
   fs::file_copy(src_[!same_], dst_[!same_], overwrite = TRUE)
   cli::cli_alert_success(
-    "Copied {sum(!same_)} {cli::qty(sum(!same_))}file{?s} to Dropbox: {.file {.files[!same_]}}"
+    "Copied {sum(!same_)} {cli::qty(sum(!same_))}file{?s} to Dropbox: {.file {(.files[!same_])}}"
   )
   invisible(tibble::tibble(File = .files, Action = ifelse(same_, "unchanged", "copied")))
 }
@@ -787,15 +787,23 @@ export_deploy <- function(.dir_out, .dir_dropbox, .files) {
 #' which one matters depends on the question: the earliest is when any part becomes releasable, the
 #' latest when all of it does.
 #'
+#' ONLY GRANTS COUNT, AND THE DEFINITION IS APPLIED HERE. 01E links every order whatever its outcome,
+#' so that the ten denials and one revocation in the corpus can be counted; the paper's variable is
+#' the permission to redact, and a denial is its opposite. A contract is covered where an order
+#' GRANTED treatment. Extensions are grants of more time and stay; the four linked references from
+#' denied orders -- three contracts -- are set aside, and the count of what was set aside is reported.
+#'
 #' THE GUARD ON THE DATES IS LOAD-BEARING. min() over a set of all-missing release dates returns Inf,
 #' which lands in a date column as a number that looks like data rather than as an absence. 01E
-#' parses no date for some orders, so the case is real rather than defensive.
+#' parses no date for some orders, and sets aside a release date thirty years past its order as a
+#' typo in the letter, so the case is real rather than defensive.
 #'
 #' TWO PROPERTIES OF 01E'S LINKAGE TRAVEL WITH THIS TABLE, and neither is introduced here. A
 #' reference links only where exactly one Exhibit 10 in the filing carries its exhibit number, which
-#' costs 43 references out of 32,410. And an attachment filed in several filings is covered in the
-#' one the order names and not in the others -- 148 attachments split that way, every one of them
-#' across different filings, which is what an order granting relief for a particular filing means.
+#' costs 44 references out of 32,410. And an attachment filed in several filings is covered in the
+#' one the order names and not in the others -- 148 attachments split that way at the last count,
+#' every one of them across different filings, which is what an order granting relief for a
+#' particular filing means.
 #'
 #' @param .path_in 01E's CtoExhibits.parquet, one row per order reference.
 #' @param .path_out Destination parquet.
@@ -818,10 +826,15 @@ export_cto <- function(.path_in, .path_out, .rerun = FALSE) {
     return(invisible(out_))
   }
 
-  ref_ <- arrow::open_dataset(sources = .path_in) |>
+  lnk_ <- arrow::open_dataset(sources = .path_in) |>
     dplyr::filter(!is.na(.data$DocIDContract)) |>
-    dplyr::select("DocIDContract", "ReleaseDate", "IsExtension") |>
+    dplyr::select("DocIDContract", "Status", "ReleaseDate", "IsExtension") |>
     dplyr::collect()
+
+  # The paper's definition: covered means granted. Status is read from the order's title line in
+  # 01E, so anything other than GRANTING is a denial, a revocation, or an order whose text was empty.
+  ref_   <- dplyr::filter(lnk_, .data$Status %in% "GRANTING")
+  n_out_ <- nrow(lnk_) - nrow(ref_)
 
   out_ <- ref_ |>
     dplyr::summarise(
@@ -849,7 +862,8 @@ export_cto <- function(.path_in, .path_out, .rerun = FALSE) {
   arrow::write_parquet(out_, .path_out)
   cli::cli_alert_success(
     "Orders: {format(nrow(out_), big.mark = ',')} contract{?s} named by \\
-     {format(nrow(ref_), big.mark = ',')} linked reference{?s}."
+     {format(nrow(ref_), big.mark = ',')} granting reference{?s}; {n_out_} linked \\
+     {cli::qty(n_out_)}reference{?s} from orders that did not grant set aside."
   )
 
   invisible(out_)
@@ -2698,21 +2712,22 @@ exp_report_final <- function(.tab) {
   "where the filer supplied none",
 
   "HasCto", "Orders",
-  "1 where a confidential treatment order names this contract.",
+  "1 where a confidential treatment order granted treatment for this contract. Orders that denied or
+   revoked treatment do not count.",
   "never",
 
   "nCtoOrders", "Orders",
-  "How many CT orders name it.",
+  "How many granting CT orders name it. Extensions of an earlier grant count.",
   "never",
 
   "CtoReleaseFirst", "Orders",
-  "Earliest release date across those orders. KNOWN DEFECT: a few rows run to 3036, which is a parse
-   error in 01E rather than a real date.",
-  "no CT order names this contract",
+  "Earliest release date across those orders. Missing where no order states one -- grants after 2019
+   often carry no expiry -- and where 01E set a date aside as a typo in the letter (one case).",
+  "no granting CT order names this contract, or none states a release date",
 
   "CtoReleaseLast", "Orders",
-  "Latest release date across those orders. Same defect as above.",
-  "no CT order names this contract",
+  "Latest release date across those orders. Missing on the same rows as CtoReleaseFirst.",
+  "no granting CT order names this contract, or none states a release date",
 
   "CtoIsExtension", "Orders",
   "1 where any of those orders extends an earlier one.",
