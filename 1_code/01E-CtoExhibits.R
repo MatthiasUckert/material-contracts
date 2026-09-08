@@ -8,10 +8,10 @@
 #
 # IT IS A JOIN, NOT A MATCHING PROBLEM
 # The letters are a generated form: one template, unchanged from 2008 to 2024, and the text in the
-# corpus is clean because 01B parsed it once. Ninety-six per cent name the source form type and
-# ninety-eight the source filing date, so the link is CIK plus form plus date into the master index,
-# then exhibit number into the filing. Two exact hops. Nothing here is fuzzy, and where a hop fails
-# the reference is recorded with the reason rather than dropped.
+# corpus is clean because 01B parsed it once. Nearly every order names the source form type and the
+# source filing date, in one of a handful of wordings, so the link is CIK plus form plus date into
+# the master index, then exhibit number into the filing. Two exact hops. Nothing here is fuzzy, and
+# where a hop fails the reference is recorded with the reason rather than dropped.
 #
 # THREE REFERENCE FORMATS, AND THE LATER TWO CARRY MORE
 # Most orders list "Exhibit 10.15 through December 31, 2016" and name the source filing once in the
@@ -24,6 +24,14 @@
 # "ORDER GRANTING CONFIDENTIAL TREATMENT" is the title line and says what the order does. Searching
 # the body for "amend" instead finds "to a Form 10-K filed on August 23, 2018, as amended", which
 # describes the source filing and not the order, and marks a fifth of plain grants as amendments.
+# Denials and revocations are parsed and counted like grants; the export applies the paper's
+# definition and keeps only what was granted.
+#
+# ONE SPELLING ON BOTH SIDES, AND ONE IMPLAUSIBLE DATE
+# Exhibit numbers are normalised on the order side exactly as on the filing side, so 10.08 meets 10.8
+# and 10.4a meets 10.4A. A release date more than thirty years after the order is a typo in the
+# letter -- one exists -- and is set to missing and flagged rather than corrected. The horizon runs
+# from the order, not the source filing: a grant extended in 2019 on a 1994 exhibit is ordinary.
 #
 # WHAT IS RECOMPUTED, AND WHAT IS NOT
 # The linkage joins against two tables that dwarf everything else here: every filing EDGAR ever
@@ -62,13 +70,40 @@ if (FALSE) {
 #' suffix (10.26(xxxi)). The last of these cannot be matched to a contract -- the filing side writes
 #' those as an unnumbered EX-10 -- but parsing them is what makes them countable.
 #'
+#' THE DATE TOLERATES A STRAY COMMA. "April, 30, 2009" appears in the letters; the comma is removed
+#' again by cto_parse_date(), which is the only place a matched date is turned into one.
+#'
+#' THE FORM COMES IN THREE SHAPES. Form captures the type after the word "Form"; FormAny is the same
+#' shape without a capture, for patterns that need to step over a form on the way to a date; and
+#' FormBare is the type standing alone -- "to a 10-Q filed on" -- which is narrower by construction,
+#' because without the word "Form" in front of it any capitalised token would qualify.
+#'
 #' @return Named character vector of pattern fragments.
 cto_patterns <- function() {
+  form_ <- "[A-Z0-9][A-Z0-9/-]{0,9}"
+
   c(
-    Exhibit = "([0-9]+(?:\\.[0-9]+)*[A-Za-z]?(?:\\([A-Za-z0-9]+\\))?)",
-    Date    = "([A-Za-z]+\\s+[0-9]{1,2},\\s*[0-9]{4})",
-    Form    = "([A-Z0-9][A-Z0-9/-]{0,9})"
+    Exhibit  = "([0-9]+(?:\\.[0-9]+)*[A-Za-z]?(?:\\([A-Za-z0-9]+\\))?)",
+    Date     = "([A-Za-z]+,?\\s+[0-9]{1,2},\\s*[0-9]{4})",
+    Form     = paste0("(", form_, ")"),
+    FormAny  = paste0("(?:", form_, ")"),
+    FormBare = "((?:[0-9]{1,2}-[A-Z0-9]{1,4}|[A-Z]{1,2}-[0-9]{1,2})(?:/A)?)"
   )
+}
+
+#' Turn a matched date into a Date
+#'
+#' One parser for every date the patterns capture, so the tolerance for a stray comma after the
+#' month lives in one place and a date that fails to parse becomes NA in the same way everywhere.
+#'
+#' @param .x Character vector of dates as the letters write them, or NA.
+#' @return Date vector.
+cto_parse_date <- function(.x) {
+  if (FALSE) .x <- c("December 31, 2016", "April, 30, 2009", NA_character_)
+
+  suppressWarnings(as.Date(
+    stringi::stri_replace_first_regex(.x, "^([A-Za-z]+),", "$1"), format = "%B %d, %Y"
+  ))
 }
 
 #' Read one order, whitespace normalised
@@ -105,6 +140,24 @@ cto_read_order <- function(.path) {
 #' Securities Act one, which is to say periodic reports against registration statements. It is
 #' carried because that distinction may matter to an analysis, not because the parser needs it.
 #'
+#' THE SOURCE FILING HAS A HANDFUL OF WORDINGS, AND ALL OF THEM ARE READ. "to a Form 10-K filed on"
+#' is the template, but the letters also write "to their Forms 10-Q filed on" for two registrants,
+#' "to a registration statement on Form S-1 filed on", "to an amended Form 10-K filed on", "to a 10-Q
+#' filed on" with no word Form at all, and "to a Form 10-K on" with no word filed. Each of those left
+#' an order whose references parsed but had no filing to join to. The form is read first, allowing the
+#' article to be absent or possessive and up to five words to sit before "Form", or a bare form type
+#' followed by "filed"; a form type carries a digit, and requiring one is what keeps "to a Form filed
+#' on" from returning FILED as the type. The date is read by two patterns -- directly after the form
+#' with "filed on" optional, and after "filed on" anywhere -- and THE EARLIER MATCH IN THE LETTER
+#' WINS. The source filing is named in the application sentence at the top; a footnote further down
+#' names a different one -- "refiled with fewer redactions as Exhibit 10.13 to a Form 10-Q filed on
+#' May 6, 2010" -- and a fixed precedence between the patterns handed nineteen orders that later
+#' date when their source was written "for the fiscal year ended ..., filed on".
+#'
+#' What stays unnamed is a post-effective amendment cited without a form type, and an order
+#' covering two registrants' filings on two dates, where one source filing is the wrong answer
+#' rather than a missing one.
+#'
 #' @param .text Character. One order, whitespace normalised.
 #' @return A one-row tibble of order-level fields.
 cto_order_fields <- function(.text) {
@@ -121,19 +174,35 @@ cto_order_fields <- function(.text) {
     paste(sort(unique(toupper(gsub("(?i)Rule\\s+", "", rule_, perl = TRUE)))), collapse = "|")
   }
 
+  # Group 2 is the type after the word Form, group 3 the bare type; at most one of them is set.
   form_ <- stringi::stri_match_first_regex(
-    .text, paste0("(?i)to\\s+(?:an?\\s+)?Forms?\\s+", pat_[["Form"]])
-  )[, 2L]
+    .text,
+    paste0(
+      "(?i)to\\s+(?:(?:an?|the|their|its)\\s+)?(?:",
+      "(?:\\S+\\s+){0,5}?Forms?\\s+(?=[A-Z0-9/-]*[0-9])", pat_[["Form"]],
+      "|", pat_[["FormBare"]], "\\s+(?:as\\s+amended\\s+)?filed\\b",
+      ")"
+    )
+  )
+  form_ <- dplyr::coalesce(form_[, 2L], form_[, 3L])
 
-  date_ <- stringi::stri_match_first_regex(
-    .text, paste0("(?i)filed\\s+(?:on\\s+)?", pat_[["Date"]])
-  )[, 2L]
+  # Two patterns, and the one matching earliest in the letter wins; see the roxygen for why.
+  rex_date_ <- c(
+    paste0("(?i)Forms?\\s+", pat_[["FormAny"]], "\\s+(?:filed\\s+)?(?:on\\s+)?", pat_[["Date"]]),
+    paste0("(?i)filed\\s+(?:on\\s+)?", pat_[["Date"]])
+  )
+  pos_  <- purrr::map_int(rex_date_, function(.r) stringi::stri_locate_first_regex(.text, .r)[1L, 1L])
+  date_ <- if (all(is.na(pos_))) {
+    NA_character_
+  } else {
+    stringi::stri_match_first_regex(.text, rex_date_[[which.min(pos_)]])[, 2L]
+  }
 
   tibble::tibble(
     Status        = toupper(trimws(title_)),
     Rule          = rule_,
     SourceForm    = toupper(trimws(form_)),
-    SourceFiledOn = suppressWarnings(as.Date(date_, format = "%B %d, %Y")),
+    SourceFiledOn = cto_parse_date(.x = date_),
     IsExtension   = as.integer(grepl("(?i)requesting\\s+an?\\s+extension", .text)),
     SourceAmended = as.integer(grepl("(?i)filed[^.]{0,60},\\s*as\\s+amended", .text)),
     nRegistrants  = stringi::stri_count_regex(.text, "(?i)File\\s+Nos?\\."),
@@ -169,8 +238,8 @@ cto_refs_inline <- function(.text) {
   tibble::tibble(
     ExhibitNo   = m_[, 2L],
     RefForm     = toupper(m_[, 3L]),
-    RefFiledOn  = suppressWarnings(as.Date(m_[, 4L], format = "%B %d, %Y")),
-    ReleaseDate = suppressWarnings(as.Date(m_[, 5L], format = "%B %d, %Y")),
+    RefFiledOn  = cto_parse_date(.x = m_[, 4L]),
+    ReleaseDate = cto_parse_date(.x = m_[, 5L]),
     RefFormat   = "inline"
   )
 }
@@ -202,8 +271,8 @@ cto_refs_table <- function(.text) {
   tibble::tibble(
     ExhibitNo   = m_[, 2L],
     RefForm     = toupper(m_[, 3L]),
-    RefFiledOn  = suppressWarnings(as.Date(m_[, 4L], format = "%B %d, %Y")),
-    ReleaseDate = suppressWarnings(as.Date(m_[, 5L], format = "%B %d, %Y")),
+    RefFiledOn  = cto_parse_date(.x = m_[, 4L]),
+    ReleaseDate = cto_parse_date(.x = m_[, 5L]),
     RefFormat   = "table"
   )
 }
@@ -262,7 +331,7 @@ cto_refs_plain <- function(.text) {
     ExhibitNo   = m_[, 2L],
     RefForm     = NA_character_,
     RefFiledOn  = as.Date(NA),
-    ReleaseDate = suppressWarnings(as.Date(m_[, 3L], format = "%B %d, %Y")),
+    ReleaseDate = cto_parse_date(.x = m_[, 3L]),
     RefFormat   = "plain"
   )
 }
@@ -274,9 +343,9 @@ cto_refs_plain <- function(.text) {
 #' information excluded from Exhibit 4.1 to the Form 8-K filed on December 11, 2007" -- exhibit and
 #' filing both named, in a sentence, with no release date because nothing was granted.
 #'
-#' There are eleven of these in sixteen years, and they matter out of proportion to that: the filer
-#' applied to withhold and was refused, so the contract had to be disclosed. Leaving them unparsed
-#' discards the one place in this data where non-disclosure was denied rather than chosen.
+#' There are ten denials and one revocation in sixteen years, and one of them links to a contract.
+#' That is too few to support the question they raise -- whether a refused application led to
+#' disclosure -- so they are parsed and counted here, and the export keeps only what was granted.
 #'
 #' @param .text Character. One order, whitespace normalised.
 #' @return A tibble: ExhibitNo, RefForm, RefFiledOn, ReleaseDate.
@@ -296,7 +365,7 @@ cto_refs_denial <- function(.text) {
   tibble::tibble(
     ExhibitNo   = m_[, 2L],
     RefForm     = toupper(m_[, 3L]),
-    RefFiledOn  = suppressWarnings(as.Date(m_[, 4L], format = "%B %d, %Y")),
+    RefFiledOn  = cto_parse_date(.x = m_[, 4L]),
     ReleaseDate = as.Date(NA),
     RefFormat   = "denial"
   )
@@ -315,6 +384,11 @@ cto_refs_denial <- function(.text) {
 #' AN ORDER WITH NO PARSABLE REFERENCE STILL RETURNS A ROW. The order-level fields are known even
 #' when the listing block is not, and a missing row is indistinguishable from an order that was never
 #' read.
+#'
+#' THE EXHIBIT NUMBER LEAVES HERE IN THE SPELLING THE JOIN USES. cto_link_tables() normalises the
+#' filing side; doing the same here is what lets 10.08 meet 10.8 and 10.4a meet 10.4A. Left raw, those
+#' references fell into the category reserved for exhibits incorporated by reference, where a
+#' spelling mismatch is invisible.
 #'
 #' @param .path Path to one parsed document.
 #' @return A tibble, one row per reference, or one row with a missing exhibit number.
@@ -347,10 +421,44 @@ cto_parse_order <- function(.path) {
 
   dplyr::bind_cols(tibble::tibble(DocID = doc_$DocID[1L]), fld_, ref_) |>
     dplyr::mutate(
+      ExhibitNo  = cto_exhibit_number(.x = .data$ExhibitNo),
       # A reference that names its own filing overrides the one from the opening paragraph.
       UseForm    = dplyr::coalesce(.data$RefForm, .data$SourceForm),
       UseFiledOn = dplyr::coalesce(.data$RefFiledOn, .data$SourceFiledOn),
       Series     = stringi::stri_extract_first_regex(.data$ExhibitNo, "^[0-9]+")
+    )
+}
+
+
+#' Set aside a release date no grant could carry
+#'
+#' A RELEASE DATE THIRTY YEARS PAST THE ORDER IS A TYPO, NOT A GRANT. One letter in the corpus writes
+#' "through August 3, 3036" where its fifteen sibling exhibits say 2026. The date is set to missing
+#' and the row flagged; it is not corrected, because which digit was wrong is a guess and a corrected
+#' value would be indistinguishable from a parsed one.
+#'
+#' THE HORIZON RUNS FROM THE ORDER, NOT FROM THE SOURCE FILING. A grant can be extended for decades:
+#' an order of 2019 covering an exhibit filed in 1994 through 2024 is ordinary, and measured from the
+#' filing it would have been flagged. Measured from the order it is five years, and the typo is a
+#' thousand. This is why the guard lives after the join to the order's own filing date rather than
+#' inside the parser, which does not know it.
+#'
+#' @param .tab Parsed references carrying ReleaseDate and the order's DateFiled.
+#' @param .years Integer. Years after the order beyond which a release date is set aside.
+#' @return .tab with ReleaseImplausible added and ReleaseDate set to NA where it is 1.
+cto_guard_release <- function(.tab, .years = 30L) {
+  if (FALSE) {
+    .tab   <- tab_refs
+    .years <- 30L
+  }
+
+  .tab |>
+    dplyr::mutate(
+      ReleaseImplausible = as.integer(
+        !is.na(.data$ReleaseDate) & !is.na(.data$DateFiled) &
+          .data$ReleaseDate > .data$DateFiled + .years * 365L
+      ),
+      ReleaseDate = dplyr::if_else(.data$ReleaseImplausible == 1L, as.Date(NA), .data$ReleaseDate)
     )
 }
 
@@ -496,6 +604,9 @@ cto_write_exhibits <- function(.tab, .path_out, .stamp, .path_stamp, .rerun = FA
 #' 10.8, another asks for 10.7 of a filing that attached 10.07. Compared as strings those are four
 #' different exhibits; compared after normalisation they are two. The normalisation is textual rather
 #' than numeric because 10.1.10 has three components and is not a number.
+#'
+#' APPLIED TO BOTH SIDES. The filing side passes through it in cto_link_tables(), the order side in
+#' cto_parse_order(); a normalisation applied to one side only is a comparison of two spellings.
 #'
 #' @param .x Character vector of exhibit type strings.
 #' @return Character vector of bare numbers, zero-padding removed.
@@ -807,10 +918,6 @@ cto_link_by_year <- function(.tab) {
     dplyr::arrange(.data$Year)
 }
 
-#' Every report in this document, in order
-#'
-#' @param .tab One row per reference, linked.
-#' @return Invisibly NULL.
 #' How the filing hop resolved
 #'
 #' PULLED OUT OF THE REPORTER. It was computed inline inside cto_report_all(), which put a

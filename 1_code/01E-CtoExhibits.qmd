@@ -85,9 +85,16 @@ This parses those letters and links each exhibit reference back to the contract 
 
 ## It is a join, not a matching problem
 
-The letters are a generated form. One template, unchanged from 2008 to 2024; ninety-six per cent name the source form
-type, ninety-eight the source filing date. So the link is `CIK` plus form plus filing date into the master index, then
+The letters are a generated form. One template, unchanged from 2008 to 2024, and nearly every order names the source
+form type and the source filing date. So the link is `CIK` plus form plus filing date into the master index, then
 exhibit number into that filing. Two exact hops, no fuzzy matching.
+
+The opening paragraph names that filing in a handful of wordings -- `to a Form 10-K filed on`, `to their Forms 10-Q
+filed on` for two registrants, `to a registration statement on Form S-1 filed on`, `to a 10-Q filed on` with no word
+Form, `to a Form 10-K on` with no word filed -- and the parser reads all of them, because each wording it does not read
+is an order whose references parse and then have nothing to join to. What it leaves unnamed is a post-effective
+amendment cited without a form type, and an order covering two registrants' filings on two dates, where one source
+filing would be the wrong answer rather than a missing one.
 
 That matters because the alternative is expensive. An earlier approach re-downloaded each order as a PDF from the SEC
 and extracted its text, which meant fighting an extractor that inserts spaces inside words -- patterns written as
@@ -111,8 +118,23 @@ that produces a confident and wrong link rather than a visible failure.
 instead finds `to a Form 10-K filed on August 23, 2018, as amended`, which describes the source filing; on this corpus
 that mistake marks a fifth of plain grants as amendments. The two are recorded separately.
 
-Denials are rare -- roughly three in a thousand -- and matter out of proportion to that: the filer applied to withhold
-and was refused, and therefore had to disclose.
+Denials are rare: ten in sixteen thousand orders, plus one revocation, and one of them links to a contract. That is too
+few to support the question they raise -- whether a refused application led to disclosure -- so they are parsed and
+counted here and not pursued. The export applies the paper's definition and keeps only what was granted. Eight further
+orders carry no status at all because 01B extracted no text from the PDF; they are kept, with no reference, so that
+every order is accounted for.
+
+## One spelling on both sides, and one implausible date
+
+Exhibit numbers are compared in one spelling: `10.08` in an order meets `10.8` in a filing, and `10.4a` meets `10.4A`.
+Left as written, those references land in the category reserved for exhibits incorporated by reference, where a
+spelling mismatch is invisible because that category is expected to be non-zero.
+
+One release date in the corpus reads `August 3, 3036`, a typo in the letter -- the fifteen sibling exhibits all say
+2026. A release date more than thirty years after the order is set to missing and flagged rather than corrected,
+because which digit was wrong is a guess, and a corrected value would be indistinguishable from a parsed one. The
+horizon runs from the order rather than from the source filing: a grant can be extended for decades, and an order of
+2019 covering an exhibit filed in 1994 through 2024 is an ordinary extension, not an implausible date.
 
 ## Nothing is dropped
 
@@ -247,8 +269,8 @@ tab_parsed <- edg_measure_corpus(
   .workers  = .lP$Param$Workers,      # parallel workers
   .label    = "CTO parsing",          # shown in progress output
   .rows     = "many",                 # one order yields one row per exhibit it names
-  .rerun    = FALSE                   # FALSE parses only what the cache does not already cover
-)
+  .rerun    = FALSE                   # FALSE parses only what the cache does not already cover; the cache
+)                                     # reconciles on coverage, so a changed parser needs TRUE once
 
 nrow(tab_parsed)
 ```
@@ -260,6 +282,7 @@ tab_refs <- tab_parsed |>
     y  = dplyr::select(tab_orders, "DocID", "HashIndex", "CIK", "CompanyName", "DateFiled", "YQ"),
     by = dplyr::join_by("DocID")
   ) |>
+  cto_guard_release(.years = 30L) |>   # a release date this far past the order is a typo, set aside and flagged
   dplyr::relocate("DocID", "CIK", "DateFiled", "Status", "RefFormat", "ExhibitNo", "ReleaseDate")
 
 c(orders = dplyr::n_distinct(tab_refs$DocID), references = sum(!is.na(tab_refs$ExhibitNo)))
@@ -394,7 +417,7 @@ tab_link_year |>
 
 # Validation
 
-Four checks. Each states its expectation first, so a result that differs is a finding rather than a number to interpret
+Five checks. Each states its expectation first, so a result that differs is a finding rather than a number to interpret
 afterwards.
 
 ```{r}
@@ -403,25 +426,31 @@ afterwards.
 # 2. A linked reference must carry a contract identifier, and an unlinked one must not: a status
 #    that claims a resolution the row does not carry is worse than no status.
 # 3. A linked contract must belong to the filing the reference named.
+# 4. A release date flagged implausible is a typo in the letter. One is known; single digits is the
+#    expectation, and a jump means the horizon is catching real grants -- as it did when it was
+#    measured from the source filing instead of the order.
 tibble::tibble(
-  nOrders        = nrow(tab_orders),
-  nOrdersSeen    = dplyr::n_distinct(tab_cto$DocID),
-  nReferences    = sum(!is.na(tab_cto$ExhibitNo)),
-  LinkedNoDoc    = sum(tab_cto$LinkStatus %in% cto_status_ok() & is.na(tab_cto$DocIDContract)),
-  UnlinkedWithDoc = sum(!tab_cto$LinkStatus %in% cto_status_ok() & !is.na(tab_cto$DocIDContract))
+  nOrders             = nrow(tab_orders),
+  nOrdersSeen         = dplyr::n_distinct(tab_cto$DocID),
+  nReferences         = sum(!is.na(tab_cto$ExhibitNo)),
+  LinkedNoDoc         = sum(tab_cto$LinkStatus %in% cto_status_ok() & is.na(tab_cto$DocIDContract)),
+  UnlinkedWithDoc     = sum(!tab_cto$LinkStatus %in% cto_status_ok() & !is.na(tab_cto$DocIDContract)),
+  nReleaseImplausible = sum(tab_cto$ReleaseImplausible == 1L)
 ) |>
   tbl_out(
     .title = "Parse and link consistency",
     .notes = c(
-      nOrdersSeen = "Must equal nOrders: an order with no parsable reference still returns a row.",
-      LinkedNoDoc = "Nonzero means a status claims a link the row does not carry."
+      nOrdersSeen         = "Must equal nOrders: an order with no parsable reference still returns a row.",
+      LinkedNoDoc         = "Nonzero means a status claims a link the row does not carry.",
+      nReleaseImplausible = "Release dates more than thirty years after the order, set to missing. One is a \\
+                             known typo in the letter."
     )
   )
 ```
 
 ```{r}
 #| label: validate-contracts
-# 4. A contract should be covered by one order. Where two orders name it, one is usually an
+# 5. A contract should be covered by one order. Where two orders name it, one is usually an
 #    extension of the other, so the count is reported by whether an extension is involved.
 tab_cto |>
   dplyr::filter(!is.na(.data$DocIDContract)) |>
@@ -444,7 +473,9 @@ tab_cto |>
 it, the exhibit and release date, the linked contract where the chain completed, and the point at which it broke where
 it did not.
 
-02 reads it to mark each contract in the register with whether an order covers it. The text of the orders stays in the
+02 reads it to mark each contract in the register with whether an order covers it, and 10-ExportData collapses it to one
+row per contract, keeping only orders that granted treatment -- the paper's definition, applied where the paper's table
+is built rather than here, so that the denials remain in this file to be counted. The text of the orders stays in the
 corpus; nothing here writes into another script's output.
 
 What this does **not** yet do is check that a linked contract is actually redacted. The order says the SEC permitted a
@@ -518,5 +549,5 @@ cto_report_all(
 summary was extracted for a filing.
 
 The checks the workflow calls for beyond the linkage -- that a covered contract shows redaction markers, that an
-unredacted version appears after the release date, that a denied application led to disclosure -- all need the text of
-the contracts themselves, and belong downstream of the entity extraction that reads it.
+unredacted version appears after the release date -- need the text of the contracts themselves, and belong downstream
+of the entity extraction that reads it.
