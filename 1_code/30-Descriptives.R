@@ -112,6 +112,9 @@ plot_register_levels(
   .colours = plot_pal_seq(4L)
 )
 
+# 05A's term families, in its order. The vocabulary is 05A's; this document only draws from its hits.
+.des_family_levels <- c("Pandemic", "Disruption", "RateReform", "Regulation", "Boilerplate")
+
 plot_register_levels(
   .key     = "FfInd",
   .levels  = .des_ff12_levels,
@@ -549,6 +552,63 @@ des_read_ak_contract <- function(.path) {
   out_
 }
 
+
+#' The Places release: every place a contract names, with the party it belongs to
+#'
+#' One row per contract, place, party role and law-clause flag, at primary-copy grain. Read whole:
+#' nine and a half million rows of short strings, which is what Figure 6 draws from.
+#'
+#' @param .path Character. Places.parquet.
+#' @return Tibble as released, GeoLevel and PartyRole as character.
+des_read_places <- function(.path) {
+  if (FALSE) .path <- .lP$Input$FilPlaces
+  out_ <- arrow::read_parquet(.path) |>
+    dplyr::mutate(InLawClause = as.integer(.data$InLawClause), nMentions = as.integer(.data$nMentions))
+  cli::cli_alert_success(
+    "{format(nrow(out_), big.mark = ',')} place rows on {format(dplyr::n_distinct(out_$DocID), big.mark = ',')} \\
+     contracts; {format(sum(out_$InLawClause == 1L), big.mark = ',')} inside a law clause"
+  )
+  out_
+}
+
+#' The TermDocs release: 05A's hits per contract and family, cut to the release
+#'
+#' @param .path Character. TermDocs.parquet.
+#' @return Tibble: DocID, Family (character, in .des_family_levels), nHits, nTerms, HasTerm, FirstPos,
+#'   PerKWords.
+des_read_term_docs <- function(.path) {
+  if (FALSE) .path <- .lP$Input$FilTermDocs
+  out_ <- arrow::read_parquet(.path) |>
+    dplyr::select(-dplyr::any_of("HashDocument")) |>
+    dplyr::mutate(Family = as.character(.data$Family), HasTerm = as.integer(.data$HasTerm), nHits = as.integer(.data$nHits))
+  unknown_ <- setdiff(unique(out_$Family), .des_family_levels)
+  if (length(unknown_) > 0L) cli::cli_abort("TermDocs carries {?a family/families} this document does not know: {unknown_}.")
+  cli::cli_alert_success(
+    "{format(dplyr::n_distinct(out_$DocID), big.mark = ',')} scanned contracts, {dplyr::n_distinct(out_$Family)} \\
+     families; {format(sum(out_$HasTerm[out_$Family == 'Pandemic']), big.mark = ',')} name a pandemic term"
+  )
+  out_
+}
+
+#' The CtoOrders release: every order reference 01E parsed, linked or not
+#'
+#' @param .path Character. CtoOrders.parquet.
+#' @return Tibble as released, plus OrderYear and Linked.
+des_read_cto_orders <- function(.path) {
+  if (FALSE) .path <- .lP$Input$FilCtoOrders
+  out_ <- arrow::read_parquet(.path) |>
+    dplyr::mutate(
+      OrderDate   = as.Date(.data$OrderDate),
+      OrderYear   = as.integer(lubridate::year(.data$OrderDate)),
+      IsExtension = as.integer(.data$IsExtension),
+      Linked      = !is.na(.data$DocID)
+    )
+  cli::cli_alert_success(
+    "{format(dplyr::n_distinct(out_$OrderDocID), big.mark = ',')} orders, {format(nrow(out_), big.mark = ',')} \\
+     references, {format(sum(out_$Linked), big.mark = ',')} linked to a contract"
+  )
+  out_
+}
 
 # 3. Samples ----------------------------------------------------------------------------------------------------------------
 
@@ -1027,11 +1087,16 @@ des_is_knitting <- function() isTRUE(getOption("knitr.in.progress"))
 #' is rendered or stepped through. The embedded preview is rasterised at 110 dpi: the manuscript files
 #' are written at 300 by plot_save(), and seventy previews at 200 made the document twenty megabytes.
 #'
+#' SEVERAL FIGURES IN ONE TAB. Where an exhibit is two figures on the page -- Figure 6's states and
+#' countries -- .fun_name, .id, .height and .caption are vectors of the same length, and every tab
+#' holds one chunk per figure, each with its own label, file and caption. Nothing is patched together.
+#'
 #' @param .tab_name Character. The name of the exhibit tibble in the calling environment.
-#' @param .fun_name Character. The name of the exhibit's plot function.
-#' @param .id Character. Exhibit id, lower case, for the chunk labels: "f01".
-#' @param .height Numeric. Figure height in inches, from plot_height().
-#' @param .caption Character. What the figure shows; the sample's own description is appended.
+#' @param .fun_name Character. The name of the exhibit's plot function; several for several figures.
+#' @param .id Character. Exhibit id, lower case, for the chunk labels: "f01"; one per function.
+#' @param .height Numeric. Figure height in inches, from plot_height(); one per function or one for all.
+#' @param .caption Character. What the figure shows; the sample's own description is appended. One
+#'   per function or one for all.
 #' @param .samples Character or NULL. Which samples to draw, in tab order; NULL draws every sample in
 #'   the tibble, in the order of .des_sample_labels.
 #' @return Invisibly, the child markdown. Its knitted form is written to the document as a side
@@ -1045,32 +1110,37 @@ des_tabs_figure <- function(.tab_name, .fun_name, .id, .height, .caption, .sampl
     .caption  <- "Contracts by form, original and amended, share of the sample above each bar."
     .samples  <- NULL
   }
+  n_fig_ <- length(.fun_name)
+  if (length(.id) != n_fig_) cli::cli_abort("des_tabs_figure(): .id must name one id per plot function.")
+  .height  <- rep_len(.height, n_fig_)
+  .caption <- rep_len(.caption, n_fig_)
 
   env_  <- parent.frame()
   tab_  <- get(.tab_name, envir = env_)
   have_ <- unique(tab_$Sample)
   want_ <- if (is.null(.samples)) names(.des_sample_labels)[names(.des_sample_labels) %in% have_] else .samples
   miss_ <- setdiff(want_, have_)
-  if (length(miss_) > 0L) cli::cli_abort("{(.id)}: no rows for sample{?s} {miss_}.")
+  if (length(miss_) > 0L) cli::cli_abort("{(.id[1L])}: no rows for sample{?s} {miss_}.")
 
-  # INTERACTIVE: one plot per sample to the device, no child, nothing written anywhere.
+  # INTERACTIVE: one plot per sample and figure to the device, no child, nothing written anywhere.
   if (!des_is_knitting()) {
-    fun_ <- get(.fun_name, envir = env_)
-    cli::cli_alert_info("{(.id)}: not rendering; drawing {length(want_)} sample{?s} to the device.")
-    for (s_ in want_) print(fun_(.tab_data = des_slice(tab_, s_)))
+    cli::cli_alert_info("{(.id[1L])}: not rendering; drawing {length(want_) * n_fig_} figure{?s} to the device.")
+    for (s_ in want_) for (k_ in seq_len(n_fig_)) print(get(.fun_name[k_], envir = env_)(.tab_data = des_slice(tab_, s_)))
     return(invisible(NULL))
   }
 
   one_ <- function(.s) {
-    label_ <- paste0("fig-", .id, "-", tolower(gsub("_", "-", .s)))
-    cap_   <- paste0(.caption, " Sample ", gsub("_", " ", .s), ": ", .des_sample_labels[[.s]], ".")
-    paste0(
-      "### ", gsub("_", " ", .s), "\n\n",
-      "```{r ", label_, ", dev=\"ragg_png\", dpi=110, fig.width=7.5, fig.height=", format(.height, nsmall = 1),
-      ", fig.cap=\"", cap_, "\"}\n",
-      .fun_name, "(.tab_data = des_slice(", .tab_name, ", \"", .s, "\"))\n",
-      "```\n"
-    )
+    chunks_ <- purrr::map_chr(seq_len(n_fig_), \(.k) {
+      label_ <- paste0("fig-", .id[.k], "-", tolower(gsub("_", "-", .s)))
+      cap_   <- paste0(.caption[.k], " Sample ", gsub("_", " ", .s), ": ", .des_sample_labels[[.s]], ".")
+      paste0(
+        "```{r ", label_, ", dev=\"ragg_png\", dpi=110, fig.width=7.5, fig.height=", format(.height[.k], nsmall = 1),
+        ", fig.cap=\"", cap_, "\"}\n",
+        .fun_name[.k], "(.tab_data = des_slice(", .tab_name, ", \"", .s, "\"))\n",
+        "```\n"
+      )
+    })
+    paste0("### ", gsub("_", " ", .s), "\n\n", paste(chunks_, collapse = "\n"))
   }
 
   child_ <- paste0(
@@ -1263,7 +1333,8 @@ des_report_f01 <- function(.tab_data, .ref = .des_reference_f01) {
 #' @param .points Logical. Mark each observation; FALSE for series dense enough that markers smear.
 #' @return A ggplot.
 des_shape_lines <- function(.tab, .x, .y, .group = NULL, .facet = NULL, .key = NULL, .key_facet = NULL,
-                            .pct = FALSE, .ncol = 4L, .free_y = FALSE, .regimes = TRUE, .ylab = NULL, .points = TRUE) {
+                            .pct = FALSE, .ncol = 4L, .free_y = FALSE, .regimes = TRUE, .ylab = NULL, .points = TRUE,
+                            .step = NULL) {
   if (FALSE) {
     .tab       <- tab_f10 |> dplyr::filter(.data$Sample == "S2_Descriptive")
     .x         <- "Year"
@@ -1306,7 +1377,7 @@ des_shape_lines <- function(.tab, .x, .y, .group = NULL, .facet = NULL, .key = N
     p_ <- p_ + ggplot2::facet_wrap(ggplot2::vars(.data$PlotF), ncol = .ncol, scales = if (.free_y) "free_y" else "fixed")
   }
   # Panels three or more abreast have room for a label every eight years, not every four.
-  step_ <- if (!is.null(.facet) && .ncol >= 3L) 8 else 4
+  step_ <- if (!is.null(.step)) .step else if (!is.null(.facet) && .ncol >= 3L) 8 else 4
 
   colour_ <- if (is.null(.group)) {
     ggplot2::scale_colour_manual(values = c(all = .plot_ink), guide = "none")
@@ -3321,7 +3392,377 @@ des_report_f07 <- function(.tab_data, .ref = .des_reference_f07) {
 }
 
 
-# 27. Manifest and reconciliation -------------------------------------------------------------------------------------------
+# 27. F06: geographic mentions, two maps ------------------------------------------------------------------------------------
+# The paper's Figure 6: where the contracts point. Panel A is the US states, Panel B the countries,
+# each filled by the number of contracts naming the place. Four views of the same file: every
+# mention outside a law clause, as the revision drew it; the mentions attached to a counterparty,
+# which is referee 1's question -- are these contracting locations? -- answered by construction; the
+# mentions attached to the registrant, which is the filer's own footprint; and the law-clause places,
+# which are jurisdictions and are drawn apart so that the other three cannot be read as them.
+
+.des_place_views <- c(
+  Any          = "every place outside a governing-law clause, attached to a party or not",
+  Counterparty = "places attached to a counterparty: contracting locations",
+  Registrant   = "places attached to the registrant: the filer's own footprint",
+  Law          = "places named inside a governing-law clause: jurisdictions"
+)
+
+#' Contracts per state and per country, per view
+#'
+#' ONE ROW PER SAMPLE, PANEL, VIEW AND AREA. The count is distinct contracts naming the place under
+#' the view, which is what a map of prevalence wants; the mention count rides beside it for a map of
+#' intensity. The Places release is at primary-copy grain, so a sample that carries co-filer copies
+#' contributes its primary copies here and nothing else.
+#'
+#' @param .tab One sample of the contract table.
+#' @param .sample Character. Its name.
+#' @param .places The Places release from `des_read_places()`.
+#' @return Tibble: Sample, Panel ("State" or "Country"), View, Area, nContracts, nMentions, nBase,
+#'   Share -- nBase being the sample's contracts with any place under the view, Share the ratio.
+des_data_f06 <- function(.tab, .sample, .places) {
+  if (FALSE) {
+    .tab    <- tab_contracts[tab_contracts$S2_Descriptive, , drop = FALSE]
+    .sample <- "S2_Descriptive"
+    .places <- tab_places
+  }
+  plc_ <- .places |>
+    dplyr::semi_join(dplyr::distinct(.tab, .data$DocID), by = dplyr::join_by(DocID))
+
+  view_ <- function(.d, .view) {
+    keep_ <- switch(
+      .view,
+      Any          = .d$InLawClause == 0L,
+      Counterparty = .d$InLawClause == 0L & .d$PartyRole == "counterparty",
+      Registrant   = .d$InLawClause == 0L & .d$PartyRole == "registrant",
+      Law          = .d$InLawClause == 1L
+    )
+    .d[keep_, , drop = FALSE] |> dplyr::mutate(View = .view)
+  }
+  long_ <- purrr::map(names(.des_place_views), \(.v) view_(plc_, .v)) |> purrr::list_rbind()
+
+  one_ <- function(.d, .panel, .col) {
+    d_ <- dplyr::filter(.d, !is.na(.data[[.col]]))
+    if (.panel == "State") d_ <- dplyr::filter(d_, .data$GeoCountryIso == "USA")
+    base_ <- d_ |> dplyr::summarise(nBase = dplyr::n_distinct(.data$DocID), .by = "View")
+    d_ |>
+      dplyr::summarise(
+        nContracts = dplyr::n_distinct(.data$DocID),
+        nMentions  = sum(.data$nMentions),
+        .by        = c("View", dplyr::all_of(.col))
+      ) |>
+      dplyr::rename(Area = dplyr::all_of(.col)) |>
+      dplyr::left_join(base_, by = dplyr::join_by(View)) |>
+      dplyr::mutate(Panel = .panel, Share = .data$nContracts / .data$nBase)
+  }
+
+  dplyr::bind_rows(one_(long_, "State", "GeoState"), one_(long_, "Country", "GeoCountryIso")) |>
+    dplyr::mutate(Sample = .sample) |>
+    dplyr::select("Sample", "Panel", "View", "Area", "nContracts", "nMentions", "nBase", "Share") |>
+    dplyr::arrange(.data$Panel, match(.data$View, names(.des_place_views)), dplyr::desc(.data$nContracts))
+}
+
+#' Figure 6, one panel: the states or the countries, for the one view the rows carry
+#'
+#' TWO FIGURES, NOT ONE. The paper's Panel A and Panel B are separate figures on the page, and a
+#' patchwork of two maps shares one height and one legend row badly. Each panel is its own plot
+#' function, and the view is chosen by the rows handed in: the runbook slices tab_f06 by View once,
+#' so the same two functions draw all four views.
+#'
+#' @param .tab_data One sample's rows from `des_data_f06()`, one View.
+#' @param .panel Character. "State" or "Country".
+#' @return A ggplot.
+des_shape_f06 <- function(.tab_data, .panel) {
+  if (FALSE) {
+    .tab_data <- des_slice(tab_f06_any, "S2_Descriptive")
+    .panel    <- "State"
+  }
+  views_ <- unique(.tab_data$View)
+  if (length(views_) != 1L) cli::cli_abort("Figure 6 draws one view at a time; the rows carry {length(views_)}.")
+  d_ <- .tab_data |>
+    dplyr::filter(.data$Panel == .panel) |>
+    dplyr::select("Area", N = "nContracts")
+  if (nrow(d_) == 0L) d_ <- tibble::tibble(Area = character(0), N = numeric(0))
+  if (.panel == "State") {
+    plot_map_usa(.tab = d_, .val = "N", .log = TRUE, .name = "Contracts", .label_n = 8L)
+  } else {
+    plot_map_world(.tab = d_, .val = "N", .log = TRUE, .name = "Contracts", .label_n = 8L)
+  }
+}
+
+#' Figure 6 Panel A, the states, and Panel B, the countries
+#' @param .tab_data One sample's rows from `des_data_f06()`, one View.
+#' @return A ggplot.
+des_plot_f06a <- function(.tab_data) des_shape_f06(.tab_data = .tab_data, .panel = "State")
+des_plot_f06b <- function(.tab_data) des_shape_f06(.tab_data = .tab_data, .panel = "Country")
+
+#' The leading places per view on the paper's sample, printed
+#' @param .tab_data Every sample from `des_data_f06()`.
+#' @param .sample Character. The sample to print.
+#' @param .top Integer. Places per panel and view.
+#' @return Invisibly, the printed table.
+des_report_f06 <- function(.tab_data, .sample = "S2_Descriptive", .top = 8L) {
+  if (FALSE) {
+    .tab_data <- tab_f06
+    .sample   <- "S2_Descriptive"
+    .top      <- 8L
+  }
+  d_ <- .tab_data |>
+    dplyr::filter(.data$Sample == .sample) |>
+    dplyr::slice_max(.data$nContracts, n = .top, by = c("Panel", "View"), with_ties = FALSE) |>
+    dplyr::mutate(Rank = dplyr::row_number(), .by = c("Panel", "View")) |>
+    dplyr::mutate(Cell = paste0(.data$Area, " (", tbl_num(100 * .data$Share, .digits = 1L), "%)")) |>
+    dplyr::select("Panel", "View", "Rank", "Cell") |>
+    tidyr::pivot_wider(names_from = "View", values_from = "Cell")
+  base_ <- .tab_data |>
+    dplyr::filter(.data$Sample == .sample) |>
+    dplyr::distinct(.data$Panel, .data$View, .data$nBase) |>
+    dplyr::mutate(Cell = tbl_num(.data$nBase, .digits = 0L), Rank = 0L) |>
+    dplyr::select("Panel", "View", "Rank", "Cell") |>
+    tidyr::pivot_wider(names_from = "View", values_from = "Cell")
+  tbl_out(.tab = dplyr::bind_rows(base_, d_) |> dplyr::arrange(.data$Panel, .data$Rank),
+          .title = paste0("Figure 6: the leading places on ", .sample,
+                          ", share of the contracts with any place in the view"),
+          .notes = c(Rank = "Row 0 is the base: contracts in the sample naming at least one place under the view."))
+  invisible(d_)
+}
+
+
+# 28. F11: the pandemic terms -----------------------------------------------------------------------------------------------
+# Referee 2 asked for a basic vocabulary search for Covid-19-related terms. 05A ran it, with four
+# control families -- disruption, rate reform, regulation, boilerplate -- so that a rise in one word
+# list can be told from a rise in words. This draws the one panel the paper needs from the released
+# hits: the share of each quarter's contracts naming a term of each family, and the quarter's count
+# split by whether the pandemic family hit.
+
+plot_register_levels(
+  .key     = "TermFamily",
+  .levels  = .des_family_levels,
+  .short   = c("Pandemic", "Disruption", "Rate reform", "Regulation", "Boilerplate"),
+  .colours = NULL
+)
+
+#' Hit shares per period and family, at year and at quarter grain
+#'
+#' THE DENOMINATOR IS THE CONTRACTS 05A SCANNED, not the contracts that hit: TermDocs carries every
+#' scanned contract five times, once per family, with zeros, and a contract in the sample the scan
+#' never reached is absent rather than a zero.
+#'
+#' @param .tab One sample of the contract table.
+#' @param .sample Character. Its name.
+#' @param .terms The TermDocs release from `des_read_term_docs()`.
+#' @param .from_quarter Integer. First year of the quarterly grain.
+#' @return Tibble: Sample, Grain ("Year" or "Quarter"), Period (numeric: the year, or year + (q-1)/4),
+#'   Family, nDocs, nWith, Share, nHits.
+des_data_f11 <- function(.tab, .sample, .terms, .from_quarter = 2018L) {
+  if (FALSE) {
+    .tab          <- tab_contracts[tab_contracts$S2_Descriptive, , drop = FALSE]
+    .sample       <- "S2_Descriptive"
+    .terms        <- tab_term_docs
+    .from_quarter <- 2018L
+  }
+  j_ <- .tab |>
+    dplyr::select("DocID", "Year", "DateFiled") |>
+    dplyr::inner_join(.terms, by = dplyr::join_by(DocID), relationship = "one-to-many") |>
+    dplyr::mutate(Quarter = .data$Year + (lubridate::quarter(.data$DateFiled) - 1L) / 4)
+
+  one_ <- function(.d, .grain, .col) {
+    .d |>
+      dplyr::summarise(
+        nDocs  = dplyr::n(),
+        nWith  = sum(.data$HasTerm == 1L),
+        nHits  = sum(.data$nHits),
+        .by    = c(dplyr::all_of(.col), "Family")
+      ) |>
+      dplyr::rename(Period = dplyr::all_of(.col)) |>
+      dplyr::mutate(Grain = .grain, Share = .data$nWith / .data$nDocs)
+  }
+  dplyr::bind_rows(
+    one_(j_, "Year", "Year"),
+    one_(dplyr::filter(j_, .data$Year >= .from_quarter), "Quarter", "Quarter")
+  ) |>
+    dplyr::mutate(Sample = .sample, Family = factor(.data$Family, levels = .des_family_levels)) |>
+    dplyr::select("Sample", "Grain", "Period", "Family", "nDocs", "nWith", "Share", "nHits") |>
+    dplyr::arrange(.data$Grain, .data$Period, .data$Family)
+}
+
+#' Figure 11: family shares per quarter above, the quarter's contracts split by the pandemic hit below
+#' @param .tab_data One sample's rows from `des_data_f11()`.
+#' @return A patchwork.
+des_plot_f11 <- function(.tab_data) {
+  if (FALSE) .tab_data <- des_slice(tab_f11, "S2_Descriptive")
+  q_ <- dplyr::filter(.tab_data, .data$Grain == "Quarter")
+  top_ <- des_shape_lines(
+    .tab = q_, .x = "Period", .y = "Share", .group = "Family", .key = "TermFamily", .pct = TRUE,
+    .regimes = FALSE, .ylab = "Share of contracts naming a term", .points = FALSE, .step = 1
+  ) +
+    ggplot2::geom_vline(xintercept = 2020, linetype = "dashed", colour = .plot_ref, linewidth = .plot_line * 2)
+
+  bot_ <- q_ |>
+    dplyr::filter(.data$Family == "Pandemic") |>
+    dplyr::transmute(.data$Period, Mentions = .data$nWith, Silent = .data$nDocs - .data$nWith) |>
+    tidyr::pivot_longer(c("Mentions", "Silent"), names_to = "Kind", values_to = "N") |>
+    dplyr::mutate(Kind = factor(.data$Kind, levels = c("Silent", "Mentions"),
+                                labels = c("No pandemic term", "Names a pandemic term")))
+  bars_ <- ggplot2::ggplot(bot_, ggplot2::aes(x = .data$Period, y = .data$N / 1000, fill = .data$Kind)) +
+    ggplot2::geom_col(width = 0.22, colour = "white", linewidth = .plot_line) +
+    ggplot2::scale_fill_manual(values = purrr::set_names(plot_pal_seq(2L), levels(bot_$Kind)), name = NULL) +
+    ggplot2::scale_x_continuous(breaks = scales::breaks_width(1)) +
+    ggplot2::scale_y_continuous(labels = scales::label_comma(), expand = ggplot2::expansion(mult = c(0, 0.05))) +
+    ggplot2::geom_vline(xintercept = 2020, linetype = "dashed", colour = .plot_ref, linewidth = .plot_line * 2) +
+    ggplot2::labs(x = NULL, y = "Contracts per quarter (000)") +
+    plot_theme(.grid = "y", .legend = "bottom")
+
+  patchwork::wrap_plots(top_, bars_, ncol = 1L, heights = c(1.4, 1))
+}
+
+#' The pandemic share by year and by filing group: which channel carried the rise
+#' @param .tab One sample of the contract table.
+#' @param .sample Character. Its name.
+#' @param .terms The TermDocs release.
+#' @param .from Integer. First year.
+#' @return Tibble: Sample, Year, FilingGroup4, nDocs, nWith, Share.
+des_data_f11b <- function(.tab, .sample, .terms, .from = 2016L) {
+  if (FALSE) {
+    .tab    <- tab_contracts[tab_contracts$S2_Descriptive, , drop = FALSE]
+    .sample <- "S2_Descriptive"
+    .terms  <- tab_term_docs
+    .from   <- 2016L
+  }
+  .tab |>
+    dplyr::filter(.data$Year >= .from) |>
+    dplyr::select("DocID", "Year", "FormFamily") |>
+    dplyr::inner_join(dplyr::filter(.terms, .data$Family == "Pandemic"), by = dplyr::join_by(DocID),
+                      relationship = "one-to-one") |>
+    dplyr::mutate(FilingGroup4 = des_group4(.data$FormFamily)) |>
+    dplyr::summarise(nDocs = dplyr::n(), nWith = sum(.data$HasTerm == 1L), .by = c("Year", "FilingGroup4")) |>
+    dplyr::mutate(Sample = .sample, Share = .data$nWith / .data$nDocs) |>
+    dplyr::select("Sample", "Year", "FilingGroup4", "nDocs", "nWith", "Share") |>
+    dplyr::arrange(.data$Year, .data$FilingGroup4)
+}
+
+#' Figure 11b: the pandemic share per year, one line per filing group
+#' @param .tab_data One sample's rows from `des_data_f11b()`.
+#' @return A ggplot.
+des_plot_f11b <- function(.tab_data) {
+  if (FALSE) .tab_data <- des_slice(tab_f11b, "S2_Descriptive")
+  des_shape_lines(
+    .tab = .tab_data, .x = "Year", .y = "Share", .group = "FilingGroup4", .key = "FilingGroup4", .pct = TRUE,
+    .regimes = FALSE, .ylab = "Share naming a pandemic term", .step = 1
+  )
+}
+
+#' The four filing groups from the form family, as Figure 2's four-group view draws them
+#' @param .form Character. FormFamily values.
+#' @return Character: 8-K, Registration, Yearly or Quarterly.
+des_group4 <- function(.form) {
+  if (FALSE) .form <- c("8-K", "S-1", "10-K")
+  grp_ <- unname(.des_form_group[.form])
+  dplyr::case_when(
+    .form == "8-K"                           ~ "8-K",
+    .form %in% c("S-1", "S-4", "F-1", "F-4") ~ "Registration",
+    .default                                 = grp_
+  )
+}
+
+#' The pandemic shares by year on the paper's sample, printed
+#' @param .tab_data Every sample from `des_data_f11()`.
+#' @param .sample Character. The sample to print.
+#' @return Invisibly, the year table.
+des_report_f11 <- function(.tab_data, .sample = "S2_Descriptive") {
+  if (FALSE) {
+    .tab_data <- tab_f11
+    .sample   <- "S2_Descriptive"
+  }
+  yr_ <- .tab_data |>
+    dplyr::filter(.data$Sample == .sample, .data$Grain == "Year", .data$Period >= 2016) |>
+    dplyr::mutate(Cell = 100 * .data$Share, Year = as.integer(.data$Period)) |>
+    dplyr::select("Year", "Family", "Cell") |>
+    tidyr::pivot_wider(names_from = "Family", values_from = "Cell")
+  n_ <- .tab_data |>
+    dplyr::filter(.data$Sample == .sample, .data$Grain == "Year", .data$Period >= 2016, .data$Family == "Pandemic") |>
+    dplyr::transmute(Year = as.integer(.data$Period), .data$nDocs)
+  tbl_out(.tab = des_fmt(dplyr::left_join(n_, yr_, by = dplyr::join_by(Year)), 1L, .counts = c("Year", "nDocs")),
+          .title = paste0("Pandemic and control families by year on ", .sample, ", percent of scanned contracts"),
+          .notes = c(nDocs = "Contracts 05A scanned; a contract the scan never reached is absent, not a zero."))
+  invisible(yr_)
+}
+
+
+# 29. CTO, the order side ---------------------------------------------------------------------------------------------------
+# What the SEC issued, from 01E's references: orders per year, what they did, how many exhibits each
+# named, how many of those resolved to a contract at all and how many to one in the paper's sample.
+# The contract side, in section 19, counts covered contracts; this counts the paperwork behind them,
+# which is what section 3.5 of the manuscript describes.
+
+# What the old text printed: 10,360 orders, 19,844 exhibits named, 3,623 unmatched, 16,221 linked.
+.des_reference_cto_orders <- tibble::tribble(
+  ~Quantity,   ~Revision,
+  "Orders",    10360,
+  "Exhibits",  19844,
+  "Linked",    16221,
+  "Unlinked",   3623
+)
+
+#' Orders and references by year and in total
+#' @param .orders The CtoOrders release from `des_read_cto_orders()`.
+#' @param .tab The contract table; the descriptive sample's DocIDs say what "in sample" means.
+#' @return Tibble: Year (with "Total"), Orders, Granting, Denying, Extensions, Exhibits, Linked,
+#'   InSample, Unlinked, Contracts.
+des_data_cto_orders <- function(.orders, .tab) {
+  if (FALSE) {
+    .orders <- tab_cto_orders
+    .tab    <- tab_contracts
+  }
+  keep_ <- .tab$DocID[.tab$Keep]
+  one_ <- function(.d, .y) {
+    tibble::tibble(
+      Year       = .y,
+      Orders     = dplyr::n_distinct(.d$OrderDocID),
+      Granting   = dplyr::n_distinct(.d$OrderDocID[.d$Status %in% "GRANTING"]),
+      Denying    = dplyr::n_distinct(.d$OrderDocID[.d$Status %in% c("DENYING", "REVOKING")]),
+      Extensions = dplyr::n_distinct(.d$OrderDocID[.d$IsExtension == 1L]),
+      Exhibits   = sum(!is.na(.d$ExhibitNo)),
+      Linked     = sum(!is.na(.d$DocID)),
+      InSample   = sum(.d$DocID %in% keep_),
+      Unlinked   = sum(!is.na(.d$ExhibitNo) & is.na(.d$DocID)),
+      Contracts  = dplyr::n_distinct(.d$DocID[!is.na(.d$DocID)])
+    )
+  }
+  by_ <- .orders |>
+    dplyr::group_split(.data$OrderYear) |>
+    purrr::map(\(.d) one_(.d, as.character(.d$OrderYear[1L]))) |>
+    purrr::list_rbind()
+  dplyr::bind_rows(by_, one_(.orders, "Total"))
+}
+
+#' The order-side counts printed, beside the old text's numbers
+#' @param .tab_data From `des_data_cto_orders()`.
+#' @param .ref The reference tibble.
+#' @return Invisibly, the table.
+des_report_cto_orders <- function(.tab_data, .ref = .des_reference_cto_orders) {
+  if (FALSE) {
+    .tab_data <- tab_cto_orders_year
+    .ref      <- .des_reference_cto_orders
+  }
+  cnt_ <- setdiff(names(.tab_data), "Year")
+  tbl_out(.tab = des_fmt(.tab_data, 0L, .counts = cnt_),
+          .title = "Confidential-treatment orders by year of the order: what the SEC issued",
+          .notes = c(
+            Exhibits = "References with an exhibit number parsed; an order can name several.",
+            Linked   = "References resolved to a contract in the release; InSample is those in the descriptive sample.",
+            Unlinked = "References with a number and no contract: the chain broke at one of 01E's numbered steps."
+          ))
+  tot_ <- dplyr::filter(.tab_data, .data$Year == "Total")
+  cmp_ <- .ref |>
+    dplyr::mutate(Pipeline = c(tot_$Orders, tot_$Exhibits, tot_$Linked, tot_$Unlinked)[match(.data$Quantity, .ref$Quantity)])
+  tbl_out(.tab = des_fmt(cmp_, 0L, .counts = c("Revision", "Pipeline")),
+          .title = "Section 3.5: the old text's counts against 01E's table",
+          .notes = c(Revision = "The old pipeline's numbers; 01E re-parsed every order, so all four move."))
+  invisible(.tab_data)
+}
+
+
+# 30. Manifest and reconciliation -------------------------------------------------------------------------------------------
 
 #' Every file this render wrote, by exhibit and sample
 #' @param .dirs Named character vector: Data, Figures, Tables.
@@ -3404,6 +3845,17 @@ des_table_reconcile <- function(.env = parent.frame()) {
       tidyr::pivot_longer(-"Measure", names_to = "Group", values_to = "Pipeline") |>
       dplyr::inner_join(.des_reference_t07, by = dplyr::join_by(Measure, Group)) |>
       dplyr::transmute(Exhibit = "T7", Quantity = paste(.data$Measure, .data$Group), .data$Pipeline, .data$Revision)
+  }
+
+  if (!is.null(t_ <- g_("tab_cto_orders_year"))) {
+    tot_ <- dplyr::filter(t_, .data$Year == "Total")
+    rows_$CTO <- .des_reference_cto_orders |>
+      dplyr::mutate(
+        Exhibit  = "3.5",
+        Pipeline = c(Orders = tot_$Orders, Exhibits = tot_$Exhibits, Linked = tot_$Linked,
+                     Unlinked = tot_$Unlinked)[.data$Quantity]
+      ) |>
+      dplyr::select("Exhibit", "Quantity", "Pipeline", "Revision")
   }
 
   out_ <- purrr::list_rbind(rows_) |>

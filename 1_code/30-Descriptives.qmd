@@ -124,6 +124,11 @@ edit in Configuration, and the Robustness section, when it exists, flips them on
 .lP$Input <- list(
   FilContracts     = fs::path(.lP$Root, "100_Data_Export", "Contracts.parquet"),
   FilSummaries     = fs::path(.lP$Root, "100_Data_Export", "Summaries.parquet"),
+  # THE THREE LONG RELEASES 10 writes beside them: the places behind the geography counts (Figure 6),
+  # 05A's term hits (the pandemic panel) and 01E's order references (the order side of section 3.5).
+  FilPlaces        = fs::path(.lP$Root, "100_Data_Export", "Places.parquet"),
+  FilTermDocs      = fs::path(.lP$Root, "100_Data_Export", "TermDocs.parquet"),
+  FilCtoOrders     = fs::path(.lP$Root, "100_Data_Export", "CtoOrders.parquet"),
   # HER FIRM-QUARTER PANEL, every Compustat quarter of a firm that filed at least once, with the
   # winsorised variables. Two and a half gigabytes as .dta; the conversion keeps 36 columns.
   DtaQuarter       = fs::path(.lP$Root, "103_Variable_Creation", "103_Output",
@@ -153,10 +158,10 @@ purrr::walk(.x = unlist(.lP$Output), .f = fs::dir_create)
 des_report_inputs(.inputs = unlist(.lP$Input))
 ```
 
-Two inputs the specification names are **not** on her side and are not read yet: the `04D` GPE store,
-which Figure 6's maps need because the export carries counts and not names, and `05A`'s term hits for
-the pandemic check referee 2 asked for. Both are repository outputs and both wait on the exhibit
-decisions; when they come in they are added here, under `.lP$Repo`, with the same existence report.
+Every input is in her folder. The three long releases -- `Places`, `TermDocs`, `CtoOrders` -- are
+what `10-ExportData` added on 9 September so that this document runs off the release alone: the rows
+behind the geography counts, the term hits behind the pandemic check, and the order references
+behind `HasCto`.
 
 # Input
 
@@ -286,6 +291,16 @@ cli::cli_alert_info(
   "{format(sum(!is.na(tab_contracts$AkKeep)), big.mark = ',')} of {format(nrow(tab_contracts), big.mark = ',')} \\
    rows have a counterpart on her file; the rest are ladder step 1, which her 102 drops."
 )
+```
+
+## The long releases
+
+```{r}
+#| label: input-long
+
+tab_places     <- des_read_places(.path = .lP$Input$FilPlaces)
+tab_term_docs  <- des_read_term_docs(.path = .lP$Input$FilTermDocs)
+tab_cto_orders <- des_read_cto_orders(.path = .lP$Input$FilCtoOrders)
 ```
 
 # Samples
@@ -566,6 +581,36 @@ Total 2.79 (SD 3.28) on 779,440. Panel C is where referee 2's two literatures se
 R&D and Licenses are redacted in 42 and 31 percent of pre-FAST contracts and 70 and 55 percent after,
 against 1.3 and 7.9 percent for Credit.
 
+## Figure 6: geographic mentions
+
+Two maps, the states and the countries, filled by the number of contracts naming the place, from the
+`Places` release. Four views of the same rows, one tabset each: every mention outside a governing-law
+clause, as the revision drew it; the mentions attached to a counterparty, which is referee 1's
+question -- are these contracting locations? -- answered by construction; the mentions attached to
+the registrant, the filer's own footprint; and the law-clause places, drawn apart because they are
+jurisdictions and the other three must not be read as such. The count is contracts, not mentions; the
+mention count rides in the tibble for a map of intensity.
+
+```{r}
+#| label: f06-data
+
+tab_f06 <- des_over_samples(
+  .tab     = tab_contracts,
+  .samples = .des_contract_samples,
+  .fun     = des_data_f06,
+  .places  = tab_places
+)
+
+des_report_f06(.tab_data = tab_f06, .sample = "S2_Descriptive")
+
+# ONE TIBBLE PER VIEW, so the two panel functions draw whichever view they are handed.
+lst_f06 <- purrr::map(purrr::set_names(names(.des_place_views)), \(v) dplyr::filter(tab_f06, .data$View == v))
+tab_f06_any          <- lst_f06$Any
+tab_f06_counterparty <- lst_f06$Counterparty
+tab_f06_registrant   <- lst_f06$Registrant
+tab_f06_law          <- lst_f06$Law
+```
+
 # Redactions
 
 ## Figure 10: redactions over time
@@ -672,8 +717,7 @@ des_print_t01(.tab_data = des_slice(tab_t01, "S2_Descriptive"))
 ## Confidential treatment, the contract side
 
 What the release says about the orders: contracts covered, extensions, orders per contract, and the
-orders against the markers. The order-side counts -- orders issued, exhibits named, exhibits that
-could not be linked -- are 01E's and wait for the export to carry them.
+orders against the markers.
 
 ```{r}
 #| label: cto-data
@@ -685,6 +729,21 @@ tab_cto <- des_over_samples(
 )
 
 des_report_cto(.tab_data = tab_cto)
+```
+
+## Confidential treatment, the order side
+
+What the SEC issued, from the `CtoOrders` release: orders per year and what they did, the exhibits
+each named, how many references resolved to a contract at all and how many to one in the descriptive
+sample. Section 3.5 of the manuscript describes this paperwork, and its four numbers came from the
+old pipeline; 01E re-parsed every order, so all four move and the comparison is printed.
+
+```{r}
+#| label: cto-orders-data
+
+tab_cto_orders_year <- des_data_cto_orders(.orders = tab_cto_orders, .tab = tab_contracts)
+
+des_report_cto_orders(.tab_data = tab_cto_orders_year, .ref = .des_reference_cto_orders)
 ```
 
 ## Where the ladder loses attachments
@@ -800,6 +859,36 @@ des_report_f07(.tab_data = tab_f07, .ref = .des_reference_f07)
 ```
 
 
+# Referee items
+
+## The pandemic terms
+
+Referee 2 asked for a basic vocabulary search for Covid-19-related terms. `05A` ran it with four
+control families -- disruption, rate reform, regulation and boilerplate -- so that a rise in one word
+list can be told from a rise in words, and released the hits per contract and family; `TermDocs` is
+that table cut to the release. Figure 11 draws the share of each quarter's contracts naming a term of
+each family from 2018, with the quarter's contracts split below by whether the pandemic family hit.
+Figure 11b asks which channel carried the rise: the pandemic share per year by filing group.
+
+```{r}
+#| label: f11-data
+
+tab_f11 <- des_over_samples(
+  .tab     = tab_contracts,
+  .samples = .des_contract_samples,
+  .fun     = des_data_f11,
+  .terms   = tab_term_docs
+)
+tab_f11b <- des_over_samples(
+  .tab     = tab_contracts,
+  .samples = .des_contract_samples,
+  .fun     = des_data_f11b,
+  .terms   = tab_term_docs
+)
+
+des_report_f11(.tab_data = tab_f11, .sample = "S2_Descriptive")
+```
+
 # Deployment
 
 Every exhibit's tibble to `Output/Data/`, one parquet per exhibit with every sample inside it, and
@@ -868,10 +957,25 @@ purrr::pwalk(
 plot_save(.plot = des_plot_loss(.tab_data = tab_loss), .name = "LOSS_S0_Universe", .dir = .lP$Output$DirFigures,
           .height = plot_height(8L))
 
+# THE MAPS AND THE PANDEMIC PANELS. Figure 6 is two figures per view -- A the states, B the
+# countries -- each written on its own; the Large rung suits a single map with its legend beside it.
+purrr::pwalk(
+  list(
+    tab  = c(rep(lst_f06, each = 2L), list(tab_f11, tab_f11b)),
+    fun  = c(rep(list(des_plot_f06a, des_plot_f06b), 4L), list(des_plot_f11, des_plot_f11b)),
+    name = c(paste0(rep(c("F06A_", "F06B_"), 4L), rep(names(.des_place_views), each = 2L)), "F11", "F11b"),
+    h    = c(rep(plot_height(12L), 8L), plot_height(18L), plot_height(5L))
+  ),
+  \(tab, fun, name, h) des_save_figures(.tab_data = tab, .fun = fun, .name = name, .dir = .lP$Output$DirFigures,
+                                       .height = h)
+)
+
 purrr::iwalk(
   list(T07 = tab_t07, T07b = tab_t07b, T01 = tab_t01, CTO = tab_cto, LOSS = tab_loss, FA1 = tab_fa1,
-       T02B = dplyr::bind_rows(Full = lst_ladder_b$Full, Quarter = lst_ladder_b$Quarter, .id = "Controls"),
-       T04 = tab_t04, F08a = tab_f08a, F08b = tab_f08b, F09 = tab_f09, F07 = tab_f07),
+       T02B = dplyr::bind_rows(Full = lst_ladder_b$Full, Filing = lst_ladder_b$Filing,
+                               Quarter = lst_ladder_b$Quarter, .id = "Controls"),
+       T04 = tab_t04, F08a = tab_f08a, F08b = tab_f08b, F09 = tab_f09, F07 = tab_f07,
+       F06 = tab_f06, F11 = tab_f11, F11b = tab_f11b, CTOO = tab_cto_orders_year),
   \(t, n) des_save_data(.tab_data = t, .name = n, .dir = .lP$Output$DirData)
 )
 
@@ -1131,6 +1235,87 @@ des_tabs_figure(
 )
 ```
 
+## Figure 6
+
+Four views, four tabsets; within each, one tab per sample holding Panel A and Panel B as two figures.
+
+```{r}
+#| label: fig-f06-any-tabs
+#| output: asis
+
+des_tabs_figure(
+  .tab_name = "tab_f06_any", .fun_name = c("des_plot_f06a", "des_plot_f06b"), .id = c("f06a-any", "f06b-any"),
+  .height   = plot_height(12L),
+  .caption  = c("Panel A. Contracts naming each state: every mention outside a governing-law clause.",
+                "Panel B. Contracts naming each country: every mention outside a governing-law clause."),
+  .samples  = NULL
+)
+```
+
+```{r}
+#| label: fig-f06-counterparty-tabs
+#| output: asis
+
+des_tabs_figure(
+  .tab_name = "tab_f06_counterparty", .fun_name = c("des_plot_f06a", "des_plot_f06b"),
+  .id       = c("f06a-counterparty", "f06b-counterparty"), .height = plot_height(12L),
+  .caption  = c("Panel A. Contracts naming each state: places attached to a counterparty.",
+                "Panel B. Contracts naming each country: places attached to a counterparty."),
+  .samples  = NULL
+)
+```
+
+```{r}
+#| label: fig-f06-registrant-tabs
+#| output: asis
+
+des_tabs_figure(
+  .tab_name = "tab_f06_registrant", .fun_name = c("des_plot_f06a", "des_plot_f06b"),
+  .id       = c("f06a-registrant", "f06b-registrant"), .height = plot_height(12L),
+  .caption  = c("Panel A. Contracts naming each state: places attached to the registrant.",
+                "Panel B. Contracts naming each country: places attached to the registrant."),
+  .samples  = NULL
+)
+```
+
+```{r}
+#| label: fig-f06-law-tabs
+#| output: asis
+
+des_tabs_figure(
+  .tab_name = "tab_f06_law", .fun_name = c("des_plot_f06a", "des_plot_f06b"),
+  .id       = c("f06a-law", "f06b-law"), .height = plot_height(12L),
+  .caption  = c("Panel A. Contracts naming each state inside a governing-law clause: jurisdictions.",
+                "Panel B. Contracts naming each country inside a governing-law clause: jurisdictions."),
+  .samples  = NULL
+)
+```
+
+## Figure 11
+
+```{r}
+#| label: fig-f11-tabs
+#| output: asis
+
+des_tabs_figure(
+  .tab_name = "tab_f11", .fun_name = "des_plot_f11", .id = "f11", .height = plot_height(18L),
+  .caption  = "Share of each quarter's contracts naming a term of each family from 2018 (above); the quarter's
+               contracts by whether a pandemic term appears (below). The dashed line marks 2020.",
+  .samples  = NULL
+)
+```
+
+```{r}
+#| label: fig-f11b-tabs
+#| output: asis
+
+des_tabs_figure(
+  .tab_name = "tab_f11b", .fun_name = "des_plot_f11b", .id = "f11b", .height = plot_height(5L),
+  .caption  = "Share of contracts naming a pandemic term per year, by the filing group the contract arrived in.",
+  .samples  = NULL
+)
+```
+
 ## Reconciliation
 
 ```{r}
@@ -1155,8 +1340,9 @@ tibble::tibble(
 
 # Next
 
-The remaining exhibits, one compute and one render function each, in the order of the specification: the
-sample table, the filing figures, the content figures and tables, the firm-level figures, the
-redaction figures, the summary table. Every tibble goes to `Output/Data/`, every figure to
-`Output/Figures/` through `plot_save()`, every table to `Output/Tables/` as `.tex`, and a manifest maps
-each exhibit to its files.
+Every exhibit the specification names is here, on every sample it is defined on, from her folder
+alone. What remains is not code: the three defaults to settle with Ann-Kristin -- class order, the
+party definition, the marker threshold -- and which Table 4 trim the paper reports; her `102`/`103`
+rerun on the current release, which closes the 621 redaction flags and the Table 4 vintage; and the
+manuscript text, which the reconciliation table and the notes under each exhibit are written to feed.
+`3_site` then pulls `Output/Figures/` and `Output/Tables/`.

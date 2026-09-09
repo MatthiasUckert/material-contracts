@@ -990,17 +990,24 @@ plot_save <- function(.plot, .name, .dir, .height, .width = 7.5,
   # Times. Cairo is not guaranteed to be compiled in, so fall back rather than fail.
   pdf_dev_ <- if (isTRUE(capabilities("cairo"))) grDevices::cairo_pdf else "pdf"
 
+  # A PATH IS NOT A FILE. ggsave() returns whether or not the device wrote anything, and one machine's
+  # cairo_pdf produced eighty-four png files and no pdf without a word: the manifest was the only
+  # thing that noticed. So every write is checked, a pdf the Cairo device did not land is retried on
+  # the base device, and a file still missing after that is a warning rather than a silence.
   out_ <- purrr::map_chr(.formats, function(.ext) {
     path_ <- fs::path(.dir, paste0(.name, ".", .ext))
-    ggplot2::ggsave(
-      filename = path_,
-      plot     = .plot,
-      width    = .width,
-      height   = .height,
-      units    = "in",
-      dpi      = .dpi,
-      device   = if (.ext == "pdf") pdf_dev_ else .ext
-    )
+    if (fs::file_exists(path_)) fs::file_delete(path_)
+    save_ <- function(.dev) {
+      try(ggplot2::ggsave(filename = path_, plot = .plot, width = .width, height = .height, units = "in",
+                          dpi = .dpi, device = .dev), silent = TRUE)
+      fs::file_exists(path_)
+    }
+    ok_ <- save_(if (.ext == "pdf") pdf_dev_ else .ext)
+    if (!ok_ && .ext == "pdf" && !identical(pdf_dev_, "pdf")) {
+      ok_ <- save_("pdf")
+      if (ok_) cli::cli_alert_warning("{(.name)}.pdf: cairo_pdf wrote nothing; written with the base pdf device.")
+    }
+    if (!ok_) cli::cli_alert_warning("{(.name)}.{(.ext)}: no file was written.")
     as.character(path_)
   })
   invisible(out_)
@@ -1132,16 +1139,35 @@ plot_map_body <- function(.shape, .tab, .val = "N", .log = TRUE, .name = NULL, .
   any_ <- any(!is.na(join_$Val))
   fmt_ <- scales::label_number(accuracy = 1, big.mark = ",")
 
+  # THE LEGEND STANDS, IT DOES NOT LIE DOWN. A horizontal colourbar the width of the default key is
+  # two centimetres, and four log-spaced labels of six characters cannot share it: the legend under
+  # the first Figure 6 read "3,000 10,000 30,000 100,000" as one smear. Stacked beside the map the
+  # labels sit one above the other, however short the bar, and the map is wide enough to give the
+  # space up. The labels are shortened to K and M so that a vertical stack stays narrow, and the
+  # breaks are the powers of ten inside the range and their triples, so a log legend reads as one.
+  brk_ <- if (.log && any_) scales::breaks_log(n = 5, base = 10) else ggplot2::waiver()
+  # Written out rather than scales::cut_short_scale(), which fails on the NA breaks ggplot2 passes for
+  # breaks outside the limits in scales below 1.3.
+  lab_ <- function(.x) {
+    dplyr::case_when(
+      is.na(.x)        ~ NA_character_,
+      abs(.x) >= 1e6   ~ paste0(formatC(.x / 1e6, format = "fg", digits = 2), "M"),
+      abs(.x) >= 1e3   ~ paste0(formatC(.x / 1e3, format = "fg", digits = 2), "K"),
+      .default         = formatC(.x, format = "d", big.mark = ",")
+    )
+  }
+
   out_ <- join_ |>
     ggplot2::ggplot() +
     ggplot2::geom_sf(ggplot2::aes(fill = .data$Val), colour = "#FFFFFF", linewidth = 0.1) +
     ggplot2::scale_fill_gradient(
-      low   = "#DCE6F1",
-      high  = "#002147",
-      trans = if (.log && any_) "log10" else "identity",
+      low      = "#DCE6F1",
+      high     = "#002147",
+      trans    = if (.log && any_) "log10" else "identity",
       na.value = "#F2F2F2",
-      name  = .name,
-      labels = fmt_
+      name     = .name,
+      breaks   = brk_,
+      labels   = lab_
     ) +
     ggplot2::labs(x = NULL, y = NULL)
 
@@ -1167,12 +1193,16 @@ plot_map_body <- function(.shape, .tab, .val = "N", .log = TRUE, .name = NULL, .
     }
   }
 
+  # NO FRAME. The house theme draws axis lines, and on a map those are a box around the world with no
+  # meaning; coord_sf() is told datum = NA by the callers so no graticule is drawn either.
   out_ +
-    plot_theme(.grid = "none", .legend = "bottom") +
+    plot_theme(.grid = "none", .legend = "right") +
     ggplot2::theme(
       axis.text        = ggplot2::element_blank(),
       axis.ticks       = ggplot2::element_blank(),
-      panel.background = ggplot2::element_rect(fill = "#FFFFFF", colour = NA)
+      axis.line        = ggplot2::element_blank(),
+      panel.background = ggplot2::element_rect(fill = "#FFFFFF", colour = NA),
+      legend.title     = ggplot2::element_text(family = .plot_font, size = .plot_base - 1, vjust = 1)
     )
 }
 
@@ -1213,7 +1243,7 @@ plot_map_world <- function(.tab, .val = "N", .log = TRUE, .name = NULL, .label_n
     .label_n    = .label_n,
     .label_size = .label_size
   ) +
-    ggplot2::coord_sf(ylim = c(-58, 84), expand = FALSE)
+    ggplot2::coord_sf(ylim = c(-58, 84), datum = NA, expand = FALSE)
 }
 
 

@@ -3,7 +3,9 @@
 # WHAT THIS FILE DOES
 # 04D released eight long files at span grain, 02B holds the register and 03F the labels. Eight
 # functions turn them into eight CONTRACT-LEVEL CACHES, and a ninth joins those into the one file
-# the Stata analysis reads.
+# the Stata analysis reads. Three more release what that file cannot hold -- the places behind the
+# geography counts, the term hits behind the pandemic panel, the orders behind HasCto -- as long files
+# beside it, so 30-Descriptives runs off the release folder alone.
 #
 # ONE FUNCTION PER FILE, AND IT TAKES PATHS. Nothing is built in the runbook and handed in. Each
 # export opens its own input, names the columns it reads at the call site, does its own work and
@@ -1085,27 +1087,41 @@ export_GPE <- function(.dir_in, .dir_org, .path_out, .rerun = FALSE) {
 
   role_ <- dplyr::distinct(src_org, .data$DocID, .data$PartyKey, .data$PartyRole)
 
+  # NULL IS NOT A STATE, AND THE COUNT HAS TO SAY SO ITSELF. A country-level mention carries a null
+  # GeoState and an unresolved city carries both nulls, and the released counts came out one too high
+  # on every contract with such a row: the Places release, which lists the rows, found 144,952
+  # registrant counts of 682,024 higher than the rows support. Whatever COUNT(DISTINCT) does with a
+  # null on the way from arrow through DuckDB, the rows with nothing to count are removed before it
+  # runs, so the count is the same on every backend. The population is kept separately, so a contract
+  # whose only places carry no state still has its row with a zero.
+  cnt_ <- function(.src, .col, .name, .by) {
+    .src |>
+      dplyr::filter(!is.na(.data[[.col]])) |>
+      dplyr::group_by(dplyr::across(dplyr::all_of(.by))) |>
+      dplyr::summarise(N = dplyr::n_distinct(.data[[.col]]), .groups = "drop") |>
+      dplyr::rename_with(.fn = \(.x) .name, .cols = "N")
+  }
+
   # ONE ROW PER DOCUMENT: every place the extractor found outside a law clause, attached or not.
   naive_ <- src_plc |>
-    dplyr::group_by(.data$DocID) |>
-    dplyr::summarise(
-      nUniStateNaive   = dplyr::n_distinct(.data$GeoState),
-      nUniCountryNaive = dplyr::n_distinct(.data$GeoCountryIso),
-      .groups          = "drop"
-    )
+    dplyr::distinct(.data$DocID) |>
+    dplyr::left_join(cnt_(src_plc, "GeoState", "nUniStateNaive", "DocID"), by = dplyr::join_by(DocID)) |>
+    dplyr::left_join(cnt_(src_plc, "GeoCountryIso", "nUniCountryNaive", "DocID"), by = dplyr::join_by(DocID))
 
   # ONE ROW PER DOCUMENT PER ROLE. The inner join is what restricts this to attached places.
-  byrole_ <- src_plc |>
-    dplyr::inner_join(role_, by = dplyr::join_by(DocID, PartyKey)) |>
-    dplyr::group_by(.data$DocID, .data$PartyRole) |>
-    dplyr::summarise(
-      State   = dplyr::n_distinct(.data$GeoState),
-      Country = dplyr::n_distinct(.data$GeoCountryIso),
-      .groups = "drop"
-    )
+  att_ <- src_plc |>
+    dplyr::inner_join(role_, by = dplyr::join_by(DocID, PartyKey))
+  byrole_ <- att_ |>
+    dplyr::distinct(.data$DocID, .data$PartyRole) |>
+    dplyr::left_join(cnt_(att_, "GeoState", "State", c("DocID", "PartyRole")),
+                     by = dplyr::join_by(DocID, PartyRole)) |>
+    dplyr::left_join(cnt_(att_, "GeoCountryIso", "Country", c("DocID", "PartyRole")),
+                     by = dplyr::join_by(DocID, PartyRole))
 
-  tab_naive <- dplyr::collect(naive_)
-  tab_role  <- dplyr::collect(byrole_)
+  tab_naive <- dplyr::collect(naive_) |>
+    dplyr::mutate(dplyr::across(c("nUniStateNaive", "nUniCountryNaive"), \(.x) dplyr::coalesce(as.integer(.x), 0L)))
+  tab_role  <- dplyr::collect(byrole_) |>
+    dplyr::mutate(dplyr::across(c("State", "Country"), \(.x) dplyr::coalesce(as.integer(.x), 0L)))
 
   # THE SHAPE COMES FROM .exp_geo_roles AND NOT FROM THE DATA. names_expand over a factor built on
   # the declared roles is what makes a subset in which no contract names a counterparty produce the
@@ -2063,6 +2079,382 @@ export_final <- function(.path_sample, .path_items, .path_summary, .path_cto, .p
   )
 
   invisible(out_)
+}
+
+
+# 9b. The long releases ---------------------------------------------------------------------------------------------------
+#
+# THREE FILES AT A GRAIN Contracts CANNOT HOLD. Contracts is one row per contract and carries counts:
+# how many states, how many countries, whether an order covers it. The descriptives in 30 want the
+# rows behind those counts -- which places, so a map can be drawn; which term families, so the
+# pandemic panel can be built; which orders, so the order side of section 3.5 can be counted rather
+# than only the contract side. Until here those three lived only in the repository, under 04D, 05A
+# and 01E, and 30 could not run off her Dropbox folder alone.
+#
+# EACH IS ONE FUNCTION IN THE SHAPE OF export_summaries(): cached on the inputs' modification time,
+# every column declared in a dictionary the function checks itself against, written as parquet with a
+# codebook beside it, and a dta only where Stata could hold it. None of them joins into Contracts, and
+# export_final() never sees them; they carry DocID so 30 joins them itself, and HashDocument so a
+# reader who wants every registrant copy can fan them out the way export_final() fans out the entity
+# blocks.
+
+#: What each place row may attach to. One role per party: export_ORG() counts a party under every
+#: role it holds, but a place on a map wants one owner, so where a party holds two the earlier one
+#: here wins. The order is the ORG rules' own: the registrant is found before its co-filers, those
+#: before the counterparties. "none" is a place no party mention reached.
+.exp_place_roles <- c("registrant", "cofiler", "counterparty", "signatory", "other", "none")
+
+#: The Places release, column by column. Checked by export_places() against what it writes.
+.exp_dictionary_places <- tibble::tribble(
+  ~Column, ~Meaning, ~Missing,
+  "DocID", "The contract: the primary copy 04D read. Joins to Contracts on DocID.", "never",
+  "HashDocument", "The attachment. Joins to every registrant copy of it in Contracts.", "never",
+  "GeoLevel", "Country, State, County, City or Other: what the name resolved to.", "never",
+  "GeoState", "The US state, where the tier or the resolution gives one.", "where the place is not in the US",
+  "GeoCountryIso", "ISO-3 code; USA for any US tier.", "where the gazetteer gave none",
+  "GeoCountry", "The country's name; United States for any US tier.", "where GeoCountryIso is",
+  "PartyRole", "registrant, cofiler, counterparty, signatory, other, or none where no party reached it.", "never",
+  "InLawClause", "1 where the mention sat inside a governing-law clause, so a jurisdiction, not a location.", "never",
+  "nMentions", "How often this contract mentions this place in this role.", "never"
+)
+
+#: The TermDocs release: 05A's term_docs, cut to the contracts, with its own names kept.
+.exp_dictionary_termdocs <- tibble::tribble(
+  ~Column, ~Meaning, ~Missing,
+  "DocID", "The contract 05A scanned. Joins to Contracts on DocID.", "never",
+  "HashDocument", "The attachment. Joins to every registrant copy of it in Contracts.", "never",
+  "Family", "Pandemic, Disruption, RateReform, Regulation or Boilerplate: the term family.", "never",
+  "nHits", "Occurrences of any term of the family; a term found twice counts twice.", "never",
+  "nTerms", "Distinct terms of the family found.", "never",
+  "HasTerm", "1 where nHits is positive.", "never",
+  "FirstPos", "Relative position of the first hit, 0 at the start of the text and 1 at its end.", "where nHits is zero",
+  "PerKWords", "nHits per thousand words of the contract.", "where the register holds no word count"
+)
+
+#: The CtoOrders release: 01E's references, one row each, the order side of the redaction story.
+.exp_dictionary_cto_orders <- tibble::tribble(
+  ~Column, ~Meaning, ~Missing,
+  "OrderDocID", "The order's own document on EDGAR.", "never",
+  "OrderCIK", "The filer the order was addressed to.", "never",
+  "OrderDate", "The day the order was filed.", "never",
+  "Status", "GRANTING, DENYING, REVOKING or what else the title line said.", "where the order's text was empty",
+  "IsExtension", "1 where the order grants more time on an earlier grant.", "never",
+  "ExhibitNo", "The exhibit the reference names, bare: 10.1, not EX-10.1.", "where no reference parsed",
+  "SourceForm", "The form the reference says the exhibit was filed under.", "where the reference named none",
+  "SourceFiledOn", "The day that filing was made, as the reference gives it.", "where the reference named none",
+  "ReleaseDate", "When the granted treatment lapses.", "where the letter gave none or gave a typo",
+  "HashIndex", "The filing 01E resolved the reference to.", "where the filing was not found",
+  "DocID", "The contract the reference resolved to. Joins to Contracts on DocID.", "where the chain broke",
+  "LinkStatus", "A-linked, or the numbered step at which the chain broke.", "never"
+)
+
+#' Places: every place a contract names, with the party it belongs to
+#'
+#' THE ROWS BEHIND export_GPE()'S COUNTS. That cache says how many distinct states and countries a
+#' contract names, per role; this file says which, so 30 can put them on a map. Same two stores, same
+#' filter on the attachment, one difference: law-clause places are kept and flagged rather than
+#' dropped, because the governing-law map is a map too and the flag is what separates the two.
+#'
+#' ONE ROW PER CONTRACT, PLACE, ROLE AND CLAUSE FLAG, with the mention count beside it. The distinct
+#' is on the geography and not on the name -- "New York" and "New York, N.Y." are one row -- and the
+#' count says how often the row's place was mentioned, so a map of contracts and a map of mentions
+#' come from the same file.
+#'
+#' ONE ROLE PER PARTY. export_ORG() counts a party under every role it holds; a place wants one owner,
+#' and .exp_place_roles says which wins.
+#'
+#' THE COUNTRY NAME IS FILLED FOR THE US TIERS. places_geo leaves GeoCountry null on a recovered
+#' subdivision -- a state, a county, a city -- and a map wants a name on every row; USA is the only
+#' code the store writes without one.
+#'
+#' CUT TO THE SAMPLE. The store covers every contract 04D processed; this file keeps the ones in the
+#' release, and that join is also where HashDocument comes from.
+#'
+#' @param .dir_in 04D's release directory for the GPE pass, including its policy hash.
+#' @param .dir_org 04D's release directory for the ORG pass; supplies the party roles.
+#' @param .path_sample The sample cache; supplies HashDocument and the cut.
+#' @param .path_out Destination parquet; the codebook is written beside it.
+#' @param .rerun Logical. TRUE rebuilds regardless of the cache check.
+#' @return Invisibly the written table.
+export_places <- function(.dir_in, .dir_org, .path_sample, .path_out, .rerun = FALSE) {
+  if (FALSE) {
+    .dir_in      <- .lP$Input$DirEntityGPE
+    .dir_org     <- .lP$Input$DirEntityORG
+    .path_sample <- .lP$Cache$CacheSample
+    .path_out    <- .lP$Output$FilPlaces
+    .rerun       <- FALSE
+  }
+
+  if (exp_cache_hit(.task = "Places", .path_out = .path_out, .paths_in = c(.dir_in, .dir_org, .path_sample),
+                    .rerun = .rerun)) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "Places: {.path {as.character(fs::path_file(.path_out))}} already written \\
+       ({format(nrow(out_), big.mark = ',')} rows, {ncol(out_)} columns). Pass .rerun = TRUE to rebuild."
+    )
+    return(invisible(out_))
+  }
+
+  ds_plc <- apl_dataset(.dir = .dir_in,  .stem = "places_geo")
+  ds_org <- apl_dataset(.dir = .dir_org, .stem = "org_mentions")
+  if (is.null(ds_plc) || is.null(ds_org)) {
+    cli::cli_abort(c(
+      "Places needs both a places_geo and an org_mentions release.",
+      "x" = "places_geo under {.path {as.character(.dir_in)}}: {!is.null(ds_plc)}.",
+      "x" = "org_mentions under {.path {as.character(.dir_org)}}: {!is.null(ds_org)}."
+    ))
+  }
+
+  spine_ <- arrow::read_parquet(file = .path_sample) |>
+    dplyr::filter(as.logical(.data$PrimaryFiler)) |>
+    dplyr::select("DocID", "HashDocument")
+
+  con_ <- DBI::dbConnect(duckdb::duckdb())
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+
+  # SEVEN OF places_geo's EIGHTEEN COLUMNS, projected in arrow; the surface form and the offsets never
+  # leave the parquet.
+  src_plc <- ds_plc |>
+    dplyr::select("DocID", "PartyKey", "GeoLevel", "GeoState", "GeoCountryIso", "GeoCountry", "InLawClause") |>
+    arrow::to_duckdb(con = con_, auto_disconnect = FALSE)
+
+  # ONE ROLE PER PARTY, the earliest in .exp_place_roles. A role the vocabulary does not know ranks
+  # after every one it does and is released as "other" rather than dropped; every step is a group-by
+  # or a join, so it runs in DuckDB without a window function.
+  rank_ <- tibble::tibble(PartyRole = .exp_place_roles, RoleRank = seq_along(.exp_place_roles))
+  role_ <- ds_org |>
+    dplyr::select("DocID", "PartyKey", "PartyRole") |>
+    dplyr::filter(!is.na(.data$PartyKey)) |>
+    arrow::to_duckdb(con = con_, auto_disconnect = FALSE) |>
+    dplyr::distinct(.data$DocID, .data$PartyKey, .data$PartyRole) |>
+    dplyr::left_join(rank_, by = dplyr::join_by(PartyRole), copy = TRUE) |>
+    dplyr::mutate(RoleRank = dplyr::coalesce(.data$RoleRank, 99L)) |>
+    dplyr::group_by(.data$DocID, .data$PartyKey) |>
+    dplyr::summarise(RoleRank = min(.data$RoleRank, na.rm = TRUE), .groups = "drop") |>
+    dplyr::left_join(rank_, by = dplyr::join_by(RoleRank), copy = TRUE) |>
+    dplyr::mutate(PartyRole = dplyr::coalesce(.data$PartyRole, "other")) |>
+    dplyr::select("DocID", "PartyKey", "PartyRole")
+
+  # THE LEFT JOIN KEEPS THE UNATTACHED PLACE, which arrives with a null role and becomes "none".
+  long_ <- src_plc |>
+    dplyr::left_join(role_, by = dplyr::join_by(DocID, PartyKey)) |>
+    dplyr::mutate(PartyRole = dplyr::coalesce(.data$PartyRole, "none")) |>
+    dplyr::group_by(
+      .data$DocID, .data$GeoLevel, .data$GeoState, .data$GeoCountryIso, .data$GeoCountry, .data$PartyRole,
+      .data$InLawClause
+    ) |>
+    dplyr::summarise(nMentions = dplyr::n(), .groups = "drop") |>
+    dplyr::collect()
+
+  out_ <- long_ |>
+    dplyr::inner_join(spine_, by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(
+      GeoCountry  = dplyr::if_else(
+        is.na(.data$GeoCountry) & !is.na(.data$GeoCountryIso) & .data$GeoCountryIso == "USA",
+        "United States", .data$GeoCountry
+      ),
+      InLawClause = as.integer(dplyr::coalesce(.data$InLawClause, FALSE)),
+      nMentions   = as.integer(.data$nMentions)
+    ) |>
+    dplyr::select(dplyr::all_of(.exp_dictionary_places$Column)) |>
+    dplyr::arrange(.data$DocID, .data$PartyRole, .data$GeoCountryIso, .data$GeoState, .data$GeoLevel)
+
+  exp_write_long(.tab = out_, .path_out = .path_out, .dict = .exp_dictionary_places, .dta = FALSE)
+
+  n_law_ <- sum(out_$InLawClause == 1L)
+  cli::cli_alert_success(
+    "Places: {format(nrow(out_), big.mark = ',')} place rows on \\
+     {format(dplyr::n_distinct(out_$DocID), big.mark = ',')} contracts; \\
+     {format(n_law_, big.mark = ',')} of them inside a law clause; \\
+     {format(nrow(long_) - nrow(out_), big.mark = ',')} {cli::qty(nrow(long_) - nrow(out_))}row{?s} on contracts \\
+     outside the release dropped."
+  )
+  invisible(out_)
+}
+
+#' TermDocs: 05A's term hits per contract and family, cut to the release
+#'
+#' NOTHING IS RECOMPUTED. 05A holds the hits per term and folds them into families in
+#' txt_doc_table(); this file takes that table for the Exhibit 10 source, keeps the contracts in the
+#' release, and adds HashDocument. The names are 05A's, so its documentation applies unchanged.
+#'
+#' EVERY SCANNED CONTRACT HAS FIVE ROWS, one per family, with zeros where nothing hit. That is what
+#' makes a prevalence over this file a prevalence: the denominator is the contracts 05A read, not the
+#' ones that happened to hit.
+#'
+#' @param .path_in 05A's term_docs.parquet.
+#' @param .path_sample The sample cache; supplies HashDocument and the cut.
+#' @param .path_out Destination parquet; the codebook is written beside it.
+#' @param .rerun Logical.
+#' @return Invisibly the written table.
+export_term_docs <- function(.path_in, .path_sample, .path_out, .rerun = FALSE) {
+  if (FALSE) {
+    .path_in     <- .lP$Input$FilTermDocs
+    .path_sample <- .lP$Cache$CacheSample
+    .path_out    <- .lP$Output$FilTermDocs
+    .rerun       <- FALSE
+  }
+
+  if (exp_cache_hit(.task = "TermDocs", .path_out = .path_out, .paths_in = c(.path_in, .path_sample),
+                    .rerun = .rerun)) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "TermDocs: {.path {as.character(fs::path_file(.path_out))}} already written \\
+       ({format(nrow(out_), big.mark = ',')} rows, {ncol(out_)} columns). Pass .rerun = TRUE to rebuild."
+    )
+    return(invisible(out_))
+  }
+
+  spine_ <- arrow::read_parquet(file = .path_sample) |>
+    dplyr::filter(as.logical(.data$PrimaryFiler)) |>
+    dplyr::select("DocID", "HashDocument")
+
+  cols_ <- c("DocID", "Source", "Family", "nHits", "nTerms", "HasTerm", "FirstPos", "PerKWords")
+  ds_ <- arrow::open_dataset(sources = .path_in)
+  miss_ <- setdiff(cols_, names(ds_))
+  if (length(miss_) > 0L) {
+    cli::cli_abort("05A's term_docs is missing {.val {miss_}}; the export reads exactly {.val {cols_}}.")
+  }
+
+  raw_ <- ds_ |>
+    dplyr::filter(.data$Source == "Exhibit10") |>
+    dplyr::select(dplyr::all_of(cols_)) |>
+    dplyr::collect() |>
+    dplyr::mutate(Family = as.character(.data$Family))
+
+  out_ <- raw_ |>
+    dplyr::inner_join(spine_, by = dplyr::join_by(DocID)) |>
+    dplyr::mutate(
+      dplyr::across(c("nHits", "nTerms", "HasTerm"), as.integer),
+      dplyr::across(c("FirstPos", "PerKWords"), as.numeric)
+    ) |>
+    dplyr::select(dplyr::all_of(.exp_dictionary_termdocs$Column)) |>
+    dplyr::arrange(.data$DocID, .data$Family)
+
+  if (anyDuplicated(out_[, c("DocID", "Family")]) > 0L) {
+    cli::cli_abort("TermDocs is not one row per contract and family.")
+  }
+
+  exp_write_long(.tab = out_, .path_out = .path_out, .dict = .exp_dictionary_termdocs, .dta = FALSE)
+
+  n_drop_ <- dplyr::n_distinct(raw_$DocID) - dplyr::n_distinct(out_$DocID)
+  cli::cli_alert_success(
+    "TermDocs: {format(dplyr::n_distinct(out_$DocID), big.mark = ',')} contracts, \\
+     {dplyr::n_distinct(out_$Family)} families, {format(nrow(out_), big.mark = ',')} rows; \\
+     {format(n_drop_, big.mark = ',')} scanned {cli::qty(n_drop_)}contract{?s} outside the release dropped."
+  )
+  invisible(out_)
+}
+
+#' CtoOrders: every order reference 01E parsed, linked or not
+#'
+#' THE ORDER SIDE OF THE REDACTION STORY. Contracts says whether a contract is covered; this file
+#' says what the SEC issued: how many orders, how many exhibits each named, how many of those
+#' resolved to a contract in the release and where the chain broke for the rest. export_cto() keeps
+#' the grants and collapses to the contract; this keeps everything and collapses nothing, so the
+#' denials and the unlinked references are countable.
+#'
+#' 01E's COLUMNS, RENAMED WHERE TWO FILES WOULD OTHERWISE DISAGREE. DocID means the contract in every
+#' release, so the order's own document is OrderDocID and its filing date OrderDate; the reference's
+#' DocIDContract becomes DocID, which is the join key 30 uses everywhere. SourceForm and SourceFiledOn
+#' are 01E's UseForm and UseFiledOn: the filing the reference itself named, falling back to the
+#' opening paragraph's.
+#'
+#' @param .path_in 01E's CtoExhibits.parquet, one row per reference.
+#' @param .path_out Destination parquet; the dta and codebook are written beside it.
+#' @param .rerun Logical.
+#' @param .dta Logical. Also write CtoOrders.dta.
+#' @return Invisibly the written table.
+export_cto_orders <- function(.path_in, .path_out, .rerun = FALSE, .dta = TRUE) {
+  if (FALSE) {
+    .path_in  <- .lP$Input$FilCtoExhibits
+    .path_out <- .lP$Output$FilCtoOrders
+    .rerun    <- FALSE
+    .dta      <- TRUE
+  }
+
+  if (exp_cache_hit(.task = "CtoOrders", .path_out = .path_out, .paths_in = .path_in, .rerun = .rerun)) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "CtoOrders: {.path {as.character(fs::path_file(.path_out))}} already written \\
+       ({format(nrow(out_), big.mark = ',')} rows, {ncol(out_)} columns). Pass .rerun = TRUE to rebuild."
+    )
+    return(invisible(out_))
+  }
+
+  take_ <- c(
+    OrderDocID = "DocID", OrderCIK = "CIK", OrderDate = "DateFiled", Status = "Status",
+    IsExtension = "IsExtension", ExhibitNo = "ExhibitNo", SourceForm = "UseForm",
+    SourceFiledOn = "UseFiledOn", ReleaseDate = "ReleaseDate", HashIndex = "HashIndex",
+    DocID = "DocIDContract", LinkStatus = "LinkStatus"
+  )
+  ds_ <- arrow::open_dataset(sources = .path_in)
+  miss_ <- setdiff(unname(take_), names(ds_))
+  if (length(miss_) > 0L) {
+    cli::cli_abort("01E's CtoExhibits is missing {.val {miss_}}; the export reads exactly {.val {unname(take_)}}.")
+  }
+
+  out_ <- ds_ |>
+    dplyr::select(dplyr::all_of(unname(take_))) |>
+    dplyr::collect() |>
+    dplyr::rename(dplyr::all_of(take_)) |>
+    dplyr::mutate(
+      IsExtension = as.integer(.data$IsExtension),
+      OrderDate   = as.Date(.data$OrderDate),
+      ReleaseDate = as.Date(.data$ReleaseDate)
+    ) |>
+    dplyr::select(dplyr::all_of(.exp_dictionary_cto_orders$Column)) |>
+    dplyr::arrange(.data$OrderDate, .data$OrderDocID, .data$ExhibitNo)
+
+  exp_write_long(.tab = out_, .path_out = .path_out, .dict = .exp_dictionary_cto_orders, .dta = .dta)
+
+  n_ref_ <- sum(!is.na(out_$ExhibitNo))
+  cli::cli_alert_success(
+    "CtoOrders: {format(dplyr::n_distinct(out_$OrderDocID), big.mark = ',')} orders, \\
+     {format(n_ref_, big.mark = ',')} references, {format(sum(!is.na(out_$DocID)), big.mark = ',')} linked \\
+     to a contract; {format(sum(out_$Status != 'GRANTING', na.rm = TRUE), big.mark = ',')} rows from orders \\
+     that did not grant."
+  )
+  invisible(out_)
+}
+
+#' Write a long release: parquet, codebook, and a dta where asked
+#'
+#' THE DICTIONARY IS THE GATE. A column in the table and not in the dictionary is undocumented, one
+#' in the dictionary and not in the table describes nothing; either aborts, so the codebook written
+#' beside the file can never describe a different one.
+#'
+#' @param .tab The table to write.
+#' @param .path_out Destination parquet.
+#' @param .dict Tibble: Column, Meaning, Missing.
+#' @param .dta Logical. Also write the dta.
+#' @return Invisibly NULL.
+exp_write_long <- function(.tab, .path_out, .dict, .dta = FALSE) {
+  if (FALSE) {
+    .tab      <- out_
+    .path_out <- .lP$Output$FilPlaces
+    .dict     <- .exp_dictionary_places
+    .dta      <- FALSE
+  }
+
+  undoc_  <- setdiff(names(.tab), .dict$Column)
+  unseen_ <- setdiff(.dict$Column, names(.tab))
+  if (length(undoc_) > 0L || length(unseen_) > 0L) {
+    cli::cli_abort(c(
+      "{.file {fs::path_file(.path_out)}} and its dictionary disagree.",
+      "x" = "In the file, not the dictionary: {.val {undoc_}}.",
+      "x" = "In the dictionary, not the file: {.val {unseen_}}."
+    ))
+  }
+
+  fs::dir_create(fs::path_dir(.path_out))
+  arrow::write_parquet(.tab, .path_out)
+  sta_ <- exp_stata_ready(.tab = .tab)
+  if (.dta) haven::write_dta(sta_$Tab, fs::path_ext_set(.path_out, "dta"))
+  tibble::tibble(Column = names(.tab), StataName = sta_$Names$Stata) |>
+    dplyr::left_join(.dict, by = dplyr::join_by(Column)) |>
+    readr::write_csv(fs::path_ext_set(paste0(fs::path_ext_remove(.path_out), "_Codebook"), "csv"))
+  invisible(NULL)
 }
 
 

@@ -90,6 +90,10 @@ analysis reads.
 | Money | `EntityMONEY` | `money_spans` | how many amounts, and how large |
 | Redactions | `EntityREDACT` | `redact_spans` | markers by kind |
 | Contracts | `Contracts` | the eight above | the join, as parquet and Stata |
+| Summaries | `Summaries` | 01D `Item101` | every Item 1.01 announcement, attached or not |
+| Places | `Places` | `places_geo`, `org_mentions` | every place a contract names, by role |
+| TermDocs | `TermDocs` | 05A `term_docs` | term hits per contract and family |
+| CtoOrders | `CtoOrders` | 01E `CtoExhibits` | every order reference, linked or not |
 
 **One function per cache, and each takes paths.** Nothing is built in a chunk and passed to a
 function: each export opens its own input, names the columns it reads at the call site, does its own
@@ -126,8 +130,10 @@ pipe-separated, aligned with the `LawKind` that named each. The cue regexes are 
 from a governing-law clause -- and it is always earlier in the document. Any first-wins rule would
 substitute the incorporation state systematically. `LawKind` is what lets a reader tell them apart.
 
-**Party and place names are not exported.** Only counts. A contract can name several registrants and
-several counterparties, so a single name column would need a pick rule of the same kind.
+**Party and place names are not exported into `Contracts`.** Only counts. A contract can name several
+registrants and several counterparties, so a single name column would need a pick rule of the same
+kind. The places themselves are released as their own long file, `Places`, where a contract naming
+five states has five rows and no rule has to pick one.
 
 ## Grain, and where the fan-out happens
 
@@ -168,6 +174,8 @@ established holds through to the released file.
     # THE SUMMARY MEASURES ride 01D's text table; only the numbers are taken, never the narrative.
     FilItem101        = "2_output/01D-GetItems/Output/Item101.parquet",
     FilCtoExhibits    = "2_output/01E-CtoExhibits/Output/CtoExhibits.parquet",
+    # THE TERM HITS, one row per document, source and family, as 05A folded them.
+    FilTermDocs       = "2_output/05A-TextSearches/Output/term_docs.parquet",
     # THE POLICY HASH IS IN THE PATH. 04D names each directory for a hash folding in its rules and
     # the extractor's own spec hashes, so pinning it here is what says which release this reads --
     # and a rehearsal directory sitting beside the full one cannot be picked up by accident.
@@ -197,6 +205,11 @@ established holds through to the released file.
     FilContracts = utils_file_path(.dir_main, "Output", "Contracts.parquet"),
     # THE SECOND RELEASE: every Item 1.01 announcement as a row, attached or not. Tables 3 and 5.
     FilSummaries = utils_file_path(.dir_main, "Output", "Summaries.parquet"),
+    # THE LONG RELEASES: the rows behind the counts, for 30-Descriptives. Parquet only, except the
+    # orders, which are small enough for a dta.
+    FilPlaces    = utils_file_path(.dir_main, "Output", "Places.parquet"),
+    FilTermDocs  = utils_file_path(.dir_main, "Output", "TermDocs.parquet"),
+    FilCtoOrders = utils_file_path(.dir_main, "Output", "CtoOrders.parquet"),
     # WHERE ANN-KRISTIN READS. The previous release is archived under a timestamp before being
     # overwritten; nothing happens if the files there already match.
     DirDropbox   = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline/100_Data_Export"
@@ -452,6 +465,14 @@ number below the published 2.56 states and 1.81 countries, which count them in.
 
 This task reads `org_mentions` as well, because a role is a property of the party and `places_geo`
 carries only the key. That is 04D's own dependency: its GPE pass folds ORG's hash into its own.
+
+**A null is not a state.** A country-level mention carries no `GeoState`, an unresolved city carries
+neither state nor country, and until 9 September the counts came out one too high on every contract
+with such a row -- the `Places` release, which lists the rows, was what caught it: 144,952 registrant
+counts out of 682,024 stood one above the rows behind them. The rows with nothing to count are now
+removed before the distinct count runs, so the result no longer depends on what `COUNT(DISTINCT)`
+does with a null on the way from arrow through DuckDB. The population is kept separately, so a
+contract whose only places carry no state still has its row, with a zero.
 
 ```{r}
 #| label: export-gpe
@@ -747,9 +768,113 @@ cli::cli_alert_success(
 )
 ```
 
+## The long releases
+
+`Contracts` is one row per contract and carries counts; `30-Descriptives` wants the rows behind three
+of them. `Places` is every place a contract names -- one row per contract, place, party role and
+law-clause flag, with the mention count -- so the maps can be drawn from the release rather than from
+04D's store. `TermDocs` is 05A's `term_docs` for the Exhibit 10 source, cut to the release, so the
+pandemic panel has its denominator. `CtoOrders` is 01E's reference table as it stands, every order
+whatever its outcome and every reference whether or not it resolved, so the order side of section 3.5
+can be counted where `export_cto()` keeps only the grants that reached a contract.
+
+None of the three joins into `Contracts`. Each carries `DocID` for the join `30` makes and
+`HashDocument` for a reader who wants every registrant copy, and each checks itself against its own
+dictionary before it writes, so the codebook beside it can never describe a different file.
+
+```{r}
+#| label: export-places
+
+tab_Places <- export_places(
+  .dir_in      = .lP$Input$DirEntityGPE,    # places_geo, law-clause places kept and flagged
+  .dir_org     = .lP$Input$DirEntityORG,    # org_mentions, one role per party
+  .path_sample = .lP$Cache$CacheSample,     # HashDocument, and the cut to the release
+  .path_out    = .lP$Output$FilPlaces,
+  .rerun       = FALSE
+)
+```
+
+```{r}
+#| label: export-term-docs
+
+tab_TermDocs <- export_term_docs(
+  .path_in     = .lP$Input$FilTermDocs,     # 05A, one row per document, source and family
+  .path_sample = .lP$Cache$CacheSample,
+  .path_out    = .lP$Output$FilTermDocs,
+  .rerun       = FALSE
+)
+```
+
+```{r}
+#| label: export-cto-orders
+
+tab_CtoOrders <- export_cto_orders(
+  .path_in  = .lP$Input$FilCtoExhibits,     # 01E, one row per order reference, nothing filtered
+  .path_out = .lP$Output$FilCtoOrders,
+  .rerun    = FALSE,
+  .dta      = TRUE
+)
+```
+
+```{r}
+#| label: report-long
+
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_Places, .col = "PartyRole"),
+  .title = "Places: which party each place row belongs to"
+)
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_Places, .col = "GeoLevel"),
+  .title = "Places: what the names resolved to"
+)
+exp_report_numeric(
+  .tab   = exp_table_numeric(.tab = tab_TermDocs),
+  .title = "TermDocs, column by column",
+  .notes = c(NonMiss = "Five rows per scanned contract, one per family; FirstPos is missing exactly
+                        where the family did not hit.")
+)
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_CtoOrders, .col = "LinkStatus"),
+  .title = "CtoOrders: where each reference's chain ended"
+)
+exp_report_levels(
+  .tab   = exp_table_levels(.tab = tab_CtoOrders, .col = "Status"),
+  .title = "CtoOrders: what the orders did"
+)
+```
+
+Three identities, stated before they are read. Every `DocID` in `Places` and `TermDocs` is a primary
+copy in `Contracts`. The contracts `export_cto()` marks as covered are exactly the `A-linked` rows of
+`CtoOrders` whose order granted. And `Places` restricted to attached, non-law rows reproduces
+`nUniStateRegistrant` on every contract it reaches.
+
+```{r}
+#| label: check-long
+
+prim_ <- tab_Contracts$DocID[as.logical(tab_Contracts$PrimaryFiler)]
+stopifnot(all(tab_Places$DocID %in% prim_), all(tab_TermDocs$DocID %in% prim_))
+
+cov_ <- tab_CtoOrders |>
+  dplyr::filter(.data$LinkStatus == "A-linked", .data$Status %in% "GRANTING") |>
+  dplyr::distinct(.data$DocID)
+stopifnot(setequal(cov_$DocID, tab_Cto$DocID))
+
+reg_ <- tab_Places |>
+  dplyr::filter(.data$PartyRole == "registrant", .data$InLawClause == 0L, !is.na(.data$GeoState)) |>
+  dplyr::summarise(nStates = dplyr::n_distinct(.data$GeoState), .by = "DocID") |>
+  dplyr::inner_join(dplyr::select(tab_EntityGPE, "DocID", "nUniStateRegistrant"), by = dplyr::join_by(DocID))
+stopifnot(all(reg_$nStates == reg_$nUniStateRegistrant))
+
+cli::cli_alert_success(
+  "{format(nrow(tab_Places), big.mark = ',')} place rows, {format(nrow(tab_TermDocs), big.mark = ',')} term \\
+   rows and {format(nrow(tab_CtoOrders), big.mark = ',')} order references agree with the joined file"
+)
+```
+
 ## To Dropbox
 
-The two files, their two codebooks, and the parquets go to the folder Ann-Kristin reads from.
+The two files, their two codebooks, the three long releases and the parquets go to the folder
+Ann-Kristin reads from.
 Whatever release is there now is zipped into `_archive/` under today's date and time before it is
 overwritten, so any table she has run can be traced to the exact file it ran on. If the release
 there already matches this one, nothing is archived and nothing is copied.
@@ -761,7 +886,10 @@ export_deploy(
   .dir_out     = fs::path_dir(.lP$Output$FilContracts),   # this document's Output
   .dir_dropbox = .lP$Output$DirDropbox,                    # her folder
   .files       = c("Contracts.parquet", "Contracts.dta", "Contracts_Codebook.csv",
-                   "Summaries.parquet", "Summaries.dta", "Summaries_Codebook.csv")
+                   "Summaries.parquet", "Summaries.dta", "Summaries_Codebook.csv",
+                   "Places.parquet", "Places_Codebook.csv",
+                   "TermDocs.parquet", "TermDocs_Codebook.csv",
+                   "CtoOrders.parquet", "CtoOrders.dta", "CtoOrders_Codebook.csv")
 )
 ```
 
@@ -934,6 +1062,10 @@ exp_report_dictionary(.tab = tab_Dictionary, .block = "Redactions")
 
 # Next
 
+The release folder now holds five files. `Contracts` and `Summaries` are what the Stata analysis
+reads; `Places`, `TermDocs` and `CtoOrders` are what `30-Descriptives` reads for the maps, the pandemic
+panel and the order counts, and each has its codebook beside it.
+
 `Contracts_Codebook.csv` now carries both halves: `Source`, `Type` and `StataName` derived from the
 file, `Block`, `Meaning` and `Missing` declared above. It is written whenever the join is, so the
 archive never holds a codebook describing a different file.
@@ -943,6 +1075,7 @@ Two items are known and outstanding, and both are upstream of this document. `Mo
 which re-runs the MONEY pass alone. And the entity variables have not been checked against a
 document-level gold set.
 
-Two smaller things this document surfaced and does not fix: `nUniCountryNaive` reaches 224, more
-countries than exist; and the released date columns other than `DurationYears` are uncapped, so a
-start in 1415 and an end in 9999 are spans the extractor really found rather than failures here.
+Two smaller things this document surfaced and does not fix: `nUniCountryNaive` reached 224 before
+the null fix above, more countries than exist, and wants reading again after it; and the released
+date columns other than `DurationYears` are uncapped, so a start in 1415 and an end in 9999 are
+spans the extractor really found rather than failures here.
