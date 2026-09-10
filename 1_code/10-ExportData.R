@@ -1855,6 +1855,47 @@ export_REDACT <- function(.dir_in, .path_out, .rerun = FALSE) {
 
 # 9. The joined file --------------------------------------------------------------------------------------------------------
 
+#' Fold the copies without a classification into the malformatted rung
+#'
+#' A copy with no class is a placeholder exhibit -- "EXHIBIT 10.1 PDF REFERENCE", an image, a cover
+#' line -- with zero words; nothing downstream ever saw its text. 02B's malformed test is about the
+#' format of the flattened file, not about whether any text survived, so these pass it and sit on
+#' every rung of the ladder. Here they take the malformed rung: step 2 with its label, out of the
+#' descriptive and estimation samples, Removed with a reason. Copies at step 1 (outside the window)
+#' are left where they are; they were never in a sample. Copies that already carry a reason keep it.
+#' Decided 10 Sep 2026; on the 9 Sep release this moves 740 copies, 735 of them primary, and the
+#' unique-contract sample goes from 1,136,095 to 1,135,360.
+#'
+#' @param .tab The assembled contract table, after the classification join.
+#' @return The table with the fold applied; the count is printed.
+exp_fold_unclassified <- function(.tab) {
+  if (FALSE) .tab <- out_
+  need_ <- c("Class", "SampleStepCode", "SampleStepDesc", "DescSample", "EstiSample", "Removed", "RemClass",
+             "PrimaryFiler")
+  miss_ <- setdiff(need_, names(.tab))
+  if (length(miss_) > 0L) cli::cli_abort("Cannot fold the unclassified copies: {miss_} missing.")
+
+  lab2_ <- unique(.tab$SampleStepDesc[.tab$SampleStepCode == 2L & !is.na(.tab$SampleStepDesc)])
+  if (length(lab2_) != 1L) cli::cli_abort("Ladder step 2 carries {length(lab2_)} labels; expected one.")
+
+  fold_ <- is.na(.tab$Class) & .tab$SampleStepCode >= 2L
+  out_ <- .tab |>
+    dplyr::mutate(
+      SampleStepCode = dplyr::if_else(fold_, 2L, .data$SampleStepCode),
+      SampleStepDesc = dplyr::if_else(fold_, lab2_, .data$SampleStepDesc),
+      DescSample     = dplyr::if_else(fold_, 0L, as.integer(.data$DescSample)),
+      EstiSample     = dplyr::if_else(fold_, 0L, as.integer(.data$EstiSample)),
+      Removed        = dplyr::if_else(fold_, TRUE, as.logical(.data$Removed)),
+      RemClass       = dplyr::if_else(fold_ & is.na(.data$RemClass), "No readable text", .data$RemClass)
+    )
+  cli::cli_alert_info(
+    "Unclassified copies folded into the malformatted rung: {format(sum(fold_), big.mark = ',')} \\
+     ({format(sum(fold_ & as.logical(.tab$PrimaryFiler)), big.mark = ',')} primary); \\
+     {sum(is.na(.tab$Class) & .tab$SampleStepCode < 2L)} outside the window left as they are."
+  )
+  out_
+}
+
 #' Everything, joined onto the sample
 #'
 #' THE ONE FILE THE ANALYSIS READS. The eight caches above are intermediate: each is cheap to rebuild
@@ -1912,7 +1953,10 @@ export_final <- function(.path_sample, .path_items, .path_summary, .path_cto, .p
     .dta          <- TRUE
   }
 
-  in_ <- c(.path_sample, .path_items, .path_summary, .path_cto, .path_class, unlist(.paths_entity))
+  # THIS FILE IS AN INPUT TOO. The assembly applies a rule of its own (exp_fold_unclassified()), so a
+  # change to the library must rebuild the release the way a moved cache does.
+  in_ <- c(.path_sample, .path_items, .path_summary, .path_cto, .path_class, unlist(.paths_entity),
+           init_create_script_fun(.dir_here = here::here(), .name_script = "10-ExportData"))
 
   if (exp_cache_hit(.task = "Contracts", .path_out = .path_out, .paths_in = in_,
                     .rerun = .rerun)) {
@@ -2008,6 +2052,13 @@ export_final <- function(.path_sample, .path_items, .path_summary, .path_cto, .p
     book_ <- dplyr::bind_rows(
       book_, tibble::tibble(Column = setdiff(names(cls_), "DocID"), Source = "Classification")
     )
+  }
+
+  # THE UNCLASSIFIED COPIES LEAVE THE SAMPLES HERE. They have no readable text; see
+  # exp_fold_unclassified(). After the classification join because "no class" is the test, before
+  # the entity map so the map is built on the corrected primaries.
+  if (!is.na(.path_class)) {
+    out_ <- exp_fold_unclassified(.tab = out_)
   }
 
   # THE MAP FROM ATTACHMENT TO COPY, built once from the spine so every entity cache fans out on the

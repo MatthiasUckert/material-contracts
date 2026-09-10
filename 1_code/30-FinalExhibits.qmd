@@ -1,5 +1,5 @@
 ---
-title: "Final Exhibits -- The Manuscript's Tables and Figures, from the Release (31)"
+title: "Final Exhibits -- The Manuscript's Tables and Figures, from the Release (30)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -41,19 +41,19 @@ purrr::walk(.x = .path_libs, .f = \(.p) source(file = .p, encoding = "UTF-8"))
 # THE UPSTREAM LIBRARIES, IN THIS ORDER. 03A owns the class vocabulary, the folds and the scoring
 # helpers; 03B, 03C and 03D are sourced for their path helpers and crown records, as 03E does, and
 # no engine is invoked; 03E owns the arm panel this document rebuilds for the classification tables;
-# 10 owns exp_cache_hit() and the column-by-column report; 30 owns every read function, every
-# vocabulary object and every exhibit tibble this document draws from. 30 registers the paper's class
-# order and the form families when sourced, which is why it comes after _Plots and before this
-# document's own library.
+# 10 owns exp_cache_hit() and the column-by-column report. The readers of the release, the
+# vocabulary the figures agree on and the reference numbers are this document's own (section 0 of
+# its library, carried over from the retired 30-Descriptives); its library registers the paper's
+# class order and the form families when sourced, which is why it comes after _Plots.
 .libs_up <- c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword", "03D-ClassifyLLM",
-              "03E-ClassifyOrchestrate", "10-ExportData", "30-Descriptives")
+              "03E-ClassifyOrchestrate", "10-ExportData")
 .path_libs <- c(
   .path_libs,
   purrr::map_chr(.libs_up, \(.s) init_create_script_fun(.dir_here = here::here(), .name_script = .s))
 )
 purrr::walk(.x = utils::tail(.path_libs, length(.libs_up)), .f = \(.p) source(file = .p, encoding = "UTF-8"))
 
-.name_script <- "31-FinalExhibits"
+.name_script <- "30-FinalExhibits"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script))
@@ -68,25 +68,25 @@ source(file = .path_fun, encoding = "UTF-8")
 
 This document produces the exhibits of the manuscript in the form the manuscript prints them: one
 view per table or figure, on the sample the paper names, with the decided styling, and with the
-figure note written from the same tibble that drew the figure. `30-Descriptives` is the lab -- every
-exhibit on every sample, reconciled against both manuscripts -- and stays so; this document is the
-paper's copy of it.
+figure note written from the same tibble that drew the figure. `30-Descriptives` was the lab --
+every exhibit on every sample, reconciled against both manuscripts -- and was retired on 10
+September 2026 once every decision it produced lived here; its readers, vocabulary and reference
+numbers are now this document's own.
 
 ## One source, and it is hers -- and this document stands alone
 
-Every input is the one `30` reads, read through `30`'s own functions: the release `10-ExportData`
-deploys to her `MatContractPipeline` folder and the outputs of her `101` and `103` do-files. Nothing
-that another document rendered is read: `30`'s library is sourced for its functions, its output
-directory is never opened, and her `.dta` files are converted under this document's own cache. What
-this buys is that a number here, a number in `30` and a number in one of her tables come from the
-same bytes, and a difference between them is a difference in definition rather than in data -- and
-that this document renders on a machine where `30` never ran.
+Every input is read through this document's own functions: the release `10-ExportData` deploys to
+her `MatContractPipeline` folder and the outputs of her `101` and `103` do-files. Nothing that
+another document rendered is read, and her `.dta` files are converted under this document's own
+cache. What this buys is that a number here and a number in one of her tables come from the same
+bytes, and a difference between them is a difference in definition rather than in data -- and that
+this document renders on a machine where nothing else ran.
 
 ## Prepared once per render, read lazily ever after
 
 Each input is read once, given its derived and membership columns, and written under
 `Output/Prepared` as one parquet per table, keyed on what it was built from: the release file or the
-`.dta` conversion, `30`'s library, and for the contract table the definitional switches. A prepared
+`.dta` conversion, this document's library, and for the contract table the definitional switches. A prepared
 table is rebuilt when any of those is newer than it and read as it stands otherwise, so it is never
 stale and a repeat render costs a few file checks. Every exhibit then opens the prepared files
 through Arrow and DuckDB and pulls the columns and rows it needs; nothing else sits in memory.
@@ -116,7 +116,7 @@ version holds the preparation and the checks only; the first exhibit follows the
   Params = list(
     # THE RELEASE THE PAPER IS WRITTEN ON. Every .parquet under Input should be at least this new.
     ReleaseMin = "2026-09-09",
-    # THE FOUR DEFINITIONAL SWITCHES, 30's defaults: 103's redaction rule with one marker enough, the
+    # THE FOUR DEFINITIONAL SWITCHES: 103's redaction rule with one marker enough, the
     # cascade duration that reproduces Table 3, the adjusted word count the text prints, and the
     # recital parties. Each is settled or overturned in the exhibit that depends on it.
     Redaction  = "symbolexplicit",
@@ -155,6 +155,10 @@ version holds the preparation and the checks only; the first exhibit follows the
   CacheConcentration = utils_file_path(.dir_main, "Cache", "Concentration.parquet")
 )
 
+# WHERE THE PAPER READS FROM. One folder on Dropbox; a deployment moves its current/ to _archive/
+# and fills a new one (see Deployment).
+.lP$Paper <- fs::path(.lP$Root, "200-Paper_figures")
+
 # THE PREPARED TABLES, and where the manuscript's copies go.
 .lP$Output <- list(
   DirPrepared = utils_file_path(.dir_main, "Output", "Prepared"),
@@ -188,7 +192,7 @@ tab_vintage <- fin_check_vintage(
 
 Three conversions under this document's own cache, each rebuilt when the `.dta`'s size changes --
 a Dropbox re-sync moves the modification time without changing a byte, and the size is what tells
-the two apart. The column maps are `30`'s, so the parquet here is the parquet `30` would write.
+the two apart.
 
 ```{r}
 #| label: input-convert
@@ -196,14 +200,14 @@ the two apart. The column maps are `30`'s, so the parquet here is the parquet `3
 fin_convert_dta(
   .path_dta   = .lP$Input$DtaQuarter,        # her quarter panel, 103's output
   .path_cache = .lP$Cache$CacheQuarter,
-  .cols       = .des_quarter_cols,           # 36 columns under this document's names
+  .cols       = .fin_quarter_cols,           # 36 columns under this document's names
   .rerun      = FALSE                        # TRUE reconverts regardless
 )
 
 fin_convert_dta(
   .path_dta   = .lP$Input$DtaAkContract,     # her contract-level flags
   .path_cache = .lP$Cache$CacheAkContract,
-  .cols       = .des_ak_contract_cols,
+  .cols       = .fin_ak_contract_cols,
   .rerun      = FALSE
 )
 
@@ -217,12 +221,13 @@ fin_convert_dta(
 
 # Prepare
 
-Seven tables, each read once through `30`'s reader and written under `Output/Prepared`. The contract
+Seven tables, each read once and written under `Output/Prepared`. The contract
 table carries the nine membership columns `fin_add_samples()` documents, one logical per sample, so
 an exhibit is drawn on a sample by filtering on the column of that name. Summaries is built after
 Contracts because the exhibit count on each 8-K comes from it. A prepared table is rebuilt when its
-release file, its `.dta` conversion, `30`'s library or -- for Contracts -- a definitional switch is
-newer than it, and read as it stands otherwise; `.rerun = TRUE` on any call forces the rebuild.
+release file, its `.dta` conversion, this document's library or -- for Contracts -- a definitional
+switch is newer than it, and read as it stands otherwise; `.rerun = TRUE` on any call forces the
+rebuild.
 
 ```{r}
 #| label: prepare-tables
@@ -243,13 +248,13 @@ fin_prepare_summaries(
 )
 
 fin_prepare_quarter(
-  .path_cache = .lP$Cache$CacheQuarter,     # 30's conversion of her quarter panel
+  .path_cache = .lP$Cache$CacheQuarter,     # the conversion of her quarter panel
   .dir        = .lP$Output$DirPrepared,
   .rerun      = FALSE
 )
 
 fin_prepare_concentration(
-  .path_cache = .lP$Cache$CacheConcentration,   # 30's conversion of 101's concentration.dta
+  .path_cache = .lP$Cache$CacheConcentration,   # the conversion of 101's concentration.dta
   .dir        = .lP$Output$DirPrepared,
   .rerun      = FALSE
 )
@@ -343,8 +348,9 @@ tab_samples <- fin_table_samples(
 
 Two checks, each stated before it is read. **The samples nest as the ladder says**: S00 holds S0 and
 S1, both hold S2, and S2 holds its subsets and the redaction window; a row outside its parent is a
-definition that drifted from `30`'s. **S2 is the paper's number**: 1,136,095, the revision's unique
-contracts, with no tolerance because there is no rounding.
+definition that drifted. **S2 is the paper's number**: 1,135,360 unique contracts on the 10 September
+release (the revision printed 1,136,095 before the copies without readable text were folded into
+the malformatted rung), with no tolerance because there is no rounding.
 
 ```{r}
 #| label: validation-samples
@@ -352,7 +358,7 @@ contracts, with no tolerance because there is no rounding.
 tab_counts <- fin_check_samples(
   .ds      = lst_ds$Contracts,
   .samples = .fin_contract_samples,
-  .ref     = .des_reference                 # the revision's Table 2 Panel A
+  .ref     = .fin_reference                 # the revision's Table 2 Panel A
 )
 ```
 
@@ -404,6 +410,39 @@ tab_sample <- fin_table_sample(
 )
 ```
 
+## What each requirement costs
+
+Two diagnostics under the sample table (decided 10 September). The attrition table is a marginal
+ladder: with the estimation sample's requirements as the reference -- fiscal quarter, industry,
+state, a state in which filing varies, and each control -- how many rows each removes on its own,
+at the contract grain and at the firm-quarter grain; a sequential ladder would depend on the order
+the requirements are listed in. The fluidity table asks who the firm-quarters without fluidity
+are, because Ann-Kristin's check found the gaps clustered in loss firms.
+
+```{r}
+#| label: tbl-attrition
+#| results: asis
+
+tab_attrition <- fin_table_attrition(
+  .ds_contracts = lst_ds$Contracts,
+  .ds_quarter   = lst_ds$Quarter,
+  .controls     = .fin_controls$Resubmission, # the same set the sample table uses
+  .dirs         = .lP$Output,
+  .name         = "SampleAttrition"
+)
+```
+
+```{r}
+#| label: tbl-fluidity
+#| results: asis
+
+tab_fluidity <- fin_table_fluidity(
+  .ds_quarter = lst_ds$Quarter,
+  .dirs       = .lP$Output,
+  .name       = "FluidityMissing"
+)
+```
+
 ## Content characteristics by category
 
 Words, duration, parties, countries and states by category on the unique-contract sample, in the Categories
@@ -429,7 +468,7 @@ tab_content_rule <- fin_table_content(
   .dirs         = .lP$Output,
   .name         = NULL,               # ContentRule
   .digits       = c(Mean = 0L, SD = 2L),
-  .ref          = .des_reference      # the revision's unique-contract count
+  .ref          = .fin_reference      # the revision's unique-contract count
 )
 ```
 
@@ -447,7 +486,7 @@ tab_content_naive <- fin_table_content(
   .dirs         = .lP$Output,
   .name         = NULL,               # ContentNaive
   .digits       = c(Mean = 0L, SD = 2L),
-  .ref          = .des_reference
+  .ref          = .fin_reference
 )
 ```
 
@@ -477,7 +516,7 @@ For the two of us, not the manuscript: where the party count comes from. The nai
 the parties after grouping by the role the rules assigned, their sum, and the two shares that say
 how often the extractor found nothing and how often it found the registrant. The recital parties of
 the content tables are the first three role columns; signatory-block and other parties are what the
-rule-based count leaves out. The two extra role columns are not in `30`'s column list and are read
+rule-based count leaves out. The two extra role columns are not in the reader's column list and are read
 from the release by `DocID`.
 
 ```{r}
@@ -515,7 +554,7 @@ For the two of us. How often the extractor found a monetary amount and how many,
 the zero and par-value filter, in USD and in other currencies; and the largest and the median USD
 amount as medians across contracts. Medians, because the release documents a defect in the amounts
 themselves -- flattened HTML tables glued adjacent cells into one figure on roughly 1,500 contracts --
-and a mean of maxima measures that defect. The money columns are not in `30`'s column list and are
+and a mean of maxima measures that defect. The money columns are not in the reader's column list and are
 read from the release by `DocID`.
 
 ```{r}
@@ -532,10 +571,13 @@ tab_money <- fin_table_money(
 
 ### Redactions by category
 
-For the two of us, on the redaction window from 2008. Extensive margin: the share of contracts with
-at least one marker, by kind, and the share under a granted order on the 2008-2018 part. Intensive
-margin, among marked contracts: how many markers, how many carry five or more -- the threshold the
-notes record and `103` does not apply -- and how many prices were withheld.
+On the redaction window from 2008, two identifications side by side. The text: the share of
+contracts whose text carries at least one redaction marker (the manuscript's measure), and, among
+those contracts, how many markers they carry and how many carry five or more -- the threshold the
+notes record and `103` does not apply. The SEC: the share of the 2008-2018 contracts under a
+granted order. A contract can be in either, both or neither, which is why the two are columns and
+not one. The other marker kinds and the price-withholding count stay in the data file (decided 10
+September).
 
 ```{r}
 #| label: tbl-redactions
@@ -618,6 +660,24 @@ tab_summaries <- fin_table_summaries(
 )
 ```
 
+### Delayed against attached, the text measures only
+
+The same table without the announcement lag and the four-business-day indicator (decided 10
+September); the nine-row version above stays.
+
+```{r}
+#| label: tbl-summaries-text
+#| results: asis
+
+tab_summaries_text <- fin_table_summaries(
+  .ds_summaries = lst_ds$Summaries,
+  .sample       = "S7_Summaries",
+  .measures     = c("Words", "Fog", "Uncertainty", "Numbers", "Dollars", "Percents", "Boilerplate"),
+  .dirs         = .lP$Output,
+  .name         = "SummariesText"
+)
+```
+
 ### The delay indicator in a regression
 
 Nine outcomes across, three specifications down: year effects; year and firm effects, which asks
@@ -639,6 +699,24 @@ tab_summaries_regression <- fin_table_summaries_regression(
   .controls     = .fin_controls$Resubmission,
   .dirs         = .lP$Output,
   .name         = "SummariesRegression"
+)
+```
+
+### The delay indicator in a regression, the text measures only
+
+```{r}
+#| label: tbl-summaries-text-regression
+#| results: asis
+
+tab_summaries_text_regression <- fin_table_summaries_regression(
+  .ds_summaries = lst_ds$Summaries,
+  .ds_quarter   = lst_ds$Quarter,
+  .con          = con,
+  .sample       = "S7_Summaries",
+  .measures     = c("Words", "Fog", "Uncertainty", "Numbers", "Dollars", "Percents", "Boilerplate"),
+  .controls     = .fin_controls$Resubmission,
+  .dirs         = .lP$Output,
+  .name         = "SummariesTextRegression"
 )
 ```
 
@@ -753,9 +831,8 @@ tab_class_confusion <- fin_table_class_confusion(
 
 Each manuscript figure is one call, with the tables' contract: the tibble behind it to
 `Output/Data`, the figure as pdf and png to `Output/Figures`, the note to `Output/Notes`, all under
-the figure's name, and the figure printed here. Where `30` computes and draws the exhibit in its
-decided form its functions are reused, so a figure here and its tabbed twin in `30` come from one
-code path; the runbook only picks the sample and writes the note.
+the figure's name, and the figure printed here. The data functions behind the figures are the
+retired lab's, carried into this library; the runbook only picks the sample and writes the note.
 
 ## Filing types
 
@@ -765,6 +842,7 @@ September for the online appendix.
 
 ```{r}
 #| label: fig-filing-types
+#| results: asis
 #| fig-cap: "Distribution of filing types on the unique-contract sample."
 #| fig-height: !expr plot_height(8L)
 
@@ -772,21 +850,23 @@ fig_filing_types <- fin_figure_filing_types(
   .ds_contracts = lst_ds$Contracts,
   .dirs         = .lP$Output,
   .name         = "FilingTypes",
-  .ref          = .des_reference_f01       # the revision's share labels, checked on the render
+  .ref          = .fin_reference_f01       # the revision's share labels, checked on the render
 )
 ```
 
 ## Filings over time
 
-Each year's contracts by filing group, shares stacked, the year's total above. Four groups: the
+Each year's contracts by filing group, shares stacked, the year's total as a line on the right axis.
+Four groups: the
 registration statements stand on their own, because the 2021 spike is theirs and the three-group
 version hides it inside ad-hoc. Unique contracts. Decided on 9 September for the manuscript; the
-four-group form is the recommendation, the three-group form is one call to `des_plot_f02()`.
+four-group form is the recommendation, the three-group form is one call to `fin_plot_f02()`.
 
 ```{r}
 #| label: fig-filings-time
+#| results: asis
 #| fig-cap: "Distribution of filings over time on the unique-contract sample, four groups."
-#| fig-height: !expr plot_height(12L)
+#| fig-height: !expr plot_height(8L)
 
 fig_filings_time <- fin_figure_filings_time(
   .ds_contracts = lst_ds$Contracts,
@@ -803,6 +883,7 @@ it does not.
 
 ```{r}
 #| label: fig-filings-seasoned
+#| results: asis
 #| fig-cap: "Contracts per year and the registration share, all filers against seasoned filers."
 #| fig-height: !expr plot_height(12L)
 
@@ -811,6 +892,501 @@ fig_seasoned <- fin_figure_seasoned(
   .dirs         = .lP$Output,
   .name         = "FilingsSeasoned"
 )
+```
+
+## Contract types
+
+Each category's count with its share, and contracts per firm-year of that category; categories in
+the Categories table's order, sub-categories under their super-category strip, no numbers. Unique
+contracts. Decided on 9 September: the new version, super-categories visible.
+
+```{r}
+#| label: fig-contract-types
+#| results: asis
+#| fig-cap: "Contracts by category on the unique-contract sample: count and share (A), contracts per firm-year (B)."
+#| fig-height: !expr plot_height(12L)
+
+fig_contract_types <- fin_figure_contract_types(
+  .ds_contracts = lst_ds$Contracts,
+  .dirs         = .lP$Output,
+  .name         = "ContractTypes",
+  .ref          = .fin_reference_f03       # the revision's share labels, checked on the render
+)
+```
+
+## Contract types over time
+
+Four forms of one tibble, each under its own sub-header until one is chosen; decided on 9 September
+for the online appendix. The revision's twelve-colour stack (D) is drawn only as the reference. The
+amendment share, which the revision draws as a line over the stack, stays on the stacked forms and
+goes into the note of the others.
+
+### A. Stacked by super-category, amendment share as a line
+
+```{r}
+#| label: fig-types-time-a
+#| results: asis
+#| fig-cap: "Each year's contracts by super-category, shares stacked, with the amendment share."
+#| fig-height: !expr plot_height(8L)
+
+fig_types_time_a <- fin_figure_types_time(
+  .ds_contracts = lst_ds$Contracts,
+  .form         = "a",
+  .dirs         = .lP$Output,
+  .name         = NULL                     # TypesTimeA
+)
+```
+
+### B. One panel per category, twelve small multiples
+
+```{r}
+#| label: fig-types-time-b
+#| results: asis
+#| fig-cap: "Each category's share of the year's contracts, one panel per category."
+#| fig-height: !expr plot_height(18L)
+
+fig_types_time_b <- fin_figure_types_time(
+  .ds_contracts = lst_ds$Contracts,
+  .form         = "b",
+  .dirs         = .lP$Output,
+  .name         = NULL                     # TypesTimeB
+)
+```
+
+### C. One panel per super-category, sub-categories as lines
+
+```{r}
+#| label: fig-types-time-c
+#| results: asis
+#| fig-cap: "Each super-category's sub-categories over time, one panel per super-category."
+#| fig-height: !expr plot_height(12L)
+
+fig_types_time_c <- fin_figure_types_time(
+  .ds_contracts = lst_ds$Contracts,
+  .form         = "c",
+  .dirs         = .lP$Output,
+  .name         = NULL                     # TypesTimeC
+)
+```
+
+### D. The revision's form: twelve on one stack
+
+```{r}
+#| label: fig-types-time-d
+#| results: asis
+#| fig-cap: "Each year's contracts by category, shares stacked, with the amendment share (reference)."
+#| fig-height: !expr plot_height(12L)
+
+fig_types_time_d <- fin_figure_types_time(
+  .ds_contracts = lst_ds$Contracts,
+  .form         = "d",
+  .dirs         = .lP$Output,
+  .name         = NULL                     # TypesTimeD
+)
+```
+
+## Content characteristics over time
+
+Mean per year of duration, countries, parties and words. Decided on 9 September: the median goes
+(it is flat at 1 and 2 for countries and parties) and a band replaces it; the band is what is open.
+One function, four forms under their own sub-headers, all on the rule-based arm of the content table.
+
+### A. Mean with one standard deviation
+
+The 9 September decision as stated. The SD exceeds the mean on words and duration, so the lower edge
+is cut at zero and the band says "wide" more than it says anything about the trend.
+
+```{r}
+#| label: fig-content-time-sd
+#| results: asis
+#| fig-cap: "Mean per year of the content measures with a one-SD band, unique-contract sample."
+#| fig-height: !expr plot_height(12L)
+
+fig_content_time_sd <- fin_figure_content_time(
+  .ds_contracts = lst_ds$Contracts,
+  .con          = con,                      # Places, for the rule-based countries
+  .form         = "sd",
+  .measures     = c("Duration", "Countries", "Parties", "Words"),   # add "States" for a fifth panel
+  .dirs         = .lP$Output,
+  .name         = NULL                      # ContentTimeSD
+)
+```
+
+### B. Mean with the interquartile range
+
+```{r}
+#| label: fig-content-time-iqr
+#| results: asis
+#| fig-cap: "Mean per year of the content measures with the interquartile range, unique-contract sample."
+#| fig-height: !expr plot_height(12L)
+
+fig_content_time_iqr <- fin_figure_content_time(
+  .ds_contracts = lst_ds$Contracts,
+  .con          = con,
+  .form         = "iqr",
+  .measures     = c("Duration", "Countries", "Parties", "Words"),
+  .dirs         = .lP$Output,
+  .name         = NULL                      # ContentTimeIQR
+)
+```
+
+### C. Mean with its confidence interval
+
+The uncertainty of the mean rather than the spread of the contracts. With forty to sixty thousand
+contracts a year the band is thin, which is the message: the movements are not noise.
+
+```{r}
+#| label: fig-content-time-ci
+#| results: asis
+#| fig-cap: "Mean per year of the content measures with its 95 percent confidence interval, unique-contract sample."
+#| fig-height: !expr plot_height(12L)
+
+fig_content_time_ci <- fin_figure_content_time(
+  .ds_contracts = lst_ds$Contracts,
+  .con          = con,
+  .form         = "ci",
+  .measures     = c("Duration", "Countries", "Parties", "Words"),
+  .dirs         = .lP$Output,
+  .name         = NULL                      # ContentTimeCI
+)
+```
+
+### D. Index, one panel
+
+Every measure relative to its 2001 mean, so the four trends sit on one axis: the sentence the text
+makes -- words up, duration down -- as one picture.
+
+```{r}
+#| label: fig-content-time-index
+#| results: asis
+#| fig-cap: "The content measures' means per year relative to 2001 (= 100), unique-contract sample."
+#| fig-height: !expr plot_height(8L)
+
+fig_content_time_index <- fin_figure_content_time(
+  .ds_contracts = lst_ds$Contracts,
+  .con          = con,
+  .form         = "index",
+  .measures     = c("Duration", "Countries", "Parties", "Words"),
+  .dirs         = .lP$Output,
+  .name         = NULL                      # ContentTimeIndex
+)
+```
+
+## Redactions over time
+
+The two identifications as the revision draws them: orders through 2018, order-or-markers
+throughout. Unique contracts from 2008. The report prints the revision's readings beside the
+render; `.markers = TRUE` adds the marker-only line for an appendix version.
+
+```{r}
+#| label: fig-redactions-time
+#| results: asis
+#| fig-cap: "Share of contracts with redactions per year, two identifications, unique contracts from 2008."
+#| fig-height: !expr plot_height(5L)
+
+fig_redactions_time <- fin_figure_redactions_time(
+  .ds_contracts = lst_ds$Contracts,
+  .markers      = FALSE,                    # TRUE adds the marker-only series
+  .dirs         = .lP$Output,
+  .name         = "RedactionsTime",
+  .ref          = .fin_reference_f10       # the revision's readings, checked on the render
+)
+```
+
+## Maps
+
+Places attached to a party, on the unique-contract sample, the rule-based arm: where the
+counterparties are, and where the registrant's own footprint is. Two forms under their own
+sub-headers. The ranked map takes the full width, fills every area and numbers the ten largest in
+circles; their names, counts and shares are set into the map's empty corner (`.counts = "inset"`,
+decided 10 September) and written into the note as well; `"note"` leaves the map alone and
+`"table"` puts the list beside it. The flow
+map draws a curve from the registrant's place to the counterparty's, which is the contracting
+relation referee 1 asked about. Colombia and Iceland are suppressed on the country panels until
+the gazetteer is fixed (Open Issues).
+
+### A. States, counterparties
+
+```{r}
+#| label: fig-map-states-counterparty
+#| results: asis
+#| fig-cap: "Contracts by the U.S. state attached to a counterparty, unique-contract sample."
+#| fig-height: !expr plot_height(8L)
+#| fig-width: 8
+
+fig_map_states_cp <- fin_figure_map(
+  .con      = con,
+  .panel    = "State",
+  .roles    = "counterparty",               # contracting locations
+  .top      = 10L,
+  .counts   = "inset",                  # the ten set into the map's empty corner; the note has them too
+  .suppress = .fin_map_suppress,
+  .dirs     = .lP$Output,
+  .name     = "MapStatesCounterparty"
+)
+```
+
+### B. States, every recital party
+
+```{r}
+#| label: fig-map-states-recital
+#| results: asis
+#| fig-cap: "Contracts by the U.S. state attached to a recital party, unique-contract sample."
+#| fig-height: !expr plot_height(8L)
+#| fig-width: 8
+
+fig_map_states_all <- fin_figure_map(
+  .con      = con,
+  .panel    = "State",
+  .roles    = .fin_roles_recital,           # registrant, co-filers, counterparties
+  .top      = 10L,
+  .counts   = "inset",                  # the ten set into the map's empty corner; the note has them too
+  .suppress = .fin_map_suppress,
+  .dirs     = .lP$Output,
+  .name     = "MapStatesRecital"
+)
+```
+
+### C. Countries, counterparties
+
+```{r}
+#| label: fig-map-countries-counterparty
+#| results: asis
+#| fig-cap: "Contracts by the country attached to a counterparty, unique-contract sample."
+#| fig-height: !expr plot_height(8L)
+#| fig-width: 8
+
+fig_map_countries_cp <- fin_figure_map(
+  .con      = con,
+  .panel    = "Country",
+  .roles    = "counterparty",
+  .top      = 10L,
+  .counts   = "inset",                  # the ten set into the map's empty corner; the note has them too
+  .suppress = .fin_map_suppress,
+  .dirs     = .lP$Output,
+  .name     = "MapCountriesCounterparty"
+)
+```
+
+### D. Countries, every recital party
+
+```{r}
+#| label: fig-map-countries-recital
+#| results: asis
+#| fig-cap: "Contracts by the country attached to a recital party, unique-contract sample."
+#| fig-height: !expr plot_height(8L)
+#| fig-width: 8
+
+fig_map_countries_all <- fin_figure_map(
+  .con      = con,
+  .panel    = "Country",
+  .roles    = .fin_roles_recital,
+  .top      = 10L,
+  .counts   = "inset",                  # the ten set into the map's empty corner; the note has them too
+  .suppress = .fin_map_suppress,
+  .dirs     = .lP$Output,
+  .name     = "MapCountriesRecital"
+)
+```
+
+### E. Flows between states
+
+From the registrant's state to the counterparty's; contracts with both in one state are counted in
+the note and not drawn.
+
+```{r}
+#| label: fig-flows-states
+#| results: asis
+#| fig-cap: "The largest flows from the registrant's state to the counterparty's state, unique-contract sample."
+#| fig-height: !expr plot_height(8L)
+
+fig_flows_states <- fin_figure_flows(
+  .con      = con,
+  .panel    = "State",
+  .top      = 25L,
+  .suppress = .fin_map_suppress,
+  .dirs     = .lP$Output,
+  .name     = "FlowsStates"
+)
+```
+
+### F. Flows from the United States to the world
+
+```{r}
+#| label: fig-flows-countries
+#| results: asis
+#| fig-cap: "The largest flows from a U.S. registrant to the counterparty's country, unique-contract sample."
+#| fig-height: !expr plot_height(8L)
+
+fig_flows_countries <- fin_figure_flows(
+  .con      = con,
+  .panel    = "Country",
+  .top      = 20L,
+  .suppress = .fin_map_suppress,
+  .dirs     = .lP$Output,
+  .name     = "FlowsCountries"
+)
+```
+
+## Geographic diversity
+
+Her `104` step for step: one contract per firm and fiscal year, the top percentile of both variables
+dropped, 85 equal-count bins, the line from an OLS on the firm-years. Two things the manuscript's
+note says that the code does not do -- "trim at the 99th percentile" and "50 bins" -- so the note
+written here describes the code, and the choice is on the page as arguments. Decided on 9 September
+for the online appendix.
+
+```{r}
+#| label: fig-diversity
+#| results: asis
+#| fig-cap: "Countries mentioned per contract against segment geographical diversity, bin means and the OLS line."
+#| fig-height: !expr plot_height(8L)
+
+fig_diversity <- fin_figure_diversity(
+  .ds_contracts     = lst_ds$Contracts,
+  .ds_concentration = lst_ds$Concentration,   # 101's segment diversity, one row per gvkey-year
+  .grain            = "first",                # 104's rule; "mean" for the firm-year mean
+  .bins             = 85L,                    # 104's binscatter; the note said 50
+  .trim             = "drop",                 # 104 drops the top percentile; "p99" clips instead
+  .dirs             = .lP$Output,
+  .name             = "Diversity"
+)
+```
+
+## Filing metrics by firm fundamentals
+
+Her `104` step for step, on the full quarter panel inside the window -- the sample restrictions
+written above the figure in `104` are commented out, so every firm-quarter of every ever-filing firm
+counts, non-filing quarters included. Panel A: smallest against largest size quartile, quartiles
+within fiscal year, periodic against current reports, by fiscal quarter. Panel B: contracts per
+firm-quarter by industry. "Current reports" is every non-periodic form, registration statements
+included, which her legend calls 8-K.
+
+```{r}
+#| label: fig-firm-fundamentals
+#| results: asis
+#| fig-cap: "Contracts per firm-quarter by size quartile and channel (A) and by industry (B), firm-quarter panel."
+#| fig-height: !expr plot_height(8L)
+#| fig-width: 10
+
+fig_firm_fundamentals <- fin_figure_firm_fundamentals(
+  .ds_quarter = lst_ds$Quarter,
+  .dirs       = .lP$Output,
+  .name       = "FirmFundamentals",
+  .ref        = .fin_reference_f08          # the revision's Panel B, checked on the render
+)
+```
+
+## Redactions by industry and category
+
+The cell is the share redacted among the contracts of that industry and category, which is what
+referee 2 asked for; the revision's version averaged year-by-category shares within industry, which
+is why its rows barely differed. Three figures from one tibble -- the whole window from 2008, before
+the FAST Act, after it -- on one fill scale, because the measure changes meaning at 2019 and two
+rows in one figure were too small to read. Matched contracts from 2008. Her reading of "full sample
+classification" for this figure is still open (Open Issues).
+
+### A. From 2008
+
+```{r}
+#| label: fig-redactions-heat-all
+#| results: asis
+#| fig-cap: "Share of contracts redacted within industry and category, contracts from 2008."
+#| fig-height: !expr plot_height(12L)
+#| fig-width: 10
+
+fig_redactions_heat_all <- fin_figure_redactions_heat(
+  .ds_contracts = lst_ds$Contracts,
+  .ds_quarter   = lst_ds$Quarter,           # the industry of the filing firm
+  .period       = "all",
+  .min_n        = 30L,                      # cells below this are shaded but not labelled
+  .limit        = 0.8,                      # top of the fill, shared by the three
+  .dirs         = .lP$Output,
+  .name         = NULL                      # RedactionsIndustryAll
+)
+```
+
+### B. Before the FAST Act
+
+```{r}
+#| label: fig-redactions-heat-pre
+#| results: asis
+#| fig-cap: "Share of contracts redacted within industry and category, before the FAST Act."
+#| fig-height: !expr plot_height(12L)
+#| fig-width: 10
+
+fig_redactions_heat_pre <- fin_figure_redactions_heat(
+  .ds_contracts = lst_ds$Contracts,
+  .ds_quarter   = lst_ds$Quarter,
+  .period       = "pre",
+  .min_n        = 30L,
+  .limit        = 0.8,
+  .dirs         = .lP$Output,
+  .name         = NULL                      # RedactionsIndustryPre
+)
+```
+
+### C. After the FAST Act
+
+```{r}
+#| label: fig-redactions-heat-post
+#| results: asis
+#| fig-cap: "Share of contracts redacted within industry and category, after the FAST Act."
+#| fig-height: !expr plot_height(12L)
+#| fig-width: 10
+
+fig_redactions_heat_post <- fin_figure_redactions_heat(
+  .ds_contracts = lst_ds$Contracts,
+  .ds_quarter   = lst_ds$Quarter,
+  .period       = "post",
+  .min_n        = 30L,
+  .limit        = 0.8,
+  .dirs         = .lP$Output,
+  .name         = NULL                      # RedactionsIndustryPost
+)
+```
+
+# Deployment
+
+Every exhibit this document writes lands under `Output/` by its name: the tibble under `Data`,
+the tabular under `Tables`, the figure under `Figures`, the note under `Notes`. The manifest lists
+them by stem with the sample each is drawn on and which files exist, checked on disk, and goes to
+`Output/Manifest.csv`; the `Where` column -- manuscript, online appendix, memo -- is empty until it
+is decided and is the list to decide it on.
+
+The paper reads from `200-Paper_figures/current/` on Dropbox: `Figures/`, `Tables/`, `Notes/`, the
+manifest and this document's html. A deployment first moves the previous `current/` to
+`_archive/<timestamp>/`, never overwriting, and writes a `VERSION.txt` with the deploy time and the
+release date. The html of the render that is running cannot be copied from inside it -- Quarto
+writes it last -- so the chunk copies the html that exists and records its time, and one line from
+the console after the render, `fin_deploy_html()`, refreshes it. The exhibit tibbles do not go to
+the paper folder; they are the replication site's business.
+
+```{r}
+#| label: deploy-manifest
+#| results: asis
+
+tab_manifest <- fin_manifest(
+  .dirs     = .lP$Output,
+  .registry = .fin_registry,                # every stem, its kind, its sample
+  .path     = utils_file_path(.dir_main, "Output", "Manifest.csv")
+)
+```
+
+```{r}
+#| label: deploy-paper
+
+fin_deploy_paper(
+  .dirs      = .lP$Output,
+  .dir_paper = .lP$Paper,                                  # 200-Paper_figures on Dropbox
+  .path_html = fs::path(.dir_main, "31-FinalExhibits.html"),
+  .manifest  = tab_manifest,                               # refuses an incomplete set
+  .release   = .lP$Params$ReleaseMin,                      # recorded in VERSION.txt
+  .run       = TRUE                                       # TRUE deploys; FALSE says what it would do
+)
+
+# AFTER THE RENDER, from the console, to put this render's html beside the exhibits:
+# fin_deploy_html(.path_html = fs::path(.dir_main, "31-FinalExhibits.html"), .dir_paper = .lP$Paper)
 ```
 
 # Overview
@@ -880,6 +1456,32 @@ three columns describe the same parties; the parties-by-role table shows what th
 words the filing header contributed. Both are defined on every contract, and the difference is
 eleven words on the mean.
 
+## The diversity figure, line by line
+
+What `104` does to draw the geographic-diversity figure, beside the argument of
+`fin_figure_diversity()` that does the same thing, so the equivalence is on the page and not in a
+memory (checked again on 10 September at Ann-Kristin's request).
+
+| `104_Figures.do` | What it does | `31` | Same? |
+|:--|:--|:--|:--|
+| `drop if Keep == 0` (at the top of `104`) | unique contracts only | `S3_Matched` (`Keep` and a matched quarter) | yes; `104`'s later merge to Compustat drops the unmatched anyway |
+| `duplicates drop gvkey fyear, force` | one contract per firm and fiscal year: the first row in Stata's memory order | `.grain = "first"`: the first by `DocID` | the same rule; not the same row. Stata's row order at that point is whatever the preceding steps left, which nobody can reproduce, and `104` does not sort first |
+| `merge 1:1 gvkey fyear using concentration.dta` | attach `101`'s segment diversity; unmatched firm-years keep going with diversity missing | `fin_data_f07()` joins the prepared Concentration; rows without diversity drop | equivalent: `binscatter` drops missing diversity itself |
+| `xtile xdiversity = diversity, nq(100)` / `xtile xloc_count = nUniCountryNaive, nq(100)` / `drop if xdiversity == 100` / `drop if xloc_count == 100` | the top percentile of each variable is **dropped** | `.trim = "drop"` | yes |
+| `binscatter nUniCountryNaive diversity, nquantiles(85)` | 85 equal-count bins of diversity; the dot is the bin mean of the country count | `fin_bins_f07(.bins = 85)` | yes |
+| `reportreg` | the line is an OLS of the country count on diversity over the underlying firm-years | `fin_bins_f07()$Fit` | yes: 1.14 with t 35.0 on 75,930 firm-years, against the revision's 1.2 and 33 |
+| the manuscript's note | "trim both variables at the 99th percentile and use 50 bins" | -- | the note describes neither the tail rule nor the bin count the code uses |
+
+Two things follow. First, the figure in this document reproduces her code, up to the row Stata
+happened to keep per firm-year, and the residual difference in the slope (1.14 against 1.2) is
+that row. Second, the note has to move or the code has to move. The recommendation is the code:
+`.grain = "mean"` (each firm-year contributes the mean country count of its contracts, which is
+what "countries mentioned in the firm's contracts" means), `.trim = "p99"` (winsorise both
+variables, as the note says) and `.bins = 50` (as the note says). On the 8 September release that
+gives a slope of 1.84 with t 63.9 on 77,481 firm-years; the direction and the sentence in the
+text do not change, and the figure becomes reproducible by anyone with the release. Recorded
+under Open Issues, decision with Ann-Kristin.
+
 **Zero against missing.** Parties, countries and states are counts and are zero, not missing, where nothing
 was extracted; duration is missing where no end was established, and only duration carries its own
 N in the notes.
@@ -890,32 +1492,29 @@ What the tables above turned up that needs a decision, with the evidence on the 
 names the options and the recommendation; the decision is Ann-Kristin's and Matthias's, and once
 taken it is recorded here and the item closed.
 
-## Contracts without readable text are in the descriptive sample
+## Contracts without readable text were in the descriptive sample (closed 10 September)
 
-735 contracts in the unique-contract sample carry no category, and every one of them has zero
+735 contracts in the unique-contract sample carried no category, and every one of them had zero
 words: the exhibit is a placeholder for a PDF or an image -- "EXHIBIT 10.1 PDF REFERENCE",
 "ORIGINAL ARABIC PDF REFERENCE" -- and no classifier, extractor or word count ever saw text. They
-pass `02B`'s malformed test because that test is about format, not about whether any text survived,
-and they sit on every rung of the ladder (366 outside Compustat, 60 without a quarter, 309 in the
-final sample), so the Compustat match is not how they got there.
+passed `02B`'s malformed test because that test is about format, not about whether any text
+survived, and they sat on every rung of the ladder. Decided with Ann-Kristin and done the same day:
+`10-ExportData` folds the copies without a classification into the malformatted rung
+(`exp_fold_unclassified()`); the release of 10 September has 1,135,360 unique contracts and every
+one of them carries a class. The probe below is kept as the check that it stays so: it should
+report zero.
 
 ```{r}
 #| label: issue-unlabelled
 
 lst_unlabelled <- fin_issue_unlabelled(
   .ds_contracts = lst_ds$Contracts,
-  .path_release = .lP$Input$FilContracts   # nChars, not in 30's column list
+  .path_release = .lP$Input$FilContracts   # nChars, not in the reader's column list
 )
 ```
 
-| | A: fix the ladder in `02B` | B: keep them, document |
-|:--|:--|:--|
-| What | `RemClass = "No readable text"` where `nWords == 0`, `DescSample = 0` | nothing upstream; every note keeps "735 contracts without a category label" |
-| Table 2 Panel A | a row "No readable text -735"; unique contracts 1,135,360 | unchanged, 1,136,095 |
-| Consequence | one `10` re-export, her `102`/`103` rerun (pending anyway), `30`'s reference count updated; every N moves by 735 | a table about words carries 735 contracts with none, and category rows never sum to the total |
-| Recommendation | **A**: a contract with no text is not a contract the pipeline analysed, and a referee summing the category rows finds the gap | |
-
-Decision: open.
+Decision: closed. Folded at the export, no new ladder row; malformatted 32,029, unique contracts
+1,135,360, firms 26,914. Her `102`/`103` rerun on this release is still pending.
 
 ## The resubmission's control set shrinks the estimation samples by a fifth
 
@@ -969,6 +1568,28 @@ re-export, not a change here.
 
 Decision: acceptable for now, stated in the note; widening deferred.
 
+## The diversity figure's note does not describe its code
+
+Three gaps between `104` and the revision's note, and one between `104` and reproducibility:
+
+| | `104` does | the note says | `31` default |
+|:--|:--|:--|:--|
+| Grain | one contract per firm-year, the first in Stata's current row order | "the number of unique countries mentioned in the material contracts" | first by `DocID` (deterministic; not the same row) |
+| Tail | drops the top percentile of both variables | "trim both variables at the 99th percentile" | drop |
+| Bins | 85 | 50 | 85 |
+
+The figure here follows the code, and its note says what the code does. The Stata row order is not
+reproducible by anyone, so "the same figure" cannot be promised whatever we do.
+
+Recommendation: change the code, not the note. `.grain = "mean"` (each firm-year contributes the
+mean country count of its contracts, which is what "countries mentioned in the firm's contracts"
+means and what a referee expects), `.trim = "p99"` (winsorise, as the note says), `.bins = 50` (as
+the note says). On the 8 September release that gives slope 1.84 and t 63.9 against 1.14 and 35.1;
+the direction and the sentence in the text are unchanged. All three are arguments on the call, so
+the switch is one line and the note rewrites itself.
+
+Decision: open -- Ann-Kristin to confirm the mean grain; then `104` and `31` say the same thing.
+
 ## Which broad label the release carries
 
 `03B` states that the published broad label is the roll-up of the detailed prediction, not the
@@ -978,6 +1599,15 @@ table above scores both readings -- the super rows are the roll-up -- and whiche
 describes is the one `10` should export.
 
 Decision: open; check `03F` / `10`.
+
+## Nine copies with a class but no word count
+
+On the 9 September release, nine copies carry a classification -- so the classifier saw text --
+but `nWords` is missing. That is a gap on the text-metrics side of `10`'s assembly (or a missing
+count in `01C`), not a sample problem: the copies stay in the sample with their class, and every
+word-based exhibit drops a missing count. Worth finding which join left them behind.
+
+Decision: open; check the `nWords` join in `10`.
 
 ## Monetary amounts carry glued figures
 
@@ -989,5 +1619,7 @@ Decision: medians only; fix deferred.
 
 # Next
 
-The remaining tables, one call each under Tables; then the figures under a Figures section; then
-Deployment with the manuscript-facing manifest.
+The `Where` column of the manifest, once the manuscript / online appendix / memo split is decided
+with Ann-Kristin; the appendix figures the specification still names (the within-year timing
+figure, redaction by category over time, the ladder-loss figure) and the memo's pandemic panel;
+then `3_site` pulls `Output/Figures` and `Output/Tables`.

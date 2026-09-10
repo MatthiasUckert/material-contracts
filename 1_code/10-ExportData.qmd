@@ -710,7 +710,16 @@ go unnoticed.
 
 **This chunk reads every cache, so it rebuilds whenever any of them does.** The row count cannot
 catch a stale join -- it is the sample's either way -- so the check has to be on the inputs rather
-than on the output.
+than on the output. The library is an input too: the assembly applies one rule of its own, and a
+change to it rebuilds the release like a moved cache.
+
+**One rule of its own.** A copy the classifier could not label is a placeholder exhibit -- a PDF
+reference, an image, a cover line -- with no readable text, and 02B's malformed test, which is about
+the format of the flattened file, lets it through onto every rung of the ladder. After the
+classification join, `exp_fold_unclassified()` moves those copies to the malformed rung: step 2, out
+of the descriptive and estimation samples, `Removed` with `RemClass = "No readable text"`. No new
+ladder row; the malformatted count grows by them. Decided 10 September 2026; on the 9 September
+release that is 740 copies, 735 of them primary, and the unique-contract sample becomes 1,135,360.
 
 ```{r}
 #| label: export-final
