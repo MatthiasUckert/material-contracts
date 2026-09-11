@@ -1,0 +1,45 @@
+% ======================================================================================================================
+% 9-online_appendix.tex -- the online appendix: numbering and paths set here, the text generated elsewhere
+% ======================================================================================================================
+% The body is online_appendix/31-OnlineAppendix.tex, GENERATED from 1_code/31-OnlineAppendix.qmd in the pipeline
+% repository. Do not edit that file here: an edit is lost at the next render. Comment on it, and the change goes
+% into the .qmd.
+%
+% TWO THINGS THE PAPER'S PREAMBLE NEEDS. \usepackage{adjustbox}, which every table 30 writes uses to shrink a wide
+% table (booktabs is loaded already). And \input{online_appendix/OA-Numbers}, which defines \oanum{Key} for every
+% number the appendix cites, so the main text can cite the same numbers.
+{
+\makeatletter
+\setcounter{figure}{0}
+\setcounter{table}{0}
+\renewcommand{\section}{\@startsection{section}{1}{\z@}%
+  {-3.5ex \@plus -1ex \@minus -.2ex}%
+  {2.3ex \@plus.2ex}%
+  {\centering\Huge\bfseries}}
+\makeatother
+
+\section*{Online Appendix}
+}
+\captionsetup[figure]{list=no}
+\captionsetup[table]{list=no}
+
+\doublespacing
+\setcounter{subsection}{0}
+
+\renewcommand\thesubsection{\Alph{subsection}}
+\renewcommand\thesubsubsection{\thesubsection.\arabic{subsubsection}}
+
+\renewcommand\thetable{\thesubsection\arabic{table}}
+\renewcommand\thefigure{\thesubsection\arabic{figure}}
+
+% Tables and figures restart at 1 in every lettered section -- A1, A2, B1 -- with no \setcounter in the text.
+\counterwithin*{table}{subsection}
+\counterwithin*{figure}{subsection}
+
+% WHERE THE FILES SIT IN THIS PROJECT. \oaexhibits is the folder holding 30's deployed Tables/, Notes/ and Figures/
+% (the contents of 200-Paper_figures/current/); \oastatic the folder holding the paper's own static tables.
+\newcommand{\oaexhibits}{exhibits/}
+\newcommand{\oastatic}{tables/}
+
+\clearpage
+\input{online_appendix/31-OnlineAppendix}
