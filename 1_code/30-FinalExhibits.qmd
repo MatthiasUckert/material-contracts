@@ -1379,14 +1379,14 @@ tab_manifest <- fin_manifest(
 fin_deploy_paper(
   .dirs      = .lP$Output,
   .dir_paper = .lP$Paper,                                  # 200-Paper_figures on Dropbox
-  .path_html = fs::path(.dir_main, "31-FinalExhibits.html"),
+  .path_html = fs::path(.dir_main, "30-FinalExhibits.html"),
   .manifest  = tab_manifest,                               # refuses an incomplete set
   .release   = .lP$Params$ReleaseMin,                      # recorded in VERSION.txt
-  .run       = TRUE                                       # TRUE deploys; FALSE says what it would do
+  .run       = TRUE                                        # TRUE deploys; FALSE says what it would do
 )
 
 # AFTER THE RENDER, from the console, to put this render's html beside the exhibits:
-# fin_deploy_html(.path_html = fs::path(.dir_main, "31-FinalExhibits.html"), .dir_paper = .lP$Paper)
+# fin_deploy_html(.path_html = fs::path(.dir_main, "30-FinalExhibits.html"), .dir_paper = .lP$Paper)
 ```
 
 # Overview
@@ -1462,7 +1462,7 @@ What `104` does to draw the geographic-diversity figure, beside the argument of
 `fin_figure_diversity()` that does the same thing, so the equivalence is on the page and not in a
 memory (checked again on 10 September at Ann-Kristin's request).
 
-| `104_Figures.do` | What it does | `31` | Same? |
+| `104_Figures.do` | What it does | `30` | Same? |
 |:--|:--|:--|:--|
 | `drop if Keep == 0` (at the top of `104`) | unique contracts only | `S3_Matched` (`Keep` and a matched quarter) | yes; `104`'s later merge to Compustat drops the unmatched anyway |
 | `duplicates drop gvkey fyear, force` | one contract per firm and fiscal year: the first row in Stata's memory order | `.grain = "first"`: the first by `DocID` | the same rule; not the same row. Stata's row order at that point is whatever the preceding steps left, which nobody can reproduce, and `104` does not sort first |
@@ -1572,7 +1572,7 @@ Decision: acceptable for now, stated in the note; widening deferred.
 
 Three gaps between `104` and the revision's note, and one between `104` and reproducibility:
 
-| | `104` does | the note says | `31` default |
+| | `104` does | the note says | `30` default |
 |:--|:--|:--|:--|
 | Grain | one contract per firm-year, the first in Stata's current row order | "the number of unique countries mentioned in the material contracts" | first by `DocID` (deterministic; not the same row) |
 | Tail | drops the top percentile of both variables | "trim both variables at the 99th percentile" | drop |
@@ -1588,7 +1588,7 @@ the note says). On the 8 September release that gives slope 1.84 and t 63.9 agai
 the direction and the sentence in the text are unchanged. All three are arguments on the call, so
 the switch is one line and the note rewrites itself.
 
-Decision: open -- Ann-Kristin to confirm the mean grain; then `104` and `31` say the same thing.
+Decision: open -- Ann-Kristin to confirm the mean grain; then `104` and `30` say the same thing.
 
 ## Which broad label the release carries
 

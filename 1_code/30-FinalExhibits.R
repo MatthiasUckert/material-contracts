@@ -1,4 +1,4 @@
-# 31-FinalExhibits: the manuscript's exhibits in their final form, from the released files ---------------------------------
+# 30-FinalExhibits: the manuscript's exhibits in their final form, from the released files ---------------------------------
 #
 # WHAT THIS FILE DOES
 # The paper's exhibits: one view per exhibit, on its manuscript sample, in the form the manuscript
@@ -32,9 +32,10 @@ if (FALSE) {
 }
 
 
-# 0. The release: readers, vocabulary, references, and the exhibit data carried over from 30 --------------------------
+# 0. The release: readers, vocabulary, references, and the exhibit data carried over from the old 30 ------------------
 # 30-Descriptives was the lab: every exhibit on every sample, reconciled against the two manuscripts.
-# It was retired on 10 September 2026 once every decision it produced lived here. What this section
+# It was retired on 10 September 2026 once every decision it produced lived here, and this document
+# took its number the next day. What this section
 # holds is what this document still used from it, verbatim except for the prefix: the readers of the
 # release and of her .dta files (fin_read_*, fin_dta_to_parquet), the vocabulary the figures agree
 # on (class order, form families, filing groups, industries, regimes), the reference numbers the
@@ -1567,7 +1568,7 @@ fin_prepared_hit <- function(.name, .dir, .paths_in, .params = NULL, .rerun = FA
     .rerun    <- FALSE
   }
   path_ <- fs::path(.dir, paste0(.name, ".parquet"))
-  lib_  <- init_create_script_fun(.dir_here = here::here(), .name_script = "31-FinalExhibits")
+  lib_  <- init_create_script_fun(.dir_here = here::here(), .name_script = "30-FinalExhibits")
   hit_  <- exp_cache_hit(
     .task     = .name,
     .path_out = path_,
@@ -2096,6 +2097,88 @@ fin_tex_escape <- function(.x) {
   out_
 }
 
+#' Finish a tabular fragment for the manuscript and write it
+#'
+#' ONE FRAME FOR EVERY TABLE, AND IT IS HERS. Ann-Kristin's fragments set the row height at 1.5, rule
+#' the table with a double line on top and a single one below, and give every column a fixed
+#' width -- the label column wide, the number columns 20 mm each and right-aligned -- so that a
+#' table has the same shape whatever its numbers and sits centred under its caption. So every
+#' fragment this document writes is rebuilt into that frame here: the column specification the
+#' writer chose is read for its column count and kinds, number columns become right-aligned 20 mm
+#' paragraph columns, the label column takes what is left of the text width, and the rules are
+#' replaced. A wide table -- more than .max_fixed number columns -- cannot take 20 mm columns and is
+#' instead scaled to the text width with resizebox, which graphicx provides. The type size is not
+#' set here: the manuscript's table environment sets it around the input, as it always did. Nothing
+#' beyond booktabs and graphicx is needed in the preamble.
+#'
+#' @param .lines Character. The fragment as the writer built it: an optional \\begingroup\\size
+#'   line, \\begin{tabular}{spec} ... \\end{tabular}, an optional \\endgroup.
+#' @param .path Character. The .tex written.
+#' @param .stretch Numeric. \\arraystretch; 1.5 is hers.
+#' @param .col_mm Numeric. Width of a number column in millimetres.
+#' @param .max_fixed Integer. Number columns beyond which the table is scaled instead.
+#' @return Invisibly, the path.
+fin_tex_write <- function(.lines, .path, .stretch = 1.5, .col_mm = 20, .max_fixed = 6L) {
+  if (FALSE) {
+    .lines     <- c("\\begin{tabular}{l r}", "\\toprule", "a & 1 \\\\", "\\bottomrule", "\\end{tabular}")
+    .path      <- fs::path(.lP$Output$DirTables, "Test.tex")
+    .stretch   <- 1.5
+    .col_mm    <- 20
+    .max_fixed <- 6L
+  }
+  body_ <- .lines[!grepl("^\\\\begingroup\\\\[a-z]+$", .lines) & !grepl("^\\\\endgroup$", .lines)]
+  i_ <- grep("^\\\\begin\\{tabular\\}\\{", body_)
+  j_ <- grep("^\\\\end\\{tabular\\}$", body_)
+  if (length(i_) != 1L || length(j_) != 1L) cli::cli_abort("The fragment for {.path {(.path)}} is not one tabular.")
+  spec_ <- sub("^\\\\begin\\{tabular\\}\\{(.*)\\}$", "\\1", body_[i_])
+
+  # THE COLUMNS, read from the specification: l, c, r, or p{width}; spaces between them are free.
+  toks_ <- regmatches(spec_, gregexpr("p\\{[^}]*\\}|[lcr]", spec_))[[1L]]
+  n_    <- length(toks_)
+  n_num_ <- sum(toks_ == "r" | toks_ == "c")
+  fixed_ <- n_num_ <= .max_fixed            # a table of p{} columns alone keeps them and is not scaled
+
+  body_[j_] <- "\\end{tabular}"
+  body_ <- sub("^\\\\toprule$", "\\\\hline\\\\hline", body_)
+  body_ <- sub("^\\\\bottomrule$", "\\\\hline", body_)
+  if (fixed_) {
+    # FIXED WIDTHS. Number columns .col_mm each; a p{} column keeps its own width; the l columns
+    # share what is left of the text width once every column's padding is taken out.
+    n_lab_ <- sum(toks_ == "l")
+    taken_ <- sum(toks_ %in% c("r", "c")) * .col_mm
+    p_w_   <- as.numeric(sub("^p\\{([0-9.]+)(mm|cm).*$", "\\1", toks_[grepl("^p\\{", toks_)])) *
+      ifelse(grepl("cm", toks_[grepl("^p\\{", toks_)]), 10, 1)
+    taken_ <- taken_ + sum(p_w_, na.rm = TRUE)
+    lab_w_ <- if (n_lab_ > 0L) {
+      paste0("\\dimexpr(\\textwidth-", taken_, "mm-", 2L * n_, "\\tabcolsep)/", n_lab_, "\\relax")
+    } else {
+      NULL
+    }
+    cols_ <- vapply(toks_, \(.t) switch(
+      .t,
+      r = paste0(">{\\raggedleft\\arraybackslash}p{", .col_mm, "mm}"),
+      c = paste0(">{\\centering\\arraybackslash}p{", .col_mm, "mm}"),
+      l = paste0("p{", lab_w_, "}"),
+      .t
+    ), character(1))
+    body_[i_] <- paste0("\\begin{tabular}{", paste(cols_, collapse = " "), "}")
+    out_ <- c(paste0("\\renewcommand*{\\arraystretch}{", .stretch, "}"), body_)
+  } else {
+    # SCALED. Too many columns for fixed widths; the tabular keeps its own specification and is
+    # shrunk to the text width.
+    body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
+    out_ <- c(
+      paste0("\\renewcommand*{\\arraystretch}{", .stretch, "}"),
+      "\\resizebox{\\textwidth}{!}{%",
+      body_,
+      "}"
+    )
+  }
+  fs::dir_create(fs::path_dir(.path))
+  writeLines(out_, .path)
+  invisible(.path)
+}
+
 #' Write a booktabs tabular from a character tibble
 #'
 #' Cells are written as given -- the caller has already formatted numbers and blanked repeated
@@ -2130,7 +2213,10 @@ fin_tex_tabular <- function(.tab, .path, .align, .space_before = integer(0)) {
     "\\end{tabular}"
   )
   fs::dir_create(fs::path_dir(.path))
-  writeLines(lines_, .path)
+  fin_tex_write(
+    .lines = lines_,
+    .path  = .path
+  )
   invisible(.path)
 }
 
@@ -2499,7 +2585,10 @@ fin_tex_sample <- function(.tab, .path) {
     "\\end{tabular}"
   )
   fs::dir_create(fs::path_dir(.path))
-  writeLines(lines_, .path)
+  fin_tex_write(
+    .lines = lines_,
+    .path  = .path
+  )
   invisible(.path)
 }
 
@@ -3039,7 +3128,10 @@ fin_tex_content <- function(.tab, .path, .digits = c(Mean = 0L, SD = 2L), .size 
     "\\endgroup"
   )
   fs::dir_create(fs::path_dir(.path))
-  writeLines(lines_, .path)
+  fin_tex_write(
+    .lines = lines_,
+    .path  = .path
+  )
   invisible(.path)
 }
 
@@ -3267,7 +3359,10 @@ fin_tex_contrast <- function(.tab, .path, .size = "footnotesize") {
     "\\endgroup"
   )
   fs::dir_create(fs::path_dir(.path))
-  writeLines(lines_, .path)
+  fin_tex_write(
+    .lines = lines_,
+    .path  = .path
+  )
   invisible(.path)
 }
 
@@ -3485,7 +3580,10 @@ fin_table_parties <- function(.ds_contracts, .path_release, .dirs, .name = "Part
     "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   tot_  <- tab_[tab_$Kind == "total", , drop = FALSE]
   note_ <- c(
     "For the authors. Mean parties per contract by category on the unique-contract sample",
@@ -3660,7 +3758,10 @@ fin_table_money <- function(.ds_contracts, .path_release, .dirs, .name = "MoneyD
     "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   tot_  <- tab_[tab_$Kind == "total", , drop = FALSE]
   note_ <- c(
     "For the authors. Monetary amounts by category on the unique-contract sample",
@@ -3822,7 +3923,10 @@ fin_table_redactions <- function(.ds_contracts, .dirs, .name = "RedactionsDetail
     "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   tot_  <- tab_[tab_$Kind == "total", , drop = FALSE]
   note_ <- c(
     "For the authors. Redaction markers by category on the unique-contract sample from 2008, when",
@@ -4032,7 +4136,10 @@ fin_table_confidence <- function(.ds_contracts, .dirs, .name = "ClassConfidence"
     "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   tot_  <- tab_[tab_$Kind == "total", , drop = FALSE]
   note_ <- c(
     "This table shows the classifier's confidence in the assigned category, by category, on the",
@@ -4279,7 +4386,10 @@ fin_table_summaries <- function(.ds_summaries, .sample = "S7_Summaries", .measur
     "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   n_d_ <- sum(rows_$Delayed == 1L)
   n_a_ <- sum(rows_$Delayed == 0L)
   note_ <- c(
@@ -4510,7 +4620,10 @@ fin_table_summaries_regression <- function(.ds_summaries, .ds_quarter, .con, .sa
     "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
 
   note_ <- c(
     "This table regresses each summary measure on an indicator for a delayed announcement, on the",
@@ -4657,7 +4770,10 @@ fin_table_summary_sample <- function(.ds_summaries, .dirs, .name = "SummarySampl
     "\\end{tabular}"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   note_ <- c(
     "This table shows how the announcement sample is selected. The starting point is every 8-K whose",
     "Item 1.01 narrative the pipeline recovered. The published restriction to filings announcing a single",
@@ -5264,7 +5380,10 @@ fin_table_class_sample <- function(.ds_sample, .dirs, .name = "ClassLabelled") {
     "\\end{tabular}", "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   note_ <- c(
     paste0("The hand-labelled training sample (N = ", format(nrow(rows_), big.mark = ","), " documents with"),
     "readable text), by category and by amendment label. Second label counts documents carrying a second",
@@ -5337,7 +5456,10 @@ fin_class_show <- function(.tab, .cols, .name, .dirs, .title, .note) {
     "\\midrule", body_, "\\bottomrule", "\\end{tabular}", "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   fin_note_write(
     .text = .note,
     .path = fs::path(.dirs$DirNotes, paste0(.name, ".tex"))
@@ -5485,7 +5607,10 @@ fin_table_class_amendment <- function(.ds_panel, .ds_crowned, .dirs, .name = "Cl
               " & N & Predicted & Accuracy & Precision & Recall & F1 \\\\", "\\midrule", body_, "\\bottomrule",
               "\\end{tabular}", "\\endgroup")
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   tot_ <- m_[m_$Label == "Total", , drop = FALSE]
   note_ <- c(
     paste0("Out-of-fold scores of the amendment classifier that ships (", eng_, ") on the labelled sample"),
@@ -5671,7 +5796,10 @@ fin_table_class_arms <- function(.ds_panel, .ds_crowned, .dirs, .name = "ClassAr
               "Task & Engine & N & Coverage & Accuracy & Accuracy, committed & Macro-F1 & Weighted F1 \\\\",
               "\\midrule", body_, "\\bottomrule", "\\end{tabular}", "\\endgroup")
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   note_ <- c(
     "Every engine on every task, out of fold on the labelled sample. Coverage is the share of documents",
     "the engine committed on; accuracy is over every document, a declined document counting as a miss,",
@@ -5770,7 +5898,10 @@ fin_table_class_sweep <- function(.ds_sweep, .ds_crowned, .dirs, .name = "ClassS
               "Task & Model & Context & Folds & Accuracy (SD) & Macro-F1 (SD) & Weighted F1 & \\\\", "\\midrule", body_,
               "\\bottomrule", "\\end{tabular}", "\\endgroup")
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   note_ <- c(
     "Every transformer configuration cross-validated, by task: the mean and standard deviation across",
     "the five folds of out-of-fold accuracy and macro-F1. Selection is on macro-F1; deployed marks the",
@@ -5855,7 +5986,10 @@ fin_table_class_confusion <- function(.ds_panel, .ds_sample, .ds_crowned, .dirs,
   lines_ <- c("\\begingroup\\footnotesize", paste0("\\begin{tabular}{l ", strrep("r", length(lab_)), "}"), "\\toprule",
               head_, "\\midrule", body_, "\\bottomrule", "\\end{tabular}", "\\endgroup")
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   note_ <- c(
     paste0("Confusion matrix of the shipping transformer (", eng_, ") on the labelled sample, out of fold:"),
     "rows are the true category, columns the predicted one, cells the number of documents. Categories",
@@ -8200,7 +8334,10 @@ fin_table_attrition <- function(.ds_contracts, .ds_quarter, .controls = .fin_con
     " & Lost & \\% & Lost & \\% \\\\", "\\midrule", body_, "\\bottomrule", "\\end{tabular}", "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   note_ <- c(
     "This table shows what each regression requirement costs. The first row is the starting point: at",
     "the contract grain, every registrant copy at ladder steps 2 to 6 matched to a Compustat fiscal",
@@ -8364,7 +8501,10 @@ fin_table_fluidity <- function(.ds_quarter, .dirs, .name = "FluidityMissing") {
     "\\midrule", body_, "\\bottomrule", "\\end{tabular}", "\\endgroup"
   )
   fs::dir_create(.dirs$DirTables)
-  writeLines(lines_, fs::path(.dirs$DirTables, paste0(.name, ".tex")))
+  fin_tex_write(
+    .lines = lines_,
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
   names(cells_) <- c(" ", "Firm-quarters", "Without fluidity", "Without fluidity (%)", "Filed a contract (%)")
   k_ <- cells_ |>
     knitr::kable(
@@ -8429,7 +8569,7 @@ fin_deploy_paper <- function(.dirs, .dir_paper, .path_html, .manifest, .release,
   if (FALSE) {
     .dirs      <- .lP$Output
     .dir_paper <- .lP$Paper
-    .path_html <- fs::path(.dir_main, "31-FinalExhibits.html")
+    .path_html <- fs::path(.dir_main, "30-FinalExhibits.html")
     .manifest  <- tab_manifest
     .release   <- .lP$Params$ReleaseMin
     .run       <- FALSE
@@ -8491,7 +8631,7 @@ fin_deploy_paper <- function(.dirs, .dir_paper, .path_html, .manifest, .release,
 #' @return Invisibly, the copied path.
 fin_deploy_html <- function(.path_html, .dir_paper) {
   if (FALSE) {
-    .path_html <- fs::path(.dir_main, "31-FinalExhibits.html")
+    .path_html <- fs::path(.dir_main, "30-FinalExhibits.html")
     .dir_paper <- .lP$Paper
   }
   cur_ <- fs::path(.dir_paper, "current")

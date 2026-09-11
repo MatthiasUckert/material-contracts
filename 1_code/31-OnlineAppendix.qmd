@@ -1,0 +1,811 @@
+---
+title: "Online Appendix -- The Appendix Text, Rendered for Overleaf (31)"
+author: "Matthias Uckert"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+format:
+  # THE RUNBOOK. Inherits everything _quarto.yml declares for html: toc, folded code, the stylesheet, one file.
+  html: default
+  # THE APPENDIX. A fragment for Overleaf rather than a document: the template is the body plus a few
+  # \providecommand lines, and natbib turns every citation into \citet or \citep against the paper's own .bib.
+  latex:
+    template: _Templates/oa-body.tex
+    cite-method: natbib
+# Read by the html pass only; the LaTeX pass leaves the references to the paper's bibliography in Overleaf.
+bibliography: _Templates/oa-references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing messages would
+# discard the runbook's entire output. comment = "" removes the "##" prefix from console blocks so they can be copied
+# verbatim. Figure geometry is NOT set here -- it is declared once in _quarto.yml.
+#
+# ECHO FOLLOWS THE FORMAT, the one option this document sets differently from the others. The html pass is the
+# runbook and shows its code folded, like every runbook. The LaTeX pass is the appendix, where code would be typeset.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = "",
+  echo     = !knitr::is_latex_output()
+)
+
+options(
+  cli.num_colors = 1,
+  cli.width      = 120,
+  mc.table_mode  = "console"
+)
+```
+
+::: {.content-visible when-format="html"}
+
+```{r}
+#| label: load-libraries
+
+# THE COMMONS ONLY. init_*() resolve this document's paths and tbl_say() is the fixed-width printer every report
+# below uses. No upstream library is sourced: this document reads the files 30 wrote and calls none of its functions.
+.path_libs <- purrr::map_chr(
+  c("_Initialize", "_Utils", "_Tables"),
+  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
+)
+purrr::walk(
+  .x = .path_libs,
+  .f = \(.p) source(file = .p, encoding = "UTF-8")
+)
+
+.name_script <- "31-OnlineAppendix"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),  # the repository root
+  .name_script = .name_script   # this document's stem
+))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),  # the repository root
+  .name_script = .name_script   # this document's stem
+))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+This document is the online appendix. Its text is written here once and rendered twice: to html, the runbook a
+reader of the replication site follows, and to a LaTeX fragment that the paper's Overleaf project inputs. The
+fragment carries the appendix and nothing else. Everything that makes this a runbook -- this section, the
+configuration, the checks -- sits in blocks the LaTeX pass removes.
+
+This first version is the structure: the five sections, every exhibit in its place, and the machinery the text
+needs. Most passages are still marked as to be written or to be decided, and Validation counts them.
+
+## Why the text lives here and not in Overleaf
+
+Most sentences of the appendix carry a number the pipeline produced -- the size of the labelled sample, a macro-F1, a
+coverage. Typed into Overleaf, each of those is a copy that stops being true the next time an upstream stage runs,
+and nothing reports it. Written here, a number is read from the tibble 30 wrote beside the exhibit that prints it,
+so the sentence and the table cannot disagree.
+
+The cost is that the fragment is not a file to edit. An edit made to it in Overleaf is lost at the next render;
+comments and suggested changes come back into this document.
+
+## What the fragment may contain
+
+Prose, headings, citations, numbers, cross-references and floats. No code and no console output: the LaTeX pass
+renders with code hidden, every chunk that prints sits inside a block that pass removes, and the functions that
+write into the appendix itself never print through `cli`. The headings map onto the appendix's own numbering: a
+level-two heading here is a lettered section there, a level-three heading a numbered subsection.
+
+## Floats point at 30's files
+
+Every table and figure in the appendix is one 30 already writes under its name: the tabular in `Tables/`, the note in
+`Notes/`, the figure in `Figures/`. The fragment reads them by name through one macro, `\oaexhibits`, which the
+Overleaf file sets to wherever those folders sit in the project. What this document decides about an exhibit is its
+caption and its place, and both are in one table under Configuration. The three tables the paper already holds as
+files of its own -- the regulation overview and the two EDGAR variable lists -- are read through a second macro,
+`\oastatic`. A table from 30 is input bare: 30's writer gives every table its own frame -- size, row spacing, the
+text width, and a box that shrinks a wide one -- so a float adds nothing around it.
+
+The html shows each exhibit where the paper prints it, numbered as the paper numbers it: a figure as 30's png copy, a
+table as 30's own tabular converted by the Pandoc that Quarto runs. So the two renders set the same content, and the
+html can be read as the appendix. The static tables live only in the Overleaf project and appear here as a framed
+line naming the file.
+
+An exhibit 30 has not built yet is not an error. It is set as a framed line naming it, so the paper still compiles,
+and Validation lists it. With `Strict` on, it stops the render instead.
+
+## Why there is no Overview
+
+A runbook collects its figures in an Overview at the end. Here the body is the appendix itself, and its figures stand
+where the paper prints them; an Overview would print every one of them a second time, so it is omitted.
+
+## Numbers come from 30's tibbles
+
+Every number the text cites is declared once, under Numbers: the exhibit it comes from, the column, and the rows. A
+number that does not resolve is set in the text as a bold marker carrying its key, in both renders, and listed.
+
+## What is recomputed, and what is not
+
+Everything, on every render, once per format. Nothing here is expensive -- a few small parquet reads and file checks
+-- so nothing is cached beyond keeping each tibble read once within a pass.
+
+## Where things are written
+
+Two files. Quarto writes the fragment to `_rendered/1_code/31-OnlineAppendix.tex`, beside this document's html, but
+only in the LaTeX pass, which the Render button does not run: RStudio renders the first format the YAML lists, and
+that is this html. And every render writes `Output/OA-Numbers.tex` under this document's output directory: the
+numbers the text cites, as macros the manuscript can use too. `oa_publish()` renders both passes, copies the two
+files to the paper folder, and lists which of them changed -- which, while Overleaf is updated by hand, is the list of
+files to upload. See Deployment.
+
+# Configuration
+
+```{r}
+#| label: configure
+.lP <- list(
+  # THE DROPBOX ROOT, used for deployment only; nothing is read from it.
+  Root   = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+  Params = list(
+    Strict   = FALSE, # TRUE stops the render on an exhibit 30 has not built or a number that does not resolve
+    FigWidth = 0.96   # a figure's width as a share of the text width, as the previous appendix set it
+  )
+)
+
+.lP$Input <- list(
+  # 30'S OUTPUT, READ IN PLACE: Data/ for the numbers, and Tables/, Notes/ and Figures/ to check what the fragment
+  # will ask Overleaf for. Pointing this at the deployed current/ folder is this one line, once 30 deploys Data/ too.
+  DirExhibits = here::here("2_output", "30-FinalExhibits", "Output"),
+  Template    = here::here("1_code", "_Templates", "oa-body.tex"),       # the LaTeX pass's template
+  Bib         = here::here("1_code", "_Templates", "oa-references.bib"), # the html pass's bibliography
+  Qmd         = here::here("1_code", "31-OnlineAppendix.qmd")            # this document, scanned for markers
+)
+
+.lP$Output <- list(
+  Tex     = here::here("_rendered", "1_code", "31-OnlineAppendix.tex"),  # written by Quarto, in the LaTeX pass
+  Numbers = utils_file_path(.dir_main, "Output", "OA-Numbers.tex"),      # written below, on every render
+  Deploy  = fs::path(.lP$Root, "200-Paper_figures", "OnlineAppendix")    # where oa_deploy_tex() copies both
+)
+
+# A FRESH RECORD FOR THIS PASS. The emitters in the text record what they set, and Validation reads the record.
+oa_state_reset()
+```
+
+## The appendix's exhibits
+
+One row per exhibit, in the order the appendix prints them. `Name` is the stem 30 writes every file under, and
+`Caption` is the only text about an exhibit written here. An exhibit that is planned but not built is registered like
+any other: it is set as a placeholder now and becomes the real float the first time 30 writes it.
+
+```{r}
+#| label: configure-floats
+tab_floats <- tibble::tribble(
+  ~Section, ~Name,                  ~Kind,    ~Caption,
+  "A",      "FilingRequirements",   "table",  "Exhibits required with each form",
+  "A",      "FilingTypes",          "figure", "Contracts by filing type",
+  "A",      "FilingsWithinYear",    "figure", "Contract filings within the calendar year",
+  "A",      "FilingsSeasoned",      "figure", "Contract filings of all filers and of seasoned filers",
+  "B",      "MasterIndexVariables", "table",  "Variables of the SEC EDGAR master index",
+  "B",      "LandingPageVariables", "table",  "Variables of the SEC EDGAR filing landing pages",
+  "B",      "SampleAttrition",      "table",  "What each sample requirement costs",
+  "C",      "ClassLabelled",        "table",  "The labelled sample",
+  "C",      "ClassSweep",           "table",  "Transformer model selection",
+  "C",      "ClassTransformer",     "table",  "Transformer classifier: out-of-fold scores by category",
+  "C",      "ClassConfusion",       "table",  "Transformer classifier: confusion matrix",
+  "C",      "ClassAmendment",       "table",  "Amendment classifier: out-of-fold scores",
+  "C",      "ClassKeyword",         "table",  "Keyword tables: out-of-fold scores by category",
+  "C",      "ClassArms",            "table",  "All classification approaches compared",
+  "C",      "ClassConfidence",      "table",  "Classifier confidence in the corpus, by category",
+  "D",      "NerEngines",           "table",  "Entity extractors compared on the labelled sample",
+  "D",      "PartiesDetail",        "table",  "Contract partners by role",
+  "D",      "DurationRungs",        "table",  "The source of each contract's end date",
+  "D",      "MoneyDetail",          "table",  "Monetary amounts by category",
+  "D",      "RedactionsDetail",     "table",  "Redaction markers by category",
+  "D",      "ContentContrast",      "table",  "Naive and rule-based content variables",
+  "E",      "TypesTimeA",           "figure", "Contract types over time",
+  "E",      "ContentTimeSD",        "figure", "Content characteristics over time",
+  "E",      "Diversity",            "figure", "Geographic dispersion of contracts and segment diversity"
+)
+```
+
+The three static tables are files the paper already holds, so they are read from the Overleaf project through
+`\oastatic` and cannot be checked here. Their notes are written out below, because no `Notes/` file exists for them.
+
+```{r}
+#| label: configure-static
+.note_requirements <- paste(
+  "Source: 17 C.F.R. 229.601 (2022). The table lists the documents that must be filed as exhibits to each form.",
+  "An X marks a document required with the form even if it was filed previously with another document; a",
+  "previously filed document may be incorporated by reference. * An exhibit need not be provided about a company",
+  "if an election has been made under Form S-4 or F-4 to provide information about it at the level prescribed",
+  "by Form S-3 or F-3, and the form so elected would not require the exhibit for a primary offering."
+)
+
+tab_static <- tibble::tribble(
+  ~Name,                  ~File,                            ~Note,
+  "FilingRequirements",   "appendix_C1_filing_requirement", .note_requirements,
+  "MasterIndexVariables", "OA_MasterIndex",                 "The variables of the master index acquisition step.",
+  "LandingPageVariables", "OA_LandingPage",                 "The variables of the landing page parsing step."
+)
+```
+
+The context joins the two tables, checks them, and records for every exhibit what 30 must have written for the
+fragment to set it.
+
+```{r}
+#| label: configure-context
+ctx_oa <- oa_context_set(
+  .floats       = tab_floats,                  # the appendix's exhibits, in print order
+  .static       = tab_static,                  # the three read from the Overleaf project
+  .dir_exhibits = .lP$Input$DirExhibits,       # where 30 writes Tables/, Notes/ and Figures/
+  .dir_doc      = fs::path_dir(.lP$Input$Qmd), # html image paths are written relative to this document
+  .fig_width    = .lP$Params$FigWidth,         # every figure at this width
+  .strict       = .lP$Params$Strict            # stop on a missing exhibit rather than mark it
+)
+
+oa_report_floats(.files = ctx_oa$Files)
+```
+
+Read the status before the text. Ready means the fragment asks Overleaf for files that exist here; whether Overleaf
+holds them too depends on what was uploaded there, which this document cannot see.
+
+# Input
+
+30 is the only source. This document calls none of 30's functions and reads only what 30 wrote, so it renders on the
+state of 30's last render -- and says so if 30 has not rendered at all.
+
+```{r}
+#| label: input-check
+oa_report_inputs(
+  .dir_exhibits = .lP$Input$DirExhibits, # 30's output, read in place
+  .template     = .lP$Input$Template,    # without it the LaTeX pass fails
+  .bib          = .lP$Input$Bib          # without it the html pass cannot resolve a citation
+)
+```
+
+# Numbers
+
+Each row is one number the text cites. `Where` is a filter over the exhibit tibble's own columns, evaluated as
+written; `Fun` reduces the matching rows to one value, and `one` demands exactly one matching row, which is what
+catches a filter that silently matches two. The keyword table's coverage and accuracy are taken from the comparison
+of all approaches rather than from its own table: that table's total row averages recall over categories, where the
+comparison counts documents.
+
+```{r}
+#| label: numbers-resolve
+# A LEAF OF THE TAXONOMY is a sub-category, or a category without sub-categories. The smallest leaf bounds how thin a
+# fold can become, which is the argument for pooled out-of-fold scoring in section C.
+.where_leaf <- "Level1 != 'Amendment' & (Kind == 'sub' | Level1 %in% c('Licenses', 'Leases', 'Other'))"
+.where_kw   <- "Task == 'ClassDetailed' & Engine == 'Kw'"
+.where_llm  <- "Task == 'ClassDetailed' & Engine == 'Llm'"
+
+tab_numbers_spec <- tibble::tribble(
+  ~Key,              ~Exhibit,           ~Column,         ~Fun,  ~Format, ~Where,
+  "NLabelled",       "ClassLabelled",    "N",             "one", "count", "Kind == 'total'",
+  "NRarest",         "ClassLabelled",    "N",             "min", "count", .where_leaf,
+  "AccDetailed",     "ClassTransformer", "Accuracy",      "one", "prop3", "Kind == 'total'",
+  "F1Detailed",      "ClassTransformer", "F1",            "one", "prop3", "Kind == 'total'",
+  "LenientDetailed", "ClassTransformer", "RecallLenient", "one", "prop3", "Kind == 'total'",
+  "AccAmend",        "ClassAmendment",   "Accuracy",      "one", "prop3", "Label == 'Total'",
+  "F1Amend",         "ClassAmendment",   "F1",            "one", "prop3", "Label == 'Total'",
+  "KwCoverage",      "ClassArms",        "Coverage",      "one", "pct1",  .where_kw,
+  "KwAccCommitted",  "ClassArms",        "AccuracySel",   "one", "prop3", .where_kw,
+  "F1Llm",           "ClassArms",        "MacroF1",       "one", "prop3", .where_llm
+)
+
+tab_numbers <- oa_numbers_set(
+  .spec     = tab_numbers_spec,                       # every number the text cites
+  .dir_data = fs::path(.lP$Input$DirExhibits, "Data") # the tibbles behind 30's exhibits
+)
+
+oa_report_numbers(
+  .tab    = tab_numbers,      # resolved above
+  .strict = .lP$Params$Strict # TRUE stops the render on an unresolved number
+)
+```
+
+The same numbers are written as LaTeX macros, so the manuscript cites them too rather than typing copies that go
+stale at the next re-export: with the file input in the paper's preamble, `\oanum{F1Detailed}` prints the macro-F1
+this render resolved. A key the file does not hold prints in bold as `??Key`, so a typo shows in the PDF.
+
+```{r}
+#| label: numbers-write
+oa_numbers_write(
+  .tab  = tab_numbers,         # resolved above
+  .path = .lP$Output$Numbers   # deployed beside the fragment
+)
+```
+
+:::
+
+::: {.content-visible when-format="html"}
+
+# Online appendix
+
+Everything from here to Validation is the appendix: shown here as the runbook renders it, and written in the LaTeX
+pass as the fragment Overleaf inputs. Each exhibit stands where the paper prints it, with the paper's number: figures
+from 30's png copies, tables converted from 30's own LaTeX.
+
+:::
+
+```{=latex}
+\clearpage
+```
+
+## SEC filing requirements and filing timing {#sec-oa-filing}
+
+Firms can append material contracts to several SEC forms, and the form determines when a contract becomes public.
+This section documents which forms require which exhibits, how the contracts in the database distribute across
+forms, when in the calendar year they are filed, and how the registration wave of 2020 and 2021 enters the annual
+counts.
+
+### Filing requirements by form {#sec-oa-filing-requirements}
+
+`r oa_ref(.name = "FilingRequirements")` lists the exhibits Item 601 of Regulation S-K requires with each Securities
+Act and Exchange Act form. The database covers Exhibit 10 filed with Forms 8-K, 10-K, 10-Q, 20-F, S-1, S-4, F-1 and
+F-4, including their amendments.
+
+```{r}
+#| label: float-filing-requirements
+#| results: asis
+oa_float(.name = "FilingRequirements")
+```
+
+### Filing types {#sec-oa-filing-types}
+
+`r oa_ref(.name = "FilingTypes")` shows the unique contracts by the form they were filed with, U.S. and foreign
+forms side by side, each split into original agreements and amendments. **[TO WRITE: the amendment share, which is
+higher than in the previous draft, and the reason.]**
+
+```{r}
+#| label: float-filing-types
+#| results: asis
+oa_float(.name = "FilingTypes")
+```
+
+### Filings within the calendar year {#sec-oa-filing-year}
+
+**[TO WRITE: the within-year distribution of ad-hoc, annual and quarterly filings, with the reporting seasons of
+December year-end filers marked; the figure is still to be built in 30.]**
+
+```{r}
+#| label: float-filings-within-year
+#| results: asis
+oa_float(.name = "FilingsWithinYear")
+```
+
+### Seasoned filers {#sec-oa-filing-seasoned}
+
+The number of contracts rises sharply in 2020 and 2021. `r oa_ref(.name = "FilingsSeasoned")` compares all filers
+with firms more than two years past their first contract filing. Had the rise come from existing firms filing more,
+it would appear among the seasoned filers; it does not, so it reflects new registrants, among them many special
+purpose acquisition companies that file a standard set of equity agreements at registration.
+
+```{r}
+#| label: float-filings-seasoned
+#| results: asis
+oa_float(.name = "FilingsSeasoned")
+```
+
+```{=latex}
+\clearpage
+```
+
+## Data collection and sample construction {#sec-oa-data}
+
+The database is built from EDGAR in four steps -- the quarterly master index, the landing page of every filing in
+scope, the attached documents, and a set of quality rules -- implemented in the rGetEDGAR package and the pipeline's
+acquisition scripts. This section documents the decisions in each step that determine what the database contains;
+the mechanics are documented in the pipeline's runbooks on the replication site.
+
+### Acquisition {#sec-oa-data-acquisition}
+
+The frame is every filing of seventeen form types in EDGAR's quarterly master index through 2024: the periodic
+reports, the current report, the registration statements that carry material agreements, each with its amendment
+variant, and the confidential treatment order. For each filing, the landing page lists the attached documents. An
+attachment counts as Exhibit 10 where its exhibit type maps to Exhibit 10 in a lookup of the raw exhibit-type
+strings filers use, rather than where it matches a pattern: filers write `EX-10.1`, `EX-10`, `EXHIBIT 10.23` and many
+further variants, and a pattern silently excludes the spellings its author did not anticipate. Three groups of
+documents are downloaded: Exhibit 10 attachments, 8-K filings reporting Item 1.01, and confidential treatment
+orders. `r oa_ref(.name = "MasterIndexVariables")` and `r oa_ref(.name = "LandingPageVariables")` list the variables
+the first two steps record. **[TO DECIDE: keep the two variable lists, or replace them with the release codebook.]**
+
+```{r}
+#| label: float-master-index
+#| results: asis
+oa_float(.name = "MasterIndexVariables")
+```
+
+```{r}
+#| label: float-landing-page
+#| results: asis
+oa_float(.name = "LandingPageVariables")
+```
+
+### Quality rules {#sec-oa-data-quality}
+
+Three rules flag documents whose conversion to text failed: ten words or fewer after the SEC header; fewer than 20%
+stopwords together with fewer than 100 words; or 75% or more numeric tokens. Each threshold sits far from anything a
+genuine agreement produces, so the rules remove conversion debris -- a PDF rendered as coordinates, a hyperlink in
+place of a document, a financial statement filed under an exhibit number -- rather than short agreements. Flagged
+documents stay in the release with the reason and are excluded from the samples. Exhibits whose text is only a
+placeholder for a PDF or an image carry no readable text and are counted with the malformatted documents.
+**[TO WRITE: the counts, from the sample table.]**
+
+### Attachments and registrant copies {#sec-oa-data-copies}
+
+A filing can list several registrants, and EDGAR lists its attachments under each of them, so one attachment can
+appear as several documents. Each attachment is identified by a hash of its address and each registrant's copy by
+its own identifier, and one copy per attachment is designated primary. Classification and entity extraction read
+the primary copy once; the release carries every copy with its attachment's values, so unique contracts are the
+primary copies and every registrant's copy remains available to an analysis at the filer level. Two parties that
+each file their own copy of one agreement produce two attachments; finding those would require comparing texts and
+is not attempted. **[TO DECIDE: the estimation samples count registrant copies while the descriptive sample counts
+unique contracts; say so in the sample table's note, or move the estimation to primary copies.]**
+
+### Sample construction {#sec-oa-data-ladder}
+
+**[TO WRITE: the steps from the full index to the descriptive sample and the estimation samples, as in
+`r oa_ref_main(.name = "SampleSelection", .kind = "table")`, and what each requirement costs on its own.]**
+
+```{r}
+#| label: float-sample-attrition
+#| results: asis
+oa_float(.name = "SampleAttrition")
+```
+
+```{=latex}
+\clearpage
+```
+
+## Contract classification {#sec-oa-classification}
+
+Each contract is classified on three tasks, all from the same text: its type in the twelve categories of
+`r oa_ref_main(.name = "Categories", .kind = "table")` (detailed), the seven parent categories (broad), and whether it
+is an original agreement or an amendment. Four approaches are evaluated on identical cross-validation folds -- a
+fine-tuned transformer, a keyword table, a local language model, and routing between them -- and the transformer
+labels the corpus.
+
+### Taxonomy and labelled sample {#sec-oa-class-sample}
+
+The labelled sample holds `r oa_n(.key = "NLabelled")` contracts with readable text
+(`r oa_ref(.name = "ClassLabelled")`). The labels come from two rounds: a first round mapped from an earlier coding
+scheme, and a second round of direct manual classification aimed at the categories the current taxonomy introduced.
+A contract that fits two categories carries a second label. Training uses the primary label only, which was set by
+manual review; the second label is used only to score leniently. The broad taxonomy is a strict roll-up of the
+detailed one, and the smallest detailed category holds `r oa_n(.key = "NRarest")` contracts. **[TO WRITE: the
+labelling protocol, the annotation tool, and who labelled; agreement between annotators is not measured.]**
+
+```{r}
+#| label: float-class-labelled
+#| results: asis
+oa_float(.name = "ClassLabelled")
+```
+
+### Evaluation design {#sec-oa-class-design}
+
+Folds are dealt once, stratified on the detailed category, and every approach is scored on the same five folds. Each
+contract is predicted once, by the fold model that did not see it in training, and the scores pool these out-of-fold
+predictions. No test set is held out beyond the folds: with `r oa_n(.key = "NRarest")` contracts in the smallest
+category, a further holdout would leave too few documents to estimate that category's performance. The headline
+metric is macro-F1, the unweighted mean of the per-category F1 scores, because accuracy is dominated by the largest
+categories; accuracy is reported beside it. Lenient scores count a prediction as correct where it equals the
+contract's second valid category, so the gap between strict and lenient scores measures ambiguity in the taxonomy
+rather than error in the model.
+
+### Transformer classifier {#sec-oa-class-transformer}
+
+Two encoders are fine-tuned, Legal-BERT [@chalkidis2020legal] and RoBERTa [@liu2019roberta], on every combination of
+two learning rates (2e-5 and 3e-5), two context lengths (256 and 512 tokens), two training budgets (three and six
+epochs), and loss weighting by inverse class frequency or none, separately for each task. A learning rate of 1e-5
+and ten epochs were each evaluated against the centre of the grid and did not improve on it, so they are not carried
+through the full crossing. `r oa_ref(.name = "ClassSweep")` reports every configuration; the configuration with the
+highest macro-F1 is refitted on the full labelled sample and deployed at both context lengths. **[TO DECIDE: which
+configuration is crowned.]**
+
+Out of fold, the deployed detailed classifier reaches an accuracy of `r oa_n(.key = "AccDetailed")` and a macro-F1
+of `r oa_n(.key = "F1Detailed")` (`r oa_ref(.name = "ClassTransformer")`); counting a contract's second valid category
+as correct raises accuracy to `r oa_n(.key = "LenientDetailed")`. The errors concentrate in adjacent categories
+(`r oa_ref(.name = "ClassConfusion")`), the same pairs that produced second labels during manual labelling. The
+amendment classifier reaches an accuracy of `r oa_n(.key = "AccAmend")` and a macro-F1 of `r oa_n(.key = "F1Amend")`
+(`r oa_ref(.name = "ClassAmendment")`). **[TO DECIDE: whether the released broad label is the roll-up of the
+detailed prediction or the separately trained broad model.]**
+
+```{r}
+#| label: float-class-sweep
+#| results: asis
+oa_float(.name = "ClassSweep")
+```
+
+```{r}
+#| label: float-class-transformer
+#| results: asis
+oa_float(.name = "ClassTransformer")
+```
+
+```{r}
+#| label: float-class-confusion
+#| results: asis
+oa_float(.name = "ClassConfusion")
+```
+
+```{r}
+#| label: float-class-amendment
+#| results: asis
+oa_float(.name = "ClassAmendment")
+```
+
+### Keyword tables {#sec-oa-class-keyword}
+
+The keyword approach is built as a published artifact rather than as a competing classifier: a short, ranked table
+of terms per category that anyone can apply to a filing with a text editor, with a stated precision. A term's
+evidence is the Wilson lower bound on its training precision [@wilson1927probable], which ranks a term found in 190
+of 200 contracts above one found in 2 of 2. A term is admitted only where its precision exceeds the category's base
+rate, where it catches contracts no accepted term caught, and where at least three of the five fold mines selected
+it; a contract is assigned the category of the single strongest term that fires. The tables target a precision of
+95% for contract types and 85% for amendments, and abstain where no term fires. Out of fold, the detailed table
+commits on `r oa_n(.key = "KwCoverage")`% of contracts, with an accuracy of `r oa_n(.key = "KwAccCommitted")` where
+it commits (`r oa_ref(.name = "ClassKeyword")`). **[TO WRITE: the mined and the generated term lists, and how the
+generated lists were produced; the generated list is estimated on the fifth fold only.]**
+
+```{r}
+#| label: float-class-keyword
+#| results: asis
+oa_float(.name = "ClassKeyword")
+```
+
+### Language model and routing {#sec-oa-class-routing}
+
+**[TO DECIDE: report the language-model arm or leave it out.]** A local instruction-tuned model, Qwen3 with eight
+billion parameters, classifies each contract from its opening characters, either from the category names alone or
+with worked examples drawn from the other folds, so that no prompt contains a contract from the fold it scores. On
+the detailed task it reaches a macro-F1 of `r oa_n(.key = "F1Llm")`. `r oa_ref(.name = "ClassArms")` compares all
+approaches on every task and reports the accuracy a perfect router would reach by taking any approach's correct
+answer. **[TO WRITE: the two routing rules -- the transformer's own confidence, and disagreement between its
+detailed and broad models -- and what they gain.]**
+
+```{r}
+#| label: float-class-arms
+#| results: asis
+oa_float(.name = "ClassArms")
+```
+
+### Application to the corpus {#sec-oa-class-apply}
+
+The deployed transformer labels every Exhibit 10 attachment once, reading its primary copy, and the release carries
+the label on every registrant copy. The keyword table runs over the same attachments as an independent second
+opinion; where it fires, the release records whether the two agree. The transformer's probability for the category
+it chose is released with each label, so an analysis can restrict itself to confident classifications
+(`r oa_ref(.name = "ClassConfidence")`). **[TO WRITE: which context length labels the corpus, and why.]**
+
+```{r}
+#| label: float-class-confidence
+#| results: asis
+oa_float(.name = "ClassConfidence")
+```
+
+```{=latex}
+\clearpage
+```
+
+## Entity extraction and rule-based variables {#sec-oa-entities}
+
+Contract partners, places, dates, monetary amounts and redaction markers are extracted in two stages. Extractors
+propose spans of text, each stored with its character offsets in the contract; rules then turn the spans into
+variables. The release carries both the naive variables, which count what the extractors proposed, and the
+rule-based variables, so an analysis that rejects a rule can fall back to the step before it.
+
+### Extractors {#sec-oa-ent-extractors}
+
+Three families of extractors ran over the labelled sample: LexNLP [@bommarito2021lexnlp]; a set of pattern and
+gazetteer extractors written for this database, covering dates, stated terms, monetary amounts, places, redaction
+markers and governing-law clauses; and the named-entity recogniser of spaCy. Every span is stored as offsets into the
+text, so a later rule can relate spans to each other -- a place to the party named before it, a redaction marker to
+the amount it replaced -- without reading the contract again. **[TO WRITE: why spaCy was not applied to the corpus
+-- its throughput, and where in a contract its organisation names fall.]**
+
+```{r}
+#| label: float-ner-engines
+#| results: asis
+oa_float(.name = "NerEngines")
+```
+
+### Contract partners {#sec-oa-ent-parties}
+
+LexNLP proposes organisation names, and a rule turns them into parties in four steps. It strips legal suffixes, so
+that ACME CORPORATION and ACME CORP. share one key; groups the spellings of one company within a contract; matches
+the parties against the registrant EDGAR records, by prefix for the filer and exactly for the co-registrants of the
+same filing; and assigns roles: registrant, co-registrant, counterparty where named within 2,000 characters of the
+registrant, signatory where named in the final tenth of the contract, and other. Where no party matches the filer,
+the first party named is taken as the registrant, and the release records that fallback. The parties the paper
+counts are the registrant, the co-registrants and the counterparties. **[TO WRITE: how often the fallback applies.]
+[TO DECIDE: whether the parties-by-role table belongs in the appendix.]**
+
+```{r}
+#| label: float-parties-detail
+#| results: asis
+oa_float(.name = "PartiesDetail")
+```
+
+### Places and governing law {#sec-oa-ent-places}
+
+Places come from a gazetteer built from the U.S. Geological Survey's domestic names and international country data.
+A place name that is also an English word, such as Enterprise, Mobile or Reading, is accepted only where a state or
+country name follows it directly, and any other place name only where a state or country is named nearby; a name
+that exists in several states, such as Springfield, is assigned a state only where the contract itself names one of
+its candidate states. A place belongs to the party named within 200 characters before it. Places inside a
+governing-law clause name a jurisdiction rather than a location and are excluded from the geography counts; the
+jurisdictions are released separately, every one a contract names.
+
+### Dates and duration {#sec-oa-ent-dates}
+
+Every date pattern requires a year written in the text, so the extractor cannot supply a year the contract does not
+state; numeric dates are read month first, as in U.S. filings. A contract's start is the latest date at or before
+its filing date, or the filing date where no such date exists. Its end comes from the first of four sources present:
+a stated term ("for a period of five years"), an open-ended clause ("until terminated"), which leaves the duration
+missing, a future date next to an end cue (maturity, through, expiration), and the farthest future date. Durations
+above 30 years are dropped rather than capped. The naive duration, from the farthest future date alone, is released
+beside it. **[TO WRITE: the share of contracts each source answers.]**
+
+```{r}
+#| label: float-duration-rungs
+#| results: asis
+oa_float(.name = "DurationRungs")
+```
+
+### Monetary amounts {#sec-oa-ent-money}
+
+An amount is recognised only together with a currency marker, which excludes section numbers by construction. Zero
+amounts, and figures with par-value language within 60 characters on either side, are dropped; figures a filer
+withheld, such as `$[***]`, are counted separately and never summed. A known defect remains: flattened tables can
+join adjacent cells into a single figure, so only medians are reported. **[TO DECIDE: whether the money table
+belongs in the appendix.]**
+
+```{r}
+#| label: float-money-detail
+#| results: asis
+oa_float(.name = "MoneyDetail")
+```
+
+### Redaction markers {#sec-oa-ent-redactions}
+
+Six kinds of marker are identified: brackets naming confidential treatment, brackets of asterisks, brackets of
+underscores, brackets recording an omission, brackets of bullets or ellipses, and unbracketed runs of three or more
+asterisks. The release counts each kind, so every definition of a redacted contract is a sum of released columns;
+the paper's measure counts bracketed asterisks and explicit redactions. A marker that sits inside a withheld amount
+identifies a withheld price. **[TO DECIDE: whether one marker or five define a redacted contract after 2018.]**
+
+```{r}
+#| label: float-redactions-detail
+#| results: asis
+oa_float(.name = "RedactionsDetail")
+```
+
+### Naive and rule-based variables {#sec-oa-ent-contrast}
+
+`r oa_ref(.name = "ContentContrast")` reports, by category, on how many contracts each measure is defined or finds
+something under the naive and under the rule-based definition. **[TO WRITE: where the rules add coverage -- a stated
+term needs no future date -- and where they remove it.]**
+
+```{r}
+#| label: float-content-contrast
+#| results: asis
+oa_float(.name = "ContentContrast")
+```
+
+```{=latex}
+\clearpage
+```
+
+## Additional descriptive evidence {#sec-oa-descriptives}
+
+### Contract types over time {#sec-oa-desc-types}
+
+`r oa_ref(.name = "TypesTimeA")` shows the composition of each year's contracts by super-category, with the share of
+amendments as a line. **[TO DECIDE: which of the four forms of this figure.]**
+
+```{r}
+#| label: float-types-time
+#| results: asis
+oa_float(.name = "TypesTimeA")
+```
+
+### Content characteristics over time {#sec-oa-desc-content}
+
+`r oa_ref(.name = "ContentTimeSD")` shows the yearly mean of duration, countries, parties and words, with a band of
+one standard deviation. **[TO DECIDE: the band -- standard deviation, interquartile range or confidence interval.]**
+
+```{r}
+#| label: float-content-time
+#| results: asis
+oa_float(.name = "ContentTimeSD")
+```
+
+### Geographic diversity {#sec-oa-desc-diversity}
+
+`r oa_ref(.name = "Diversity")` relates the number of countries the contracts of a firm-year mention to the
+geographic diversity of the firm's segment sales. **[TO DECIDE: the grain, the treatment of the tails and the number
+of bins.]**
+
+```{r}
+#| label: float-diversity
+#| results: asis
+oa_float(.name = "Diversity")
+```
+
+::: {.content-visible when-format="html"}
+
+# Validation
+
+Two checks on the text itself. **Every registered exhibit is set exactly once, in the registry's order**: a registered
+exhibit the text never sets would be listed as ready above and be absent from the paper, with nothing else to say so.
+**The open markers are counted by section**, which is the appendix's progress report while it is being written.
+
+```{r}
+#| label: validate-floats
+tab_emitted <- oa_report_emitted(.strict = .lP$Params$Strict)
+```
+
+```{r}
+#| label: validate-markers
+tab_markers <- oa_markers(.path_qmd = .lP$Input$Qmd)
+
+oa_report_markers(.tab = tab_markers)
+```
+
+# Deployment
+
+The fragment is written only by the LaTeX pass. A terminal render, `quarto render 1_code/31-OnlineAppendix.qmd`, runs
+both passes, html first; the Render button runs the html alone. Either way, the check below sees the fragment as it
+stood before this render began.
+
+```{r}
+#| label: deploy-status
+oa_report_tex(
+  .path_tex     = .lP$Output$Tex,        # the fragment as the last LaTeX pass left it
+  .path_qmd     = .lP$Input$Qmd,         # a fragment older than this document or its library is stale
+  .dir_exhibits = .lP$Input$DirExhibits  # and so is one older than what 30 wrote
+)
+```
+
+To bring Overleaf up to date, one call from the console. It renders both passes in a separate R process, as a
+terminal render would, checks that the fragment and the numbers file were written by this call, copies them to the
+paper folder, archives the ones they replace, and ends with the files that changed -- the ones to upload.
+
+```r
+source(here::here("1_code", "31-OnlineAppendix.R"), encoding = "UTF-8")
+
+oa_publish(
+  .path_qmd     = here::here("1_code", "31-OnlineAppendix.qmd"),                          # this document
+  .path_tex     = here::here("_rendered", "1_code", "31-OnlineAppendix.tex"),             # the LaTeX pass writes it
+  .path_numbers = here::here("2_output", "31-OnlineAppendix", "Output", "OA-Numbers.tex"), # every render writes it
+  .dir_exhibits = here::here("2_output", "30-FinalExhibits", "Output"),                   # tested for staleness
+  .dir_deploy   = fs::path(                                                               # the paper folder
+    "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+    "200-Paper_figures",
+    "OnlineAppendix"
+  ),
+  .quarto       = NULL                                                                    # found as a terminal would
+)
+```
+
+The fragment goes to `online_appendix/` in the Overleaf project, and so does `OA-Numbers.tex`, which the paper's
+preamble inputs once: `\input{online_appendix/OA-Numbers}`. 30's exhibits reach Overleaf as they always have, from
+`200-Paper_figures/current/`.
+
+On the Overleaf side, `9-online_appendix.tex` sets the lettered numbering, points `\oaexhibits` and `\oastatic` at the
+project's folders, and inputs the fragment.
+
+# Next
+
+The three static tables move into 30 as exhibits of its own, written through the same frame as every other table;
+the static path here then disappears. The appendix's text follows, section by section, starting with classification,
+and the manuscript's method section switches its numbers to `\oanum{}`.
+
+:::
