@@ -9,6 +9,8 @@
 % Where 30's deployed exhibits (Tables/, Notes/, Figures/) and the paper's static tables sit in the Overleaf project.
 \providecommand{\oaexhibits}{exhibits/}
 \providecommand{\oastatic}{tables/}
+% Where the exhibits this appendix builds itself sit: its own Tables/, Notes/ and Figures/, beside the fragment.
+\providecommand{\oaown}{online_appendix/}
 % For the static tables only: shrunk to the line when wider, never enlarged. 30's tables carry their own frame.
 \providecommand{\oafit}[1]{\resizebox{\ifdim\width>\linewidth\linewidth\else\width\fi}{!}{#1}}
 % An exhibit 30 has not built yet: a framed line in its place, so the paper still compiles.

@@ -1,0 +1,731 @@
+---
+title: "Online Appendix C -- The Classification Approach (40)"
+author: "Matthias Uckert"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+format:
+  # THE RUNBOOK. Inherits everything _quarto.yml declares for html: toc, folded code, the stylesheet, one file.
+  html: default
+  # THE APPENDIX. A fragment for Overleaf rather than a document: the template is the body plus a few
+  # \providecommand lines, and natbib turns every citation into \citet or \citep against the paper's own .bib.
+  latex:
+    template: _Templates/oa-body.tex
+    cite-method: natbib
+# Read by the html pass only; the LaTeX pass leaves the references to the paper's bibliography in Overleaf.
+bibliography: _Templates/oa-references.bib
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr, so suppressing messages would
+# discard the runbook's entire output. comment = "" removes the "##" prefix from console blocks so they can be copied
+# verbatim. Figure geometry is NOT set here -- it is declared once in _quarto.yml.
+#
+# ECHO FOLLOWS THE FORMAT, the one option this document sets differently from the others. The html pass is the
+# runbook and shows its code folded, like every runbook. The LaTeX pass is the appendix, where code would be typeset.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = "",
+  echo     = !knitr::is_latex_output()
+)
+
+options(
+  cli.num_colors = 1,
+  cli.width      = 120,
+  mc.table_mode  = "console"
+)
+```
+
+::: {.content-visible when-format="html"}
+
+```{r}
+#| label: load-libraries
+
+# THE COMMONS, AND THE APPENDIX'S OWN. init_*() resolve this document's paths, tbl_say() is the fixed-width printer
+# every report below uses, _Plots.R gives the figures built here the house theme, and _OnlineAppendix.R is the
+# machinery every chapter of the appendix shares: numbers, floats, references, markers, the LaTeX pass, deployment.
+# No upstream library is sourced: this document reads the files 30 wrote and calls none of its functions.
+.path_libs <- purrr::map_chr(
+  c("_Initialize", "_Utils", "_Tables", "_Plots", "_OnlineAppendix"),
+  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
+)
+purrr::walk(
+  .x = .path_libs,
+  .f = \(.p) source(file = .p, encoding = "UTF-8")
+)
+
+.name_script <- "40-OnlineAppendix-C"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),  # the repository root
+  .name_script = .name_script   # this document's stem
+))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),  # the repository root
+  .name_script = .name_script   # this document's stem
+))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+This document is Appendix C of the online appendix: how every contract of the corpus received its category and its
+amendment flag. The transformer is the paper's classifier and takes most of the chapter -- the taxonomy and the
+labelled sample it learned from, the sweep that selected it, its scores by category and where it errs. The keyword
+table and the language model are described more briefly, as the two alternatives the paper measured on the same
+folds; every engine then stands on one table, with the ceiling any combination of them could reach. The chapter
+closes with what the release carries per contract and how the model's second choice relates to the annotators'
+second label.
+
+The conventions are those of every chapter of the appendix and are set out once, in the Purpose of
+`40-OnlineAppendix-A`. Every table of this chapter is written here, in the appendix's own cut. Seven read the data
+tibbles 30 wrote beside its own tables and print the same numbers with fewer columns, no fold uncertainty and
+numbered categories -- 30 stays the manuscript's writer and is neither changed nor rerun. Two read other sources:
+the descriptions filers give their contracts, from the release, and the second-label table, from 03B's out-of-fold
+classification of the labelled sample.
+
+# Configuration
+
+```{r}
+#| label: configure
+.lP <- list(
+  Root   = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+  Params = list(
+    Strict   = FALSE, # TRUE stops the render on an exhibit that is not built or a number that does not resolve
+    FigWidth = 0.96,  # a figure's width as a share of the text width
+    Rebuild  = FALSE, # TRUE rebuilds this chapter's own exhibits even where their inputs have not changed
+    Titles   = 5L     # descriptions per category in the titles table, on one line each
+  )
+)
+
+.lP$Input <- list(
+  DirExhibits = here::here("2_output", "30-FinalExhibits", "Output"),
+  DirData30   = here::here("2_output", "30-FinalExhibits", "Output", "Data"),  # the tibbles behind 30's tables
+  Contracts   = fs::path(.lP$Root, "100_Data_Export", "Contracts.parquet"),     # the release, for the titles
+  ClassFile   = here::here("2_output", "03B-ClassifyTrainBERT", "classification", # 03B's per-document output
+                           "crowned_classification.parquet"),
+  Lib         = here::here("1_code", "40-OnlineAppendix-C.R"),
+  Template    = here::here("1_code", "_Templates", "oa-body.tex"),
+  Bib         = here::here("1_code", "_Templates", "oa-references.bib"),
+  Qmd         = here::here("1_code", "40-OnlineAppendix-C.qmd")
+)
+
+.lP$Output <- list(
+  Tex     = here::here("_rendered", "1_code", "40-OnlineAppendix-C.tex"),
+  Numbers = utils_file_path(.dir_main, "Output", "OA-Numbers-C.tex"),
+  DirOwn  = fs::path(.dir_main, "Output"),
+  Deploy  = fs::path(.lP$Root, "200-Paper_figures", "OnlineAppendix")
+)
+
+oa_state_reset()
+```
+
+```{r}
+#| label: configure-floats
+tab_floats <- tibble::tribble(
+  ~Section, ~Name,              ~Kind,   ~Source, ~Caption,
+  "C",      "ClassLabelled",    "table", "C",     "The labelled sample",
+  "C",      "CategoryTitles",   "table", "C",     "What filers call their contracts, by category",
+  "C",      "ClassDeployed",    "table", "C",     "The configurations that left the sweep",
+  "C",      "ClassTransformer", "table", "C",     "The transformer by category, out of fold",
+  "C",      "ClassConfusion",   "table", "C",     "Confusion matrix of the detailed transformer",
+  "C",      "ClassAmendment",   "table", "C",     "The amendment classifier, out of fold",
+  "C",      "ClassKeyword",     "table", "C",     "The keyword table by category, out of fold",
+  "C",      "ClassArms",        "table", "C",     "Every engine on every task, and the ceiling",
+  "C",      "ClassSecondPairs", "table", "C",     "Contracts with two labels: primary against second label",
+  "C",      "ClassSecond",      "table", "C",     "The model's two choices on the contracts with two labels"
+)
+
+tab_sources <- tibble::tribble(
+  ~Source, ~Dir,                            ~Macro,
+  "30",    .lP$Input$DirExhibits,           "\\oaexhibits",
+  "C",     as.character(.lP$Output$DirOwn), "\\oaown"
+)
+
+tab_static <- tibble::tibble(
+  Name = character(0),
+  File = character(0),
+  Note = character(0)
+)
+```
+
+# Input
+
+```{r}
+#| label: input-check
+oa_report_inputs(
+  .dir_exhibits = .lP$Input$DirExhibits,
+  .template     = .lP$Input$Template,
+  .bib          = .lP$Input$Bib
+)
+```
+
+# Build
+
+```{r}
+#| label: build-exhibits
+.b_ <- list(.dir_data = .lP$Input$DirData30, .dir_own = .lP$Output$DirOwn, .force = .lP$Params$Rebuild,
+            .path_lib = .lP$Input$Lib)
+
+st_build <- c(
+  ClassLabelled    = do.call(oac_build_labelled, .b_),  # 30's ClassLabelled, without round and words
+  ClassDeployed    = do.call(oac_build_deployed, .b_),  # 30's ClassSweep, the crowned and deployed rows only
+  ClassTransformer = do.call(oac_build_scores, c(.b_, list(
+    .name    = "ClassTransformer",
+    .columns = c("Precision", "Recall", "F1", "RecallLenient"),
+    .header  = c("Precision", "Recall", "F1", "Lenient recall"),
+    .note    = paste(
+      "Out-of-fold scores of the transformer that ships on the labelled sample. Sub-category rows score the",
+      "detailed prediction against the detailed label; parent rows score the same predictions rolled up to their",
+      "parent, so an error inside a parent does not count there. Precision, recall and F1 are per category; the",
+      "Total row reports their macro averages. Lenient recall credits a prediction that equals the contract's",
+      "second valid category."
+    )
+  ))),
+  ClassConfusion   = do.call(oac_build_confusion, .b_),
+  ClassAmendment   = do.call(oac_build_amendment, .b_),
+  ClassKeyword     = do.call(oac_build_scores, c(.b_, list(
+    .name    = "ClassKeyword",
+    .columns = c("Coverage", "Precision", "RecallSel", "F1"),
+    .header  = c("Coverage", "Precision", "Recall where committed", "F1"),
+    .note    = paste(
+      "Out-of-fold scores of the published keyword table on the labelled sample. Coverage is the share of a",
+      "category's contracts on which a term of the table fired; the table abstains on the rest. Precision is",
+      "over the contracts assigned the category; recall where committed is over the contracts of the category on",
+      "which the table committed; F1 combines them. A dash marks a score that is undefined because the table never",
+      "assigned the category to any contract. The Total row reports the macro averages."
+    )
+  ))),
+  ClassArms        = do.call(oac_build_arms, .b_),
+  CategoryTitles   = oac_build_titles(
+    .path_contracts = .lP$Input$Contracts, # the filer's description of each contract
+    .n              = .lP$Params$Titles,   # descriptions per category
+    .dir_own        = .lP$Output$DirOwn,
+    .force          = .lP$Params$Rebuild,
+    .path_lib       = .lP$Input$Lib
+  ),
+  ClassSecond = oac_build_second(                # writes ClassSecondPairs and ClassSecond together
+    .path_class = .lP$Input$ClassFile,     # first and second choice per labelled document, with the second label
+    .dir_own    = .lP$Output$DirOwn,
+    .force      = .lP$Params$Rebuild,
+    .path_lib   = .lP$Input$Lib
+  )
+)
+
+oa_report_builds(.status = st_build)
+```
+
+```{r}
+#| label: configure-context
+ctx_oa <- oa_context_set(
+  .floats    = tab_floats,
+  .static    = tab_static,
+  .sources   = tab_sources,
+  .own       = "C",
+  .dir_doc   = fs::path_dir(.lP$Input$Qmd),
+  .fig_width = .lP$Params$FigWidth,
+  .strict    = .lP$Params$Strict,
+  .long      = character(0)               # every table of the chapter fits a page
+)
+
+oa_report_floats(.files = ctx_oa$Files)
+```
+
+# Numbers
+
+```{r}
+#| label: numbers-resolve
+# THE LABELLED SAMPLE lists parents, sub-categories and a total; the rarest category is a leaf.
+.where_leaf <- "Level1 != 'Amendment' & (Kind == 'sub' | Level1 %in% c('Licenses', 'Leases', 'Other'))"
+# THE ARMS TABLE has one row per task and engine; the transformer appears at both context lengths, Ships marks one.
+.where_bert <- "Task == 'ClassDetailed' & startsWith(Engine, 'Bert') & Ships"
+.where_kw   <- "Task == 'ClassDetailed' & Engine == 'Kw'"
+.where_llm  <- "Task == 'ClassDetailed' & Engine == 'Llm'"
+# THE SECOND-LABEL DATA: one row per primary category, a total, and two margin rows.
+
+tab_numbers_spec <- tibble::tribble(
+  ~Key,              ~Exhibit,           ~Column,         ~Fun,   ~Format, ~Where,
+  # C.1
+  "NLabelled",       "ClassLabelled",    "N",             "one",  "count", "Kind == 'total'",
+  "NRarest",         "ClassLabelled",    "N",             "min",  "count", .where_leaf,
+  "NSecond",         "ClassLabelled",    "Second",        "one",  "count", "Kind == 'total'",
+  "NAmended",        "ClassLabelled",    "N",             "one",  "count", "Row == 'Amended'",
+  "TitlesNamed",     "CategoryTitles",   "pNamed",        "mean", "pct1",  "Rank == 1",
+  # C.2
+  "SweepConfigs",    "ClassSweep",       "1L",            "sum",  "count", "TRUE",
+  "SweepPerTask",    "ClassSweep",       "1L",            "sum",  "count", "Task == 'Detailed'",
+  "AccDetailed",     "ClassTransformer", "Accuracy",      "one",  "prop3", "Kind == 'total'",
+  "F1Detailed",      "ClassTransformer", "F1",            "one",  "prop3", "Kind == 'total'",
+  "LenientDetailed", "ClassTransformer", "RecallLenient", "one",  "prop3", "Kind == 'total'",
+  "AccAmend",        "ClassAmendment",   "Accuracy",      "one",  "prop3", "Label == 'Total'",
+  "F1Amend",         "ClassAmendment",   "F1",            "one",  "prop3", "Label == 'Total'",
+  # C.3 -- C.5
+  "KwCoverage",      "ClassArms",        "Coverage",      "one",  "pct1",  .where_kw,
+  "KwAccCommitted",  "ClassArms",        "AccuracySel",   "one",  "prop3", .where_kw,
+  "F1Llm",           "ClassArms",        "MacroF1",       "one",  "prop3", .where_llm,
+  "AccLlm",          "ClassArms",        "Accuracy",      "one",  "prop3", .where_llm,
+  "AccBert",         "ClassArms",        "Accuracy",      "one",  "prop3", .where_bert,
+  "AccCeiling",      "ClassArmsCeiling", "Accuracy",      "max",  "prop3", "TRUE",
+  # C.6
+  "SecondDocs",      "ClassSecond",      "N",             "one",  "count", "Kind == 'total'",
+  "SecondHit1",      "ClassSecond",      "Hit1 / N",      "one",  "pct1",  "Kind == 'total'",
+  "SecondHit2",      "ClassSecond",      "Hit2 / N",      "one",  "pct1",  "Kind == 'total'",
+  "SecondBoth",      "ClassSecond",      "Both / N",      "one",  "pct1",  "Kind == 'total'",
+  "MarginDual",      "ClassSecond",      "Value",         "one",  "prop3", "Row == 'Margin, two labels'",
+  "MarginSingle",    "ClassSecond",      "Value",         "one",  "prop3", "Row == 'Margin, one label'"
+)
+
+tab_numbers <- oa_numbers_set(
+  .spec     = tab_numbers_spec,
+  .dir_data = c(
+    fs::path(.lP$Input$DirExhibits, "Data"),
+    fs::path(.lP$Output$DirOwn, "Data")
+  )
+)
+
+oa_report_numbers(
+  .tab    = tab_numbers,
+  .strict = .lP$Params$Strict
+)
+```
+
+```{r}
+#| label: numbers-write
+oa_numbers_write(
+  .tab  = tab_numbers,
+  .path = .lP$Output$Numbers,
+  .doc  = .name_script
+)
+```
+
+# Sources
+
+Every method claim in the chapter, with the runbook that is its source and the number or exhibit that carries it.
+The sources here are the pipeline's own documents, so "verified" means read in the runbook's text or code; the
+boxes in the text quote the code.
+
+```{r}
+#| label: sources-register
+#| results: asis
+tab_sources_c <- tibble::tribble(
+  ~No, ~Claim, ~Source, ~Carried, ~Status,
+  1L, "Twelve detailed categories in seven parents; amendment flag orthogonal",
+      "03A-ClassifyPrepare, Purpose; the paper's categories table", "ClassLabelled", "verified",
+  2L, "Two labelling rounds; second labels reviewed, primary deliberate; never used in training",
+      "03A-ClassifyPrepare, Purpose (second labels, LabelRound)", "NSecond; ClassSecondPairs", "verified",
+  3L, "Five folds dealt once, stratified on the detailed category; pooled out of fold; no holdout",
+      "03A (folds frozen); 03B bert_predictions_best() docstring", "AccDetailed, F1Detailed", "verified",
+  4L, "The grid and the two dropped levels; batch 32, seed 42",
+      "03B-ClassifyTrainBERT, The grid", "SweepPerTask, SweepConfigs; ClassDeployed", "verified (code quoted)",
+  5L, "Crowned by the highest mean out-of-fold macro-F1",
+      "03B-ClassifyTrainBERT.R, bert_best_config()", "ClassDeployed", "verified (code quoted)",
+  6L, "Leading configurations within a fold SD; context length does not separate; weighting helps rare classes",
+      "03B-ClassifyTrainBERT, readings after the sweep", "ClassSweep (30's data)", "verified (text quoted)",
+  7L, "Legal-BERT at 256 tokens ships for the detailed and the amendment task",
+      "03B deploy chunk (crowned_classification); 30's ClassSweep Crown/Deployed", "ClassDeployed", "check on render",
+  8L, "Lenient scoring against the second label",
+      "03B / 30 scoring (RecallLenient)", "LenientDetailed", "verified",
+  9L, "Keyword table: Wilson lower bound, target precision, base-rate and marginal-reach guards, fold agreement",
+      "03C-ClassifyTrainKeyword, Configuration and Purpose", "KwCoverage, KwAccCommitted", "verified (code quoted)",
+  10L, "LLM arm: Qwen3 8B, zero and few shot, prompts from complement folds, written blind",
+      "03D-ClassifyLLM, Configuration and Purpose", "AccLlm, F1Llm", "verified (code quoted)",
+  11L, "Routing ceiling needs the true label; the gap over the transformer is small",
+      "03E-ClassifyOrchestrate, Purpose, step 2", "AccBert, AccCeiling", "verified",
+  12L, "The release carries top-2 with probabilities, the keyword label, the broad roll-up",
+      "03F-ClassifyApply, Purpose", "(release columns)", "check the column names on the release"
+)
+rows_ <- paste0("| ", tab_sources_c$No, " | ", tab_sources_c$Claim, " | ", tab_sources_c$Source, " | ",
+                tab_sources_c$Carried, " | ", tab_sources_c$Status, " |")
+cat(paste(c("", "| No | Claim | Source | Carried by | Status |", "|---:|---|---|---|---|", rows_, ""),
+          collapse = "\n"))
+```
+
+<details class="oa-authors">
+<summary><strong>Note for the authors:</strong> Section 3.2 of the manuscript still describes the first submission's classifier</summary>
+
+Every quantitative statement in 3.2 differs from this chapter: ten categories against twelve; 4,327 contracts
+split 70/15/15 against 4,398 in five folds; BERT-base against RoBERTa as the comparison encoder; 512 tokens
+against 256; a hand-picked list of ten keywords per category against a mined table with abstention; 93.4% and
+94.7% test accuracy against out-of-fold accuracy and macro-F1; 90.9% on 54.0% against 0.919 on 52.3%. The LLM
+arm, the ceiling and the second labels are absent from 3.2. The rewrite of 3.2 should cite this chapter's keys
+(`OA-Numbers-C.tex`) so that the two cannot drift again. The list is in `claude_31-OA-Structure.md`.
+
+</details>
+
+:::
+
+::: {.content-visible when-format="html"}
+
+# Appendix C
+
+:::
+
+```{=latex}
+\clearpage
+```
+
+## Classification approach {#sec-oa-c}
+
+Each contract of the corpus carries a category in the twelve of `r oa_ref_main(.name = "Categories", .kind = "table")`,
+its parent among the seven broad ones, and a flag for whether it is an original agreement or an amendment. A
+fine-tuned transformer assigns them. This appendix describes the sample it learned from (C.1), how it was selected
+and how well it does (C.2), the two alternatives the paper measured on the same folds -- a keyword table (C.3) and a
+language model (C.4) -- what all of them reach together and what no combination could exceed (C.5), and what the
+release carries for every contract (C.6).
+
+### Taxonomy and labelled sample {#sec-oa-c-sample}
+
+The twelve detailed categories nest in seven broad ones, so the broad label is a roll-up of the detailed one and the
+two never contradict each other; the amendment flag is orthogonal to both, and an amendment carries the category of
+the agreement it amends. A contract's category follows from its primary obligation, and four boundaries matter most.
+A contract for the purchase or sale of tangible or intangible assets is Assets, unless the assets are inventory or
+operational services, which make it Customer / Supplier: selling a plant is Assets, supplying from it is Customer /
+Supplier. Research and development agreements, with the consulting attached to them, form a category of their own
+within Purchases and Sales. M&A covers the business combination and the agreements that stem from it, such as
+tax-matters agreements, while collaborations that leave the firms separate -- joint ventures, alliances,
+co-development -- are Peer Agreements. Employment splits into compensation plans and the employment relationship
+itself: offer letters, severance, non-competition and change-in-control agreements.
+
+The labelled sample holds `r oa_n(.key = "NLabelled")` contracts with readable text
+(`r oa_ref(.name = "ClassLabelled")`), of which `r oa_n(.key = "NAmended")` are amendments, labelled with rLabelDocs
+(Appendix B.3) in two rounds: a first round in which contracts labelled under an earlier scheme were mapped to the
+current categories, and a second round of direct labelling aimed at the categories the mapping could not fill.
+A contract that fits two categories carries a second
+label, which `r oa_n(.key = "NSecond")` contracts do; every such contract was reviewed and the intended primary
+recorded, so the order of the two labels is deliberate. Training uses the primary label only. The second label
+serves to score leniently and, in Section C.6, to read the model's second choice.
+
+```{r}
+#| label: float-class-labelled
+#| results: asis
+oa_float(.name = "ClassLabelled")
+```
+
+`r oa_ref(.name = "CategoryTitles")` shows, for each category, the five descriptions filers most often give their
+contracts. The description is the filer's own free text and the only human-written label an attachment carries, so
+it is the most direct view of what a category holds -- and, unlike an example contract, it is a count rather than a
+choice. Filers supply a description beyond the exhibit number for `r oa_n(.key = "TitlesNamed")` percent of
+contracts; for the rest, the exhibit number is all they write. The descriptions are what the boundaries above look like
+from the filer's side: stock purchase agreements and plans of merger under M&A, purchase agreements and asset
+purchase agreements under Assets, supply and distribution agreements under Customer / Supplier, and research and
+collaboration agreements under R&D.
+
+```{r}
+#| label: float-category-titles
+#| results: asis
+oa_float(.name = "CategoryTitles")
+```
+
+### The transformer: selection and scores {#sec-oa-c-transformer}
+
+Every approach in this appendix is scored the same way. Five folds are dealt once, stratified on the detailed
+category, and each contract is predicted once, by the fold model that did not see it in training; the scores pool
+these out-of-fold predictions. No test set is held out beyond the folds: with `r oa_n(.key = "NRarest")` contracts in
+the smallest category, a further holdout would leave too few to estimate that category's performance, and the
+cross-validated score is a conservative estimate of the deployed model, which trains on all of the sample. The
+headline metric is macro-F1, the unweighted mean of the per-category F1 scores, because accuracy is dominated by the
+three largest categories, which hold close to half of the sample; accuracy is reported beside it. A lenient score
+counts a prediction as correct where it equals the contract's second label, so the gap between the strict and the
+lenient score measures ambiguity in the taxonomy rather than error in the model.
+
+Two encoders are fine-tuned: Legal-BERT [@chalkidis2020legal], pre-trained on legal text, and RoBERTa
+[@liu2019roberta], pre-trained on general text. The grid crosses them with two learning rates (2e-5 and 3e-5), two
+context lengths (256 and 512 tokens read from the start of the contract), two training budgets (three and six
+epochs) and loss weighting by inverse class frequency or none, separately for each task; a learning rate of 1e-5 and
+ten epochs were each tried against the centre of the grid and did not improve on it, and were dropped rather than
+carried through the whole factorial. Batch size (32) and the seed (42) are held fixed and are not swept axes. That
+leaves `r oa_n(.key = "SweepPerTask")` configurations per task,
+`r oa_n(.key = "SweepConfigs")` in all, each estimated on the five folds, so that the effect of each axis --
+encoder, context length, epochs, weighting -- reads as a like-for-like comparison. The configuration with the
+highest mean out-of-fold macro-F1 is selected per task and refitted on the full labelled sample; the leading
+configurations sit within a fold-level standard deviation of one another, so the selection is between near-equals.
+`r oa_ref(.name = "ClassDeployed")` lists the configurations that left the sweep. For the detailed task and the
+amendment task alike, the classifier that labels the corpus is Legal-BERT reading the first 256 tokens; the longer
+context is deployed beside it, and Section C.5 reports what it buys.
+
+```{r}
+#| label: float-class-deployed
+#| results: asis
+oa_float(.name = "ClassDeployed")
+```
+
+::: {.content-visible when-format="html"}
+
+<details class="oa-source">
+<summary><strong>Source:</strong> 03B-ClassifyTrainBERT, "The grid" (the sweep as configured in code)</summary>
+
+The full crossing, and the two levels dropped after a centre check, as the runbook declares them:
+
+```r
+grid_full <- tidyr::expand_grid(
+  model         = c("nlpaueb/legal-bert-base-uncased", "roberta-base"),   # legal-domain vs general encoder
+  label_col     = c("ClassDetailed", "ClassBroad", "AmendType"),          # the three tasks
+  lr            = c(1e-5, 2e-5, 3e-5),                                    # learning rate
+  max_len       = c(256L, 512L),                                          # tokens read per document
+  epochs        = c(3, 6, 10),                                            # passes over the training data
+  class_weights = c(FALSE, TRUE),                                         # inverse-frequency loss weighting
+  fold          = 1:5                                                     # cross-validation folds from 03A
+)
+
+grid_all <- grid_full |>
+  dplyr::filter(epochs != 10, lr != 1e-5)
+```
+
+> [Two levels are dropped rather than estimated everywhere. Ten epochs and a learning rate of 1e-5 were each
+> evaluated against the centre configuration and neither improved on six epochs at 2e-5; carrying them through
+> the whole factorial would roughly double the sweep in order to re-answer a question already settled. Every
+> remaining combination is estimated.]{.mark}
+
+The sweep call holds `.batch_size = 32L` and `.seed = 42L` fixed ("held fixed across the study; not a swept
+axis"). The runbook's reading of the completed sweep: "Differences between the leading configurations are smaller
+than the spread across folds within any one of them"; on class weighting, "Weighting the loss by inverse class
+frequency improves macro-F1 by a margin that is small but consistent across folds. The effect is concentrated in
+the rarest categories."
+
+</details>
+
+:::
+
+::: {.content-visible when-format="html"}
+
+<details class="oa-source">
+<summary><strong>Source:</strong> 03B-ClassifyTrainBERT.R, bert_best_config() (the crowning rule)</summary>
+
+> Thin wrapper over clf_leaderboard() that returns only the winning ConfigName. [...] @return Character scalar:
+> [the ConfigName ranked first by mean macro-F1.]{.mark}
+
+```r
+bert_best_config <- function(.tab_overall, .label_col = "ClassDetailed") {
+  .tab_overall |>
+    dplyr::filter(.data$LabelCol == .label_col) |>
+    clf_leaderboard() |>
+    dplyr::slice(1) |>
+    dplyr::pull(.data$ConfigName)
+}
+```
+
+And the pooling rule, from the function that follows it: "Each document is predicted exactly once, by the fold
+model that did not see it in training."
+
+</details>
+
+:::
+
+
+Out of fold, the detailed classifier reaches an accuracy of `r oa_n(.key = "AccDetailed")` and a macro-F1 of
+`r oa_n(.key = "F1Detailed")` (`r oa_ref(.name = "ClassTransformer")`); scored leniently, its accuracy rises to
+`r oa_n(.key = "LenientDetailed")`, so the second labels explain few of its errors. The errors that remain
+concentrate in adjacent categories (`r oa_ref(.name = "ClassConfusion")`): between the two employment categories,
+between credit and equity instruments, and among the purchase-and-sale categories whose boundaries Section C.1
+draws -- the pairs on which the annotators, too, most often recorded a second label. The amendment classifier
+reaches an accuracy of `r oa_n(.key = "AccAmend")` and a macro-F1 of `r oa_n(.key = "F1Amend")`
+(`r oa_ref(.name = "ClassAmendment")`). The published broad label is the roll-up of the detailed prediction; a
+classifier trained on the seven broad categories directly is deployed as a consistency check and is not the source
+of the label.
+
+```{r}
+#| label: float-class-transformer
+#| results: asis
+oa_float(.name = "ClassTransformer")
+```
+
+```{r}
+#| label: float-class-confusion
+#| results: asis
+oa_float(.name = "ClassConfusion")
+```
+
+```{r}
+#| label: float-class-amendment
+#| results: asis
+oa_float(.name = "ClassAmendment")
+```
+
+### The keyword table {#sec-oa-c-keyword}
+
+The keyword table is a published artifact rather than a competing classifier: a short, ranked table of terms per
+category that anyone can apply to a filing with a text editor and no model, each term with a stated precision. A
+term's evidence is the Wilson lower bound on its precision in training [@wilson1927probable], which ranks a term
+found in 190 of 200 contracts above one found in 2 of 2. A term enters the table only where its precision exceeds
+the category's base rate, where it catches contracts that no accepted term caught, and where the fold-wise mines
+agree on it; a contract receives the category of the strongest term it contains, and the table abstains where no
+term fires. A table that abstains is judged on two numbers rather than one. Out of fold, the detailed table commits
+on `r oa_n(.key = "KwCoverage")` percent of contracts, with an accuracy of `r oa_n(.key = "KwAccCommitted")` where
+it commits (`r oa_ref(.name = "ClassKeyword")`). Coverage is uneven: credit agreements and leases are named by
+their terms and the table covers most of them, while the two thinnest categories, research agreements and peer
+agreements, have no term precise enough to enter the table at all, so it never assigns them and their precision
+is undefined. The table itself is part of the release.
+
+```{r}
+#| label: float-class-keyword
+#| results: asis
+oa_float(.name = "ClassKeyword")
+```
+
+::: {.content-visible when-format="html"}
+
+<details class="oa-source">
+<summary><strong>Source:</strong> 03C-ClassifyTrainKeyword, Configuration (the keyword table's admission thresholds)</summary>
+
+```r
+TargetPrecision = c(ClassDetailed = 0.95, ClassBroad = 0.95, AmendType = 0.85),
+MinClasses      = c(ClassDetailed = 9L, ClassBroad = 5L, AmendType = 2L),
+Tolerance       = 0.01, # precision band treated as indistinguishable; roughly two SEs here
+MinFolds        = 3L,   # fold agreement required of a published term
+```
+
+The runbook mines the filer's own description of the contract as one arm and the text at 256 and 512 words as
+the like-for-like comparison with the transformer; it judges mines "on the terms they produce, not on the
+accuracy column". The Wilson lower bound and the base-rate and marginal-reach guards are the admission rules of
+the library (kw_*); the released table is the one the catalogue marks as default.
+
+</details>
+
+:::
+
+
+### The language model {#sec-oa-c-llm}
+
+A reader will ask why a fine-tuned encoder was necessary when an open-weight instruction model can be handed a
+contract and asked what it is. The answer is a number on the same folds. A local model, Qwen3 with eight billion
+parameters [@qwen2025qwen3], classifies each contract from its opening text, prompted with the category names and
+definitions alone or with worked examples drawn from the other folds, so that no prompt contains a contract from the
+fold it scores; the prompts were written from the taxonomy without sight of any prediction or labelled contract,
+so that the comparison is not fitted to the transformer's errors. It runs offline and its results reproduce. On the
+detailed task it reaches an accuracy of `r oa_n(.key = "AccLlm")` and a macro-F1 of `r oa_n(.key = "F1Llm")`,
+well below the fine-tuned transformer, at a cost per contract several orders of magnitude above it.
+
+::: {.content-visible when-format="html"}
+
+<details class="oa-source">
+<summary><strong>Source:</strong> 03D-ClassifyLLM, Configuration (the language-model arm)</summary>
+
+```r
+Models = "qwen3:8b",
+```
+
+> [qwen3:32b is installed on this machine and deliberately not swept]{.mark} [...]
+
+Prompts are the category list with definitions, plus categories-times-shots worked examples drawn from the
+complement folds, so that no prompt contains a contract of the fold it scores; the zero-shot prompt shows no
+labelled example. The runbook notes that a four-shot prompt over twelve categories is several thousand tokens,
+which is why the arm is measured on the labelled sample rather than run over the corpus.
+
+</details>
+
+:::
+
+### Every engine on one table, and the ceiling {#sec-oa-c-arms}
+
+`r oa_ref(.name = "ClassArms")` puts the three engines on every task, with the transformer at both context lengths.
+Two things are read from it. The longer context does not separate itself from the shorter one on any task, which is
+why the shorter, cheaper one ships. And the last row is the ceiling: the accuracy that perfect routing would reach
+-- for every contract, whichever engine is right -- which requires the true label and therefore cannot be run, but
+bounds what any rule for combining the engines could achieve. The transformer alone reaches an accuracy of
+`r oa_n(.key = "AccBert")` on the detailed task; the ceiling over all engines is `r oa_n(.key = "AccCeiling")`. The
+gap is what the other engines know that the transformer does not, and it is small: on the contracts the transformer
+gets wrong, the keyword table mostly abstains and the language model is mostly wrong too. The paper therefore
+publishes the transformer's label and the keyword label as an independent second opinion, and no combination of
+them.
+
+```{r}
+#| label: float-class-arms
+#| results: asis
+oa_float(.name = "ClassArms")
+```
+
+### Applied to the corpus {#sec-oa-c-apply}
+
+The classifier labels every Exhibit 10 attachment once, reading its primary copy, and the release carries the label
+on every registrant copy. For each contract, the release holds the most likely and the second most likely category,
+each with its probability, for the detailed task and the amendment flag, the broad label as the roll-up of the
+detailed one, and, where a term of the keyword table fires, the table's category and the term. Each contract thus
+receives one label, and a contract that combines several agreements -- a merger agreement with employment terms, a
+license with a supply obligation -- is labelled by its primary obligation, with the second probability as the
+reading of how mixed it is.
+
+The `r oa_n(.key = "SecondDocs")` labelled contracts that carry a second label show where that happens.
+`r oa_ref(.name = "ClassSecondPairs")` sets their primary label against their second: the pairs concentrate on the
+boundaries Section C.1 draws -- research agreements against customer-supplier and license agreements, asset
+purchases against customer-supplier agreements -- and hardly occur elsewhere. `r oa_ref(.name = "ClassSecond")`
+then asks whether the model's two choices are the annotators' two labels. On these contracts the model's first
+choice is the primary label in `r oa_n(.key = "SecondHit1")` percent of cases and its runner-up the second label in
+`r oa_n(.key = "SecondHit2")` percent, both in `r oa_n(.key = "SecondBoth")` percent. The model is also less sure
+on them than on the rest: the margin between its first and second choice averages `r oa_n(.key = "MarginDual")` on
+contracts with two labels against `r oa_n(.key = "MarginSingle")` on contracts with one. A high second probability
+in the release therefore marks a contract the annotators would also have read as mixed, and an analysis of mixed
+contracts can select on it.
+
+```{r}
+#| label: float-class-second-pairs
+#| results: asis
+oa_float(.name = "ClassSecondPairs")
+```
+
+```{r}
+#| label: float-class-second
+#| results: asis
+oa_float(.name = "ClassSecond")
+```
+
+::: {.content-visible when-format="html"}
+
+# Validation
+
+```{r}
+#| label: validate-floats
+tab_emitted <- oa_report_emitted(.strict = .lP$Params$Strict)
+```
+
+```{r}
+#| label: validate-markers
+tab_markers <- oa_markers(.path_qmd = .lP$Input$Qmd)
+
+oa_report_markers(.tab = tab_markers)
+```
+
+# Deployment
+
+```{r}
+#| label: deploy-status
+oa_report_tex(
+  .path_tex     = .lP$Output$Tex,
+  .path_qmd     = .lP$Input$Qmd,
+  .dir_exhibits = .lP$Input$DirExhibits
+)
+```
+
+```r
+source(here::here("1_code", "_Commons", "_OnlineAppendix.R"), encoding = "UTF-8")
+
+oa_publish(
+  .path_qmd     = here::here("1_code", "40-OnlineAppendix-C.qmd"),
+  .path_tex     = here::here("_rendered", "1_code", "40-OnlineAppendix-C.tex"),
+  .path_numbers = here::here("2_output", "40-OnlineAppendix-C", "Output", "OA-Numbers-C.tex"),
+  .dir_exhibits = here::here("2_output", "30-FinalExhibits", "Output"),
+  .dir_own      = here::here("2_output", "40-OnlineAppendix-C", "Output"),
+  .dir_deploy   = fs::path(
+    "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+    "200-Paper_figures",
+    "OnlineAppendix"
+  ),
+  .quarto       = NULL
+)
+```
+
+# Next
+
+**40-OnlineAppendix-D** -- named entity recognition and the rule set.
+
+:::

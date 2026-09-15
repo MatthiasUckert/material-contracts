@@ -5,9 +5,9 @@
 % repository. Do not edit that file here: an edit is lost at the next render. Comment on it, and the change goes
 % into the .qmd.
 %
-% TWO THINGS THE PAPER'S PREAMBLE NEEDS. \usepackage{adjustbox}, which every table 30 writes uses to shrink a wide
-% table (booktabs is loaded already). And \input{online_appendix/OA-Numbers}, which defines \oanum{Key} for every
-% number the appendix cites, so the main text can cite the same numbers.
+% ONE THING THE PAPER'S PREAMBLE NEEDS: \input{online_appendix/OA-Numbers}, which defines \oanum{Key} for every
+% number the appendix cites, so the main text can cite the same numbers. 30's tables need only booktabs and
+% graphicx, which the paper loads already.
 {
 \makeatletter
 \setcounter{figure}{0}
@@ -40,6 +40,9 @@
 % (the contents of 200-Paper_figures/current/); \oastatic the folder holding the paper's own static tables.
 \newcommand{\oaexhibits}{exhibits/}
 \newcommand{\oastatic}{tables/}
+% \oaown the folder holding the exhibits the appendix builds itself: the fragment's own folder, with its Tables/,
+% Notes/ and Figures/ uploaded as oa_publish() lists them.
+\newcommand{\oaown}{online_appendix/}
 
 \clearpage
 \input{online_appendix/31-OnlineAppendix}

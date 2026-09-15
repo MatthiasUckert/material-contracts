@@ -2102,29 +2102,40 @@ fin_tex_escape <- function(.x) {
 #' ONE FRAME FOR EVERY TABLE, AND IT IS HERS. Ann-Kristin's fragments set the row height at 1.5, rule
 #' the table with a double line on top and a single one below, and give every column a fixed
 #' width -- the label column wide, the number columns 20 mm each and right-aligned -- so that a
-#' table has the same shape whatever its numbers and sits centred under its caption. So every
-#' fragment this document writes is rebuilt into that frame here: the column specification the
-#' writer chose is read for its column count and kinds, number columns become right-aligned 20 mm
-#' paragraph columns, the label column takes what is left of the text width, and the rules are
-#' replaced. A wide table -- more than .max_fixed number columns -- cannot take 20 mm columns and is
-#' instead scaled to the text width with resizebox, which graphicx provides. The type size is not
-#' set here: the manuscript's table environment sets it around the input, as it always did. Nothing
-#' beyond booktabs and graphicx is needed in the preamble.
+#' table has the same shape whatever its numbers. Every fragment this document writes is rebuilt
+#' into that frame here, and the widths are decided by what fits:
+#'
+#'   1. FIXED WIDTHS when they fit: number columns at .col_mm, narrowed down to .col_min if the
+#'      label column would otherwise fall under .label_min; the label column takes the rest.
+#'   2. NATURAL WIDTH when fixed columns would squeeze the label below .label_min: the tabular
+#'      sizes itself from its content, rules and stretch as in 1.
+#'   3. SCALED when the natural width would exceed the text block anyway -- more than .max_natural
+#'      number columns -- with resizebox from graphicx.
+#'
+#' The type size is not set here: the manuscript's table environment sets it around the input.
+#' Nothing beyond booktabs and graphicx is needed in the preamble. The text width is taken as
+#' .text_mm for the arithmetic only; the fragment itself uses \\textwidth.
 #'
 #' @param .lines Character. The fragment as the writer built it: an optional \\begingroup\\size
 #'   line, \\begin{tabular}{spec} ... \\end{tabular}, an optional \\endgroup.
 #' @param .path Character. The .tex written.
 #' @param .stretch Numeric. \\arraystretch; 1.5 is hers.
-#' @param .col_mm Numeric. Width of a number column in millimetres.
-#' @param .max_fixed Integer. Number columns beyond which the table is scaled instead.
+#' @param .col_mm,.col_min Numeric. Target and minimum width of a number column, millimetres.
+#' @param .label_min Numeric. Minimum width of the label column, millimetres.
+#' @param .max_natural Integer. Number columns beyond which the table is scaled.
+#' @param .text_mm Numeric. The text width assumed for the arithmetic, millimetres.
 #' @return Invisibly, the path.
-fin_tex_write <- function(.lines, .path, .stretch = 1.5, .col_mm = 20, .max_fixed = 6L) {
+fin_tex_write <- function(.lines, .path, .stretch = 1.5, .col_mm = 20, .col_min = 14, .label_min = 50,
+                          .max_natural = 8L, .text_mm = 160) {
   if (FALSE) {
-    .lines     <- c("\\begin{tabular}{l r}", "\\toprule", "a & 1 \\\\", "\\bottomrule", "\\end{tabular}")
-    .path      <- fs::path(.lP$Output$DirTables, "Test.tex")
-    .stretch   <- 1.5
-    .col_mm    <- 20
-    .max_fixed <- 6L
+    .lines       <- c("\\begin{tabular}{l r}", "\\toprule", "a & 1 \\\\", "\\bottomrule", "\\end{tabular}")
+    .path        <- fs::path(.lP$Output$DirTables, "Test.tex")
+    .stretch     <- 1.5
+    .col_mm      <- 20
+    .col_min     <- 14
+    .label_min   <- 50
+    .max_natural <- 8L
+    .text_mm     <- 160
   }
   body_ <- .lines[!grepl("^\\\\begingroup\\\\[a-z]+$", .lines) & !grepl("^\\\\endgroup$", .lines)]
   i_ <- grep("^\\\\begin\\{tabular\\}\\{", body_)
@@ -2133,46 +2144,42 @@ fin_tex_write <- function(.lines, .path, .stretch = 1.5, .col_mm = 20, .max_fixe
   spec_ <- sub("^\\\\begin\\{tabular\\}\\{(.*)\\}$", "\\1", body_[i_])
 
   # THE COLUMNS, read from the specification: l, c, r, or p{width}; spaces between them are free.
-  toks_ <- regmatches(spec_, gregexpr("p\\{[^}]*\\}|[lcr]", spec_))[[1L]]
-  n_    <- length(toks_)
-  n_num_ <- sum(toks_ == "r" | toks_ == "c")
-  fixed_ <- n_num_ <= .max_fixed            # a table of p{} columns alone keeps them and is not scaled
+  toks_  <- regmatches(spec_, gregexpr("p\\{[^}]*\\}|[lcr]", spec_))[[1L]]
+  n_     <- length(toks_)
+  n_num_ <- sum(toks_ %in% c("r", "c"))
+  n_lab_ <- sum(toks_ == "l")
+  p_w_   <- as.numeric(sub("^p\\{([0-9.]+)(mm|cm).*$", "\\1", toks_[grepl("^p\\{", toks_)])) *
+    ifelse(grepl("cm", toks_[grepl("^p\\{", toks_)]), 10, 1)
+  pad_mm_ <- 2 * n_ * 2.1                                            # \tabcolsep is 6pt, 2.1 mm, twice per column
+  # THE WIDTH A NUMBER COLUMN CAN HAVE, given the label its minimum: the target, or less down to the
+  # floor; below the floor fixed widths do not fit.
+  room_  <- .text_mm - pad_mm_ - sum(p_w_, na.rm = TRUE) - n_lab_ * .label_min
+  col_w_ <- if (n_num_ > 0L) min(.col_mm, room_ / n_num_) else .col_mm
+  mode_  <- if (n_num_ > .max_natural) "scaled" else if (col_w_ >= .col_min || n_num_ == 0L) "fixed" else "natural"
 
   body_[j_] <- "\\end{tabular}"
   body_ <- sub("^\\\\toprule$", "\\\\hline\\\\hline", body_)
   body_ <- sub("^\\\\bottomrule$", "\\\\hline", body_)
-  if (fixed_) {
-    # FIXED WIDTHS. Number columns .col_mm each; a p{} column keeps its own width; the l columns
-    # share what is left of the text width once every column's padding is taken out.
-    n_lab_ <- sum(toks_ == "l")
-    taken_ <- sum(toks_ %in% c("r", "c")) * .col_mm
-    p_w_   <- as.numeric(sub("^p\\{([0-9.]+)(mm|cm).*$", "\\1", toks_[grepl("^p\\{", toks_)])) *
-      ifelse(grepl("cm", toks_[grepl("^p\\{", toks_)]), 10, 1)
-    taken_ <- taken_ + sum(p_w_, na.rm = TRUE)
-    lab_w_ <- if (n_lab_ > 0L) {
-      paste0("\\dimexpr(\\textwidth-", taken_, "mm-", 2L * n_, "\\tabcolsep)/", n_lab_, "\\relax")
-    } else {
-      NULL
-    }
+  head_ <- paste0("\\renewcommand*{\\arraystretch}{", .stretch, "}")
+  if (mode_ == "fixed") {
+    col_w_ <- round(col_w_, 1)
+    taken_ <- n_num_ * col_w_ + sum(p_w_, na.rm = TRUE)
+    lab_w_ <- paste0("\\dimexpr(\\textwidth-", taken_, "mm-", 2L * n_, "\\tabcolsep)/", max(n_lab_, 1L), "\\relax")
     cols_ <- vapply(toks_, \(.t) switch(
       .t,
-      r = paste0(">{\\raggedleft\\arraybackslash}p{", .col_mm, "mm}"),
-      c = paste0(">{\\centering\\arraybackslash}p{", .col_mm, "mm}"),
+      r = paste0(">{\\raggedleft\\arraybackslash}p{", col_w_, "mm}"),
+      c = paste0(">{\\centering\\arraybackslash}p{", col_w_, "mm}"),
       l = paste0("p{", lab_w_, "}"),
       .t
     ), character(1))
     body_[i_] <- paste0("\\begin{tabular}{", paste(cols_, collapse = " "), "}")
-    out_ <- c(paste0("\\renewcommand*{\\arraystretch}{", .stretch, "}"), body_)
-  } else {
-    # SCALED. Too many columns for fixed widths; the tabular keeps its own specification and is
-    # shrunk to the text width.
+    out_ <- c(head_, body_)
+  } else if (mode_ == "natural") {
     body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
-    out_ <- c(
-      paste0("\\renewcommand*{\\arraystretch}{", .stretch, "}"),
-      "\\resizebox{\\textwidth}{!}{%",
-      body_,
-      "}"
-    )
+    out_ <- c(head_, body_)
+  } else {
+    body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
+    out_ <- c(head_, "\\resizebox{\\textwidth}{!}{%", body_, "}")
   }
   fs::dir_create(fs::path_dir(.path))
   writeLines(out_, .path)

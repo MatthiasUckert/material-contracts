@@ -1,0 +1,385 @@
+---
+title: "01B -- EDGAR"
+subtitle: "The documents behind every in-scope filing, as filed, one parquet per quarter"
+date: today
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+source(here::here("1_code", "_Commons", "_Initialize.R"))
+init_setup()
+init_source_commons()
+```
+
+# Purpose
+
+The second filing stage. For every in-scope filing in `01A`'s `Filings` it fetches the complete submission
+from EDGAR, splits it into its documents, and keeps the ones later stages read, exactly as filed, in one
+parquet per quarter. Nothing is parsed beyond that split: sections, tables and text are later stages' work,
+and they read what this one leaves on disk.
+
+## What it fetches, and why not keep it
+
+EDGAR keeps every filing as one complete submission file: each document the filer submitted, behind a
+header carrying the accession number, the form and the period of report. Its address needs nothing but the
+CIK and the accession number, both in `Filings`, so there is no index to scrape and no document map to keep.
+
+Kept whole, the series projects to about 1.6 TB: most of a submission is images, PDFs and exhibits nobody
+here reads (the 800-filing pilot). So each quarter is split as soon as it is on disk, and the parquet keeps
+the content of every document whose type matches `Keep`:
+
+- the 10-K or 20-F itself;
+- EX-13, where some 10-K filers put the annual report and with it the MD&A and the statements. In a 20-F,
+  Exhibit 13 is the Section 906 certification: small, and kept by the same rule;
+- EX-99, where some 20-F filers put their audited statements and others the statements of an investee.
+  Which is which is read from the description by the stage that uses them;
+- the label linkbase, the labels a filer declares, printed or not. It is 4.6% of a 10-K submission's
+  bytes and 3.4% of a 20-F's (2025q2), about 4 to 5 GB on disk for the series.
+
+Every other document keeps its type, file name, description and size, so the record still says what each
+submission held. The rule is written into every row, and a quarter split under another rule is refused
+rather than mixed: a later stage must be able to tell a document that was never filed from one that was
+filed and not kept.
+
+## The split is not ours
+
+`secsgml` parses the SGML container of a submission; its author has run it over the whole EDGAR corpus.
+`_python/split_submissions.py` turns its output into rows and does nothing else. Content is stored as
+bytes, not text: filings arrive in UTF-8, Latin-1, Windows-1252 and now and then in bytes valid in no
+encoding, and decoding here could only fail or change what was filed.
+
+## The accession number is the key
+
+Every row carries its `Adsh`, so a document is joined to its filing by construction. Nothing this stage
+fetches from the SEC ever needs matching.
+
+## Resumable, per filing
+
+A filing is done when its header row is in one of its quarter's parquets. A render fetches what is not
+done, splits the arrivals into a new part, reads the part back, and only then -- when `KeepRaw` is `FALSE`
+-- deletes the complete files of the filings it holds, so the peak on disk is one quarter. Requests stay
+below the SEC's published fair-access ceiling of ten a second (SEC, *Accessing EDGAR Data*), and a run of
+consecutive failures stops the loop instead of turning every remaining filing into a failure.
+
+A 403 is its own case. The SEC answers too many requests with a 403 and lifts the block once the rate has
+stayed below the ceiling for ten minutes; it serves the same page to an undeclared user agent, so the text
+cannot tell the two apart. The timing can. A 403 before anything in the render was fetched is the user
+agent or a block already in place, and stops the render at once; a 403 after successful fetches is waited
+out for `BlockWait` seconds and the filing tried again, up to `MaxBlocks` times.
+
+## EDGAR-CORPUS, as a benchmark
+
+The item-parsed 10-K corpus of Loukas et al. (ECONLP 2021), 1993-2020, is fetched as published and pinned
+to one revision. It is someone else's parse, with the numerical tables removed and keyed on CIK and period
+year, so it is kept as the yardstick a later parse is compared against. Each year ships as three files
+that are one corpus cut at random; all three are fetched.
+
+# Configuration
+
+```{r}
+#| label: config
+
+.lP <- init_config(
+  .script  = "01B-EDGAR",
+  .inputs  = c(Filings = "01A:Filings"),                     # the download universe: every FSDS submission
+  .outputs = c(
+    "Raw/",                                                  # complete submissions, <Qtr>/<Adsh>.txt; transient
+    "Documents/",                                            # the kept documents, <Qtr>/part-NNN.parquet
+    "EdgarCorpus/",                                          # the corpus as published; empty if not requested
+    "Downloads",                                             # one row per planned filing: outcome, what is kept
+    "CorpusFiles"                                            # one row per requested corpus file
+  ),
+  .params  = list(
+    Quarters     = "2025q2",                                 # the test: one full quarter; NULL = every quarter
+    UserAgent    = "University of Amsterdam - M. Uckert m.uckert@uva.nl",  # the SEC returns 403 without one
+    Rate         = 5L,                                       # requests a second; the SEC's ceiling is 10
+    MaxRunFail   = 25L,                                      # consecutive failures that stop the loop
+    MaxFailShare = 0.01,                                     # gate: planned filings allowed without documents
+    Keep         = "(10-K|20-F|EX-(13|99)([.\\s].*)?|EX-101\\.LAB)",  # types kept whole, a full-match regex
+    KeepRaw      = TRUE,                                     # the test keeps the complete files; FALSE deletes
+                                                             #   each quarter's once its parquet is read back
+    BlockWait    = 600,                                      # seconds to wait out a rate block: the SEC's ten minutes
+    MaxBlocks    = 3L,                                       # waits for one filing before the render stops
+    CorpusYears  = 2018L,                                    # EDGAR-CORPUS period years; NULL skips the corpus
+    CorpusSplits = c("train", "validate", "test"),           # all three: one corpus, cut at random
+    CorpusRev    = "7e90f0f342569b35213445f809cfaf3b91f9964f"  # pinned revision of the Hugging Face repository
+  ),
+  .duck    = list(MemoryLimit = "32GB", TempDir = NULL)      # the default; this stage opens no database
+)
+
+source(.lP$Fun)
+```
+
+## The test
+
+Coverage is `Quarters`, and the unit is a whole quarter. The test is 2025q2: recent, and a quarter in which
+both forms are well represented. `KeepRaw = TRUE` leaves its complete files in `Raw/`, so a change to
+`Keep` re-splits the quarter without a second download: delete `Documents/2025q2/`, which the keep rule
+check asks for anyway, and render. The full run sets `Quarters` to `NULL` and `KeepRaw` to `FALSE`.
+
+# Input
+
+## Filings
+
+Every FSDS submission of every form, with the scope flagged rather than applied.
+
+```{r}
+#| label: input-filings
+
+tab_filings_ <- arrow::read_parquet(.lP$Input$Filings)
+qtrs_ <- edg_quarters(
+  .tab_filings = tab_filings_,                               # the universe the quarters are checked against
+  .qtrs        = .lP$Params$Quarters                         # NULL resolves to every quarter it holds
+)
+```
+
+## What is fetched
+
+The rule that defines the download list, in the open: in scope, in the requested quarters. Nothing else
+bounds it.
+
+```{r}
+#| label: input-scope
+
+tab_scope_ <- tab_filings_ |>
+  dplyr::filter(
+    .data$InScope,                                           # D7: 10-K or 20-F, no amendment, PrevRpt 0
+    .data$Qtr %in% qtrs_                                     # the requested quarters
+  )
+```
+
+## The download list
+
+The address and the file name. The keys are checked on the way: a missing CIK or a malformed accession
+number could only produce failures, and stops the render here instead.
+
+```{r}
+#| label: input-plan
+
+tab_plan_ <- edg_plan(.tab_scope = tab_scope_)
+```
+
+## Where the rows went
+
+```{r}
+#| label: input-funnel
+#| results: asis
+
+edg_report_plan(
+  .tab_filings = tab_filings_,                               # every submission, for the drops
+  .qtrs        = qtrs_,                                      # the requested quarters
+  .tab_plan    = tab_plan_                                   # what survived
+)
+```
+
+# Acquire
+
+## Fetch, split, keep
+
+Quarter by quarter: fetch what no parquet holds yet, split the arrivals into a new part, read it back, and
+account for every filing. Complete files are deleted only after that, and only when `KeepRaw` is `FALSE`.
+
+```{r}
+#| label: acquire-documents
+
+tab_status_ <- edg_acquire(
+  .tab_plan     = tab_plan_,                                 # what to fetch
+  .dir_raw      = .lP$Output$Raw,                            # where complete submissions land
+  .dir_docs     = .lP$Output$Documents,                      # where the kept documents go
+  .keep         = .lP$Params$Keep,                           # which document types keep their content
+  .keep_raw     = .lP$Params$KeepRaw,                        # keep the complete files after the split
+  .user_agent   = .lP$Params$UserAgent,                      # declared to the SEC with every request
+  .rate         = .lP$Params$Rate,                           # requests a second
+  .max_run_fail = .lP$Params$MaxRunFail,                     # consecutive failures that stop the loop
+  .block_wait   = .lP$Params$BlockWait,                      # seconds to wait out a rate block
+  .max_blocks   = .lP$Params$MaxBlocks,                      # waits for one filing before stopping
+  .root         = .lP$Root                                   # for _python/
+)
+```
+
+## What the parquets hold
+
+The index of every document in every parquet, without the content, and one row per planned filing.
+
+```{r}
+#| label: acquire-index
+
+tab_index_ <- edg_index(
+  .dir_docs = .lP$Output$Documents,                          # every part of every quarter
+  .qtrs     = NULL                                           # all quarters, so the projection sees them all
+)
+tab_downloads_ <- edg_downloads(
+  .tab_status = tab_status_,                                 # what happened to each planned filing
+  .tab_index  = tab_index_                                   # what its parquet holds
+)
+```
+
+```{r}
+#| label: acquire-arrived
+#| results: asis
+
+edg_report_downloads(.tab_downloads = tab_downloads_)
+```
+
+## Where the bytes go
+
+What a submission is made of, by form and document type, and what share of it is kept. This is the table
+that says whether a type left out should be kept -- for 20-F filers in particular, whose annual report can
+sit in an exhibit.
+
+```{r}
+#| label: acquire-types
+#| results: asis
+
+tab_types_ <- edg_types(.tab_index = tab_index_, .tab_downloads = tab_downloads_)
+edg_report_types(.tab_types = tab_types_)
+```
+
+## EDGAR-CORPUS
+
+Every split of every requested year, at the pinned revision.
+
+```{r}
+#| label: acquire-corpus
+
+tab_corpus_plan_ <- edg_corpus_plan(
+  .years    = .lP$Params$CorpusYears,                        # NULL: nothing to fetch
+  .splits   = .lP$Params$CorpusSplits,                       # the published splits
+  .revision = .lP$Params$CorpusRev                           # a fixed release, not the repository's head
+)
+tab_corpus_ <- edg_corpus_fetch_all(
+  .tab_corpus_plan = tab_corpus_plan_,                       # what to fetch
+  .dir_corpus      = .lP$Output$EdgarCorpus,                 # where it goes
+  .user_agent      = .lP$Params$UserAgent                    # sent with every request
+)
+```
+
+```{r}
+#| label: acquire-corpus-report
+#| results: asis
+
+edg_report_corpus(.tab_corpus = tab_corpus_)
+```
+
+# Gate
+
+## Downloads
+
+One row per planned filing; every held filing in a parquet exactly once; filings without their documents
+within `MaxFailShare`, a split without the filing's own form counting as one; and, when complete files are
+deleted, none left behind for a held filing.
+
+```{r}
+#| label: gate-downloads
+
+edg_gate_downloads(
+  .tab_plan       = tab_plan_,                               # what was asked for
+  .tab_downloads  = tab_downloads_,                          # what the parquets hold
+  .max_fail_share = .lP$Params$MaxFailShare,                 # tolerated share without documents
+  .dir_raw        = .lP$Output$Raw,                          # checked for leftovers
+  .keep_raw       = .lP$Params$KeepRaw                       # whether leftovers are expected
+)
+```
+
+## Corpus
+
+```{r}
+#| label: gate-corpus
+
+edg_gate_corpus(.tab_corpus = tab_corpus_)
+```
+
+# Validation
+
+## Size by filing year and form
+
+The complete submission and what is kept of it. Filing year is the year of the FSDS quarter.
+
+```{r}
+#| label: validation-size
+#| results: asis
+
+tab_size_ <- edg_size_by_year(.tab_downloads = tab_downloads_)
+edg_report_size(.tab_size = tab_size_)
+```
+
+## The full series, projected
+
+The number the design turns on is disk. If the projected parquets fit, this is the stage; if they do not,
+the next cut is the `Keep` list, which the bytes table above prices type by type.
+
+```{r}
+#| label: validation-projection
+#| results: asis
+
+tab_projection_ <- edg_projection(
+  .tab_downloads = tab_downloads_,                           # the sizes and the pace
+  .tab_filings   = tab_filings_,                             # the universe projected to
+  .tab_index     = tab_index_,                               # what is held, every quarter
+  .dir_docs      = .lP$Output$Documents                      # the parquets' sizes on disk
+)
+edg_report_projection(.tab_projection = tab_projection_)
+```
+
+# Overview
+
+## Megabytes kept per filing
+
+```{r}
+#| label: fig-size
+#| fig-height: !expr plot_height(.n_rows = nrow(tab_size_))
+
+edg_plot_size(.tab_size = tab_size_)
+```
+
+# Results
+
+```{r}
+#| label: results
+#| results: asis
+
+step_report()
+edg_report_coverage(
+  .tab_downloads = tab_downloads_,                           # what this render found and did
+  .tab_filings   = tab_filings_,                             # the full series, for scale
+  .qtrs          = qtrs_                                     # the requested quarters
+)
+```
+
+# Deployment
+
+```{r}
+#| label: deploy
+
+utils_write_parquet(.tab = tab_downloads_, .path = .lP$Output$Downloads)
+utils_write_parquet(.tab = tab_corpus_,    .path = .lP$Output$CorpusFiles)
+# Documents/, Raw/ and EdgarCorpus/ were written file by file in # Acquire.
+
+cli::cli_alert_success("Written to {.path {(.lP)$Dir}}.")
+```
+
+# Next
+
+## The full series
+
+Set `Quarters` to `NULL` and `KeepRaw` to `FALSE`. The parquets are kept, so the full run starts from them,
+and the peak on disk is one quarter of complete files.
+
+## The keep list
+
+The bytes table prices it type by type. A change is a change to `Keep`, and it applies to quarters split
+afterwards; quarters already split under the old rule are refused until they are split again.
+
+## Items
+
+A later pair reads `Documents/` and splits the 10-K and 20-F documents into items, with the tables kept.
+Existing item parsers are the first candidates; the 20-F item list is the one piece nobody ships.
+
+## Matching the corpus
+
+EDGAR-CORPUS joins to `Filings` on CIK and period year, the only key it carries. Then the two parses are
+compared item by item, which is what the benchmark is for.
