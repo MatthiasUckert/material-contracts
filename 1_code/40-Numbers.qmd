@@ -1,0 +1,789 @@
+---
+title: "Numbers -- every number the paper and the online appendix cite (40)"
+author: "Matthias Uckert"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+format:
+  html: default
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr. comment = "" removes the "##"
+# prefix from console blocks so they can be copied verbatim.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(
+  cli.num_colors = 1,
+  cli.width      = 120,
+  mc.table_mode  = "console"
+)
+```
+
+```{r}
+#| label: load-libraries
+
+# THE COMMONS, AND THIS PAIR'S OWN. _Plots.R gives the figures built here the house theme; _OnlineAppendix.R holds the
+# number machinery every chapter shares -- one row of
+# the registry resolved over the tibble beside the exhibit that prints it -- and this document is now the one place
+# that machinery runs. No chapter's library is sourced: this document reads the files 30 and the chapters wrote and
+# calls none of their functions.
+.path_libs <- purrr::map_chr(
+  c("_Initialize", "_Utils", "_Tables", "_Plots", "_OnlineAppendix"),
+  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
+)
+purrr::walk(
+  .x = .path_libs,
+  .f = \(.p) source(file = .p, encoding = "UTF-8")
+)
+
+.name_script <- "40-Numbers"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),  # the repository root
+  .name_script = .name_script   # this document's stem
+))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),  # the repository root
+  .name_script = .name_script   # this document's stem
+))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+Every number the manuscript and the online appendix cite is resolved here, once, and written as one LaTeX file the
+Overleaf project inputs. A number is a row of the registry below: the tibble it is read from, the column, the rows,
+how several rows reduce to one value, how it is printed, the section of the paper it appears in, and one line saying
+what it is. The tibbles are the ones the exhibits are printed from -- 30's under `30-FinalExhibits/Output/Data`, the
+appendix chapters' under their own `Data/`, and two built here that no exhibit holds -- so a sentence and the table
+beside it cannot disagree.
+
+## Why one file
+
+Until now each appendix chapter wrote its own numbers file and the manuscript typed its numbers. Typed copies stop
+being true at the next re-export and nothing reports it; the introduction and Section 4 of the revision disagreed
+on the size of the sample, the Compustat match and the share of 8-K filings for exactly that reason. With one
+registry a key is unique across the paper, cited as `\pnum{Key}` in the manuscript and `\oanum{Key}` in the
+appendix, and both names read the same table.
+
+## What is written
+
+Three files under this document's `Output/`, on every render: `Numbers.tex`, the file Overleaf inputs;
+`Numbers.csv`, the same numbers as a register with their source and note, readable without compiling anything;
+and `Numbers-unresolved.txt`, the keys that did not resolve and why, empty when all did. `num_deploy()` copies the
+first to the paper folder beside the appendix fragments and says whether Overleaf needs a new upload.
+
+## What is not here
+
+Prose. The manuscript's method chapter is `41-Methods`, the appendix chapters are `42-OnlineAppendix-A` to `-D`;
+they cite keys and format tibbles, and compute nothing. The regression numbers of Sections 5 and 6 are not in the
+registry yet; when they come, they come from the release through 30, not as typed values.
+
+# Configuration
+
+```{r}
+#| label: configure
+.lP <- list(
+  Root   = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+  Params = list(
+    Strict     = FALSE, # TRUE stops the render on a number that does not resolve or a citation without a key
+    Rebuild    = FALSE, # TRUE rebuilds this pair's own tibbles even where their inputs have not changed
+    MinMarkers = 1L,    # markers a contract needs to count as redacted by text; the paper's rule (5 = robustness)
+    AhciTo     = 2019L, # last order year of the Ahci (2025) comparison
+    # THE CHAPTERS' PARAMETERS, moved here with their builders.
+    FilesFrom  = 1998.1,           # A: the exhibit-files table's first quarter, as 01A writes year-quarters
+    FilesTo    = 2001.2,           # A: and its last
+    Titles     = 5L,               # C: descriptions per category in the titles table
+    SpacyModel = "en_core_web_trf" # D: the spaCy model 04A ran
+  )
+)
+
+.dirs_edgar <- rGetEDGAR::get_directories(here::here("2_output", "01A-EdgarIndex", "GetEDGAR"))
+
+.lP$Input <- list(
+  Contracts = fs::path(.lP$Root, "100_Data_Export", "Contracts.parquet"), # the release
+  Orders    = fs::path(.lP$Root, "100_Data_Export", "CtoOrders.parquet"), # one row per reference an order makes
+  Lib       = here::here("1_code", "40-Numbers.R"),                      # a changed builder rebuilds
+  # 30'S OUTPUT, read in place: Data/ for the tibbles its tables print from.
+  DirExhibits = here::here("2_output", "30-FinalExhibits", "Output"),
+  DirData30   = here::here("2_output", "30-FinalExhibits", "Output", "Data"),
+  # THE CHAPTERS' INPUTS, moved here with their builders.
+  DirMaster = .dirs_edgar$MasterIndex$DirParquet,                            # A: the master index 01A mirrors
+  DirLinks  = .dirs_edgar$DocLinks$DirMain$Links,                            # A: the document lists 01A mirrors
+  Landing   = here::here("2_output", "01A-EdgarIndex", "Output", "LandingPageAll.parquet"), # A: SIC per filing
+  ClassFile = here::here("2_output", "03B-ClassifyTrainBERT", "classification",           # C: 03B's output
+                         "crowned_classification.parquet"),
+  DirStore  = here::here("2_output", "04A-EntityExtract", "Output"),                        # D: the span stores
+  Sample    = here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet"), # D: the documents
+  # THE DATA DIRECTORIES, in search order: 30's first, then this pair's own.
+  DirData   = c(
+    here::here("2_output", "30-FinalExhibits", "Output", "Data"),
+    here::here("2_output", "40-Numbers", "Output", "Data")
+  ),
+  # THE FILES THAT CITE KEYS, scanned under Validation: the manuscript's section files as exported from Overleaf
+  # (a folder of .tex, optional) and the appendix chapters' sources.
+  DirManuscript = fs::path(.lP$Root, "200-Paper_figures", "Manuscript"),
+  Chapters      = here::here("1_code", c("41-Methods.qmd", paste0("42-OnlineAppendix-", c("A", "B", "C", "D"), ".qmd")))
+)
+
+.lP$Output <- list(
+  DirOwn  = fs::path(.dir_main, "Output"),                            # Data/ for the tibbles built here
+  Numbers = fs::path(.dir_main, "Output", "Numbers.tex"),             # the file Overleaf inputs
+  Deploy  = fs::path(.lP$Root, "200-Paper_figures", "OnlineAppendix") # beside the appendix fragments
+)
+
+# THE SECTIONS OF THE REGISTER, in print order: the manuscript's sections first, then the appendix chapters. A key
+# is filed under the first section that cites it.
+.num_sections <- c("Intro", "3.1", "3.2", "3.3", "3.4", "4.1", "OA-A", "OA-B", "OA-C", "OA-D")
+
+oa_state_reset()
+```
+
+# Input
+
+30 is the one input the builders below do not make for themselves: the release readers and the classification
+tibbles its tables print from. The chapters' former inputs -- the master index, the document lists, 03B's
+classification file, 04A's span stores -- are listed above and opened by the builders that need them.
+
+```{r}
+#| label: input-check
+oa_report_inputs(
+  .dir_exhibits = .lP$Input$DirExhibits,                               # 30's output, read in place
+  .template     = here::here("1_code", "_Templates", "oa-body.tex"),   # the chapters' template, checked once here
+  .bib          = here::here("1_code", "_Templates", "oa-references.bib")
+)
+```
+
+# Build
+
+Every exhibit any chapter sets, and the two tibbles no exhibit holds. The builders came from the chapters unchanged
+and write in 30's layout -- `Tables/`, `Notes/`, `Figures/`, `Data/` -- under this document's output directory,
+which the chapters' sources tables name as their own. Each build compares its outputs with its inputs and with this
+library, and runs only where an output is missing or older; `Rebuild` forces them all.
+
+```{r}
+#| label: build-own
+st_own <- c(
+  CtoAhci = num_build(
+    .name    = "CtoAhci",                                                   # orders on the forms Ahci (2025) covers
+    .fun     = \() num_data_cto_ahci(
+      .path_orders = .lP$Input$Orders,
+      .to          = .lP$Params$AhciTo
+    ),
+    .inputs  = c(.lP$Input$Orders, .lP$Input$Lib),
+    .dir_own = .lP$Output$DirOwn,
+    .force   = .lP$Params$Rebuild
+  ),
+  CtoMarkers = num_build(
+    .name    = "CtoMarkers",                                                # orders against text markers, 2008-2018
+    .fun     = \() num_data_cto_markers(
+      .path_contracts = .lP$Input$Contracts,
+      .min_markers    = .lP$Params$MinMarkers
+    ),
+    .inputs  = c(.lP$Input$Contracts, .lP$Input$Lib),
+    .dir_own = .lP$Output$DirOwn,
+    .force   = .lP$Params$Rebuild
+  )
+)
+```
+
+```{r}
+#| label: build-appendix-a
+.b_a <- list(.dir_own = .lP$Output$DirOwn, .force = .lP$Params$Rebuild, .path_lib = .lP$Input$Lib)
+
+st_a <- c(
+  ExhibitRequired  = do.call(oaa_build_exhibit_table, .b_a),
+  FormDescriptions = do.call(oaa_build_form_descriptions, .b_a),
+  FormCoverage     = do.call(oaa_build_coverage, c(.b_a, list(
+    .dir_master     = .lP$Input$DirMaster,    # filings per form type
+    .path_contracts = .lP$Input$Contracts     # the contracts the database holds
+  ))),
+  FilingsWithinYear = do.call(oaa_build_within_year, c(.b_a, list(.path_contracts = .lP$Input$Contracts))),
+  CtoLinkage       = do.call(oaa_build_cto, c(.b_a, list(
+    .path_orders    = .lP$Input$Orders,       # one row per reference an order makes
+    .path_contracts = .lP$Input$Contracts     # the release's flag on the sample
+  ))),
+  TextCounts       = do.call(oaa_build_counts, c(.b_a, list(.path_contracts = .lP$Input$Contracts))),
+  ExhibitFiles     = do.call(oaa_build_files, c(.b_a, list(
+    .dir_links = .lP$Input$DirLinks,          # the document lists of the index pages, by quarter
+    .from      = .lP$Params$FilesFrom,
+    .to        = .lP$Params$FilesTo
+  ))),
+  SeasonedFilers   = do.call(oaa_build_seasoned, c(.b_a, list(
+    .path_contracts = .lP$Input$Contracts,    # the sample, its forms and its labels
+    .path_landing   = .lP$Input$Landing,      # the SIC code of each filing
+    .dir_master     = .lP$Input$DirMaster     # the first EDGAR filing of each CIK
+  )))
+)
+```
+
+```{r}
+#| label: build-appendix-b
+st_b <- c(
+  PipelineStages  = oab_build_stages(
+    .dir_own  = .lP$Output$DirOwn,  # the table's wording lives in the library
+    .force    = .lP$Params$Rebuild,
+    .path_lib = .lP$Input$Lib
+  ),
+  PackageVersions = oab_build_versions(
+    .dir_own = .lP$Output$DirOwn    # rebuilt on every render: the installed versions
+  )
+)
+```
+
+```{r}
+#| label: build-appendix-c
+.b_c <- list(.dir_data = .lP$Input$DirData30, .dir_own = .lP$Output$DirOwn, .force = .lP$Params$Rebuild,
+             .path_lib = .lP$Input$Lib)
+
+st_c <- c(
+  ClassLabelled    = do.call(oac_build_labelled, .b_c),  # 30's ClassLabelled, without round and words
+  ClassDeployed    = do.call(oac_build_deployed, .b_c),  # 30's ClassSweep, the crowned and deployed rows only
+  ClassTransformer = do.call(oac_build_scores, c(.b_c, list(
+    .name    = "ClassTransformer",
+    .columns = c("Precision", "Recall", "F1", "RecallLenient"),
+    .header  = c("Precision", "Recall", "F1", "Lenient recall"),
+    .note    = paste(
+      "Out-of-fold scores of the transformer that ships on the labelled sample. Sub-category rows score the",
+      "detailed prediction against the detailed label; parent rows score the same predictions rolled up to their",
+      "parent, so an error inside a parent does not count there. Precision, recall and F1 are per category; the",
+      "Total row reports their macro averages. Lenient recall credits a prediction that equals the contract's",
+      "second valid category."
+    )
+  ))),
+  ClassConfusion   = do.call(oac_build_confusion, .b_c),
+  ClassAmendment   = do.call(oac_build_amendment, .b_c),
+  ClassKeyword     = do.call(oac_build_scores, c(.b_c, list(
+    .name    = "ClassKeyword",
+    .columns = c("Coverage", "Precision", "RecallSel", "F1"),
+    .header  = c("Coverage", "Precision", "Recall where committed", "F1"),
+    .note    = paste(
+      "Out-of-fold scores of the published keyword table on the labelled sample. Coverage is the share of a",
+      "category's contracts on which a term of the table fired; the table abstains on the rest. Precision is",
+      "over the contracts assigned the category; recall where committed is over the contracts of the category on",
+      "which the table committed; F1 combines them. A dash marks a score that is undefined because the table never",
+      "assigned the category to any contract. The Total row reports the macro averages."
+    )
+  ))),
+  ClassArms        = do.call(oac_build_arms, .b_c),
+  CategoryTitles   = oac_build_titles(
+    .path_contracts = .lP$Input$Contracts,  # the filer's description of each contract
+    .n              = .lP$Params$Titles,    # descriptions per category
+    .dir_own        = .lP$Output$DirOwn,
+    .force          = .lP$Params$Rebuild,
+    .path_lib       = .lP$Input$Lib
+  ),
+  ClassSecond      = oac_build_second(      # writes ClassSecondPairs and ClassSecond together
+    .path_class = .lP$Input$ClassFile,      # first and second choice per labelled document
+    .dir_own    = .lP$Output$DirOwn,
+    .force      = .lP$Params$Rebuild,
+    .path_lib   = .lP$Input$Lib
+  )
+)
+```
+
+```{r}
+#| label: build-appendix-d
+st_d <- c(
+  EntityCoverage  = oad_build_coverage(
+    .dir_store   = .lP$Input$DirStore,      # 04A's three stores, opened read-only
+    .path_sample = .lP$Input$Sample,        # the documents every store indexes
+    .spacy_model = .lP$Params$SpacyModel,   # the spaCy model printed
+    .dir_own     = .lP$Output$DirOwn,
+    .force       = .lP$Params$Rebuild,
+    .path_lib    = .lP$Input$Lib
+  ),
+  EntityAlignment = oad_build_alignment(    # writes EntityPositions and EntityAgreement from one pass
+    .dir_store   = .lP$Input$DirStore,
+    .path_sample = .lP$Input$Sample,
+    .spacy_model = .lP$Params$SpacyModel,
+    .dir_own     = .lP$Output$DirOwn,
+    .force       = .lP$Params$Rebuild,
+    .path_lib    = .lP$Input$Lib
+  ),
+  ContentValues   = oad_build_values(
+    .path_contracts = .lP$Input$Contracts,  # the naive and rule-based content columns
+    .dir_own        = .lP$Output$DirOwn,
+    .force          = .lP$Params$Rebuild,
+    .path_lib       = .lP$Input$Lib
+  ),
+  DurationRungs   = oad_build_duration(
+    .path_contracts = .lP$Input$Contracts,  # DurationSource, DurationDropped and the two durations
+    .dir_own        = .lP$Output$DirOwn,
+    .force          = .lP$Params$Rebuild,
+    .path_lib       = .lP$Input$Lib
+  )
+)
+
+oa_report_builds(.status = c(st_own, st_a, st_b, st_c, st_d))
+```
+
+# The registry
+
+One row per number. `Where` is a filter over the tibble's own columns, evaluated as written; `Fun` reduces the
+matching rows to one value, and `one` demands exactly one matching row, which is what catches a filter that silently
+matches two. `Column` names a column, or an expression over the tibble's columns where the text needs a share the
+tibble holds as two counts. `Section` is where the number first appears in the paper; `Note` is what it is.
+
+The rows are grouped by the section of the paper. The appendix chapters' rows are their former specifications,
+moved here unchanged; the manuscript's rows are new.
+
+```{r}
+#| label: registry-manuscript
+# FILTER HELPERS, named once. The linkage funnel holds one row per step; Code is the release's LinkStatus prefix.
+.where_step <- \(.c) paste0("Code == '", .c, "'")
+.where_form <- \(.f) paste0("FormFamily == '", .f, "'")
+.where_amd  <- \(.f) paste0("FormFamily == '", .f, "' & Amend == 'Amended'")
+.where_ahci <- "Row == '10-K, 10-Q and 8-K' & Period != 'all years' & Kind == 'granting-new'"
+# THE LADDER (Table 2) holds one row per rung and panel; exclusions are negative, so a count is abs() and a level
+# is the sum of the rows down to it.
+.where_a   <- \(.r) paste0("Panel == 'Panel A: Unique contracts' & Row == '", .r, "'")
+.where_b   <- \(.r) paste0("Panel == 'Panel B: Estimation samples' & Row == '", .r, "'")
+.where_b_k <- "Panel == 'Panel B: Estimation samples' & Kind == 'firm'"
+.rows_uni  <- "Panel == 'Panel A: Unique contracts' & Row %in% c('Full sample', 'Multiple filer')"
+.rows_cs   <- paste0("Panel == 'Panel B: Estimation samples' & ",
+                     "Row %in% c('Full sample', 'Malformatted documents', 'Missing Compustat match')")
+
+spec_manuscript <- tibble::tribble(
+  ~Key,                        ~Section, ~Exhibit,        ~Column,      ~Fun,  ~Format, ~Where,
+  ~Note,
+  # 3.1 -- what is downloaded
+  "DocsAll",                   "3.1",    "SampleSelection", "Contracts", "one", "count", .where_a(.r = "Full sample"),
+  "Exhibit 10 attachments 2001-2024, every registrant copy counted: Table 2's first line",
+  "Docs8K",                    "3.1",    "SummarySample", "All",        "one", "count",
+  "Rung == 'Item 1.01 announcements recovered'",
+  "8-K filings from which an Item 1.01 narrative was recovered",
+  "Orders",                    "3.1",    "CtoLinkage",    "N",          "one", "count", "Step == 'Orders in the release'",
+  "Confidential treatment orders on EDGAR, 2008 onwards, whatever their status",
+  # 3.4 -- orders and their linkage
+  "OrderRefs",                 "3.4",    "CtoLinkage",    "N",          "one", "count",
+  "Step == 'References to exhibits they make'",
+  "Exhibit references the orders make; one order names one or several exhibits",
+  "OrderRefsLinked",           "3.4",    "CtoLinkage",    "N",          "one", "count", .where_step(.c = "A-linked"),
+  "References that reach an attachment in the register",
+  "DocsWithCto",               "3.4",    "CtoLinkage",    "N",          "one", "count", "Kind == 'result'",
+  "Unique contracts covered by at least one granted order",
+  "OrdersAhci",                "3.4",    "CtoAhci",       "Orders",     "one", "count", .where_ahci,
+  "New grants through 2019 whose references name a 10-K, 10-Q or 8-K: the comparison with Ahci (2025)",
+  "OrderRefsAhci",             "3.4",    "CtoAhci",       "References", "one", "count", .where_ahci,
+  "Exhibit references of those orders",
+  "CtoMarkerAgree",            "3.4",    "CtoMarkers",    "Share",      "one", "pct1",
+  "Row == 'Share of ordered contracts with a marker'",
+  "Share of CTO-covered unique contracts of 2008-2018 that also carry a bracketed redaction marker",
+  "MarkerCtoAgree",            "3.4",    "CtoMarkers",    "Share",      "one", "pct1",
+  "Row == 'Share of marked contracts with an order'",
+  "Share of marked unique contracts of 2008-2018 that are covered by an order",
+  # 3.4 -- announcements
+  "AnnouncementsNoDate",       "3.4",    "SummarySample", "abs(All)",   "one", "count",
+  "Rung == 'No agreement date read in the narrative'",
+  "8-Ks whose narrative names no agreement date, dropped before the single-agreement test",
+  "AnnouncementsMultiSummary", "3.4",    "SummarySample", "abs(All)",   "one", "count",
+  "Rung == 'Two or more agreement dates'",
+  "8-Ks dropped because the narrative opens with two or more agreement dates",
+  "AnnouncementsMultiExhibit", "3.4",    "SummarySample", "abs(All)",   "one", "count",
+  "Rung == 'More than one Exhibit 10 on the 8-K'",
+  "8-Ks dropped because more than one Exhibit 10 rides on them",
+  "Announcements",             "3.4",    "SummarySample", "All",        "one", "count", "Rung == 'Announcement sample'",
+  "Single-agreement Item 1.01 announcements on 8-Ks with at most one Exhibit 10: the paper's sample",
+  # 4.1 -- filing types and the ladder, as chapter A defines them
+  "Share8K",                   "4.1",    "FilingTypes",   "Share",      "max", "pct1",  .where_form(.f = "8-K"),
+  "Share of unique contracts filed with an 8-K, percent",
+  "Share10K",                  "4.1",    "FilingTypes",   "Share",      "max", "pct1",  .where_form(.f = "10-K"),
+  "Share filed with a 10-K, percent",
+  "Share10Q",                  "4.1",    "FilingTypes",   "Share",      "max", "pct1",  .where_form(.f = "10-Q"),
+  "Share filed with a 10-Q, percent",
+  "ShareS1",                   "4.1",    "FilingTypes",   "Share",      "max", "pct1",  .where_form(.f = "S-1"),
+  "Share filed with an S-1, percent",
+  "FirmsAll",                  "4.1",    "SampleSelection", "Firms",     "one", "count", .where_a(.r = "Full sample"),
+  "Firms (CIKs) in the full sample",
+  "DocsFlagged",               "4.1",    "SampleSelection", "abs(Contracts)", "one", "count",
+  .where_a(.r = "Malformatted documents"),
+  "Attachments excluded as malformatted (three text rules and PDF/image placeholders), all copies",
+  "DocsCopies",                "4.1",    "SampleSelection", "abs(Contracts)", "one", "count",
+  .where_a(.r = "Multiple filer"),
+  "Additional registrant copies of an attachment filed under several CIKs",
+  "DocsUnique",                "4.1",    "SampleSelection", "Contracts", "sum", "count", .rows_uni,
+  "Distinct attachments 2001-2024: the full sample less the registrant copies",
+  "DocsSample",                "4.1",    "SampleSelection", "Contracts", "one", "count", .where_a(.r = "Unique contracts"),
+  "Unique contracts with readable text: the descriptive sample",
+  "FirmsSample",               "4.1",    "SampleSelection", "Firms",     "one", "count", .where_a(.r = "Unique contracts"),
+  "Firms with at least one unique contract",
+  "DocsNoCompustat",           "4.1",    "SampleSelection", "abs(Contracts)", "one", "count",
+  .where_b(.r = "Missing Compustat match"),
+  "Contracts without a Compustat match in their filing quarter",
+  "DocsCompustat",             "4.1",    "SampleSelection", "Contracts", "sum", "count", .rows_cs,
+  "Contracts merged to quarterly Compustat: the full sample less malformatted and unmatched",
+  "DocsEstimation",            "4.1",    "SampleSelection", "Contracts", "one", "count",
+  .where_b(.r = "Contract-level sample"),
+  "Contract-level estimation sample",
+  "QuartersEstimation",        "4.1",    "SampleSelection", "Quarters",  "one", "count",
+  .where_b(.r = "Contract-level sample"),
+  "Firm-quarters in the contract-level sample",
+  "FirmsEstimation",           "4.1",    "SampleSelection", "Firms",     "one", "count",
+  .where_b(.r = "Contract-level sample"),
+  "Firms in the contract-level sample",
+  "DocsEstimation2008",        "4.1",    "SampleSelection", "Contracts", "one", "count", .where_b(.r = "from 2008"),
+  "Contract-level sample from 2008",
+  "QuartersFirmLevel",         "4.1",    "SampleSelection", "Quarters",  "one", "count", .where_b_k,
+  "Firm-quarters in the firm-level sample, non-filing quarters included",
+  "FirmsFirmLevel",            "4.1",    "SampleSelection", "Firms",     "one", "count", .where_b_k,
+  "Firms in the firm-level sample"
+)
+
+```
+
+```{r}
+#| label: registry-appendix-a
+# CHAPTER A's rows, as its specification had them, less the keys the manuscript now owns.
+.where_reg <- "Group %in% c('Exchange Act registrations', 'Real-estate registrations')"
+.where_out <- "Panel == 'Outside it' & Kind == 'total'"
+.where_in  <- "Panel == 'In the database' & Kind == 'total'"
+.where_all      <- \(.y) paste0("Filers == 'All filers' & Year == ", .y)
+.where_seasoned <- \(.y) paste0("Filers == 'Seasoned filers' & Year == ", .y)
+.where_group    <- \(.g, .y) paste0("grepl('", .g, "', Filers) & Year == ", .y)
+
+spec_a <- tibble::tribble(
+  ~Key,                 ~Exhibit,         ~Column,       ~Fun,  ~Format, ~Where,
+  "DocsRelease",        "TextCounts",     "Value",       "one", "count", "Key == 'DocsAll'",
+  "DocsReleaseUnique",  "TextCounts",     "Value",       "one", "count", "Key == 'DocsUnique'",
+  "DocsReleaseFlagged", "TextCounts",     "Value",       "one", "count", "Key == 'DocsFlagged'",
+  "DocsPre2001",        "TextCounts",     "Value",       "one", "count", "Key == 'DocsPre2001'",
+  "CovInside",          "FormCoverage",   "Filings",     "one", "count", .where_in,
+  "CovSmallBusiness",   "FormCoverage",   "Filings",     "sum", "count", "grepl('Small business', Group)",
+  "CovTenKVariants",    "FormCoverage",   "Filings",     "one", "count", "Group == '10-K variants'",
+  "CovRegistrations",   "FormCoverage",   "Filings",     "sum", "count", .where_reg,
+  "Cov20FFilings",      "FormCoverage",   "Filings",     "one", "count", "Group == 'Foreign annual reports'",
+  "Cov20FContracts",    "FormCoverage",   "Contracts",   "one", "count", "Group == 'Foreign annual reports'",
+  "CovOutside",         "FormCoverage",   "Filings",     "one", "count", .where_out,
+  "FilesShare2000Q2",   "ExhibitFiles",   "ShareFile",   "one", "pct1",  "Quarter == '2000 Q2'",
+  "FilesShare2000Q3",   "ExhibitFiles",   "ShareFile",   "one", "pct1",  "Quarter == '2000 Q3'",
+  "FilesShare1999Q4",   "ExhibitFiles",   "ShareFile",   "one", "pct1",  "Quarter == '1999 Q4'",
+  "ShareForeign",       "FilingTypes",    "N / sum(N)",  "sum", "pct1",  "Region == 'Foreign filings'",
+  "Amend8K",            "FilingTypes",    "N / NForm",   "one", "pct1",  .where_amd(.f = "8-K"),
+  "Amend10K",           "FilingTypes",    "N / NForm",   "one", "pct1",  .where_amd(.f = "10-K"),
+  "Amend10Q",           "FilingTypes",    "N / NForm",   "one", "pct1",  .where_amd(.f = "10-Q"),
+  "RuleShort",          "TextCounts",     "Value",       "one", "count", "Key == 'RuleShort'",
+  "RuleStopwords",      "TextCounts",     "Value",       "one", "count", "Key == 'RuleStopwords'",
+  "RuleNumeric",        "TextCounts",     "Value",       "one", "count", "Key == 'RuleNumeric'",
+  "Placeholders",       "TextCounts",     "Value",       "one", "count", "Key == 'Placeholders'",
+  "OrderRefsNotEx10",   "CtoLinkage",     "N",           "one", "count", .where_step(.c = "2-"),
+  "OrderRefsFrame",     "CtoLinkage",     "N",           "one", "count", .where_step(.c = "6-"),
+  "OrderRefsMissing",   "CtoLinkage",     "N",           "one", "count", .where_step(.c = "9-"),
+  "LinkedExtensions",   "CtoLinkage",     "N",           "one", "count", "Step == 'Extends an earlier grant'",
+  "LinkedDenials",      "CtoLinkage",     "N",           "one", "count", "grepl('^Denies', Step)",
+  "NAll2020",           "SeasonedFilers", "N",           "one", "count", .where_all(.y = 2020),
+  "NAll2021",           "SeasonedFilers", "N",           "one", "count", .where_all(.y = 2021),
+  "NSeasoned2020",      "SeasonedFilers", "N",           "one", "count", .where_seasoned(.y = 2020),
+  "NSeasoned2021",      "SeasonedFilers", "N",           "one", "count", .where_seasoned(.y = 2021),
+  "RegAll2021",         "SeasonedFilers", "ShareReg",    "one", "pct1",  .where_all(.y = 2021),
+  "RegSeasoned2021",    "SeasonedFilers", "ShareReg",    "one", "pct1",  .where_seasoned(.y = 2021),
+  "EqAll2021",          "SeasonedFilers", "ShareEquity", "one", "pct1",  .where_all(.y = 2021),
+  "EqSeasoned2021",     "SeasonedFilers", "ShareEquity", "one", "pct1",  .where_seasoned(.y = 2021),
+  "NBlankCheck2021",    "SeasonedFilers", "N",           "one", "count", .where_group(.g = "Blank-check", .y = 2021),
+  "NSeasonedEdgar2021", "SeasonedFilers", "N",           "one", "count", .where_group(.g = "first EDGAR", .y = 2021)
+) |>
+  dplyr::mutate(
+    Section = "OA-A",
+    Note    = paste0("Appendix A, read from ", .data$Exhibit, " where ", .data$Where)
+  )
+```
+
+```{r}
+#| label: registry-appendix-b
+# CHAPTER B's rows: the installed package versions, cited as text.
+spec_b <- tibble::tribble(
+  ~Key,               ~Exhibit,          ~Column, ~Fun,  ~Format, ~Where,
+  "VersionGetEDGAR",  "PackageVersions", "Value", "one", "text",  "Key == 'rGetEDGAR'",
+  "VersionLabelDocs", "PackageVersions", "Value", "one", "text",  "Key == 'rLabelDocs'"
+) |>
+  dplyr::mutate(
+    Section = "OA-B",
+    Note    = paste0("Appendix B, read from ", .data$Exhibit, " where ", .data$Where)
+  )
+```
+
+```{r}
+#| label: registry-appendix-c
+# CHAPTER C's rows. The manuscript's Section 3.2 cites the first block, so those are filed under 3.2.
+.where_leaf <- "Level1 != 'Amendment' & (Kind == 'sub' | Level1 %in% c('Licenses', 'Leases', 'Other'))"
+.where_bert <- "Task == 'ClassDetailed' & startsWith(Engine, 'Bert') & Ships"
+.where_kw   <- "Task == 'ClassDetailed' & Engine == 'Kw'"
+.where_llm  <- "Task == 'ClassDetailed' & Engine == 'Llm'"
+# THE SWEEP TIBBLE holds one row per configuration; the learning rate and the epochs sit in ConfigName (_E6_, _LR2e-05_).
+# The factorial is the two learning rates and the two epoch budgets; the runs at 1e-5 and at ten epochs are the two
+# checks of the dropped levels and are counted apart.
+.in_grid     <- "grepl('_E(3|6)_', ConfigName) & grepl('_LR(2|3)e-05_', ConfigName)"
+.where_sweep <- paste0("Task %in% c('ClassDetailed', 'AmendType') & ", .in_grid)
+.where_task  <- paste0("Task == 'ClassDetailed' & ", .in_grid)
+.where_check <- paste0("Task == 'ClassDetailed' & !(", .in_grid, ")")
+
+spec_c_manuscript <- tibble::tribble(
+  ~Key,              ~Exhibit,           ~Column,         ~Fun,   ~Format, ~Where,
+  ~Note,
+  "NLabelled",       "ClassLabelled",    "N",             "one",  "count", "Kind == 'total'",
+  "Manually labeled contracts with readable text",
+  "NAmended",        "ClassLabelled",    "N",             "one",  "count", "Row == 'Amended'",
+  "Of which amendments",
+  "NSecond",         "ClassLabelled",    "Second",        "one",  "count", "Kind == 'total'",
+  "Labeled contracts that carry a second category",
+  "NRarest",         "ClassLabelled",    "N",             "min",  "count", .where_leaf,
+  "Labeled contracts in the smallest detailed category",
+  "SweepConfigs",    "ClassSweep",       "1L",            "sum",  "count", .where_sweep,
+  "Factorial configurations across the category and the amendment task (32 each; the broad task is a roll-up)",
+  "AccDetailed",     "ClassTransformer", "Accuracy",      "one",  "prop3", "Kind == 'total'",
+  "Out-of-fold accuracy of the deployed model, category task",
+  "F1Detailed",      "ClassTransformer", "F1",            "one",  "prop3", "Kind == 'total'",
+  "Out-of-fold macro-F1, category task",
+  "LenientDetailed", "ClassTransformer", "RecallLenient", "one",  "prop3", "Kind == 'total'",
+  "Accuracy counting a prediction that matches the second label as correct",
+  "AccAmend",        "ClassAmendment",   "Accuracy",      "one",  "prop3", "Label == 'Total'",
+  "Out-of-fold accuracy, amendment task",
+  "F1Amend",         "ClassAmendment",   "F1",            "one",  "prop3", "Label == 'Total'",
+  "Out-of-fold macro-F1, amendment task",
+  "KwCoverage",      "ClassArms",        "Coverage",      "one",  "pct1",  .where_kw,
+  "Share of labeled contracts the keyword table classifies, percent",
+  "KwAccCommitted",  "ClassArms",        "AccuracySel",   "one",  "prop3", .where_kw,
+  "Accuracy of the keyword table where it classifies"
+) |>
+  dplyr::mutate(Section = "3.2")
+
+spec_c <- tibble::tribble(
+  ~Key,           ~Exhibit,           ~Column,   ~Fun,   ~Format, ~Where,
+  "TitlesNamed",  "CategoryTitles",   "pNamed",  "mean", "pct1",  "Rank == 1",
+  "SweepPerTask", "ClassSweep",       "1L",      "sum",  "count", .where_task,
+  "SweepChecks",  "ClassSweep",       "1L",      "sum",  "count", .where_check,
+  "F1Llm",        "ClassArms",        "MacroF1", "one",  "prop3", .where_llm,
+  "AccLlm",       "ClassArms",        "Accuracy", "one", "prop3", .where_llm,
+  "AccBert",      "ClassArms",        "Accuracy", "one", "prop3", .where_bert,
+  "AccCeiling",   "ClassArmsCeiling", "Accuracy", "max", "prop3", "TRUE",
+  "SecondDocs",   "ClassSecond",      "N",       "one",  "count", "Kind == 'total'",
+  "SecondHit1",   "ClassSecond",      "Hit1 / N", "one", "pct1",  "Kind == 'total'",
+  "SecondHit2",   "ClassSecond",      "Hit2 / N", "one", "pct1",  "Kind == 'total'",
+  "SecondBoth",   "ClassSecond",      "Both / N", "one", "pct1",  "Kind == 'total'",
+  "MarginDual",   "ClassSecond",      "Value",   "one",  "prop3", "Row == 'Margin, two labels'",
+  "MarginSingle", "ClassSecond",      "Value",   "one",  "prop3", "Row == 'Margin, one label'"
+) |>
+  dplyr::mutate(
+    Section = "OA-C",
+    Note    = paste0("Appendix C, read from ", .data$Exhibit, " where ", .data$Where)
+  )
+```
+
+```{r}
+#| label: registry-appendix-d
+# CHAPTER D's rows. Section 3.3 cites the values and the duration rungs; the rest is the appendix's.
+.where_cov <- \(.f, .e) paste0("Family == '", .f, "' & Entity == '", .e, "'")
+.where_gpe <- "Block == 'pairwise' & Entity == 'GPE' & ProducerA == 'lexnlp' & ProducerB == 'matcon'"
+
+spec_d_manuscript <- tibble::tribble(
+  ~Key,           ~Exhibit,        ~Column,     ~Fun,  ~Format, ~Where,
+  ~Note,
+  "ValPartNaive", "ContentValues", "PartNaive", "one", "num2",  "Kind == 'total'",
+  "Distinct organizations a contract names, mean",
+  "ValPartRule",  "ContentValues", "PartRule",  "one", "num2",  "Kind == 'total'",
+  "Contracting parties (registrant, co-registrants, counterparties), mean",
+  "ValCtryNaive", "ContentValues", "CtryNaive", "one", "num2",  "Kind == 'total'",
+  "Countries a contract mentions, mean",
+  "ValCtryReg",   "ContentValues", "CtryReg",   "one", "num2",  "Kind == 'total'",
+  "Countries attributed to the registrant, mean",
+  "ValCtryCpty",  "ContentValues", "CtryCpty",  "one", "num2",  "Kind == 'total'",
+  "Countries attributed to the counterparties, mean",
+  "DurTerm",      "DurationRungs", "Share",     "one", "pct1",  "Rung == 'term'",
+  "Share of contracts whose end comes from a stated term, percent",
+  "DurMedRule",   "DurationRungs", "Med",       "one", "num1",  "Rung == 'all-rule'",
+  "Median duration in years under the rule",
+  "DurMedNaive",  "DurationRungs", "Med",       "one", "num1",  "Rung == 'all-naive'",
+  "Median duration in years reading the latest date in the contract as its end"
+) |>
+  dplyr::mutate(Section = "3.3")
+
+spec_d <- tibble::tribble(
+  ~Key,                ~Exhibit,          ~Column,      ~Fun,  ~Format, ~Where,
+  "NerDocs",           "EntityCoverage",  "nDocs",      "max", "count", "TRUE",
+  "CovOrgSpacy",       "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "spacy",  .e = "ORG"),
+  "CovOrgLexnlp",      "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "lexnlp", .e = "ORG"),
+  "SpansOrgSpacy",     "EntityCoverage",  "Spans",      "one", "count", .where_cov(.f = "spacy",  .e = "ORG"),
+  "SpansOrgLexnlp",    "EntityCoverage",  "Spans",      "one", "count", .where_cov(.f = "lexnlp", .e = "ORG"),
+  "CovPersonSpacy",    "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "spacy",  .e = "PERSON"),
+  "CovGpeSpacy",       "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "spacy",  .e = "GPE"),
+  "CovGpeLexnlp",      "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "lexnlp", .e = "GPE"),
+  "CovDateLexnlp",     "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "lexnlp", .e = "DATE"),
+  "CovMoneyLexnlp",    "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "lexnlp", .e = "MONEY"),
+  "CovMoneyMatcon",    "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "matcon", .e = "MONEY"),
+  "CovTermMatcon",     "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "matcon", .e = "TERM"),
+  "CovRedactMatcon",   "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "matcon", .e = "REDACT"),
+  "CovLawMatcon",      "EntityCoverage",  "Coverage",   "one", "pct1",  .where_cov(.f = "matcon", .e = "LAW"),
+  "ContrastOrgLexnlp", "EntityPositions", "Contrast",   "max", "num2",  "Producer == 'lexnlp' & Entity == 'ORG'",
+  "ContrastOrgSpacy",  "EntityPositions", "Contrast",   "max", "num2",  "Producer == 'spacy:trf' & Entity == 'ORG'",
+  "JaccardOrg",        "EntityAgreement", "Jaccard",    "one", "num2",  "Block == 'pairwise' & Entity == 'ORG'",
+  "JaccardGpeLex",     "EntityAgreement", "Jaccard",    "one", "num2",  .where_gpe,
+  "ExactGpeLex",       "EntityAgreement", "ExactShare", "one", "pct1",  .where_gpe,
+  "JaccardGpeSpacy",   "EntityAgreement", "Jaccard",    "max", "num2",
+                       "Block == 'pairwise' & Entity == 'GPE' & (ProducerA == 'spacy:trf' | ProducerB == 'spacy:trf')",
+  "JaccardDate",       "EntityAgreement", "Jaccard",    "one", "num2",  "Block == 'pairwise' & Entity == 'DATE'",
+  "ExactDate",         "EntityAgreement", "ExactShare", "one", "pct1",  "Block == 'pairwise' & Entity == 'DATE'",
+  "JaccardMoney",      "EntityAgreement", "Jaccard",    "one", "num2",  "Block == 'pairwise' & Entity == 'MONEY'",
+  "OneProducerGpe",    "EntityAgreement", "Share",      "one", "pct1",
+                       "Block == 'consensus' & Entity == 'GPE' & NProducer == 1",
+  "OneProducerOrg",    "EntityAgreement", "Share",      "one", "pct1",
+                       "Block == 'consensus' & Entity == 'ORG' & NProducer == 1",
+  "ValAmtNaive",       "ContentValues",   "AmtNaive",   "one", "num2",  "Kind == 'total'",
+  "ValAmtRule",        "ContentValues",   "AmtRule",    "one", "num2",  "Kind == 'total'",
+  "DurOpen",           "DurationRungs",   "Share",      "one", "pct1",  "Rung == 'open'",
+  "DurCue",            "DurationRungs",   "Share",      "one", "pct1",  "Rung == 'cue'",
+  "DurMaxDate",        "DurationRungs",   "Share",      "one", "pct1",  "Rung == 'maxdate'",
+  "DurNone",           "DurationRungs",   "Share",      "one", "pct1",  "Rung == 'none'",
+  "DurCapped",         "DurationRungs",   "N",          "one", "count", "Rung == 'dropped-capped'",
+  "DurDefRule",        "DurationRungs",   "Defined",    "one", "count", "Rung == 'all-rule'",
+  "DurDefNaive",       "DurationRungs",   "Defined",    "one", "count", "Rung == 'all-naive'"
+) |>
+  dplyr::mutate(
+    Section = "OA-D",
+    Note    = paste0("Appendix D, read from ", .data$Exhibit, " where ", .data$Where)
+  )
+```
+
+```{r}
+#| label: registry-assemble
+tab_numbers_spec <- dplyr::bind_rows(
+  spec_manuscript,
+  spec_c_manuscript,
+  spec_d_manuscript,
+  spec_a,
+  spec_b,
+  spec_c,
+  spec_d
+) |>
+  num_registry_check(.sections = .num_sections)
+
+n_sec_ <- dplyr::n_distinct(tab_numbers_spec$Section)
+cli::cli_alert_info("{nrow(tab_numbers_spec)} numbers registered across {n_sec_} sections.")
+
+tab_sources <- num_report_sources(
+  .spec     = tab_numbers_spec,   # which tibbles the registry names
+  .dir_data = .lP$Input$DirData   # and where each is looked for, in order
+)
+```
+
+# Numbers
+
+```{r}
+#| label: numbers-resolve
+tab_numbers <- oa_numbers_set(
+  .spec     = tab_numbers_spec,  # every number the paper and the appendix cite
+  .dir_data = .lP$Input$DirData  # the tibbles behind the exhibits, 30's first
+)
+
+oa_report_numbers(
+  .tab    = tab_numbers,       # resolved above
+  .strict = .lP$Params$Strict  # TRUE stops the render on an unresolved number
+)
+```
+
+```{r}
+#| label: numbers-write
+paths_numbers <- num_numbers_write(
+  .tab     = tab_numbers,        # resolved above
+  .dir_own = .lP$Output$DirOwn,  # Numbers.tex, Numbers.csv, Numbers-unresolved.txt
+  .doc     = .name_script
+)
+```
+
+# Validation
+
+**Every citation resolves, and every key is cited.** The manuscript's section files, where a folder of them exists,
+and the appendix chapters' sources are scanned for `\pnum{}`, `\oanum{}` and `oa_n("")`. A cited key the registry
+does not hold would print as `??Key`; a registered key cited nowhere is either dead weight or a chapter not yet
+written, and is listed so the registry stays honest.
+
+```{r}
+#| label: validate-citations
+paths_cite <- c(
+  if (fs::dir_exists(.lP$Input$DirManuscript)) fs::dir_ls(.lP$Input$DirManuscript, glob = "*.tex"),
+  .lP$Input$Chapters
+)
+
+tab_cited <- num_cited_keys(.paths = paths_cite)
+
+lst_check <- num_check_citations(
+  .tab    = tab_numbers,       # what is defined
+  .cited  = tab_cited,         # what is cited, where
+  .strict = .lP$Params$Strict  # TRUE aborts on a citation without a key
+)
+```
+
+**The register, as written.** The same table `Numbers.csv` holds; what a reader opens to check a value.
+
+```{r}
+#| label: validate-register
+tab_numbers |>
+  dplyr::select(dplyr::all_of(c("Section", "Key", "Value", "Status", "Note"))) |>
+  tbl_say()
+```
+
+# Deployment
+
+Every render writes `Output/Numbers.tex`. One call copies it to the paper folder beside the appendix fragments,
+archives the version it replaces, and says whether the content changed -- which, while Overleaf is updated by hand,
+is whether to upload it.
+
+```r
+source(here::here("1_code", "_Commons", "_OnlineAppendix.R"), encoding = "UTF-8")
+source(here::here("1_code", "40-Numbers.R"), encoding = "UTF-8")
+
+num_deploy(
+  .path_numbers = here::here("2_output", "40-Numbers", "Output", "Numbers.tex"),
+  .dir_deploy   = fs::path(
+    "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+    "200-Paper_figures",
+    "OnlineAppendix"
+  )
+)
+```
+
+On the Overleaf side, the preamble inputs this one file in place of the four chapter files:
+`\input{online_appendix/Numbers}`. The chapter files can be removed once it compiles.
+
+```{r}
+#| label: deploy-status
+if (fs::file_exists(.lP$Output$Numbers)) {
+  cli::cli_alert_info(
+    "{.file Numbers.tex} last written {format(fs::file_info(.lP$Output$Numbers)$modification_time, '%Y-%m-%d %H:%M')}."
+  )
+}
+```
+
+# Overview
+
+```{r}
+#| label: overview
+tab_numbers |>
+  dplyr::count(.data$Section, Resolved = .data$Status == "ok", name = "N") |>
+  tidyr::pivot_wider(names_from = "Resolved", values_from = "N", values_fill = 0L) |>
+  tbl_say()
+```
+
+# Next
+
+- Rename the moved builders (`oaa_*`, `oac_*`, `oad_*`) to `num_*` once the identity checks against the chapters'
+  last outputs have passed; until then the names say where each came from.
+- The introduction and Section 4 keys beyond chapter A's (words per contract by class, contracts per filing quarter
+  by industry, the amendment share, the redaction shares before and after the FAST Act): rows over 30's
+  `ContentDetail`, `FirmFundamentals`, `ContractTypes` and `RedactionsTime`, once their columns are confirmed.
+- `AnnouncementsNoDate` is a third exclusion the manuscript does not mention; either the sentence names it or the
+  sample definition folds it into the single-agreement test.

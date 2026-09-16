@@ -61,7 +61,7 @@ purrr::walk(
   .f = \(.p) source(file = .p, encoding = "UTF-8")
 )
 
-.name_script <- "40-OnlineAppendix-B"
+.name_script <- "42-OnlineAppendix-B"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
@@ -76,6 +76,7 @@ cat("Function File:  ")
 ))
 
 source(file = .path_fun, encoding = "UTF-8")
+source(file = here::here("1_code", "40-Numbers.R"), encoding = "UTF-8") # the builders and the register loader
 ```
 
 # Purpose
@@ -87,7 +88,7 @@ fragment that the paper's Overleaf project inputs. The fragment carries the chap
 that makes this a runbook sits in blocks the LaTeX pass removes.
 
 The conventions are those of every chapter of the appendix and are set out once, in the Purpose of
-`40-OnlineAppendix-A`: why the text lives here and not in Overleaf, what a fragment may contain, where exhibits come
+`42-OnlineAppendix-A`: why the text lives here and not in Overleaf, what a fragment may contain, where exhibits come
 from, and what is recomputed. This chapter is the smallest of the six. It has one exhibit of its own, the pipeline
 table, whose content is text rather than data and is kept in the library as a tibble so that it deploys like every
 other exhibit; and two numbers, the versions of the packages, read from the installed packages so that the text
@@ -108,16 +109,16 @@ cannot name a version the database was not built with.
 
 .lP$Input <- list(
   DirExhibits = here::here("2_output", "30-FinalExhibits", "Output"),          # 30's output, for the input check
-  Lib         = here::here("1_code", "40-OnlineAppendix-B.R"),                 # the table's only input
   Template    = here::here("1_code", "_Templates", "oa-body.tex"),
   Bib         = here::here("1_code", "_Templates", "oa-references.bib"),
-  Qmd         = here::here("1_code", "40-OnlineAppendix-B.qmd")
+  Qmd         = here::here("1_code", "42-OnlineAppendix-B.qmd")
 )
 
+.lP$Input$Register <- here::here("2_output", "40-Numbers", "Output", "Numbers.csv") # every number, as 40 resolved it
+
 .lP$Output <- list(
-  Tex     = here::here("_rendered", "1_code", "40-OnlineAppendix-B.tex"),
-  Numbers = utils_file_path(.dir_main, "Output", "OA-Numbers-B.tex"),
-  DirOwn  = fs::path(.dir_main, "Output"),
+  Tex     = here::here("_rendered", "1_code", "42-OnlineAppendix-B.tex"),
+  DirOwn  = here::here("2_output", "40-Numbers", "Output"),
   Deploy  = fs::path(.lP$Root, "200-Paper_figures", "OnlineAppendix")
 )
 
@@ -157,21 +158,9 @@ oa_report_inputs(
 
 # Build
 
-```{r}
-#| label: build-exhibits
-st_build <- c(
-  PipelineStages  = oab_build_stages(
-    .dir_own  = .lP$Output$DirOwn,  # this chapter's own exhibits
-    .force    = .lP$Params$Rebuild, # TRUE rebuilds regardless
-    .path_lib = .lP$Input$Lib       # the table's wording lives in the library
-  ),
-  PackageVersions = oab_build_versions(
-    .dir_own = .lP$Output$DirOwn    # rebuilt on every render
-  )
-)
-
-oa_report_builds(.status = st_build)
-```
+This chapter builds nothing. Every exhibit it sets is built by `40-Numbers`, which writes them in 30's layout under
+its own output directory, the directory the sources table names as this chapter's. The package-versions table
+is rebuilt on every render of 40, so a version cited here is the one installed when 40 last ran.
 
 ```{r}
 #| label: configure-context
@@ -190,37 +179,18 @@ oa_report_floats(.files = ctx_oa$Files)
 
 # Numbers
 
-```{r}
-#| label: numbers-resolve
-tab_numbers_spec <- tibble::tribble(
-  ~Key,                 ~Exhibit,          ~Column, ~Fun,  ~Format, ~Where,
-  "VersionGetEDGAR",    "PackageVersions", "Value", "one", "text",  "Key == 'rGetEDGAR'",
-  "VersionLabelDocs",   "PackageVersions", "Value", "one", "text",  "Key == 'rLabelDocs'"
-)
+Every number the text cites is a key in 40's registry. This chapter loads the register 40 last wrote and cites
+through `oa_n()`, as before.
 
-tab_numbers <- oa_numbers_set(
-  .spec     = tab_numbers_spec,
-  .dir_data = fs::path(.lP$Output$DirOwn, "Data")
-)
+```{r}
+#| label: numbers-load
+tab_numbers <- num_numbers_load(.path_register = .lP$Input$Register)
 
 oa_report_numbers(
-  .tab    = tab_numbers,
-  .strict = .lP$Params$Strict
+  .tab    = tab_numbers,       # as 40 resolved them
+  .strict = .lP$Params$Strict  # TRUE stops the render on an unresolved number
 )
 ```
-
-```{r}
-#| label: numbers-write
-oa_numbers_write(
-  .tab  = tab_numbers,
-  .path = .lP$Output$Numbers,
-  .doc  = .name_script
-)
-```
-
-:::
-
-::: {.content-visible when-format="html"}
 
 # Appendix B
 
@@ -232,19 +202,20 @@ oa_numbers_write(
 
 ## The software {#sec-oa-b}
 
-The database is built by a pipeline of six stages, two of which are R packages published with the paper and two of
-which are code published alongside it. This appendix describes them at the level a reader needs to place the chapters
-that follow; each package carries its own documentation, and how the code is obtained is set out in Appendix F.
+We build our database with a pipeline of six stages, two of which are R packages we publish with the paper and two
+of which are code we publish alongside it. This appendix describes them at the level a reader needs to place the
+chapters that follow; each package carries its own documentation, and how the code is obtained is set out in
+Appendix F.
 
 ### The pipeline {#sec-oa-b-pipeline}
 
 `r oa_ref(.name = "PipelineStages")` lists the stages in the order they run. Each reads what the previous one
 produced and writes its own result, so a stage can be rerun -- with a new model, a changed rule, a further year --
-without repeating the ones before it. Acquisition is the work of rGetEDGAR (Section B.2) and is described, with
+without repeating the ones before it. The data retrieval is the work of rGetEDGAR (Section B.2) and is described, with
 what it downloads and what it leaves out, in Appendix A. The database stage turns downloaded documents into contract
-rows (Section A.4). The labelled sample is produced with rLabelDocs (Section B.3). Classification and entity
-extraction are the subject of Appendices C and D, and the code that runs them is described in Section B.4. The
-release is Appendix F.
+rows (Section A.4). We produce the labeled sample with rLabelDocs (Section B.3). Contract classification and content
+variable creation are the subject of Appendices C and D, and the code that runs them is described in Section B.4.
+The publication of the database is Appendix F.
 
 ```{r}
 #| label: float-pipeline-stages
@@ -254,46 +225,47 @@ oa_float(.name = "PipelineStages")
 
 ### rGetEDGAR {#sec-oa-b-rgetedgar}
 
-rGetEDGAR retrieves EDGAR filings and converts them to text. It is not tied to material contracts: a run is defined
-by a period, a set of filers, the form types and the exhibit types wanted, so the frame of this database is one
-selection among many the package supports. Retrieval runs in three stages -- EDGAR's quarterly master index, which
-lists every filing; the index page of each selected filing, which lists its documents; and the documents themselves
--- and each stage stores its result, so that a later stage never repeats an earlier stage's requests and an
-interrupted run resumes where it stopped. Requests carry the identification the SEC requires and stay under its rate
+rGetEDGAR retrieves EDGAR filings and converts them to text. It is not tied to material contracts: a retrieval is
+defined by a period, a set of filers, the form types and the exhibit types of interest, so the scope of our database
+is one selection among many the package supports. The retrieval runs in three stages -- EDGAR's quarterly master
+index, which lists every filing; the index page of each selected filing, which lists its documents; and the documents
+themselves -- and each stage stores its result, so that a later stage never repeats an earlier stage's requests and
+an interrupted retrieval resumes where it stopped. Requests carry the identification the SEC requires and stay under its rate
 limit; a request that fails is logged and skipped, so one bad response cannot stall a run of hundreds of thousands.
 Each document is stored twice: as the text of the filed document, with the reading of HTML that preserves the
-whitespace filers use to lay out a contract, and in a standardised form -- punctuation removed, whitespace collapsed,
-transliterated to ASCII and upper-cased -- on which the keyword table and the text searches of this paper run. The
-database was built with version `r oa_n(.key = "VersionGetEDGAR")`, published at
+whitespace filers use to lay out a contract, and in a standardized form -- punctuation removed, whitespace collapsed,
+transliterated to ASCII and upper-cased -- on which the keyword table and the text searches of this paper run. We
+built our database with version `r oa_n(.key = "VersionGetEDGAR")`, published at
 `github.com/MatthiasUckert/rGetEDGAR`.
 
 ### rLabelDocs {#sec-oa-b-rlabeldocs}
 
-rLabelDocs is an application for labelling documents against a classification scheme, built for projects with
-several annotators. A scheme -- the questions an annotator answers about a document and the answers each admits --
+rLabelDocs is an interactive Shiny-based application for labeling documents against a classification scheme,
+built for projects with several annotators. A scheme -- the questions an annotator answers about a document and
+the answers each admits --
 is a table the project supplies, so the package is tied neither to contracts nor to any one taxonomy, and several
 schemes can run over the same documents in one pass, which is how a contract received its category and its amendment
 flag together. Labels are kept as an append-only log: every answer is recorded with its document, annotator and
 time, the current label is the newest entry, and nothing is overwritten, so a correction leaves the original in
-place and the labelling can be read as it stood at any earlier moment. The application records a hash of the scheme
-when labelling begins and warns if the scheme changes afterwards -- the error that would otherwise pass unnoticed,
-answers given under one set of categories and read under another. The labelled sample of Appendix C was produced
+place and the labeling can be read as it stood at any earlier moment. The application records a hash of the scheme
+when labeling begins and warns if the scheme changes afterwards -- the error that would otherwise pass unnoticed,
+answers given under one set of categories and read under another. We produced the labeled sample of Appendix C
 with version `r oa_n(.key = "VersionLabelDocs")`, published at `github.com/MatthiasUckert/rLabelDocs`.
 
 ### The classifier and the extractors {#sec-oa-b-code}
 
 The classification and extraction stages are code rather than packages, written in Python where the model libraries
 live and in R where the pipeline does. The classifier is a pair of scripts around the Hugging Face transformers
-library: one fine-tunes a pre-trained legal-domain transformer on the labelled sample, with the training run set by
-a configuration file rather than by edits to the code, and one applies the resulting model to the corpus and writes,
-for every contract, the top categories with their probabilities. The keyword table is derived from the labelled
-sample by the pipeline itself and is published as a file, so that it can be applied without the model. The entity
+library: one fine-tunes a pre-trained legal-domain transformer on the labeled sample, with the training run set by
+a configuration file rather than by edits to the code, and one applies the resulting model to every contract and
+writes, for every contract, the top categories with their probabilities. We derive the keyword table from the
+labeled sample in the pipeline itself and publish it as a file, so that it can be applied without the model. The entity
 extractors are of two kinds: two scripts that run the LexNLP and spaCy libraries over every contract and write each
 entity as a span with its position in the text, and the pattern and gazetteer extractors of the pipeline, which find
 what those libraries do not -- exhibit-style party definitions, contract dates, monetary amounts, redaction markers
--- and are regular expressions and lookup tables rather than models. The rules that turn spans into the release's
-variables (Appendix D) are part of the pipeline. All of it is published with the paper; the form of the publication
-is set out in Appendix F.
+-- and are regular expressions and lookup tables rather than models. The rules that turn spans into our database's
+content variables (Appendix D) are part of the pipeline. We publish all of it with the paper; the form of the
+publication is set out in Appendix F.
 
 ::: {.content-visible when-format="html"}
 
@@ -326,11 +298,11 @@ oa_report_tex(
 source(here::here("1_code", "_Commons", "_OnlineAppendix.R"), encoding = "UTF-8")
 
 oa_publish(
-  .path_qmd     = here::here("1_code", "40-OnlineAppendix-B.qmd"),
-  .path_tex     = here::here("_rendered", "1_code", "40-OnlineAppendix-B.tex"),
-  .path_numbers = here::here("2_output", "40-OnlineAppendix-B", "Output", "OA-Numbers-B.tex"),
+  .path_qmd     = here::here("1_code", "42-OnlineAppendix-B.qmd"),
+  .path_tex     = here::here("_rendered", "1_code", "42-OnlineAppendix-B.tex"),
+  .path_numbers = NULL,                                                                     # 40 deploys Numbers.tex
   .dir_exhibits = here::here("2_output", "30-FinalExhibits", "Output"),
-  .dir_own      = here::here("2_output", "40-OnlineAppendix-B", "Output"),
+  .dir_own      = here::here("2_output", "40-Numbers", "Output"),                            # the exhibits 40 built
   .dir_deploy   = fs::path(
     "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
     "200-Paper_figures",
@@ -342,6 +314,6 @@ oa_publish(
 
 # Next
 
-**40-OnlineAppendix-C** -- the classification approach.
+**42-OnlineAppendix-C** -- the classification approach.
 
 :::

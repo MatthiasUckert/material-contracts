@@ -1,0 +1,399 @@
+---
+title: "Methodology and data -- the manuscript's Section 3 (41)"
+author: "Matthias Uckert"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+format:
+  # THE RUNBOOK: the chapter as it will read, with the values 40 resolved in place of the macros.
+  html: default
+  # THE FRAGMENT: 4-method.tex for Overleaf. wrap: none keeps one paragraph on one line, as the paper's files are
+  # kept; natbib leaves \citet and \citep to the paper's bibliography.
+  latex:
+    template: _Templates/manuscript-body.tex
+    cite-method: natbib
+    wrap: none
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = "",
+  echo     = !knitr::is_latex_output()
+)
+
+options(
+  cli.num_colors = 1,
+  cli.width      = 120,
+  mc.table_mode  = "console"
+)
+```
+
+::: {.content-visible when-format="html"}
+
+```{r}
+#| label: load-libraries
+
+# THE COMMONS, AND THIS PAIR'S OWN. Nothing upstream is sourced: this document reads 40's register and writes prose.
+.path_libs <- purrr::map_chr(
+  c("_Initialize", "_Utils", "_Tables"),
+  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
+)
+purrr::walk(
+  .x = .path_libs,
+  .f = \(.p) source(file = .p, encoding = "UTF-8")
+)
+
+.name_script <- "41-Methods"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),
+  .name_script = .name_script
+))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),
+  .name_script = .name_script
+))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+This document is the manuscript's Section 3, "Methodology and data". The text is written here once and rendered
+twice: to html, the runbook, where every number appears as the value `40-Numbers` last resolved; and to a LaTeX
+fragment, `4-method.tex`, where every number is a `\pnum{Key}` macro that Overleaf reads from `Numbers.tex`. The
+fragment replaces the file of the same name in the Overleaf project.
+
+## What comes from where
+
+Numbers: 40's register, `Numbers.csv`, and nothing else -- this document computes no value. Table 1 stays the static
+table Ann-Kristin keeps in Overleaf (`tables/T1_contract_classification.tex`); the fragment carries its environment
+verbatim. Citations and cross-references are written through two helpers so the html reads and the LaTeX resolves.
+
+## How edits flow
+
+The fragment is not a file to edit. Formatting decided in Overleaf -- a paragraph break, a footnote moved, a
+sentence cut -- comes back into this document, and the next render carries it. An edit left in Overleaf is lost at
+the next paste.
+
+# Configuration
+
+```{r}
+#| label: configure
+.lP <- list(
+  Root   = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+  Params = list(
+    Strict = FALSE # TRUE stops the render on a cited key that 40 did not resolve
+  )
+)
+
+.lP$Input <- list(
+  Register = here::here("2_output", "40-Numbers", "Output", "Numbers.csv"), # every number, as 40 last resolved it
+  Qmd      = here::here("1_code", "41-Methods.qmd"),
+  Template = here::here("1_code", "_Templates", "manuscript-body.tex")
+)
+
+.lP$Output <- list(
+  Tex    = here::here("_rendered", "1_code", "41-Methods.tex"),          # written by Quarto, in the LaTeX pass
+  Deploy = fs::path(.lP$Root, "200-Paper_figures", "Manuscript")        # where met_deploy() copies it
+)
+```
+
+# Input
+
+```{r}
+#| label: input-register
+tab_register <- met_numbers_load(.path_register = .lP$Input$Register)
+```
+
+:::
+
+```{r}
+#| label: load-quiet
+#| include: false
+# THE LATEX PASS sees none of the blocks above, so the library and the register are loaded again here, silently.
+if (!exists("met_n")) {
+  purrr::walk(
+    .x = purrr::map_chr(c("_Initialize", "_Utils", "_Tables"), \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))),
+    .f = \(.p) source(file = .p, encoding = "UTF-8")
+  )
+  source(file = here::here("1_code", "41-Methods.R"), encoding = "UTF-8")
+  met_numbers_load(.path_register = here::here("2_output", "40-Numbers", "Output", "Numbers.csv"))
+}
+```
+
+# Methodology and data {#sec:method}
+
+Next, we describe our methodology and data. In the following, we explain the data retrieval process from the SEC
+EDGAR database and the resulting material contract database (`r met_ref("sec:data")`), the contract classification
+(`r met_ref("sec:classification")`), the extraction of content-related information such as contract partners,
+locations, and durations (`r met_ref("sec:content")`), the identification of redactions (`r met_ref("sec:redactions")`), and the
+extraction of 8-K Item 1.01 contract summaries (`r met_ref("sec:announcements")`). For each step, we provide open-source R and
+Python packages. The Online Appendix provides an extended description of the SEC filing requirements and the database
+(`r met_ref("sec-oa-a", "Online Appendix")`), the software (`r met_ref("sec-oa-b", "Online Appendix")`), the
+classification approach (`r met_ref("sec-oa-c", "Online Appendix")`), and the information extraction
+(`r met_ref("sec-oa-d", "Online Appendix")`).
+
+## Data extraction {#sec:data}
+
+All SEC filings, including material contracts, are publicly available via the EDGAR database. However, EDGAR is
+designed for targeted searches rather than for comprehensive data collection. The platform offers a full-text search,
+filtering by company identifier (CIK) and by form type, but no index of the exhibits attached to a filing. Material
+contracts can be identified by their standardized designation in the filing index (e.g., "EX-10.1"), but each exhibit
+must be located and retrieved individually, and the SEC limits access to ten requests per second. Bulk retrieval of
+specific exhibit types across hundreds of thousands of filings therefore requires a systematic approach.
+
+To address these challenges, we developed the rGetEDGAR R package. First, we retrieve the quarterly master index
+files published by the SEC, which contain the metadata of all filings. Second, we retrieve each filing's index page to
+extract document-level metadata, including document descriptions, types, and URLs. Third, we download the identified
+documents and convert them to text. Each step stores the results, so that an interrupted retrieval resumes where it
+stopped and no request is repeated. The package is not tied to material contracts: a retrieval is defined by the
+period, the filers, and the form and exhibit types of interest. `r met_ref("sec-oa-b-rgetedgar", "Online Appendix")`
+describes the package in detail.
+
+Using rGetEDGAR, we download three groups of documents. First, we retrieve all attachments filed as Exhibit 10 with
+Forms 10-K, 10-Q, 8-K, S-1, S-4, 20-F, F-1, and F-4 and their amendments, resulting in `r met_n("DocsAll")`
+documents.^[Material contracts filed under other form types, or under other exhibit numbers, are not part of our
+database. `r met_ref("sec-oa-a-holds", "Online Appendix")` lists all form types carrying material contracts and their
+coverage.] Second, we retrieve all Form 8-K filings that report the entry into a material definitive agreement under
+Item 1.01 (`r met_n("Docs8K")` filings), whose contract summaries we analyze in `r met_ref("sec:announcements")`.
+Third, we retrieve all confidential treatment orders (`r met_n("Orders")` orders), which we use to identify redacted
+contracts before the 2019 FAST Act. Our sample period starts in 2001. Although EDGAR lists filings from 1993 (when the
+phase-in of electronic filing began) and electronic filing has been mandatory for all domestic registrants since May
+1996, exhibits were included in the text of the complete submission until mid-2000 and only became separately
+retrievable documents with EDGAR Release 7.0 in May 2000.^[The phase-in of mandated electronic filing under Regulation
+S-T began on April 26, 1993 (SEC Release 33-6977) and ended on May 6, 1996 (SEC Release 33-7122). EDGAR Release 7.0
+took effect on May 30, 2000 (SEC Release 33-7855). `r met_ref("sec-oa-a-holds", "Online Appendix")` documents the
+share of Exhibit 10 attachments available as separate files by quarter around this date.] The year 2001 is therefore
+the first full year in which every material contract is available as a document of its own.
+
+## Contract classification {#sec:classification}
+
+Material contracts are a heterogeneous group of documents including credit, employment, and leasing contracts.
+`r met_ref("fig:contract_ex", "Appendix")` provides a contract example. As these contracts cover very different
+economic transactions, prior studies classify them in different ways and at different levels of granularity. We start
+with the classification of `r met_cite("verrecchia2006redacted")` and extend it with recent schemes used in the
+contracting literature (e.g., `r met_cite(c("Boone2016", "Bao2022DoNews", "Thompson2023", "Bao2025"), "p")`).
+Comparing these schemes, we design our twelve categories to (i) cover the contract types that recur across studies,
+(ii) remain granular enough to separate contracts with distinct disclosure incentives, and (iii) avoid categories that
+are too narrow to support meaningful empirical analysis. Our aim is a categorization that balances coverage and
+granularity and offers a useful reference point for future research.
+`r met_ref("tab:contract_classification", "Table")` defines each category.
+
+```{=latex}
+\begin{table}[h!]
+    \caption{Contract Categories}\label{tab:contract_classification}
+    \footnotesize
+        \input{tables/T1_contract_classification.tex}
+
+    {\footnotesize
+    Notes: Table \ref{tab:contract_classification} defines the twelve contract categories and provides
+    representative agreement titles. The categorization builds on \citet{verrecchia2006redacted} and incorporates
+    the schemes used in \cite{Boone2016}, \cite{Bao2022DoNews}, \cite{Thompson2023}, and \cite{Bao2025}.
+    Categories are mutually exclusive; contracts are classified according to their primary obligation.}
+\end{table}
+```
+
+::: {.content-visible when-format="html"}
+*[Table 1, the static contract-category table Ann-Kristin keeps in Overleaf, is set here in the fragment.]*
+:::
+
+Our classification addresses two tasks: (1) the classification of each contract into one of the twelve categories,
+which nest in seven broad categories so that both levels of granularity are available, and (2) the amendment
+classification, distinguishing original contracts from amendments and modifications. To ensure classification quality
+and consistency, we developed rLabelDocs, an interactive Shiny-based package for systematic document annotation, which
+provides a structured interface for document classification, progress tracking, and controls across multiple
+annotators (`r met_ref("sec-oa-b-rlabeldocs", "Online Appendix")`). Using this package, we manually labeled a sample
+of `r met_n("NLabelled")` contracts, `r met_n("NAmended")` of which are amendments. Where a contract fits two
+categories, the annotators recorded a second label (`r met_n("NSecond")` contracts); we train on the primary label
+only. `r met_ref("sec-oa-c-sample", "Online Appendix")` explains the boundaries between adjacent categories and shows
+the most frequent contract titles per category.
+
+Our classification approach employs transformer-based models. We evaluate all models with five-fold cross-validation
+stratified on the contract category, so that every labeled contract is predicted once by a model that did not see it
+in training. Given the small number of contracts in the rarest category (`r met_n("NRarest")`), a further held-out
+test set would leave too few observations to evaluate that category. As accuracy is dominated by the three largest
+categories, which hold almost half of the sample, we select models on macro-F1, the unweighted mean of the
+per-category F1 scores, and report accuracy beside it. We compare Legal-BERT, a model pre-trained on legal texts
+`r met_cite("chalkidis2020legal", "p")`, with the general-purpose RoBERTa `r met_cite("liu2019roberta", "p")` and
+vary the learning rate, the number of tokens read from the beginning of the contract (256 or 512), the number of
+training epochs, and whether classes are weighted by their inverse frequency, resulting in `r met_n("SweepConfigs")`
+configurations across both tasks. For each task, we select the configuration with the highest cross-validated
+macro-F1 and re-train it on the full labeled sample. For both tasks, the selected model is Legal-BERT reading the
+first 256 tokens of each contract; reading 512 tokens does not improve
+performance.^[`r met_ref("sec-oa-c-transformer", "Online Appendix")` reports the full grid and the performance of all
+configurations.]
+
+Our classification procedure achieves a robust performance across both tasks. For the contract category
+classification, we obtain an accuracy of `r met_n("AccDetailed")` and a macro-F1 of `r met_n("F1Detailed")`. Counting
+a prediction as correct if it matches the contract's second label raises the accuracy to `r met_n("LenientDetailed")`,
+so few errors reflect the ambiguity of mixed contracts. The remaining errors concentrate in adjacent categories, such
+as the two employment categories or credit and equity instruments. The amendment classification achieves an accuracy
+of `r met_n("AccAmend")` and a macro-F1 of `r met_n("F1Amend")`. For each contract, our database provides the two most
+likely categories and the amendment flag with their probabilities, and the broad category as the roll-up of the
+detailed one.
+
+As methodological validation, we implement a rule-based classification using domain keywords comparable to
+`r met_cite(c("Ahci2024", "Boone2016"))`. Instead of selecting keywords manually, we derive a keyword table from the
+labeled sample: a term enters the table for a category only if its precision in the training folds exceeds the
+category's base rate, and a contract receives the category of its most precise term, or no category if no term
+applies. Out of fold, the keyword table classifies `r met_n("KwCoverage")`\% of the contracts with an accuracy of
+`r met_n("KwAccCommitted")`, confirming the value of explicit terminology for contracts that carry it and the
+limitations of rule-based approaches for comprehensive coverage. We publish the keyword table alongside the
+transformer's labels as an independent second opinion. `r met_ref("sec-oa-c-arms", "Online Appendix")` additionally
+reports the performance of a local large language model on the same folds, which remains well below the fine-tuned
+transformer, and shows that no combination of the three approaches could substantially exceed the transformer alone.
+
+## Content variable creation {#sec:content}
+
+To facilitate quantitative analysis of contract characteristics, we extract three content-based variables from each
+contract text (i.e., contract partners, contract dates and duration, and geographic locations), translating these
+textual concepts into machine-readable formats following established practices in computational text analysis
+`r met_cite("gentzkow2019text", "p")`. We combine LexNLP, an open-source Python package designed for legal text
+`r met_cite("bommarito2021lexnlp", "p")`, with purpose-built extractors based on regular expressions and lookup
+tables. LexNLP identifies the organizations named in a contract, which concentrate in the preamble and the signature
+block where the parties are named; our own extractors handle dates, stated terms, locations, and redaction markers,
+which no general-purpose recognizer provides.^[We compared LexNLP with spaCy's transformer-based model on the labeled
+sample. spaCy recognizes every mention of every company in a contract, which suits questions about the companies a
+contract refers to rather than about its parties, so we use LexNLP for organizations and do not run spaCy on the
+database. `r met_ref("sec-oa-d", "Online Appendix")` reports the comparison.] Rather than counts, our database
+stores every extracted entity as a span with its position in the text, together with the context the rules below
+rely on, so that researchers can apply their own rules to the same data. `r met_ref("sec-oa-d", "Online Appendix")`
+documents the extractors, their agreement, and the rules in detail.
+
+For contract partners, we turn the organizations LexNLP identifies into contracting parties. We strip legal suffixes
+and group the spellings of one company within a contract, match the parties against the registrant names EDGAR
+records for the filing, and assign each party a role: registrant, co-registrant, counterparty if named close to the
+registrant in the preamble, signatory if named in the final part of the contract, and other. The partners we count
+are the registrant, its co-registrants, and the counterparties. On average, a contract names `r met_n("ValPartNaive")`
+distinct organizations and `r met_n("ValPartRule")` contracting parties; the rest are subsidiaries, lenders, agents,
+and companies the contract merely mentions.
+
+For contract dates, we identify dates in all common formats with regular expressions that require a year, so that no
+date is inferred. A contract's start date is the latest date at or before its filing date. Its end date is taken from
+the first of four sources present in the text: a stated term (e.g., "for a period of five years"), an open-ended
+clause ("until terminated"), which leaves the duration undefined, a future date next to an end cue, and, as a last
+resort, the latest future date mentioned in the contract. A stated term settles `r met_n("DurTerm")`\% of contracts,
+and durations above 30 years are excluded. Using the latest date mentioned in the contract alone, as in prior work,
+yields a median duration of `r met_n("DurMedNaive")` years against `r met_n("DurMedRule")` years under our approach,
+because the latest date in a contract is often a date it refers to rather than the date it runs to.
+
+For geographic locations, we develop a custom gazetteer combining the U.S. Geological Survey (USGS) Domestic Names
+dataset with international country data, covering U.S. states, counties, cities, and populated places as well as
+countries, with their spelling variations. A place name that exists in several states is left unresolved unless the
+contract names one of its states, and a place that appears within a governing-law clause names the applicable law
+rather than a location and is excluded. We attribute each location to the contracting party named directly before
+it, so that the locations we count are those of the parties rather than every place a contract mentions: a contract
+mentions `r met_n("ValCtryNaive")` countries on average, of which `r met_n("ValCtryReg")` are attributed to the
+registrant and `r met_n("ValCtryCpty")` to its counterparties.
+
+## Contract redactions {#sec:redactions}
+
+We identify redacted contracts in two ways, corresponding to the two regimes described in
+`r met_ref("ch:inst_set")`. Until the FAST Act, a firm withholding information had to obtain a confidential treatment
+order (CTO), which the SEC publishes on EDGAR since 2008. Each order names the filing it refers to, the exhibit numbers
+it covers, and the date the withheld information becomes public, so that we can link every order to the contracts in
+our database. Comparable to `r met_cite("Ahci2024")`, we count orders that grant confidential treatment, including
+extensions of an earlier grant, and exclude denials. Overall, we identify `r met_n("Orders")` CTOs naming
+`r met_n("OrderRefs")` exhibits, of which we link `r met_n("OrderRefsLinked")` to a contract in our database; the
+remaining references name exhibits other than Exhibit 10, filings outside our form types, or exhibit numbers we
+cannot locate in the filing.^[When restricting the sample to new grants through 2019 on 10-K, 10-Q, and 8-K filings,
+our numbers closely align with `r met_cite("Ahci2024")` for both CTOs (`r met_n("OrdersAhci")` vs. 9,625) and exhibits
+(`r met_n("OrderRefsAhci")` vs. 16,397).] In total, `r met_n("DocsWithCto")` unique contracts are covered by at least
+one order.
+
+After the FAST Act in 2019, firms are required to "include a prominent statement on the first page of the redacted
+exhibit"^[17 C.F.R. \S229.601(b)(2)(ii)] and to indicate the omitted information with brackets. Comparable to
+`r met_cite("Thompson2023")`, we use a set of regular expressions to identify these redactions in the contract text,
+distinguishing between different types of redaction indicators. We classify a contract as redacted if it contains at
+least one bracketed redaction marker, such as asterisks (e.g., "[\*\*\*]"), underscores, or explicit omission notes
+(e.g., "[REDACTED]"). We exclude bullet points, ellipses, and similar formatting characters, which typically indicate
+redactions of personal information such as names and addresses rather than sensitive contract terms. Throughout the
+paper, a contract is redacted if it is covered by a CTO in the years through 2018, and if it is covered by a CTO or
+contains a redaction marker from 2019 onwards.^[Both indicators are available for all years in the database. In 2008
+to 2018, `r met_n("CtoMarkerAgree")`\% of the contracts covered by a CTO also contain a redaction marker, which
+supports the textual identification in the period without CTOs.]
+
+## 8-K Item 1.01 disclosures {#sec:announcements}
+
+SEC regulations mandate that firms file Form 8-K within four business days of entering a material definitive
+agreement, providing a summary of its material terms under Item 1.01. `r met_ref("sec: contract_sum_ex", "Appendix")`
+provides an example of such a summary. While firms must include these summaries in an 8-K, they retain discretion over
+whether to attach the full contract text immediately or delay its disclosure until the next periodic filing. We
+extract the Item 1.01 text between the item's heading and the next item or the signature section from all
+`r met_n("Docs8K")` 8-K filings that report the item. To ensure a clean link between a summary and its contract, we
+retain only 8-Ks that announce a single agreement, which we proxy by the number of agreement dates the narrative opens
+with, and that attach at most one Exhibit 10; this excludes `r met_n("AnnouncementsNoDate")` filings whose narrative
+names no agreement date, `r met_n("AnnouncementsMultiSummary")` filings that announce several agreements, and
+`r met_n("AnnouncementsMultiExhibit")` filings that attach several contracts. The resulting `r met_n("Announcements")`
+announcements are linked to our contract database to determine whether the firm attached the full contract
+immediately or delayed its disclosure. For each summary, we calculate the Gunning Fog index as an indicator of
+complexity `r met_cite("Li2008", "p")`, the share of uncertainty-related words per 1,000 words based on the
+`r met_cite("Loughran2011")` dictionary, and the number of numerical values per 1,000 words, distinguishing dollar
+amounts, percentages, and other numbers `r met_cite("Siano2018", "p")`.
+
+::: {.content-visible when-format="html"}
+
+# Validation
+
+```{r}
+#| label: validate-cited
+tab_cited <- met_report_cited(.strict = .lP$Params$Strict)
+```
+
+# Deployment
+
+The fragment is written only by the LaTeX pass. A terminal render, `quarto render 1_code/41-Methods.qmd`, runs both
+passes; the Render button runs the html alone. Then one call copies the fragment to the paper folder as
+`4-method.tex`, archiving the version it replaces:
+
+```r
+source(here::here("1_code", "41-Methods.R"), encoding = "UTF-8")
+
+met_deploy(
+  .path_tex   = here::here("_rendered", "1_code", "41-Methods.tex"),
+  .path_qmd   = here::here("1_code", "41-Methods.qmd"),
+  .dir_deploy = fs::path(
+    "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+    "200-Paper_figures",
+    "Manuscript"
+  )
+)
+```
+
+In Overleaf, the file replaces `4-method.tex`. The preamble must input `Numbers.tex` (deployed by 40) for the
+`\pnum{}` macros to print, and the bibliography must hold `chalkidis2020legal` and `liu2019roberta` (both in
+`_Templates/oa-references.bib`).
+
+```{r}
+#| label: deploy-status
+if (fs::file_exists(.lP$Output$Tex)) {
+  cli::cli_alert_info(
+    "Fragment last written {format(fs::file_info(.lP$Output$Tex)$modification_time, '%Y-%m-%d %H:%M')}."
+  )
+} else {
+  cli::cli_alert_warning("No fragment yet: run the LaTeX pass from a terminal.")
+}
+```
+
+# Next
+
+- Fold the "Matching identifier and external data" paragraph (label `matching`) into Section 4.1 in Overleaf; it is
+  no longer part of this chapter.
+- The no-date exclusion of the announcement sample (`AnnouncementsNoDate`) is now stated; confirm with Ann-Kristin
+  that her Table 7 sample applies the same three filters.
+- Table 2's Panel B in Overleaf types values that 30's `SampleSelection` no longer matches; once Section 4 cites
+  `\pnum{}` keys the two cannot drift.
+
+:::

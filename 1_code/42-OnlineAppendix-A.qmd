@@ -61,7 +61,7 @@ purrr::walk(
   .f = \(.p) source(file = .p, encoding = "UTF-8")
 )
 
-.name_script <- "40-OnlineAppendix-A"
+.name_script <- "42-OnlineAppendix-A"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
@@ -76,6 +76,7 @@ cat("Function File:  ")
 ))
 
 source(file = .path_fun, encoding = "UTF-8")
+source(file = here::here("1_code", "40-Numbers.R"), encoding = "UTF-8") # the builders and the register loader
 ```
 
 # Purpose
@@ -88,7 +89,7 @@ paper's Overleaf project inputs. The fragment carries the chapter and nothing el
 runbook -- this section, the configuration, the checks, and the exhibits built for the response memo -- sits in
 blocks the LaTeX pass removes.
 
-The online appendix is one such document per chapter, `40-OnlineAppendix-A` to `-F`, each with its own library of
+The online appendix is one such document per chapter, `42-OnlineAppendix-A` to `-F`, each with its own library of
 builders and its own output directory. What the chapters share -- how a number is read from the tibble beside the
 exhibit that prints it, how a float points at an exhibit's files, how the fragment is rendered and deployed -- is
 one library, `_Commons/_OnlineAppendix.R`, sourced as the commons are.
@@ -135,12 +136,12 @@ library; `Rebuild` forces them.
 
 ## Where things are written
 
-Two files. Quarto writes the fragment to `_rendered/1_code/40-OnlineAppendix-A.tex`, beside this document's html,
+One file. Quarto writes the fragment to `_rendered/1_code/42-OnlineAppendix-A.tex`, beside this document's html,
 but only in the LaTeX pass, which the Render button does not run: RStudio renders the first format the YAML lists,
-and that is this html. And every render writes `Output/OA-Numbers-A.tex` under this document's output directory: the
-numbers the text cites, as macros the manuscript can use too. `oa_publish()` renders both passes, copies the two
-files and this chapter's own exhibits to the paper folder, and lists which of them changed -- which, while Overleaf
-is updated by hand, is the list of files to upload. See Deployment.
+and that is this html. The numbers the text cites are not written here: `40-Numbers` resolves them and writes the
+one `Numbers.tex` the paper inputs. `oa_publish()` renders both passes, copies the fragment and the exhibits 40 built
+for this chapter to the paper folder, and lists which of them changed -- which, while Overleaf is updated by hand, is
+the list of files to upload. See Deployment.
 
 # Configuration
 
@@ -169,16 +170,16 @@ is updated by hand, is the list of files to upload. See Deployment.
   DirMaster   = .dirs_edgar$MasterIndex$DirParquet,                          # the master index 01A mirrors
   DirLinks    = .dirs_edgar$DocLinks$DirMain$Links,                          # the document lists 01A mirrors
   Landing     = here::here("2_output", "01A-EdgarIndex", "Output", "LandingPageAll.parquet"), # SIC per filing
-  Lib         = here::here("1_code", "40-OnlineAppendix-A.R"),              # a changed builder rebuilds
   Template    = here::here("1_code", "_Templates", "oa-body.tex"),           # the LaTeX pass's template
   Bib         = here::here("1_code", "_Templates", "oa-references.bib"),     # the html pass's bibliography
-  Qmd         = here::here("1_code", "40-OnlineAppendix-A.qmd")             # this document, scanned for markers
+  Qmd         = here::here("1_code", "42-OnlineAppendix-A.qmd")             # this document, scanned for markers
 )
 
+.lP$Input$Register <- here::here("2_output", "40-Numbers", "Output", "Numbers.csv") # every number, as 40 resolved it
+
 .lP$Output <- list(
-  Tex     = here::here("_rendered", "1_code", "40-OnlineAppendix-A.tex"), # written by Quarto, in the LaTeX pass
-  Numbers = utils_file_path(.dir_main, "Output", "OA-Numbers-A.tex"),      # written below, on every render
-  DirOwn  = fs::path(.dir_main, "Output"),                                 # the exhibits built here, in 30's layout
+  Tex     = here::here("_rendered", "1_code", "42-OnlineAppendix-A.tex"), # written by Quarto, in the LaTeX pass
+  DirOwn  = here::here("2_output", "40-Numbers", "Output"),                                 # the exhibits built here, in 30's layout
   Deploy  = fs::path(.lP$Root, "200-Paper_figures", "OnlineAppendix")      # where oa_deploy_tex() copies all of it
 )
 
@@ -241,74 +242,9 @@ oa_report_inputs(
 
 # Build
 
-The exhibits this chapter writes itself, into its own output directory in the layout 30 uses. Each build compares
-its outputs with its inputs and with this chapter's library, and runs only where an output is missing or older;
-`Rebuild` forces them all. One build prints nothing: it writes the counts the text cites that belong to no table.
-
-```{r}
-#| label: build-exhibits
-st_build <- c(
-  ExhibitRequired = oaa_build_exhibit_table(
-    .dir_own  = .lP$Output$DirOwn,         # row (10) of the exhibit table, from the library's tibble
-    .force    = .lP$Params$Rebuild,
-    .path_lib = .lP$Input$Lib
-  ),
-  FormDescriptions = oaa_build_form_descriptions(
-    .dir_own  = .lP$Output$DirOwn,         # the sixteen forms and their CFR sections, from the library's tibble
-    .force    = .lP$Params$Rebuild,
-    .path_lib = .lP$Input$Lib
-  ),
-  FormCoverage = oaa_build_coverage(
-    .dir_master     = .lP$Input$DirMaster, # filings per form type
-    .path_contracts = .lP$Input$Contracts, # the contracts the database holds
-    .dir_own        = .lP$Output$DirOwn,   # this chapter's own exhibits
-    .force          = .lP$Params$Rebuild,  # TRUE rebuilds regardless
-    .path_lib       = .lP$Input$Lib        # a changed builder rebuilds
-  ),
-  FilingsWithinYear = oaa_build_within_year(
-    .path_contracts = .lP$Input$Contracts, # filing dates of the unique contracts
-    .dir_own        = .lP$Output$DirOwn,
-    .force          = .lP$Params$Rebuild,
-    .path_lib       = .lP$Input$Lib
-  ),
-  CtoLinkage = oaa_build_cto(
-    .path_orders    = .lP$Input$Orders,    # one row per reference an order makes
-    .path_contracts = .lP$Input$Contracts, # the release's flag on the sample
-    .dir_own        = .lP$Output$DirOwn,
-    .force          = .lP$Params$Rebuild,
-    .path_lib       = .lP$Input$Lib
-  ),
-  TextCounts = oaa_build_counts(
-    .path_contracts = .lP$Input$Contracts, # counts the text cites that no exhibit prints
-    .dir_own        = .lP$Output$DirOwn,
-    .force          = .lP$Params$Rebuild,
-    .path_lib       = .lP$Input$Lib
-  ),
-  ExhibitFiles = oaa_build_files(
-    .dir_links = .lP$Input$DirLinks,       # the document lists of the index pages, by quarter
-    .from      = .lP$Params$FilesFrom,     # 1998 Q1
-    .to        = .lP$Params$FilesTo,       # 2001 Q2
-    .dir_own   = .lP$Output$DirOwn,
-    .force     = .lP$Params$Rebuild,
-    .path_lib  = .lP$Input$Lib
-  ),
-  SeasonedFilers = oaa_build_seasoned(
-    .path_contracts = .lP$Input$Contracts, # the sample, its forms and its labels
-    .path_landing   = .lP$Input$Landing,   # the SIC code of each filing
-    .dir_master     = .lP$Input$DirMaster, # the first EDGAR filing of each CIK
-    .dir_own        = .lP$Output$DirOwn,
-    .force          = .lP$Params$Rebuild,
-    .path_lib       = .lP$Input$Lib
-  )
-)
-
-oa_report_builds(.status = st_build)
-```
-
-## The exhibits against disk
-
-The context joins the registry, the sources and the static table, checks them, and records for every exhibit what
-its writer must have written for the fragment to set it.
+This chapter builds nothing. Every exhibit it sets -- 30's and its own -- is built by `40-Numbers`, which writes
+them in 30's layout under its own output directory, the directory the sources table names as this chapter's.
+A missing exhibit is therefore a render of 40 away, not of this document.
 
 ```{r}
 #| label: configure-context
@@ -331,111 +267,17 @@ holds them too depends on what was uploaded there, which this document cannot se
 
 # Numbers
 
-Each row is one number the text cites. `Where` is a filter over the exhibit tibble's own columns, evaluated as
-written; `Fun` reduces the matching rows to one value, and `one` demands exactly one matching row, which is what
-catches a filter that silently matches two. `Column` names a column, or an expression over the tibble's columns
-where the text needs a share the tibble holds as two counts.
+Every number the text cites is a key in 40's registry, resolved there over the tibble beside the exhibit that
+prints it. This chapter loads the register 40 last wrote and cites through `oa_n()`, as before; a key it does not
+hold aborts the render, and a key it holds but could not resolve prints as a marker and is listed under Validation.
 
 ```{r}
-#| label: numbers-resolve
-# THE COVERAGE TABLE holds one row per group and a total per counted panel.
-.where_reg <- "Group %in% c('Exchange Act registrations', 'Real-estate registrations')"
-.where_out <- "Panel == 'Outside it' & Kind == 'total'"
-.where_in  <- "Panel == 'In the database' & Kind == 'total'"
-
-# THE FILING-TYPES FIGURE holds one row per form family and amendment status; Share is the family's, repeated.
-.where_form <- \(.f) paste0("FormFamily == '", .f, "'")
-.where_amd  <- \(.f) paste0("FormFamily == '", .f, "' & Amend == 'Amended'")
-
-# THE LINKAGE FUNNEL holds one row per step; Code is the release's LinkStatus prefix, Kind separates the totals.
-.where_step <- \(.c) paste0("Code == '", .c, "'")
-
-# THE SEASONED-FILER FIGURE holds one row per group of filers and year.
-.where_all      <- \(.y) paste0("Filers == 'All filers' & Year == ", .y)
-.where_seasoned <- \(.y) paste0("Filers == 'Seasoned filers' & Year == ", .y)
-.where_group    <- \(.g, .y) paste0("grepl('", .g, "', Filers) & Year == ", .y)
-
-tab_numbers_spec <- tibble::tribble(
-  ~Key,                ~Exhibit,        ~Column,      ~Fun,  ~Format, ~Where,
-  # A.1 -- what the database holds
-  "DocsAll",           "TextCounts",    "Value",      "one", "count", "Key == 'DocsAll'",
-  "DocsUnique",        "TextCounts",    "Value",      "one", "count", "Key == 'DocsUnique'",
-  "DocsSample",        "TextCounts",    "Value",      "one", "count", "Key == 'DocsSample'",
-  "DocsPre2001",       "TextCounts",    "Value",      "one", "count", "Key == 'DocsPre2001'",
-  "Docs8K",            "SummarySample", "All",        "one", "count", "Rung == 'Item 1.01 announcements recovered'",
-  "Announcements",     "SummarySample", "All",        "one", "count", "Rung == 'Announcement sample'",
-  "Orders",            "CtoLinkage",    "N",          "one", "count", "Step == 'Orders in the release'",
-  "CovInside",         "FormCoverage",  "Filings",    "one", "count", .where_in,
-  "CovSmallBusiness",  "FormCoverage",  "Filings",    "sum", "count", "grepl('Small business', Group)",
-  "CovTenKVariants",   "FormCoverage",  "Filings",    "one", "count", "Group == '10-K variants'",
-  "CovRegistrations",  "FormCoverage",  "Filings",    "sum", "count", .where_reg,
-  "Cov20FFilings",     "FormCoverage",  "Filings",    "one", "count", "Group == 'Foreign annual reports'",
-  "Cov20FContracts",   "FormCoverage",  "Contracts",  "one", "count", "Group == 'Foreign annual reports'",
-  "CovOutside",        "FormCoverage",  "Filings",    "one", "count", .where_out,
-  "FilesShare2000Q2",  "ExhibitFiles",  "ShareFile",  "one", "pct1",  "Quarter == '2000 Q2'",
-  "FilesShare2000Q3",  "ExhibitFiles",  "ShareFile",  "one", "pct1",  "Quarter == '2000 Q3'",
-  "FilesShare1999Q4",  "ExhibitFiles",  "ShareFile",  "one", "pct1",  "Quarter == '1999 Q4'",
-  # A.2 -- distributions
-  "Share8K",           "FilingTypes",   "Share",      "max", "pct1",  .where_form(.f = "8-K"),
-  "Share10Q",          "FilingTypes",   "Share",      "max", "pct1",  .where_form(.f = "10-Q"),
-  "Share10K",          "FilingTypes",   "Share",      "max", "pct1",  .where_form(.f = "10-K"),
-  "ShareS1",           "FilingTypes",   "Share",      "max", "pct1",  .where_form(.f = "S-1"),
-  "ShareForeign",      "FilingTypes",   "N / sum(N)", "sum", "pct1",  "Region == 'Foreign filings'",
-  "Amend8K",           "FilingTypes",   "N / NForm",  "one", "pct1",  .where_amd(.f = "8-K"),
-  "Amend10K",          "FilingTypes",   "N / NForm",  "one", "pct1",  .where_amd(.f = "10-K"),
-  "Amend10Q",          "FilingTypes",   "N / NForm",  "one", "pct1",  .where_amd(.f = "10-Q"),
-  # A.3 -- what a row of the release is
-  "DocsFlagged",       "TextCounts",    "Value",      "one", "count", "Key == 'DocsFlagged'",
-  "RuleShort",         "TextCounts",    "Value",      "one", "count", "Key == 'RuleShort'",
-  "RuleStopwords",     "TextCounts",    "Value",      "one", "count", "Key == 'RuleStopwords'",
-  "RuleNumeric",       "TextCounts",    "Value",      "one", "count", "Key == 'RuleNumeric'",
-  "Placeholders",      "TextCounts",    "Value",      "one", "count", "Key == 'Placeholders'",
-  "OrderRefs",         "CtoLinkage",    "N",          "one", "count", "Step == 'References to exhibits they make'",
-  "OrderRefsLinked",   "CtoLinkage",    "N",          "one", "count", .where_step(.c = "A-linked"),
-  "OrderRefsNotEx10",  "CtoLinkage",    "N",          "one", "count", .where_step(.c = "2-"),
-  "OrderRefsFrame",    "CtoLinkage",    "N",          "one", "count", .where_step(.c = "6-"),
-  "OrderRefsMissing",  "CtoLinkage",    "N",          "one", "count", .where_step(.c = "9-"),
-  "LinkedExtensions",  "CtoLinkage",    "N",          "one", "count", "Step == 'Extends an earlier grant'",
-  "LinkedDenials",     "CtoLinkage",    "N",          "one", "count", "grepl('^Denies', Step)",
-  "DocsWithCto",       "CtoLinkage",    "N",          "one", "count", "Kind == 'result'",
-  # A.3 -- the registration wave
-  "NAll2020",          "SeasonedFilers", "N",         "one", "count", .where_all(.y = 2020),
-  "NAll2021",          "SeasonedFilers", "N",         "one", "count", .where_all(.y = 2021),
-  "NSeasoned2020",     "SeasonedFilers", "N",         "one", "count", .where_seasoned(.y = 2020),
-  "NSeasoned2021",     "SeasonedFilers", "N",         "one", "count", .where_seasoned(.y = 2021),
-  "RegAll2021",        "SeasonedFilers", "ShareReg",  "one", "pct1",  .where_all(.y = 2021),
-  "RegSeasoned2021",   "SeasonedFilers", "ShareReg",  "one", "pct1",  .where_seasoned(.y = 2021),
-  "EqAll2021",         "SeasonedFilers", "ShareEquity", "one", "pct1", .where_all(.y = 2021),
-  "EqSeasoned2021",    "SeasonedFilers", "ShareEquity", "one", "pct1", .where_seasoned(.y = 2021),
-  "NBlankCheck2021",   "SeasonedFilers", "N",         "one", "count", .where_group(.g = "Blank-check", .y = 2021),
-  "NSeasonedEdgar2021", "SeasonedFilers", "N",        "one", "count", .where_group(.g = "first EDGAR", .y = 2021)
-)
-
-tab_numbers <- oa_numbers_set(
-  .spec     = tab_numbers_spec,                       # every number the text cites
-  .dir_data = c(                                       # the tibbles behind the exhibits, 30's first
-    fs::path(.lP$Input$DirExhibits, "Data"),
-    fs::path(.lP$Output$DirOwn, "Data")
-  )
-)
+#| label: numbers-load
+tab_numbers <- num_numbers_load(.path_register = .lP$Input$Register)
 
 oa_report_numbers(
-  .tab    = tab_numbers,      # resolved above
-  .strict = .lP$Params$Strict # TRUE stops the render on an unresolved number
-)
-```
-
-The same numbers are written as LaTeX macros, so the manuscript cites them too rather than typing copies that go
-stale at the next re-export: with the file input in the paper's preamble, `\oanum{DocsSample}` prints the size of
-the unique-contract sample this render resolved. A key the file does not hold prints in bold as `??Key`, so a typo
-shows in the PDF.
-
-```{r}
-#| label: numbers-write
-oa_numbers_write(
-  .tab  = tab_numbers,         # resolved above
-  .path = .lP$Output$Numbers,  # deployed beside the fragment
-  .doc  = .name_script         # named in the file's header
+  .tab    = tab_numbers,       # as 40 resolved them
+  .strict = .lP$Params$Strict  # TRUE stops the render on an unresolved number
 )
 ```
 
@@ -568,15 +410,16 @@ LaTeX pass as the fragment Overleaf inputs. Each exhibit stands where the paper 
 
 ## SEC filing requirements and distributions {#sec-oa-a}
 
-This appendix describes what the database contains and why. Section A.1 sets out who must file a material contract,
-on which forms, what the database takes from those forms and what it leaves out. Section A.2 shows how the contracts
-distribute across forms and over the calendar year. Section A.3 shows how the mix of contract types moved over the
-sample period, and separates the rise of 2020 and 2021 into the filings of new registrants and those of established
-firms. Section A.4 describes what a row of the release is: how one attachment becomes several rows, which rows the
-sample excludes and why they stay in the file, and how a contract is linked to the confidential treatment order that
-covers it and to the 8-K that announced it. The construction of the regression samples is in the paper.
+This appendix describes what our database contains and why. Section A.1 sets out who must file a material
+contract, on which forms, what we retrieve from those forms and what we leave out. Section A.2 shows how the
+contracts distribute across forms and over the calendar year. Section A.3 shows how the mix of contract types moved
+over the sample period, and separates the rise of 2020 and 2021 into the filings of new registrants and those of
+established firms. Section A.4 describes what a row of our database is: how one attachment becomes several rows,
+which rows we exclude from the sample and why they stay in the database, and how we link a contract to the
+confidential treatment order that covers it and to the 8-K that announced it. The construction of the estimation
+samples is described in the paper (Section 4.1).
 
-### Who files what, and what the database holds {#sec-oa-a-holds}
+### Who files what, and what our database holds {#sec-oa-a-holds}
 
 Item 601 of Regulation S-K requires a firm to file every material contract as Exhibit 10 to its registration
 statements under the Securities Act -- Forms S-1 and S-4, and Forms F-1 and F-4 for foreign private issuers -- and to
@@ -743,24 +586,25 @@ oa_float(.name = "ExhibitRequired")
 oa_float(.name = "FormDescriptions")
 ```
 
-EDGAR filing became mandatory for all domestic registrants in 1996, and the master index lists filings from
-1993.^[SEC Release 33-7122 (December 19, 1994) set the final phase-in of mandated electronic filing, completed in
-May 1996.]
-The database starts with 2001 for a different reason. EDGAR's index page lists the documents of a filing back to
+EDGAR filing became mandatory for all domestic registrants in May 1996, and the master index lists filings from
+1993, when the phase-in of electronic filing began.^[SEC Release 33-6977 (February 23, 1993) adopted Regulation
+S-T and began the phase-in on April 26, 1993; SEC Release 33-7122 (December 19, 1994) set its final schedule,
+completed on May 6, 1996.]
+Our sample period starts in 2001 for a different reason. EDGAR's index page lists the documents of a filing back to
 1993, read from the tags of the complete submission, but until mid-2000 an exhibit existed only inside that
 submission's text file -- there was no file of its own to retrieve. Separately disseminated exhibit files arrived
-with the modernised system: a handful of filings in 1999, a quarter of the listed Exhibit 10s in the second quarter
+with the modernized system: a handful of filings in 1999, a quarter of the listed Exhibit 10s in the second quarter
 of 2000, nearly all of them in June, after Release 7.0 took effect on May 30, 2000, and every listed exhibit from
 July 2000 on. The year 2001 is therefore the first full year in which every
-material contract is a document that can be retrieved on its own, and the database's frame runs from 2001 to 2024.
-The `r oa_n(.key = "DocsPre2001")` contracts of mid-1999 to 2000 that already were such documents are in the
-release and outside the sample (Section A.4). Two further dates shape what the database holds: EDGAR lists
-confidential treatment orders as filings of their own from May 2008, which is where the database's orders begin,
-and since April 2, 2019, the amendments to Item 601 that followed the FAST Act allow a firm to redact a contract
-without a confidential treatment request.^[SEC Release 33-7855 (April 24, 2000) put EDGAR Release 7.0 into
+material contract is available as a document of its own, and our sample period runs from 2001 to 2024.
+The `r oa_n(.key = "DocsPre2001")` contracts of mid-1999 to 2000 that already were such documents are in our
+database and outside the sample (Section A.4). Two further dates shape what our database holds: EDGAR lists
+confidential treatment orders as filings of their own from May 2008, which is where our orders begin, and since
+April 2, 2019, the amendments to Item 601 that followed the FAST Act allow a firm to redact a contract without a
+confidential treatment request.^[SEC Release 33-7855 (April 24, 2000) put EDGAR Release 7.0 into
 effect on May 30, 2000; the SEC's documentation on accessing EDGAR data states that filings after May 26, 2000 are
 also reachable through an accession-number directory holding every document of the filing. The first date is the
-earliest CT ORDER in EDGAR's master index, which is the database's own record. Release 33-10618 (March 20, 2019),
+earliest CT ORDER in EDGAR's master index, which is our database's own record. Release 33-10618 (March 20, 2019),
 effective April 2, 2019, added Item 601(b)(10)(iv).]
 
 ::: {.content-visible when-format="html"}
@@ -789,7 +633,7 @@ redacted contract on EDGAR and submitted the unredacted text to the SEC staff fo
 Freedom of Information Act; the redacted exhibit is filed publicly and the unredacted text submitted separately.]
 Filing was not delayed by the request; the redacted contract was public while the staff reviewed it. About 10 to
 11 percent of requests were denied at least in part [@thompson2023; @ahci2025], and a firm whose request was
-denied refiled the contract with fewer redactions, so the database holds such a contract twice, once with each
+denied refiled the contract with fewer redactions, so our database holds such a contract twice, once with each
 filing. Since April 2019, a firm redacts without a request, marking the omission with brackets and a statement on
 the exhibit's first page, and the staff reviews redacted contracts selectively; the standard for what may be
 omitted was information that is not material and would likely cause competitive harm, and since November 2020
@@ -856,44 +700,44 @@ while writing.
 
 :::
 
-The database downloads three groups of documents. The first is every attachment filed as Exhibit 10 with the eight
-forms above and their amendments. An attachment counts as Exhibit 10 where its exhibit type maps to Exhibit 10 in a
-lookup of the raw exhibit-type strings filers use, rather than where it matches a pattern: filers write `EX-10.1`,
-`EX-10`, `EXHIBIT 10.23` and many further variants, and a pattern silently excludes the spellings its author did not
-anticipate. The second is every 8-K that reports Item 1.01, whose narrative the paper uses to measure how firms
-announce their contracts. The third is every confidential treatment order, which links a redacted contract to the
-SEC's grant of confidential treatment. The first group yields `r oa_n(.key = "DocsAll")` documents, of which
-`r oa_n(.key = "DocsUnique")` are distinct attachments and `r oa_n(.key = "DocsSample")` form the unique-contract
-sample; the second yields the announcement narrative of `r oa_n(.key = "Docs8K")` current reports; and the third
-holds `r oa_n(.key = "Orders")` orders.
+Using rGetEDGAR, we download three groups of documents. The first is every attachment filed as Exhibit 10 with the
+eight forms above and their amendments. An attachment counts as Exhibit 10 where its exhibit type maps to Exhibit
+10 in a lookup of the raw exhibit-type strings filers use, rather than where it matches a pattern: filers write
+`EX-10.1`, `EX-10`, `EXHIBIT 10.23` and many further variants, and a pattern silently excludes the spellings its
+author did not anticipate. The second is every Form 8-K filing that reports Item 1.01, whose contract summary we
+use to measure how firms announce their contracts. The third is every confidential treatment order, which links a
+redacted contract to the SEC's grant of confidential treatment. The first group yields `r oa_n(.key = "DocsAll")`
+documents in our sample period, of which `r oa_n(.key = "DocsUnique")` are distinct attachments and
+`r oa_n(.key = "DocsSample")` form the unique-contract sample; the second yields the contract summary of
+`r oa_n(.key = "Docs8K")` current reports; and the third holds `r oa_n(.key = "Orders")` orders.
 
-The database is thus defined by EDGAR form type and exhibit number, and material contracts filed under other form
+Our database is thus defined by EDGAR form type and exhibit number, and material contracts filed under other form
 types or exhibit numbers lie outside it. `r oa_ref(.name = "FormCoverage")` lists every form that carries material
-contracts, the filings EDGAR lists for it from 2001 to 2024, whether the database covers it, and the contracts the
+contracts, the filings EDGAR lists for it from 2001 to 2024, whether our database covers it, and the contracts our
 database holds from it. Four groups lie outside. The largest are the forms of small business issuers -- 10-KSB,
-10-QSB, SB-2 and Form 10-SB -- used until 2008, after which these firms file on Forms 10-K and 10-Q, which the
+10-QSB, SB-2 and Form 10-SB -- used until 2008, after which these firms file on Forms 10-K and 10-Q, which our
 database covers; EDGAR lists `r oa_n(.key = "CovSmallBusiness")` such filings. The second consists of EDGAR's
 separate form types for variants of the annual report: 10-K405, a 10-K on which the Item 405 box is checked, used
 until 2002, and 10-KT, the transition report after a change of fiscal year, together
 `r oa_n(.key = "CovTenKVariants")` filings. The third consists of registrations under the Exchange Act on Form 10,
 among them spin-offs, and on Form S-11, the registration statement of real-estate companies,
 `r oa_n(.key = "CovRegistrations")` filings; both carry material contracts by the same rule and were left outside
-the frame when it was fixed on the eight forms that hold the bulk of filings. The fourth lies inside a form the
-database covers: Form 20-F lists
-material contracts as Exhibit 4, so the database holds only the 20-F contracts that filers number as Exhibit 10,
+our sample when we fixed it on the eight forms that hold the bulk of filings. The fourth lies inside a form our
+database covers: Form 20-F lists material contracts as Exhibit 4, so our database holds only the 20-F contracts
+that filers number as Exhibit 10,
 `r oa_n(.key = "Cov20FContracts")` contracts from `r oa_n(.key = "Cov20FFilings")` filings. The registration
 statements of foreign issuers, Forms F-1 and F-4, follow Item 601 and number their contracts as Exhibit 10, so they
 are covered.
 
-Together, the forms outside the frame account for `r oa_n(.key = "CovOutside")` filings against
-`r oa_n(.key = "CovInside")` of the forms inside it. Their contracts were never downloaded, so the table does not
-count them, and the two counts of filings are not comparable: the forms in the database include every current
+Together, the forms outside our sample account for `r oa_n(.key = "CovOutside")` filings against
+`r oa_n(.key = "CovInside")` of the forms inside it. We never downloaded their contracts, so the table does not
+count them, and the two counts of filings are not comparable: the forms in our database include every current
 report, most of which carry no contract at all, while the small-business forms are periodic reports and registration
 statements concentrated in the years before 2009. The gap matters most for small firms before 2009: their contracts
-filed with current reports are in the database, while those filed with periodic reports and registration statements
-are not. The paper's firm-quarter analyses for the years to 2008 are therefore repeated without the firms that filed
+filed with current reports are in our database, while those filed with periodic reports and registration statements
+are not. We therefore repeat the paper's firm-quarter analyses for the years to 2008 without the firms that filed
 on small-business forms in the respective quarter (Appendix E). Two further groups are excluded by design.
-Asset-backed issuers (Forms SF-1, SF-3 and 10-D) are securitisation vehicles rather than operating firms, and the
+Asset-backed issuers (Forms SF-1, SF-3 and 10-D) are securitization vehicles rather than operating firms, and the
 current reports of foreign private issuers on Form 6-K carry no exhibit numbering; a contract filed with one usually
 carries the type EX-99.
 
@@ -1064,41 +908,42 @@ filed in 2020 and 2021. What changed is who was filing.
 oa_float(.name = "SeasonedFilers")
 ```
 
-### What a row of the release is {#sec-oa-a-rows}
+### What a row of our database is {#sec-oa-a-rows}
 
 A filing can list several registrants, and EDGAR lists its attachments under each of them, so one attachment can
-appear as several documents. Each attachment is identified by a hash of its address and each registrant's copy by an
-identifier of its own, and one copy per attachment is designated primary. Classification and entity extraction read
-the primary copy; the release carries every copy with its attachment's values, so unique contracts are the primary
-copies, and every registrant's copy remains available for analyses at the filer level. The release holds
-`r oa_n(.key = "DocsAll")` rows and `r oa_n(.key = "DocsUnique")` unique attachments. Two cases produce distinct
-attachments for one agreement and are not merged: two parties that each file their own copy of it, and a contract
-refiled with fewer redactions after a partially denied confidential treatment request.
+appear as several documents. We identify each attachment by a hash of its address and each registrant's copy by an
+identifier of its own, and designate one copy per attachment as primary. Classification and entity extraction read
+the primary copy; our database carries every copy with its attachment's values, so unique contracts are the primary
+copies, and every registrant's copy remains available for analyses at the filer level. Including the attachments of
+1999 and 2000, our database holds `r oa_n(.key = "DocsRelease")` rows and `r oa_n(.key = "DocsReleaseUnique")`
+unique attachments. Two cases produce distinct attachments for one agreement and are not merged: two parties that
+each file their own copy of it, and a contract refiled with fewer redactions after a partially denied confidential
+treatment request.
 
-Three rules flag attachments whose conversion to text failed: ten words or fewer after the SEC header; fewer than 20
-percent stopwords together with fewer than 100 words; or 75 percent or more numeric tokens. Each threshold sits far
-from anything a genuine agreement produces, so the rules remove conversion debris -- a PDF rendered as coordinates, a
-hyperlink in place of a document, a financial statement filed under an exhibit number -- rather than short
-agreements. Exhibits whose text is only a placeholder for a PDF or an image carry no readable text and are counted
-with them. Of the `r oa_n(.key = "DocsUnique")` unique attachments, `r oa_n(.key = "DocsFlagged")` are flagged:
-`r oa_n(.key = "RuleShort")` for length, `r oa_n(.key = "RuleStopwords")` for a want of prose,
-`r oa_n(.key = "RuleNumeric")` for numeric tokens, and `r oa_n(.key = "Placeholders")` placeholders. Flagged
-attachments stay in the release with the rule that flagged them and are excluded from every sample, as are the
-`r oa_n(.key = "DocsPre2001")` attachments filed before 2001; each row carries the step of the sample selection at
-which it left, so a study that wants either group back has it.
+We apply three rules to flag attachments whose conversion to text failed: ten words or fewer after the SEC header;
+fewer than 20 percent stopwords together with fewer than 100 words; or 75 percent or more numeric tokens. Each
+threshold sits far from anything a genuine agreement produces, so the rules remove conversion debris -- a PDF
+rendered as coordinates, a hyperlink in place of a document, a financial statement filed under an exhibit number --
+rather than short agreements. Exhibits whose text is only a placeholder for a PDF or an image carry no readable text
+and are counted with them. Of the `r oa_n(.key = "DocsReleaseUnique")` unique attachments,
+`r oa_n(.key = "DocsReleaseFlagged")` are flagged: `r oa_n(.key = "RuleShort")` for length,
+`r oa_n(.key = "RuleStopwords")` for a want of prose, `r oa_n(.key = "RuleNumeric")` for numeric tokens, and
+`r oa_n(.key = "Placeholders")` placeholders. Flagged attachments stay in our database with the rule that flagged
+them and are excluded from every sample, as are the `r oa_n(.key = "DocsPre2001")` attachments filed before 2001;
+each row carries the step of the sample selection at which it left, so a study that wants either group back has it.
 
-Confidential treatment orders are parsed for the exhibits they cover. An order identifies an exhibit by the filing
-it came with and its exhibit number, and each such reference is followed to the attachment in the database.
+We parse the confidential treatment orders for the exhibits they cover. An order identifies an exhibit by the
+filing it came with and its exhibit number, and we follow each such reference to the attachment in our database.
 `r oa_ref(.name = "CtoLinkage")` reports where every reference ends. The `r oa_n(.key = "Orders")` orders make
 `r oa_n(.key = "OrderRefs")` references, of which `r oa_n(.key = "OrderRefsLinked")` reach the attachment they
-name. The rest fail at a point the release records for each reference. The largest group,
+name. The rest fail at a point our database records for each reference. The largest group,
 `r oa_n(.key = "OrderRefsNotEx10")` references, covers exhibits other than Exhibit 10, such as the indentures and
-plans filed as Exhibit 4; `r oa_n(.key = "OrderRefsFrame")` name a filing of a form outside the frame, the
+plans filed as Exhibit 4; `r oa_n(.key = "OrderRefsFrame")` name a filing of a form outside our sample, the
 small-business forms among them; and `r oa_n(.key = "OrderRefsMissing")` name an exhibit number that is not among
 the attachments downloaded from the filing, mostly where the filer numbered the exhibit differently from the order.
 Of the linked references, `r oa_n(.key = "LinkedExtensions")` extend an earlier grant and
-`r oa_n(.key = "LinkedDenials")` deny the request; as in @ahci2025, the paper's measure counts grants and their
-extensions and not denials, and `r oa_n(.key = "DocsWithCto")` unique contracts of the sample carry one.
+`r oa_n(.key = "LinkedDenials")` deny the request; as in @ahci2025, we count grants and their extensions and not
+denials, and `r oa_n(.key = "DocsWithCto")` unique contracts of the sample are covered by at least one order.
 
 ```{r}
 #| label: float-cto-linkage
@@ -1106,15 +951,14 @@ extensions and not denials, and `r oa_n(.key = "DocsWithCto")` unique contracts 
 oa_float(.name = "CtoLinkage")
 ```
 
-For every 8-K that reports Item 1.01, the narrative of the item is recovered from the filing, running from the item's
-heading to the next heading, or to the signature block where it is the last item. A heading is recognised
+For every 8-K that reports Item 1.01, we extract the contract summary of the item from the filing, running from the
+item's heading to the next heading, or to the signature block where it is the last item. A heading is recognized
 differently in the two formats a filing comes in: in markup it follows a closing tag, and in plain text it begins a
 line. Both anchors are needed, because the word "item" appears inside most agreements, and a rule that ignored the
-markup would find a heading in the middle of a sentence. The narrative is recovered for
-`r oa_n(.key = "Docs8K")` current reports. The paper's announcement sample keeps the
-`r oa_n(.key = "Announcements")` of them that announce a single agreement and carry at most one Exhibit 10; the
-proxy for a single agreement and what it costs on each side are reported with the sample's construction in the
-paper.
+markup would find a heading in the middle of a sentence. We recover the summary for `r oa_n(.key = "Docs8K")`
+current reports. The paper's announcement sample keeps the `r oa_n(.key = "Announcements")` of them that announce
+a single agreement and carry at most one Exhibit 10; the proxy for a single agreement and what each filter excludes
+are reported with the sample's construction in the paper (Section 3.5).
 
 ::: {.content-visible when-format="html"}
 
@@ -1173,7 +1017,7 @@ oa_report_markers(.tab = tab_markers)
 
 # Deployment
 
-The fragment is written only by the LaTeX pass. A terminal render, `quarto render 1_code/40-OnlineAppendix-A.qmd`,
+The fragment is written only by the LaTeX pass. A terminal render, `quarto render 1_code/42-OnlineAppendix-A.qmd`,
 runs both passes, html first; the Render button runs the html alone. Either way, the check below sees the fragment
 as it stood before this render began.
 
@@ -1195,11 +1039,11 @@ changed -- the ones to upload.
 source(here::here("1_code", "_Commons", "_OnlineAppendix.R"), encoding = "UTF-8")
 
 oa_publish(
-  .path_qmd     = here::here("1_code", "40-OnlineAppendix-A.qmd"),                          # this document
-  .path_tex     = here::here("_rendered", "1_code", "40-OnlineAppendix-A.tex"),             # the LaTeX pass writes it
-  .path_numbers = here::here("2_output", "40-OnlineAppendix-A", "Output", "OA-Numbers-A.tex"), # every render writes it
+  .path_qmd     = here::here("1_code", "42-OnlineAppendix-A.qmd"),                          # this document
+  .path_tex     = here::here("_rendered", "1_code", "42-OnlineAppendix-A.tex"),             # the LaTeX pass writes it
+  .path_numbers = NULL,                                                                     # 40 deploys Numbers.tex
   .dir_exhibits = here::here("2_output", "30-FinalExhibits", "Output"),                     # tested for staleness
-  .dir_own      = here::here("2_output", "40-OnlineAppendix-A", "Output"),                  # the exhibits built here
+  .dir_own      = here::here("2_output", "40-Numbers", "Output"),                            # the exhibits 40 built
   .dir_deploy   = fs::path(                                                                 # the paper folder
     "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
     "200-Paper_figures",
@@ -1211,12 +1055,12 @@ oa_publish(
 
 Every chapter deploys to the same `OnlineAppendix/` folder: its fragment and its numbers file at the root, its own
 exhibits under `Tables/`, `Notes/` and `Figures/`. On the Overleaf side, `9-online_appendix.tex` sets the lettered
-numbering, points `\oaexhibits` at 30's `current/` and `\oaown` at this folder, inputs each chapter's numbers file in
+numbering, points `\oaexhibits` at 30's `current/` and `\oaown` at this folder, inputs `Numbers.tex` (deployed by 40) in
 the preamble, and inputs the fragments in order.
 
 # Next
 
-**40-OnlineAppendix-B** -- the two open-source packages, rGetEDGAR and rLabelDocs. The response memo's own document
+**42-OnlineAppendix-B** -- the two open-source packages, rGetEDGAR and rLabelDocs. The response memo's own document
 sets the exhibit-files table built here from this chapter's output directory.
 
 :::
