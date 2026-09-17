@@ -1,993 +1,280 @@
----
-title: "Final Exhibits -- The Manuscript's Tables and Figures, from the Release (31)"
-author: "Matthias Uckert"
-date: "`r format(Sys.Date(), '%Y-%m-%d')`"
----
+# 02A-Compustat: acquire Compustat fundamentals and turn quarters into date ranges ---------------------------------------
+#
+# WHAT THIS FILE DOES
+# Downloads the annual and quarterly fundamentals from WRDS and converts each firm-quarter into a
+# date interval, so that a filing date can be matched to the quarter it falls in.
+#
+# IT IS AN ACQUISITION SCRIPT AND NOTHING ELSE
+# It does not know what a contract is. Separating it from the register that consumes it means the
+# register can be rebuilt without carrying the WRDS machinery, and a second external source -- CRSP,
+# say -- becomes another script here rather than another section of an already long one.
+#
+# THE DOWNLOADS ARE GATED, THE CHECKS ARE NOT
+# Both WRDS calls sit behind .lP$Param$Acquire, which defaults to FALSE, exactly as the EDGAR
+# downloads do in 01A and 01B. Credentials are read inside the gated chunk and nowhere else, so a
+# missing key file is an error only when a connection is actually wanted.
+#
+# WHERE THINGS ARE WRITTEN
+# QuarterRange.parquet is what 02B reads, so it goes in Output/. The two downloads are neither an
+# output nor a cache: they are a local copy of a licensed external archive, they cannot be rebuilt
+# without WRDS credentials, and nothing downstream opens them. They sit at the script root for the
+# same reason 01A's GetEDGAR/ tree does.
+#
+# WHAT IS RECOMPUTED, AND WHAT IS NOT
+# cmp_quarter_range() takes .rerun, defaulting to FALSE, and fingerprints the quarterly download
+# before deciding. Four sorted deduplications over the whole of Compustat is the only real work here,
+# and it cannot produce a different answer while that file stands still. The result is also the
+# published artifact, so a stale rewrite would move its modification time and make any cache 02B
+# later keys on it miss for nothing.
+#
+# FIGURES ARE DEFINED HERE AND WRITTEN NOWHERE. The document displays what cmp_plot_coverage()
+# returns; the consolidated release script writes the files the manuscript needs.
+#
+# House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
+# locals; .data$ for existing columns, bare CamelCase for new ones; if (FALSE) dev blocks; pure
+# ASCII; parenthesised cli interpolation.
 
-```{r}
-#| label: setup
-#| include: false
-#| purl: false
+if (FALSE) {
+  .path_quarter <- .lP$Download$QuarterData
+  .path_out     <- .lP$Output$QuarterRange
+  .path_stamp   <- .lP$Cache$RangeStamp
+  .tab_range    <- tab_range
+  .rerun        <- FALSE
+}
 
-here::i_am("1_code/_Commons/_Initialize.R")
-knitr::opts_knit$set(root.dir = here::here())
 
-# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
-# messages would discard this document's entire output. comment = "" removes the "##" prefix from
-# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
-# once in _quarto.yml.
-knitr::opts_chunk$set(
-  root.dir = here::here(),
-  message  = TRUE,
-  warning  = FALSE,
-  comment  = ""
-)
+# 1. Dates -------------------------------------------------------------------------------------------------------------
 
-options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
-```
+#' Add years or quarters to a date, rolling back rather than overflowing
+#'
+#' Adding three months to 31 May gives 31 August, but adding three months to 30 November gives
+#' 30 February, which does not exist. Base arithmetic rolls that forward into March and silently
+#' moves the observation into the next quarter; rolling back to the last valid day of the intended
+#' month keeps it where it belongs.
+#'
+#' @param .date Date vector.
+#' @param .type Character. "Years" or "Quarters".
+#' @param .n Integer number of periods; negative subtracts.
+#' @return Date vector.
+cmp_add_periods <- function(.date, .type = c("Years", "Quarters"), .n = 1L) {
+  if (FALSE) {
+    .date <- as.Date("2015-11-30")
+    .type <- "Quarters"
+    .n    <- 1L
+  }
 
-```{r}
-#| label: load-libraries
-#| echo: false
+  type_ <- match.arg(.type)
+  if (identical(type_, "Years")) {
+    lubridate::add_with_rollback(.date, lubridate::years(.n))
+  } else {
+    lubridate::add_with_rollback(.date, base::months(.n * 3L))
+  }
+}
 
-# THE COMMONS FIRST. _Plots.R rebuilds its level registry empty every time it is sourced, so every
-# library that registers a vocabulary must follow it.
-.path_libs <- purrr::map_chr(
-  c("_Initialize", "_Utils", "_NER", "_Plots", "_Tables", "_Entity"),
-  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
-)
-purrr::walk(.x = .path_libs, .f = \(.p) source(file = .p, encoding = "UTF-8"))
 
-# THE UPSTREAM LIBRARIES, IN THIS ORDER. 03A owns the class vocabulary, the folds and the scoring
-# helpers; 03B, 03C and 03D are sourced for their path helpers and crown records, as 03E does, and
-# no engine is invoked; 03E owns the arm panel this document rebuilds for the classification tables;
-# 10 owns exp_cache_hit() and the column-by-column report; 30 owns every read function, every
-# vocabulary object and every exhibit tibble this document draws from. 30 registers the paper's class
-# order and the form families when sourced, which is why it comes after _Plots and before this
-# document's own library.
-.libs_up <- c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword", "03D-ClassifyLLM",
-              "03E-ClassifyOrchestrate", "10-ExportData", "30-Descriptives")
-.path_libs <- c(
-  .path_libs,
-  purrr::map_chr(.libs_up, \(.s) init_create_script_fun(.dir_here = here::here(), .name_script = .s))
-)
-purrr::walk(.x = utils::tail(.path_libs, length(.libs_up)), .f = \(.p) source(file = .p, encoding = "UTF-8"))
+# 2. The Compustat matching frame --------------------------------------------------------------------------------------
 
-.name_script <- "31-FinalExhibits"
+#' Turn Compustat quarters into date ranges a filing date can fall inside
+#'
+#' A filing carries a date; Compustat carries fiscal quarters. Matching them means turning each
+#' quarter into an interval and asking which one the filing date falls in. That is only well defined
+#' if a firm has one observation per quarter, which Compustat does not guarantee.
+#'
+#' FOUR DEDUPLICATIONS, IN ORDER, EACH KEEPING THE LARGEST FIRM. Compustat carries the same quarter
+#' under more than one identifier pairing: a CIK mapped to two gvkeys after a restructuring, one
+#' gvkey reported under two CIKs, and the same fiscal quarter filed twice. Sorting on total assets
+#' before each deduplication keeps the observation describing the larger entity, which is the parent
+#' rather than a subsidiary shell in the cases where they differ.
+#'
+#' THE INTERVAL IS ONE QUARTER FROM THE FISCAL QUARTER END, ALWAYS. datadate is the date the quarter
+#' closed, and the filing reporting that quarter arrives in the months after it, so [datadate,
+#' datadate + 1 quarter) is the window a filing for that quarter falls in.
+#'
+#' THE ALTERNATIVE WAS CONSIDERED AND IS WORSE, BUT NOT PERFECT EITHER. Running each interval to the
+#' start of the firm's next observation fails in two ways. A firm that stops reporting leaves an
+#' interval running to its next appearance years later, and a filing anywhere in that gap is matched
+#' to a quarter it has no business being matched to. A firm reporting irregularly produces intervals
+#' that overlap, and a filing then matches several quarters at once.
+#'
+#' The fixed window removes the first failure entirely -- an interval cannot stretch -- and bounds
+#' the second rather than eliminating it. Where a firm reports two quarters less than three calendar
+#' months apart, which happens on a stub quarter after a fiscal year-end change and on 52/53-week
+#' calendars, the windows still overlap. The document measures how often: 1,820 firm-quarters of
+#' 1,676,449, or about one in a thousand, and 02B counts the filings that actually land in one.
+#'
+#' What the fixed window gives up is the few days before an unusually early next filing. That is the
+#' smallest of the three losses and the only bounded one.
+#'
+#' THE COLLECTED TABLE IS SORTED BEFORE ANY DEDUPLICATION, AND THAT IS A CORRECTNESS FIX RATHER THAN
+#' TIDINESS. An Arrow scan makes no promise about the order in which record batches are returned, and
+#' distinct(.keep_all = TRUE) keeps the FIRST occurrence. Where two rows tie on the sort key of a
+#' deduplication -- same firm, same quarter, same total assets -- which of them survived was decided
+#' by whatever order Arrow happened to produce, so the published artifact was not a deterministic
+#' function of its input. Sorting once on all six selected columns fixes it without touching the
+#' rule: dplyr::arrange() is stable, so every later sort preserves this order among its own ties, and
+#' the only cases affected are ones that were previously arbitrary.
+#'
+#' CACHED ON THE OUTPUT ITSELF. The four deduplications are the only real work in this document and
+#' they are a pure function of the quarterly download. The result is also what 02B reads, so
+#' rewriting it on every render would move its modification time and make any cache keyed on it miss
+#' for nothing -- the failure 01C produced for five documents downstream.
+#'
+#' @param .path_quarter Path to the Compustat quarterly parquet.
+#' @param .path_out Destination parquet path; the published artifact.
+#' @param .path_stamp Parquet under Cache/ holding the fingerprint .path_out was built under.
+#' @param .rerun Logical. TRUE rebuilds regardless of the fingerprint.
+#' @return A tibble: CIK, gvkey, datadate, fyear, fqtr, atq, DateStart, DateStop.
+cmp_quarter_range <- function(.path_quarter, .path_out, .path_stamp, .rerun = FALSE) {
+  if (FALSE) {
+    .path_quarter <- .lP$Download$QuarterData
+    .path_out     <- .lP$Output$QuarterRange
+    .path_stamp   <- .lP$Cache$RangeStamp
+    .rerun        <- FALSE
+  }
 
-cat("Main Directory: ")
-(.dir_main <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script))
+  stamp_ <- utils_dir_stamp(.dirs = .path_quarter)
 
-cat("Function File:  ")
-(.path_fun <- init_create_script_fun(.dir_here = here::here(), .name_script = .name_script))
+  fresh_ <- !.rerun &&
+    fs::file_exists(.path_out) &&
+    identical(utils_stamp_read(.path = .path_stamp), stamp_)
 
-source(file = .path_fun, encoding = "UTF-8")
-```
+  if (fresh_) {
+    out_ <- arrow::read_parquet(file = .path_out)
+    cli::cli_alert_info(
+      "Fundamentals unchanged: {format(nrow(out_), big.mark = ',')} firm-quarters read from the published file."
+    )
+    return(out_)
+  }
 
-# Purpose
+  if (!.rerun && fs::file_exists(.path_stamp)) {
+    cli::cli_alert_warning("The quarterly download has moved; the matching frame is being rebuilt.")
+  }
 
-This document produces the exhibits of the manuscript in the form the manuscript prints them: one
-view per table or figure, on the sample the paper names, with the decided styling, and with the
-figure note written from the same tibble that drew the figure. `30-Descriptives` is the lab -- every
-exhibit on every sample, reconciled against both manuscripts -- and stays so; this document is the
-paper's copy of it.
+  out_ <- arrow::open_dataset(sources = .path_quarter) |>
+    dplyr::select(CIK = "cik", "gvkey", "datadate", fyear = "fyearq", "fqtr", "atq") |>
+    dplyr::filter(
+      !is.na(.data$CIK), !is.na(.data$gvkey), !is.na(.data$datadate),
+      !is.na(.data$fyear), !is.na(.data$fqtr)
+    ) |>
+    dplyr::collect() |>
+    # Every selected column, so a tie anywhere below is broken the same way on every run.
+    dplyr::arrange(
+      .data$CIK, .data$gvkey, .data$datadate, .data$fyear, .data$fqtr, .data$atq
+    ) |>
+    dplyr::arrange(.data$CIK, .data$gvkey, .data$datadate, dplyr::desc(.data$atq)) |>
+    dplyr::distinct(.data$CIK, .data$gvkey, .data$datadate, .keep_all = TRUE) |>
+    dplyr::arrange(.data$CIK, .data$datadate, dplyr::desc(.data$atq)) |>
+    dplyr::distinct(.data$CIK, .data$datadate, .keep_all = TRUE) |>
+    dplyr::arrange(.data$gvkey, .data$datadate, dplyr::desc(.data$atq)) |>
+    dplyr::distinct(.data$gvkey, .data$datadate, .keep_all = TRUE) |>
+    dplyr::arrange(.data$gvkey, .data$fyear, .data$fqtr, dplyr::desc(.data$atq)) |>
+    dplyr::distinct(.data$gvkey, .data$fyear, .data$fqtr, .keep_all = TRUE) |>
+    dplyr::arrange(.data$gvkey, .data$fyear, .data$fqtr, .data$datadate) |>
+    dplyr::mutate(
+      DateStart = .data$datadate,
+      DateStop  = cmp_add_periods(.date = .data$datadate, .type = "Quarters", .n = 1L)
+    )
 
-## One source, and it is hers -- and this document stands alone
-
-Every input is the one `30` reads, read through `30`'s own functions: the release `10-ExportData`
-deploys to her `MatContractPipeline` folder and the outputs of her `101` and `103` do-files. Nothing
-that another document rendered is read: `30`'s library is sourced for its functions, its output
-directory is never opened, and her `.dta` files are converted under this document's own cache. What
-this buys is that a number here, a number in `30` and a number in one of her tables come from the
-same bytes, and a difference between them is a difference in definition rather than in data -- and
-that this document renders on a machine where `30` never ran.
-
-## Prepared once per render, read lazily ever after
-
-Each input is read once, given its derived and membership columns, and written under
-`Output/Prepared` as one parquet per table, keyed on what it was built from: the release file or the
-`.dta` conversion, `30`'s library, and for the contract table the definitional switches. A prepared
-table is rebuilt when any of those is newer than it and read as it stands otherwise, so it is never
-stale and a repeat render costs a few file checks. Every exhibit then opens the prepared files
-through Arrow and DuckDB and pulls the columns and rows it needs; nothing else sits in memory.
-
-## One release, and it is dated
-
-The paper is written on the 9 September release, the first to carry the corrected state and country
-counts. Every parquet in the release is checked against that date before anything is read; an older
-file is named on the page and, for the manuscript render, aborts.
-
-## One exhibit at a time
-
-Each exhibit is added behind the samples as one block: the decision it implements, the sample it is
-drawn on, the tibble it computes from the prepared tables, its final plot or table function, and the
-note. The Overview at the end holds every figure once, in the order the manuscript prints them. This
-version holds the preparation and the checks only; the first exhibit follows the first decision.
-
-# Configuration
-
-```{r}
-#| label: configure
-
-.lP <- list(
-  # WHERE HER FOLDER IS. The Dropbox root on this machine; ~/Downloads/Pipeline is a copy with the same
-  # layout and works as a drop-in while Dropbox is offline.
-  Root = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
-  Params = list(
-    # THE RELEASE THE PAPER IS WRITTEN ON. Every .parquet under Input should be at least this new.
-    ReleaseMin = "2026-09-09",
-    # THE FOUR DEFINITIONAL SWITCHES, 30's defaults: 103's redaction rule with one marker enough, the
-    # cascade duration that reproduces Table 3, the adjusted word count the text prints, and the
-    # recital parties. Each is settled or overturned in the exhibit that depends on it.
-    Redaction  = "symbolexplicit",
-    RedactMin  = 1L,
-    Duration   = "cascade",
-    Words      = "adjusted",
-    Parties    = "recital"
+  arrow::write_parquet(out_, .path_out)
+  arrow::write_parquet(tibble::tibble(Stamp = stamp_), .path_stamp)
+  cli::cli_alert_success(
+    "Matching frame rebuilt: {format(nrow(out_), big.mark = ',')} firm-quarters written."
   )
-)
 
-.lP$Input <- list(
-  FilContracts     = fs::path(.lP$Root, "100_Data_Export", "Contracts.parquet"),
-  FilSummaries     = fs::path(.lP$Root, "100_Data_Export", "Summaries.parquet"),
-  FilPlaces        = fs::path(.lP$Root, "100_Data_Export", "Places.parquet"),
-  FilTermDocs      = fs::path(.lP$Root, "100_Data_Export", "TermDocs.parquet"),
-  FilCtoOrders     = fs::path(.lP$Root, "100_Data_Export", "CtoOrders.parquet"),
-  DtaQuarter       = fs::path(.lP$Root, "103_Variable_Creation", "103_Output",
-                              "quarter_dictionary_COMPUSTAT_variables.dta"),
-  DtaAkContract    = fs::path(.lP$Root, "103_Variable_Creation", "103_Output",
-                              "full_dictionary_contract_level_AK.dta"),
-  DtaConcentration = fs::path(.lP$Root, "101_Data_prep", "101_Output", "concentration.dta")
-)
-
-# THE CLASSIFICATION STAGES' OUTPUT DIRECTORIES, resolved the way 03E resolves them.
-.dir_03 <- purrr::map(
-  purrr::set_names(c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword", "03D-ClassifyLLM"),
-                   c("Prep", "Bert", "Kw", "Llm")),
-  \(.s) init_create_script_dir(.dir_here = here::here(), .name_script = .s)
-)
-
-# THIS DOCUMENT'S OWN CACHE: her .dta files converted to parquet here, keyed on their size. Nothing
-# under another document's output directory is ever read.
-.lP$Cache <- list(
-  CacheQuarter       = utils_file_path(.dir_main, "Cache", "Quarter.parquet"),
-  CacheAkContract    = utils_file_path(.dir_main, "Cache", "AkContract.parquet"),
-  CacheConcentration = utils_file_path(.dir_main, "Cache", "Concentration.parquet")
-)
-
-# THE PREPARED TABLES, and where the manuscript's copies go.
-.lP$Output <- list(
-  DirPrepared = utils_file_path(.dir_main, "Output", "Prepared"),
-  DirFigures  = utils_file_path(.dir_main, "Output", "Figures"),
-  DirTables   = utils_file_path(.dir_main, "Output", "Tables"),
-  DirNotes    = utils_file_path(.dir_main, "Output", "Notes"),
-  DirData     = utils_file_path(.dir_main, "Output", "Data")
-)
-
-purrr::walk(.x = unlist(.lP$Output), .f = fs::dir_create)
-
-# ONE DUCKDB CONNECTION for the document, in memory; every prepared table is registered on it below.
-con <- DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
-```
-
-# Input
-
-## The release, dated
-
-```{r}
-#| label: input-vintage
-
-tab_vintage <- fin_check_vintage(
-  .inputs   = unlist(.lP$Input),        # every path above
-  .min_date = .lP$Params$ReleaseMin,    # the release the paper is written on
-  .strict   = FALSE                     # older parquet warns; TRUE aborts, for the manuscript render
-)
-```
-
-## Her .dta files, converted here
-
-Three conversions under this document's own cache, each rebuilt when the `.dta`'s size changes --
-a Dropbox re-sync moves the modification time without changing a byte, and the size is what tells
-the two apart. The column maps are `30`'s, so the parquet here is the parquet `30` would write.
-
-```{r}
-#| label: input-convert
-
-fin_convert_dta(
-  .path_dta   = .lP$Input$DtaQuarter,        # her quarter panel, 103's output
-  .path_cache = .lP$Cache$CacheQuarter,
-  .cols       = .des_quarter_cols,           # 36 columns under this document's names
-  .rerun      = FALSE                        # TRUE reconverts regardless
-)
-
-fin_convert_dta(
-  .path_dta   = .lP$Input$DtaAkContract,     # her contract-level flags
-  .path_cache = .lP$Cache$CacheAkContract,
-  .cols       = .des_ak_contract_cols,
-  .rerun      = FALSE
-)
-
-fin_convert_dta(
-  .path_dta   = .lP$Input$DtaConcentration,  # 101's segment concentration
-  .path_cache = .lP$Cache$CacheConcentration,
-  .cols       = NULL,                        # small; every column under its Stata name
-  .rerun      = FALSE
-)
-```
-
-# Prepare
-
-Seven tables, each read once through `30`'s reader and written under `Output/Prepared`. The contract
-table carries the nine membership columns `fin_add_samples()` documents, one logical per sample, so
-an exhibit is drawn on a sample by filtering on the column of that name. Summaries is built after
-Contracts because the exhibit count on each 8-K comes from it. A prepared table is rebuilt when its
-release file, its `.dta` conversion, `30`'s library or -- for Contracts -- a definitional switch is
-newer than it, and read as it stands otherwise; `.rerun = TRUE` on any call forces the rebuild.
-
-```{r}
-#| label: prepare-tables
-
-fin_prepare_contracts(
-  .path    = .lP$Input$FilContracts,        # the release
-  .path_ak = .lP$Cache$CacheAkContract,     # her flags, joined on DocID
-  .params  = .lP$Params,                    # the definitional switches; a flip rebuilds
-  .dir     = .lP$Output$DirPrepared,
-  .rerun   = FALSE                          # TRUE rebuilds regardless
-)
-
-fin_prepare_summaries(
-  .path           = .lP$Input$FilSummaries,
-  .path_contracts = fs::path(.lP$Output$DirPrepared, "Contracts.parquet"),   # for the exhibit count per 8-K
-  .dir            = .lP$Output$DirPrepared,
-  .rerun          = FALSE
-)
-
-fin_prepare_quarter(
-  .path_cache = .lP$Cache$CacheQuarter,     # 30's conversion of her quarter panel
-  .dir        = .lP$Output$DirPrepared,
-  .rerun      = FALSE
-)
-
-fin_prepare_concentration(
-  .path_cache = .lP$Cache$CacheConcentration,   # 30's conversion of 101's concentration.dta
-  .dir        = .lP$Output$DirPrepared,
-  .rerun      = FALSE
-)
-
-fin_prepare_places(
-  .path  = .lP$Input$FilPlaces,             # the release
-  .dir   = .lP$Output$DirPrepared,
-  .rerun = FALSE
-)
-
-fin_prepare_term_docs(
-  .path  = .lP$Input$FilTermDocs,           # the release
-  .dir   = .lP$Output$DirPrepared,
-  .rerun = FALSE
-)
-
-fin_prepare_cto_orders(
-  .path  = .lP$Input$FilCtoOrders,          # the release
-  .dir   = .lP$Output$DirPrepared,
-  .rerun = FALSE
-)
-```
-
-## Opened lazily, registered once
-
-```{r}
-#| label: prepare-open
-
-lst_ds <- fin_open_prepared(
-  .dir    = .lP$Output$DirPrepared,
-  .tables = .fin_tables                     # the seven, in build order
-)
-
-fin_register_prepared(
-  .con      = con,                          # the document's connection
-  .datasets = lst_ds
-)
-
-fin_report_prepared(.datasets = lst_ds)
-```
-
-From here, `lst_ds$Contracts` is the contract table as an Arrow dataset and `Contracts` is a DuckDB
-view over the same parquet file; `dplyr::tbl(con, "Contracts")` or a `DBI::dbGetQuery()` reads it in
-place with every predicate pushed down.
-
-## The classification panel
-
-Nothing about the classifiers is in the release. What `03E` assembles at render -- one row per
-labelled document and task, the truth beside every engine's out-of-fold prediction, `NA` where an
-engine declined -- is built here once, from the run folders and crown records of `03B`, `03C` and
-`03D`, and written beside the other prepared tables with the labelled sample, the crowned
-configurations and the sweep metrics. Keyed on those folders, so a retrained model rebuilds it.
-
-```{r}
-#| label: prepare-classification
-
-fin_prepare_classification(
-  .dir_prep = .dir_03$Prep,                 # prepared.parquet: the labelled sample and the folds
-  .dir_bert = .dir_03$Bert,                 # runs, model_final/deployed.parquet
-  .dir_kw   = .dir_03$Kw,                   # runs, table/catalogue.parquet
-  .dir_llm  = .dir_03$Llm,                  # runs, if that stage ran
-  .dir      = .lP$Output$DirPrepared,
-  .rerun    = FALSE
-)
-
-lst_ds_class <- fin_open_prepared(
-  .dir    = .lP$Output$DirPrepared,
-  .tables = .fin_class_tables
-)
-
-fin_register_prepared(
-  .con      = con,
-  .datasets = lst_ds_class
-)
-
-fin_report_prepared(.datasets = lst_ds_class)
-```
-
-# Samples
-
-```{r}
-#| label: samples-table
-
-tab_samples <- fin_table_samples(
-  .con     = con,
-  .samples = .fin_contract_samples          # the nine contract-level samples, ladder order
-)
-```
-
-# Validation
-
-Two checks, each stated before it is read. **The samples nest as the ladder says**: S00 holds S0 and
-S1, both hold S2, and S2 holds its subsets and the redaction window; a row outside its parent is a
-definition that drifted from `30`'s. **S2 is the paper's number**: 1,136,095, the revision's unique
-contracts, with no tolerance because there is no rounding.
-
-```{r}
-#| label: validation-samples
-
-tab_counts <- fin_check_samples(
-  .ds      = lst_ds$Contracts,
-  .samples = .fin_contract_samples,
-  .ref     = .des_reference                 # the revision's Table 2 Panel A
-)
-```
-
-# Tables
-
-Each manuscript table is one call. The call builds the tibble, saves it under `Output/Data`, writes
-the booktabs tabular under `Output/Tables` and the note under `Output/Notes`, all under the table's
-name rather than a number, and renders the table into this document. The manuscript's table
-environment supplies the caption and the note around the tabular.
-
-## Contract categories
-
-The taxonomy's definition, hand-written. Rows in the revision's taxonomic order; `.order = "paper"`
-sorts them into the numbered order every other exhibit uses, which is the class-order question
-still open with Ann-Kristin.
-
-```{r}
-#| label: tbl-categories
-#| results: asis
-
-tab_categories <- fin_table_categories(
-  .order = "taxonomic",       # "paper" for the numbered order (1) M&A ... (12) Other
-  .dirs  = .lP$Output,        # Data, Tables, Notes
-  .name  = "Categories"       # the stem of every file written
-)
-```
-
-## Sample selection
-
-Panel A from the release's ladder columns, checked against the revision's Table 2 and aborting on
-any difference. Panel B as her `106` builds the estimation samples: every registrant copy, less the
-malformed, less the CIKs Compustat does not cover, less the rows whose fiscal quarter lacks a
-regression variable, the industry, the state, or sits in a state where filing never varies; then
-the two start years; then the firm-level sample of `105`, non-filing quarters included, firms whose
-filing never varies within a FAST Act period excluded. The control set is the resubmission's --
-the revision's plus product-market fluidity -- and it is what moves the Panel B numbers off the
-revision's page; `.fin_controls$Revision` prints the old set for comparison.
-
-```{r}
-#| label: tbl-sample
-#| results: asis
-
-tab_sample <- fin_table_sample(
-  .ds_contracts = lst_ds$Contracts,           # ladder columns and the Compustat keys
-  .ds_quarter   = lst_ds$Quarter,             # her panel, inside the window
-  .controls     = .fin_controls$Resubmission, # 105/106's control set, September 2026
-  .dirs         = .lP$Output,
-  .name         = "SampleSelection"
-)
-```
-
-## Content characteristics by category
-
-Words, duration, parties, countries and states by category on the unique-contract sample, in the Categories
-table's order: super-categories pooled and bold, sub-categories indented, Total last. Twice, from
-the same rows: the rule-based arm is what the pipeline's rules made of the extraction and is the
-manuscript's table; the naive arm is what the extractor proposed before any rule, and the pair
-shows where the rules move the level and the N. Duration carries its own N because it is undefined
-where no end was found; parties, countries and states are counts, so nothing extracted is a zero. The note
-states the sample and its size, and the function prints the size the revision assumed beside the
-size counted here.
-
-### Rule-based
-
-```{r}
-#| label: tbl-content-rule
-#| results: asis
-
-tab_content_rule <- fin_table_content(
-  .ds_contracts = lst_ds$Contracts,   # S2 rows, the raw columns of both arms
-  .con          = con,                # Places, for countries and states attached to a party
-  .arm          = "rule",             # the manuscript's table
-  .roles        = .fin_roles_recital, # registrant, co-filers, counterparties: parties, countries, states alike
-  .dirs         = .lP$Output,
-  .name         = NULL,               # ContentRule
-  .digits       = c(Mean = 0L, SD = 2L),
-  .ref          = .des_reference      # the revision's unique-contract count
-)
-```
-
-### Naive
-
-```{r}
-#| label: tbl-content-naive
-#| results: asis
-
-tab_content_naive <- fin_table_content(
-  .ds_contracts = lst_ds$Contracts,
-  .con          = con,
-  .arm          = "naive",            # before the rules
-  .roles        = .fin_roles_recital, # unused on this arm; kept so both calls read alike
-  .dirs         = .lP$Output,
-  .name         = NULL,               # ContentNaive
-  .digits       = c(Mean = 0L, SD = 2L),
-  .ref          = .des_reference
-)
-```
-
-### Observation contrast
-
-The same rows, N against N: on how many contracts each measure is defined or found something under
-each arm, and the difference. Words have no block because both arms define them on every contract.
-Duration is where the cascade adds coverage -- a stated term needs no future date in the text --
-and parties, countries and states are where the rules subtract: a recital party is a stricter thing
-than an organisation name, and a place attached to one is stricter than a place mentioned.
-
-```{r}
-#| label: tbl-content-contrast
-#| results: asis
-
-tab_content_contrast <- fin_table_content_contrast(
-  .tab_rule  = tab_content_rule,      # the two tables above, same rows
-  .tab_naive = tab_content_naive,
-  .dirs      = .lP$Output,
-  .name      = "ContentContrast"
-)
-```
-
-### Parties by role
-
-For the two of us, not the manuscript: where the party count comes from. The naive spellings, then
-the parties after grouping by the role the rules assigned, their sum, and the two shares that say
-how often the extractor found nothing and how often it found the registrant. The recital parties of
-the content tables are the first three role columns; signatory-block and other parties are what the
-rule-based count leaves out. The two extra role columns are not in `30`'s column list and are read
-from the release by `DocID`.
-
-```{r}
-#| label: tbl-parties
-#| results: asis
-
-tab_parties <- fin_table_parties(
-  .ds_contracts = lst_ds$Contracts,
-  .path_release = .lP$Input$FilContracts,   # nUniSignatory, nUniOther
-  .dirs         = .lP$Output,
-  .name         = "PartiesDetail"
-)
-```
-
-### Classifier confidence by category
-
-The probability the transformer put on the category it assigned, by category: mean, SD and
-quartiles; beside them, how often the keyword-based classifier fired and confirmed or contradicted
-it. Labelled contracts only, so the 735 without text are outside the N (Open Issues).
-
-```{r}
-#| label: tbl-confidence
-#| results: asis
-
-tab_confidence <- fin_table_confidence(
-  .ds_contracts = lst_ds$Contracts,         # BertClassDetailedProb, ClassDetailedFlag
-  .dirs         = .lP$Output,
-  .name         = "ClassConfidence"
-)
-```
-
-### Money by category
-
-For the two of us. How often the extractor found a monetary amount and how many, before and after
-the zero and par-value filter, in USD and in other currencies; and the largest and the median USD
-amount as medians across contracts. Medians, because the release documents a defect in the amounts
-themselves -- flattened HTML tables glued adjacent cells into one figure on roughly 1,500 contracts --
-and a mean of maxima measures that defect. The money columns are not in `30`'s column list and are
-read from the release by `DocID`.
-
-```{r}
-#| label: tbl-money
-#| results: asis
-
-tab_money <- fin_table_money(
-  .ds_contracts = lst_ds$Contracts,
-  .path_release = .lP$Input$FilContracts,   # the seven money columns
-  .dirs         = .lP$Output,
-  .name         = "MoneyDetail"
-)
-```
-
-### Redactions by category
-
-For the two of us, on the redaction window from 2008. Extensive margin: the share of contracts with
-at least one marker, by kind, and the share under a granted order on the 2008-2018 part. Intensive
-margin, among marked contracts: how many markers, how many carry five or more -- the threshold the
-notes record and `103` does not apply -- and how many prices were withheld.
-
-```{r}
-#| label: tbl-redactions
-#| results: asis
-
-tab_redact <- fin_table_redactions(
-  .ds_contracts = lst_ds$Contracts,         # the marker counts, coalesced to zero at read time
-  .dirs         = .lP$Output,
-  .name         = "RedactionsDetail"
-)
-```
-
-## Item 1.01 summaries
-
-Three tables on the announcement sample: single-agreement Item 1.01 8-Ks carrying at most one
-Exhibit 10. Delayed means the 8-K carried no contract -- it came later, in a periodic filing;
-attached means it rode on the 8-K. First the measures, defined once; then the revision's
-comparison, replaced on the release with the three measures the export added; then the same nine
-measures as outcomes of a regression on the delay indicator, which asks what the comparison cannot:
-whether the same firm writes differently when it delays.
-
-### The announcement sample
-
-From every Item 1.01 8-K the pipeline recovered to the sample the tests run on. The single-agreement
-restriction is a proxy -- the number of distinct agreement-date openings in the narrative -- and the
-ladder shows what it costs on each side.
-
-```{r}
-#| label: tbl-summary-sample
-#| results: asis
-
-tab_summary_sample <- fin_table_summary_sample(
-  .ds_summaries = lst_ds$Summaries,
-  .dirs         = .lP$Output,
-  .name         = "SummarySample"
-)
-```
-
-### The announcement lag
-
-Its tails before winsorising, and the winsorised mean the tables report. For the authors; the
-manuscript carries the decision in the notes.
-
-```{r}
-#| label: tbl-summary-lag
-#| results: asis
-
-tab_summary_lag <- fin_table_summary_lag(
-  .ds_summaries = lst_ds$Summaries,
-  .sample       = "S7_Summaries",
-  .winsor       = c(0.01, 0.99),            # the clip points every summary table uses
-  .dirs         = .lP$Output,
-  .name         = "SummaryLag"
-)
-```
-
-### Summary measures
-
-```{r}
-#| label: tbl-summary-variables
-#| results: asis
-
-tab_summary_variables <- fin_table_summary_variables(
-  .dirs = .lP$Output,
-  .name = "SummaryVariables"
-)
-```
-
-### Delayed against attached
-
-```{r}
-#| label: tbl-summaries
-#| results: asis
-
-tab_summaries <- fin_table_summaries(
-  .ds_summaries = lst_ds$Summaries,
-  .sample       = "S7_Summaries",           # the paper's announcement sample
-  .dirs         = .lP$Output,
-  .name         = "Summaries"
-)
-```
-
-### The delay indicator in a regression
-
-Nine outcomes across, three specifications down: year effects; year and firm effects, which asks
-whether the same firm's delayed summaries differ from its attached ones; and the resubmission's
-firm-quarter controls on the announcements matched to a fiscal quarter. Delayed announcements
-carry no contract row and hence no Compustat key, so every announcement, delayed or attached, is
-matched by one rule -- the firm's first quarter ending on or after the filing, at most a hundred
-days later. Standard errors clustered by firm.
-
-```{r}
-#| label: tbl-summaries-regression
-#| results: asis
-
-tab_summaries_regression <- fin_table_summaries_regression(
-  .ds_summaries = lst_ds$Summaries,
-  .ds_quarter   = lst_ds$Quarter,           # the controls
-  .con          = con,                      # the quarter match
-  .sample       = "S7_Summaries",
-  .controls     = .fin_controls$Resubmission,
-  .dirs         = .lP$Output,
-  .name         = "SummariesRegression"
-)
-```
-
-## Classification
-
-Everything about the classifiers, for the authors, until the manuscript's set is chosen. Every
-score is out of fold: five folds dealt once in `03A` and shared by every arm, each document predicted
-once by a model that never saw it; there is no held-out test set, by design, because the rarest
-category has seventy-one documents. Tables by category follow the Categories order, the super rows
-scoring the detailed predictions rolled up to their parent.
-
-### The labelled sample
-
-```{r}
-#| label: tbl-class-sample
-#| results: asis
-
-tab_class_sample <- fin_table_class_sample(
-  .ds_sample = lst_ds_class$ClassSample,
-  .dirs      = .lP$Output,
-  .name      = "ClassLabelled"
-)
-```
-
-### The transformer, out of fold
-
-```{r}
-#| label: tbl-class-transformer
-#| results: asis
-
-tab_class_transformer <- fin_table_class_transformer(
-  .ds_panel   = lst_ds_class$ClassPanel,
-  .ds_sample  = lst_ds_class$ClassSample,   # the second label, for lenient recall
-  .ds_crowned = lst_ds_class$ClassCrowned,  # which length ships
-  .dirs       = .lP$Output,
-  .name       = "ClassTransformer"
-)
-```
-
-### The amendment classifier
-
-```{r}
-#| label: tbl-class-amendment
-#| results: asis
-
-tab_class_amendment <- fin_table_class_amendment(
-  .ds_panel   = lst_ds_class$ClassPanel,
-  .ds_crowned = lst_ds_class$ClassCrowned,
-  .dirs       = .lP$Output,
-  .name       = "ClassAmendment"
-)
-```
-
-### The keyword arm
-
-```{r}
-#| label: tbl-class-keyword
-#| results: asis
-
-tab_class_keyword <- fin_table_class_keyword(
-  .ds_panel  = lst_ds_class$ClassPanel,
-  .ds_sample = lst_ds_class$ClassSample,
-  .dirs      = .lP$Output,
-  .name      = "ClassKeyword"
-)
-```
-
-### The arms compared
-
-```{r}
-#| label: tbl-class-arms
-#| results: asis
-
-lst_class_arms <- fin_table_class_arms(
-  .ds_panel   = lst_ds_class$ClassPanel,
-  .ds_crowned = lst_ds_class$ClassCrowned,
-  .dirs       = .lP$Output,
-  .name       = "ClassArms"
-)
-```
-
-### Model selection
-
-```{r}
-#| label: tbl-class-sweep
-#| results: asis
-
-tab_class_sweep <- fin_table_class_sweep(
-  .ds_sweep   = lst_ds_class$ClassSweep,
-  .ds_crowned = lst_ds_class$ClassCrowned,
-  .dirs       = .lP$Output,
-  .name       = "ClassSweep"
-)
-```
-
-### The confusion matrix
-
-```{r}
-#| label: tbl-class-confusion
-#| results: asis
-
-tab_class_confusion <- fin_table_class_confusion(
-  .ds_panel   = lst_ds_class$ClassPanel,
-  .ds_sample  = lst_ds_class$ClassSample,
-  .ds_crowned = lst_ds_class$ClassCrowned,
-  .dirs       = .lP$Output,
-  .name       = "ClassConfusion"
-)
-```
-
-# Figures
-
-Each manuscript figure is one call, with the tables' contract: the tibble behind it to
-`Output/Data`, the figure as pdf and png to `Output/Figures`, the note to `Output/Notes`, all under
-the figure's name, and the figure printed here. Where `30` computes and draws the exhibit in its
-decided form its functions are reused, so a figure here and its tabbed twin in `30` come from one
-code path; the runbook only picks the sample and writes the note.
-
-## Filing types
-
-Contracts by the form they arrived in, U.S. and foreign forms side by side, each bar split into
-original agreements and amendments, the form's share above it. Unique contracts. Decided on 9
-September for the online appendix.
-
-```{r}
-#| label: fig-filing-types
-#| fig-cap: "Distribution of filing types on the unique-contract sample."
-#| fig-height: !expr plot_height(8L)
-
-fig_filing_types <- fin_figure_filing_types(
-  .ds_contracts = lst_ds$Contracts,
-  .dirs         = .lP$Output,
-  .name         = "FilingTypes",
-  .ref          = .des_reference_f01       # the revision's share labels, checked on the render
-)
-```
-
-## Filings over time
-
-Each year's contracts by filing group, shares stacked, the year's total above. Four groups: the
-registration statements stand on their own, because the 2021 spike is theirs and the three-group
-version hides it inside ad-hoc. Unique contracts. Decided on 9 September for the manuscript; the
-four-group form is the recommendation, the three-group form is one call to `des_plot_f02()`.
-
-```{r}
-#| label: fig-filings-time
-#| fig-cap: "Distribution of filings over time on the unique-contract sample, four groups."
-#| fig-height: !expr plot_height(12L)
-
-fig_filings_time <- fin_figure_filings_time(
-  .ds_contracts = lst_ds$Contracts,
-  .dirs         = .lP$Output,
-  .name         = "FilingsTime"
-)
-```
-
-## Seasoned filers
-
-The referee's SPAC question in one figure: all filers against firms more than two years past their
-first contract. If the 2021 rise were existing firms filing faster it would show among the seasoned;
-it does not.
-
-```{r}
-#| label: fig-filings-seasoned
-#| fig-cap: "Contracts per year and the registration share, all filers against seasoned filers."
-#| fig-height: !expr plot_height(12L)
-
-fig_seasoned <- fin_figure_seasoned(
-  .ds_contracts = lst_ds$Contracts,
-  .dirs         = .lP$Output,
-  .name         = "FilingsSeasoned"
-)
-```
-
-# Overview
-
-```{r}
-#| label: overview-samples
-
-tbl_out(
-  .tab   = tab_samples,
-  .title = "The named samples every exhibit cites"
-)
-
-tibble::tibble(
-  Parameter = names(.lP$Params),
-  Value     = as.character(unlist(.lP$Params))
-) |>
-  tbl_out(.title = "The choices this render made")
-```
-
-# Explanations
-
-Definitions a reader of the tables above will ask about, written once here rather than repeated
-under each table. Every note refers back to this section by its heading.
-
-## Naive against rule-based extraction
-
-Every content measure except words exists in two arms. The **naive** arm is what the extractor
-proposed before any rule was applied; the **rule-based** arm is what the pipeline's rules made of
-it. The two are built from the same rows, so where they differ they differ in exactly one
-definition, and the observation contrast above shows where that moves the N.
-
-**Duration.** The naive measure asks one question of the text: is there a calendar date written out
-that lies after the filing date? If so, duration is the farthest such date less the start date,
-uncapped; if not, it is undefined. The rule-based measure is a cascade that stops at the first rung
-that answers: (1) a **stated term** -- "for a period of five years from the Effective Date",
-"36 months" -- from which the end is computed as start plus term and no future date need appear in
-the text; (2) an **open-ended clause** -- "until terminated by either party"; (3) a **cue-word
-date** -- a future date with MATURITY, THROUGH or EXPIRE beside it; (4) the **farthest future
-date**, which is the naive rule as the fallback. The stated term alone answers 56 percent of
-contracts, which is why the rule-based arm is defined on far more contracts than the naive one
-(779,440 against 450,940 on the unique-contract sample): everything the naive rule answers, rung
-four answers too, and rungs one to three add the contracts that state their length in words rather
-than as a date. Employment compensation plans are the extreme case -- "ten years from the date of
-grant" -- and their N more than doubles. In the other direction the cascade caps at 30 years and
-drops the rest, and drops negative spans; uncapped, a single mistyped year dominates a mean, which is
-why the naive arm gives leases a mean of 35 years with a standard deviation of 400 and the cascade
-4.2 with 4.4.
-
-**Parties.** The naive count is the number of distinct organisation names the extractor proposed,
-before grouping merged spellings of one organisation into one party -- about eight per contract.
-The rule-based count is the parties in the recital: the registrant, its co-filers and the
-counterparties, after grouping and after role assignment -- about two. A recital party is a stricter
-thing than a name, so the rule-based arm finds at least one party on fewer contracts than the naive
-arm finds a name.
-
-**Countries and states.** The naive counts are every distinct country, and every distinct U.S.
-state, named outside a governing-law clause, attached to a party or not; a state mention carries its
-country, so nearly every contract names at least one country. The rule-based counts are the distinct
-countries and states attached to a recital party, outside a governing-law clause, which is the count
-that reads as a contracting location rather than a mention. The law-clause places are excluded from
-both because they are jurisdictions, not locations. States are U.S. states, so foreign parties
-contribute none, and the state count is a U.S.-footprint measure rather than a geography measure.
-Parties, countries and states use one role set -- registrant, co-filers, counterparties -- so the
-three columns describe the same parties; the parties-by-role table shows what the other roles add.
-
-**Words.** The naive count is the words of the flattened text; the rule-based count subtracts the
-words the filing header contributed. Both are defined on every contract, and the difference is
-eleven words on the mean.
-
-**Zero against missing.** Parties, countries and states are counts and are zero, not missing, where nothing
-was extracted; duration is missing where no end was established, and only duration carries its own
-N in the notes.
-
-# Open Issues
-
-What the tables above turned up that needs a decision, with the evidence on the page. Each item
-names the options and the recommendation; the decision is Ann-Kristin's and Matthias's, and once
-taken it is recorded here and the item closed.
-
-## Contracts without readable text are in the descriptive sample
-
-735 contracts in the unique-contract sample carry no category, and every one of them has zero
-words: the exhibit is a placeholder for a PDF or an image -- "EXHIBIT 10.1 PDF REFERENCE",
-"ORIGINAL ARABIC PDF REFERENCE" -- and no classifier, extractor or word count ever saw text. They
-pass `02B`'s malformed test because that test is about format, not about whether any text survived,
-and they sit on every rung of the ladder (366 outside Compustat, 60 without a quarter, 309 in the
-final sample), so the Compustat match is not how they got there.
-
-```{r}
-#| label: issue-unlabelled
-
-lst_unlabelled <- fin_issue_unlabelled(
-  .ds_contracts = lst_ds$Contracts,
-  .path_release = .lP$Input$FilContracts   # nChars, not in 30's column list
-)
-```
-
-| | A: fix the ladder in `02B` | B: keep them, document |
-|:--|:--|:--|
-| What | `RemClass = "No readable text"` where `nWords == 0`, `DescSample = 0` | nothing upstream; every note keeps "735 contracts without a category label" |
-| Table 2 Panel A | a row "No readable text -735"; unique contracts 1,135,360 | unchanged, 1,136,095 |
-| Consequence | one `10` re-export, her `102`/`103` rerun (pending anyway), `30`'s reference count updated; every N moves by 735 | a table about words carries 735 contracts with none, and category rows never sum to the total |
-| Recommendation | **A**: a contract with no text is not a contract the pipeline analysed, and a referee summing the category rows finds the gap | |
-
-Decision: open.
-
-## The resubmission's control set shrinks the estimation samples by a fifth
-
-Her `105` and `106` now control for the revision's set plus market-to-book and product-market
-fluidity (referee 2's request), and drop the Herfindahl and the one-quarter sales change. Fluidity
-is missing on roughly two quarters in five. On the 9 September release, Panel B of the sample
-table on that set gives a contract-level sample of 523,687 (revision: 647,429), 171,840 firm-quarters
-(209,692) and 9,735 firms (12,303); the firm-level sample 335,249 quarters (462,572) and 9,080 firms
-(12,017). Every regression in `106` inherits this. Options: keep fluidity as a control and report the
-smaller samples; move fluidity to a robustness column and keep the larger samples for the main
-tables; impute nothing. `.fin_controls$Revision` reproduces the old ladder for comparison.
-
-Decision: open.
-
-## Panel B counts registrant copies
-
-`106` estimates on every registrant copy of a contract (it never filters `Keep == 1`), so Panel B of
-the sample table counts copies, as the revision did, while Panel A counts unique contracts. The
-primary-copy count rides in `Data/SampleSelection.parquet`. Either the note says that Panel B is at
-copy grain, or `106` moves to primary copies and Panel B follows.
-
-Decision: open.
-
-## Marker threshold for the textual redaction measure
-
-The project notes record a minimum of five markers post-2018 to match the historical rate; `103`
-applies one. With one marker the 2008-2018 textual rate is 3.9 percent against 3.2 percent under
-orders; with five it is 3.1. The redactions table above reports, by category, the share of marked
-contracts with five or more, which is the fact the threshold decision needs. `Params$RedactMin`
-carries the choice.
-
-Decision: open.
-
-## Vintage
-
-The `Summaries` release on Dropbox predates 9 September (harmless: no geography count on it) and her
-`103` outputs predate the corrected release. Table 2 Panel B, the firm-level tables and the redaction
-reconciliation close only after her `102`/`103` rerun on the 9 September export.
-
-Decision: open, waiting on the rerun.
-
-## The single-agreement filter is a date proxy
-
-The announcement sample keeps Item 1.01 8-Ks whose narrative names exactly one agreement, and
-`01D` implements "exactly one agreement" as exactly one distinct "On <Month> <D>, <YYYY>" opening
-in the text. Two agreements signed the same day pass; one agreement whose narrative repeats a
-second date -- an amendment date, an effective date -- is dropped. The ladder above the summary
-tables shows the N on each side. `01D`'s own comment says the pattern will be widened; candidates
-are counting "entered into" clauses or agreement nouns. That is a `01D` change and a `10`
-re-export, not a change here.
-
-Decision: acceptable for now, stated in the note; widening deferred.
-
-## Which broad label the release carries
-
-`03B` states that the published broad label is the roll-up of the detailed prediction, not the
-separately fitted broad model. The release's `ClassBroad` disagrees with the parent of `Class` on
-29,607 unique contracts (2.6 percent), so the export appears to carry the broad head. The transformer
-table above scores both readings -- the super rows are the roll-up -- and whichever the paper
-describes is the one `10` should export.
-
-Decision: open; check `03F` / `10`.
-
-## Monetary amounts carry glued figures
-
-Flattened HTML tables glued adjacent cells into one number on roughly 1,500 contracts, so the
-largest USD amount is unusable as a mean and only medians are reported. A fix is in `04B4`, not
-here; until then no manuscript exhibit reports a mean amount.
-
-Decision: medians only; fix deferred.
-
-# Next
-
-The remaining tables, one call each under Tables; then the figures under a Figures section; then
-Deployment with the manuscript-facing manifest.
+  out_
+}
+
+#' Compustat coverage, reported before anything is joined to it
+#'
+#' @param .tab_range Output of cmp_quarter_range().
+#' @return A one-row tibble.
+cmp_coverage_summary <- function(.tab_range) {
+  if (FALSE) .tab_range <- tab_range
+
+  tibble::tibble(
+    nRows     = nrow(.tab_range),
+    nFirms    = dplyr::n_distinct(.tab_range$gvkey),
+    nCIKs     = dplyr::n_distinct(.tab_range$CIK),
+    YearFirst = min(lubridate::year(.tab_range$DateStart), na.rm = TRUE),
+    YearLast  = max(lubridate::year(.tab_range$DateStart), na.rm = TRUE)
+  )
+}
+
+
+#' Firm-quarters and distinct firms per calendar year
+#'
+#' PULLED OUT OF THE REPORTER, where it was computed inline. It is the coverage result rather than
+#' formatting, the figure plots the same numbers, and the report is called twice -- so derived in
+#' place it was three traversals producing three answers that must agree by construction.
+#'
+#' @param .tab_range Output of cmp_quarter_range().
+#' @param .year_min Integer. Earliest year to report; Compustat runs back further than any sample.
+#' @return A tibble: Year, nQuarters, nFirms.
+cmp_quarters_by_year <- function(.tab_range, .year_min = 1990L) {
+  if (FALSE) {
+    .tab_range <- tab_range
+    .year_min  <- 1990L
+  }
+
+  .tab_range |>
+    dplyr::mutate(Year = lubridate::year(.data$DateStart)) |>
+    dplyr::summarise(nQuarters = dplyr::n(), nFirms = dplyr::n_distinct(.data$gvkey), .by = "Year") |>
+    dplyr::filter(.data$Year >= .year_min) |>
+    dplyr::arrange(.data$Year)
+}
+
+
+# 4. Reports -----------------------------------------------------------------------------------------------------------
+
+#' Every report in this document, in order
+#'
+#' TAKES THE TWO SUMMARIES, DOES NOT COMPUTE THEM. Shown once in Results and again in the Overview.
+#'
+#' @param .tab_cov Output of cmp_coverage_summary().
+#' @param .tab_year Output of cmp_quarters_by_year().
+#' @return Invisibly NULL.
+cmp_report_all <- function(.tab_cov, .tab_year) {
+  if (FALSE) {
+    .tab_cov  <- tab_coverage
+    .tab_year <- tab_by_year
+  }
+
+  tbl_head("Compustat coverage")
+  tbl_out(
+    .tab   = .tab_cov,
+    .title = NULL,
+    .notes = c(YearLast = "Compustat runs past the acquisition frame; the sample ladder in 02B closes it.")
+  )
+
+  tbl_head("Firm-quarters per year")
+  tbl_out(
+    .tab   = .tab_year,
+    .title = NULL,
+    .n     = 40L
+  )
+
+  invisible(NULL)
+}
+
+
+# 5. Figures -----------------------------------------------------------------------------------------------------------
+# DEFINED HERE, WRITTEN NOWHERE. The document displays what this returns and the consolidated release
+# script writes the file the manuscript needs.
+
+#' Firm-quarters in the matching frame, per calendar year
+#'
+#' IN THE LIBRARY RATHER THAN THE CHUNK. It was built inline in the Overview, which put a ggplot
+#' specification in a runbook and left the release script with nothing to call to reproduce it. Every
+#' other figure in the pipeline is a named function for exactly that reason.
+#'
+#' @param .tab Output of cmp_quarters_by_year().
+#' @return A ggplot object.
+cmp_plot_coverage <- function(.tab) {
+  if (FALSE) .tab <- tab_by_year
+
+  ggplot2::ggplot(.tab, ggplot2::aes(x = .data$Year, y = .data$nQuarters)) +
+    ggplot2::geom_col(fill = plot_pal_seq(.n = 1L)) +
+    plot_scale_y_count() +
+    ggplot2::labs(x = NULL, y = "Firm-quarters") +
+    plot_theme(.grid = "y")
+}

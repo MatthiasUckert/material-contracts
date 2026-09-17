@@ -1,321 +1,488 @@
----
-title: "Final Exhibits -- The Manuscript's Tables and Figures, from the Release (31)"
-author: "Matthias Uckert"
-date: "`r format(Sys.Date(), '%Y-%m-%d')`"
----
+# 02B-Register: one row per document, every decision recorded ------------------------------------------------------------
+#
+# WHAT THIS FILE DOES
+# Joins the corpus to Compustat, applies the sample ladder, and attaches what 01D and 01E found. The
+# result is one table describing every document the pipeline holds.
+#
+# NOTHING IS REMOVED, EVER
+# The register has exactly as many rows as 01C published. A document outside the window, one that
+# failed a quality rule, one whose filer is not in Compustat, one that matched two fiscal quarters --
+# each is marked and kept. Completeness is then true by construction rather than by arithmetic, and
+# every downstream script filters the same table rather than re-deriving a subset.
+#
+# That is a change from the arrangement it replaces, which deleted the documents matching more than
+# one Compustat quarter. Three hundred and thirty-two of them, which is nothing; but they were
+# deleted outside the ladder, so no table in the paper accounted for them.
+#
+# NO ABSOLUTE PATHS
+# A path written on one machine is wrong on every other. The register carries the type, quarter and
+# identifier that determine it, and utils_doc_path() rebuilds it at read time. That is what lets the
+# table be archived and used by someone who did not run the pipeline.
+#
+# ONE TABLE, SORTED BY GROUP
+# Contracts, 8-K reports and CT orders are one file rather than three. Parquet keeps per-row-group
+# statistics, so sorting by group means a reader asking only for 8-K documents skips the contract row
+# groups without reading them. One artifact, and the column sets cannot drift apart.
+#
+# House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
+# locals; .data$ for existing columns, bare CamelCase for new ones; if (FALSE) dev blocks; pure
+# ASCII; parenthesised cli interpolation.
 
-```{r}
-#| label: setup
-#| include: false
-#| purl: false
+if (FALSE) {
+  .path_meta <- .lP$Input$MetaData
+  .tab_range <- tab_range
+  .tab       <- tab_register
+}
 
-here::i_am("1_code/_Commons/_Initialize.R")
-knitr::opts_knit$set(root.dir = here::here())
 
-# message = TRUE is required: cli writes through the message stream under knitr, so suppressing
-# messages would discard this document's entire output. comment = "" removes the "##" prefix from
-# console blocks so they can be copied verbatim. Figure geometry is NOT set here -- it is declared
-# once in _quarto.yml.
-knitr::opts_chunk$set(
-  root.dir = here::here(),
-  message  = TRUE,
-  warning  = FALSE,
-  comment  = ""
-)
+# 1. Merging -----------------------------------------------------------------------------------------------------------
 
-options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
-```
+#' Join the corpus to Compustat on the filing date
+#'
+#' An interval join: a document matches the Compustat quarter whose window contains its filing date.
+#' Left, so a document with no match survives and is attributed by the ladder rather than disappearing
+#' here.
+#'
+#' A DOCUMENT MATCHING TWO QUARTERS HAS NO QUARTER. The join can return several rows where two of a
+#' firm's windows overlap, and something has to collapse them. Deleting the document, as an earlier
+#' version did, removes it from every count without recording that it existed. Setting the Compustat
+#' fields to missing and keeping one row says what is true: the filing date does not determine a
+#' fiscal quarter for this firm, so no quarter is assigned.
+#'
+#' THE INTERVAL JOIN RUNS ON THREE COLUMNS, NOT ON FORTY. Only DocID, CIK and DateFiled decide which
+#' quarter a document falls in, and a non-equi join carrying the whole of the consolidated metadata
+#' through it moves 1.77 million rows of text statistics and filer flags for nothing. The match is
+#' computed narrow and joined back on DocID.
+#'
+#' CACHED, AND THE CACHE IS THE NARROW TABLE. Six columns per document rather than forty-five, so it
+#' is a few tens of megabytes rather than most of a gigabyte, and it is what the expensive step
+#' actually produces. The consolidated metadata is read either way, because the ladder below needs
+#' every column of it.
+#'
+#' @param .path_meta Path to 01C's consolidated metadata.
+#' @param .tab_range Output of 02A's cmp_quarter_range().
+#' @param .stamp Character. Fingerprint of what determines the match, from utils_dir_stamp().
+#' @param .path_cache Parquet holding the match and the fingerprint it was built under.
+#' @param .rerun Logical. TRUE rematches regardless of the fingerprint.
+#' @return A tibble, one row per document, with the Compustat columns and nQuarters.
+reg_merge_compustat <- function(.path_meta, .tab_range, .stamp, .path_cache, .rerun = FALSE) {
+  if (FALSE) {
+    .path_meta  <- .lP$Input$MetaData
+    .tab_range  <- tab_range
+    .stamp      <- stamp_merge
+    .path_cache <- .lP$Cache$QuarterMatch
+    .rerun      <- FALSE
+  }
 
-```{r}
-#| label: load-libraries
-#| echo: false
+  cols_ <- c("gvkey", "datadate", "fyear", "fqtr")
+  meta_ <- dplyr::collect(arrow::open_dataset(sources = .path_meta))
 
-# THE COMMONS FIRST. _Plots.R rebuilds its level registry empty every time it is sourced, so every
-# library that registers a vocabulary must follow it.
-.path_libs <- purrr::map_chr(
-  c("_Initialize", "_Utils", "_NER", "_Plots", "_Tables", "_Entity"),
-  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
-)
-purrr::walk(.x = .path_libs, .f = \(.p) source(file = .p, encoding = "UTF-8"))
+  fresh_ <- !.rerun && identical(utils_stamp_read(.path = .path_cache), .stamp)
 
-# THREE UPSTREAM LIBRARIES, IN THIS ORDER. 03A owns the class vocabulary; 10 owns exp_cache_hit() and
-# the column-by-column report; 30 owns every read function, every vocabulary object and every
-# exhibit tibble this document draws from. 30 registers the paper's class order and the form families
-# when sourced, which is why it comes after _Plots and before this document's own library.
-.path_libs <- c(
-  .path_libs,
-  purrr::map_chr(
-    c("03A-ClassifyPrepare", "10-ExportData", "30-Descriptives"),
-    \(.s) init_create_script_fun(.dir_here = here::here(), .name_script = .s)
-  )
-)
-purrr::walk(.x = utils::tail(.path_libs, 3L), .f = \(.p) source(file = .p, encoding = "UTF-8"))
+  if (fresh_) {
+    link_ <- dplyr::select(arrow::read_parquet(file = .path_cache), -"Stamp")
+    cli::cli_alert_info(
+      "Corpus and matching frame unchanged: the quarter match was read from cache."
+    )
+    return(dplyr::left_join(meta_, link_, by = dplyr::join_by("DocID")))
+  }
 
-.name_script <- "31-FinalExhibits"
+  if (!.rerun && fs::file_exists(.path_cache)) {
+    cli::cli_alert_warning("The corpus or the matching frame has moved; the quarter match is being rebuilt.")
+  }
 
-cat("Main Directory: ")
-(.dir_main <- init_create_script_dir(.dir_here = here::here(), .name_script = .name_script))
+  link_ <- meta_ |>
+    dplyr::select("DocID", "CIK", "DateFiled") |>
+    dplyr::left_join(
+      y  = dplyr::select(.tab_range, "CIK", dplyr::all_of(cols_), "DateStart", "DateStop"),
+      by = dplyr::join_by("CIK", "DateFiled" >= "DateStart", "DateFiled" < "DateStop")
+    ) |>
+    dplyr::mutate(nQuarters = dplyr::n(), .by = "DocID") |>
+    dplyr::mutate(
+      dplyr::across(
+        .cols = dplyr::all_of(cols_),
+        .fns  = \(.x) dplyr::if_else(.data$nQuarters > 1L, NA, .x)
+      )
+    ) |>
+    # Selected before the deduplication rather than after it. Once the Compustat fields of an
+    # ambiguous document are missing, its several rows differ only in the window bounds, and
+    # dropping those first makes the surviving row identical whichever one distinct() keeps.
+    dplyr::select("DocID", dplyr::all_of(cols_), "nQuarters") |>
+    dplyr::distinct() |>
+    dplyr::arrange(.data$DocID)
 
-cat("Function File:  ")
-(.path_fun <- init_create_script_fun(.dir_here = here::here(), .name_script = .name_script))
-
-source(file = .path_fun, encoding = "UTF-8")
-```
-
-# Purpose
-
-This document produces the exhibits of the manuscript in the form the manuscript prints them: one
-view per table or figure, on the sample the paper names, with the decided styling, and with the
-figure note written from the same tibble that drew the figure. `30-Descriptives` is the lab -- every
-exhibit on every sample, reconciled against both manuscripts -- and stays so; this document is the
-paper's copy of it.
-
-## One source, and it is hers
-
-Every input is the one `30` reads, read through `30`'s own functions: the release `10-ExportData`
-deploys to her `MatContractPipeline` folder and the outputs of her `101` and `103` do-files. The
-conversions of her `.dta` files are `30`'s artifacts under `30`'s cache and are read from there; this
-document does not rebuild them unless told to on the page. What this buys is that a number here, a
-number in `30` and a number in one of her tables come from the same bytes, and a difference between
-them is a difference in definition rather than in data.
-
-## One release, and it is dated
-
-The paper is written on the 9 September release, the first to carry the corrected state and country
-counts. Every parquet in the release is checked against that date before anything is read, and a
-render on an older file aborts rather than printing numbers the paper would have to retract.
-
-## One exhibit at a time
-
-Each exhibit is added behind the samples as one block: the decision it implements, the sample it is
-drawn on, the `30` tibble it reads or the one it computes, its final plot or table function, and the
-note. The Overview at the end holds every figure once, in the order the manuscript prints them.
-This version holds the readiness checks only; the first exhibit follows the first decision.
-
-# Configuration
-
-```{r}
-#| label: configure
-
-.lP <- list(
-  # WHERE HER FOLDER IS. The Dropbox root on this machine; ~/Downloads/Pipeline is a copy with the same
-  # layout and works as a drop-in while Dropbox is offline.
-  Root = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
-  Params = list(
-    # THE RELEASE THE PAPER IS WRITTEN ON. Every .parquet under Input must be at least this new.
-    ReleaseMin = "2026-09-09",
-    # THE FOUR DEFINITIONAL SWITCHES, 30's defaults: 103's redaction rule with one marker enough, the
-    # cascade duration that reproduces Table 3, the adjusted word count the text prints, and the
-    # recital parties. Each is settled or overturned in the exhibit that depends on it.
-    Redaction  = "symbolexplicit",
-    RedactMin  = 1L,
-    Duration   = "cascade",
-    Words      = "adjusted",
-    Parties    = "recital"
-  )
-)
-
-.lP$Input <- list(
-  FilContracts     = fs::path(.lP$Root, "100_Data_Export", "Contracts.parquet"),
-  FilSummaries     = fs::path(.lP$Root, "100_Data_Export", "Summaries.parquet"),
-  FilPlaces        = fs::path(.lP$Root, "100_Data_Export", "Places.parquet"),
-  FilTermDocs      = fs::path(.lP$Root, "100_Data_Export", "TermDocs.parquet"),
-  FilCtoOrders     = fs::path(.lP$Root, "100_Data_Export", "CtoOrders.parquet"),
-  DtaQuarter       = fs::path(.lP$Root, "103_Variable_Creation", "103_Output",
-                              "quarter_dictionary_COMPUSTAT_variables.dta"),
-  DtaAkContract    = fs::path(.lP$Root, "103_Variable_Creation", "103_Output",
-                              "full_dictionary_contract_level_AK.dta"),
-  DtaConcentration = fs::path(.lP$Root, "101_Data_prep", "101_Output", "concentration.dta")
-)
-
-# 30'S CACHE, READ NOT WRITTEN. The parquet conversions of her .dta files are 30's artifacts; the
-# paths are resolved from 30's script directory so that they cannot drift from where 30 writes them.
-.dir_30 <- init_create_script_dir(.dir_here = here::here(), .name_script = "30-Descriptives")
-
-.lP$Cache <- list(
-  CacheQuarter       = utils_file_path(.dir_30, "Cache", "Quarter.parquet"),
-  CacheAkContract    = utils_file_path(.dir_30, "Cache", "AkContract.parquet"),
-  CacheConcentration = utils_file_path(.dir_30, "Cache", "Concentration.parquet")
-)
-
-# WHERE THE MANUSCRIPT'S COPIES GO. One folder per artifact kind; the file names follow the
-# manuscript's once they are known.
-.lP$Output <- list(
-  DirFigures = utils_file_path(.dir_main, "Output", "Figures"),
-  DirTables  = utils_file_path(.dir_main, "Output", "Tables"),
-  DirNotes   = utils_file_path(.dir_main, "Output", "Notes"),
-  DirData    = utils_file_path(.dir_main, "Output", "Data")
-)
-
-purrr::walk(.x = unlist(.lP$Output), .f = fs::dir_create)
-```
-
-# Input
-
-## The release, dated
-
-```{r}
-#| label: input-vintage
-
-tab_vintage <- fin_check_vintage(
-  .inputs   = unlist(.lP$Input),        # every path above
-  .min_date = .lP$Params$ReleaseMin,    # the release the paper is written on
-  .strict   = FALSE                     # older parquet warns; TRUE aborts, for the manuscript render
-)
-```
-
-## Her conversions, from 30's cache
-
-```{r}
-#| label: input-cache
-
-fin_check_cache(
-  .path_cache = .lP$Cache$CacheQuarter,      # 30's conversion of her quarter panel
-  .path_dta   = .lP$Input$DtaQuarter,
-  .cols       = .des_quarter_cols,           # 30's column map, so a rebuild here equals 30's
-  .build      = FALSE                        # TRUE converts into 30's cache from here
-)
-
-fin_check_cache(
-  .path_cache = .lP$Cache$CacheAkContract,
-  .path_dta   = .lP$Input$DtaAkContract,
-  .cols       = .des_ak_contract_cols,
-  .build      = FALSE
-)
-
-fin_check_cache(
-  .path_cache = .lP$Cache$CacheConcentration,
-  .path_dta   = .lP$Input$DtaConcentration,
-  .cols       = NULL,                        # small; every column under its Stata name
-  .build      = FALSE
-)
-```
-
-## The tables
-
-Every table `30` reads, read the same way, switches as in Configuration. Nothing is filtered here;
-the samples are named in the next section.
-
-```{r}
-#| label: input-read
-
-tab_contracts <- des_read_contracts(
-  .path       = .lP$Input$FilContracts,
-  .redaction  = .lP$Params$Redaction,   # which marker kinds count
-  .redact_min = .lP$Params$RedactMin,   # how many of them
-  .duration   = .lP$Params$Duration,    # cascade or naive
-  .words      = .lP$Params$Words,       # adjusted or raw
-  .parties    = .lP$Params$Parties      # recital, counterparty or spellings
-)
-
-stopifnot(setequal(setdiff(unique(tab_contracts$Class), NA), .des_class_levels))
-
-tab_summaries     <- des_read_summaries(.path = .lP$Input$FilSummaries, .tab_contracts = tab_contracts)
-tab_quarter       <- des_read_quarter(.path = .lP$Cache$CacheQuarter)
-tab_concentration <- des_read_concentration(.path = .lP$Cache$CacheConcentration)
-tab_ak            <- des_read_ak_contract(.path = .lP$Cache$CacheAkContract)
-tab_places        <- des_read_places(.path = .lP$Input$FilPlaces)
-tab_term_docs     <- des_read_term_docs(.path = .lP$Input$FilTermDocs)
-tab_cto_orders    <- des_read_cto_orders(.path = .lP$Input$FilCtoOrders)
-
-# HER FLAGS ON THE CONTRACT ROW, as 30 joins them: her sample flag and redaction indicators, so that
-# any exhibit can be reconciled against her side row by row.
-exp_check_collide(.a = names(tab_contracts), .b = names(tab_ak), .by = "DocID", .what = "the reconciliation join")
-tab_contracts <- dplyr::left_join(tab_contracts, tab_ak, by = dplyr::join_by(DocID), relationship = "one-to-one")
-
-fin_report_tables(.tabs = list(
-  Contracts     = tab_contracts,
-  Summaries     = tab_summaries,
-  Quarter       = tab_quarter,
-  Concentration = tab_concentration,
-  Places        = tab_places,
-  TermDocs      = tab_term_docs,
-  CtoOrders     = tab_cto_orders
-))
-```
-
-# Samples
-
-The same membership columns `30` defines, written out again because they are the sample definition
-of every exhibit that follows and a reader of this document should not have to open `30` to find
-them. The filters are `30`'s to the letter; the invariant check below is what guards the copy.
-
-```{r}
-#| label: samples-define
-
-tab_contracts <- tab_contracts |>
-  dplyr::mutate(
-    # S00: every row of the release, ladder step 1 included.
-    S00_Edgar       = TRUE,
-    # S0: every row at ladder steps 2-6, every copy. The paper's full sample.
-    S0_Universe     = .data$SampleStepCode >= 2L,
-    # S1: one row per attachment, whatever its ladder step.
-    S1_Unique       = .data$PrimaryFiler == 1L,
-    # S2: the descriptive sample. Inside the window, well-formed, one copy per attachment.
-    S2_Descriptive  = .data$Keep,
-    # S2s: S2 from filers more than two years past their first contract (104_SPAC.do's rule).
-    S2s_Seasoned    = .data$Keep & .data$IsSeasoned == 1L,
-    # S3: S2 with a matched Compustat quarter; from 2005 for delay, from 2008 for redaction.
-    S3_Matched      = .data$Keep & .data$Matched,
-    S3a_Matched2005 = .data$Keep & .data$Matched & .data$Year >= 2005L,
-    S3b_Matched2008 = .data$Keep & .data$Matched & .data$Year >= 2008L,
-    # S6: the redaction window on the descriptive sample, matched or not.
-    S6_Redaction    = .data$Keep & .data$Year >= 2008L
+  arrow::write_parquet(dplyr::mutate(link_, Stamp = .stamp), .path_cache)
+  cli::cli_alert_success(
+    "Quarter match rebuilt: {format(nrow(link_), big.mark = ',')} documents, cached."
   )
 
-# THE CONTRACT-LEVEL SAMPLES, in ladder order. 30 defines this vector in its runbook, not its library,
-# so it is written here again; the invariant check below is what guards the copy.
-.des_contract_samples <- c(
-  "S00_Edgar", "S0_Universe", "S1_Unique", "S2_Descriptive", "S2s_Seasoned", "S3_Matched", "S3a_Matched2005",
-  "S3b_Matched2008", "S6_Redaction"
-)
+  dplyr::left_join(meta_, link_, by = dplyr::join_by("DocID"))
+}
 
-# THE TWO SAMPLES THAT ARE NOT CONTRACT TABLES.
-lst_other <- list(
-  # S7: single-agreement announcements on 8-Ks carrying at most one Exhibit 10, attached or not.
-  S7_Summaries = dplyr::filter(tab_summaries, .data$SumIsSingle == 1L, .data$nExhibits <= 1L),
-  # S7_All: every announcement 01D recovered, the restriction lifted.
-  S7_All       = tab_summaries,
-  # S5: her firm-quarter panel inside the window.
-  S5_Quarter   = dplyr::filter(tab_quarter, dplyr::between(.data$cyear, 2001L, 2024L))
-)
 
-tab_samples <- des_table_samples(.tab = tab_contracts, .samples = .des_contract_samples, .others = lst_other)
-```
+# 2. The sample flags ----------------------------------------------------------------------------------------------------
 
-# Validation
+#' Derive the sample flags from the ladder step
+#'
+#' The ladder itself is written in the document, because the thresholds and their order are the
+#' argument. This is the mechanical part: the step number read from its own label, and the two sample
+#' indicators derived from it.
+#'
+#' THE DESCRIPTIVE SAMPLE DOES NOT REQUIRE A COMPUSTAT MATCH. It is every well-formatted document
+#' filed inside the window, which is what the corpus can describe. The estimation sample is the subset
+#' that also matched, which is what a regression can use. Reporting only the second would understate
+#' the corpus by whatever share of filers Compustat does not cover.
+#'
+#' @param .tab A merged table carrying SampleStepDesc.
+#' @param .step_final Integer. The ladder step denoting the final sample.
+#' @return The same table with SampleStepCode, DescSample and EstiSample added.
+reg_sample_flags <- function(.tab, .step_final = 6L) {
+  if (FALSE) {
+    .tab        <- tab_merged
+    .step_final <- 6L
+  }
 
-Two checks, each stated before it is read. **The samples nest as the ladder says**: S00 holds S0 and
-S1, both hold S2, and S2 holds its subsets and the redaction window; a row outside its parent is a
-definition that drifted from `30`'s. **S2 is the paper's number**: 1,136,095, the revision's unique
-contracts, with no tolerance because there is no rounding.
+  .tab |>
+    dplyr::mutate(
+      SampleStepCode = as.integer(stringi::stri_extract_first_regex(.data$SampleStepDesc, "\\d+")),
+      DescSample     = as.integer(.data$SampleStepCode >= 3L),
+      EstiSample     = as.integer(.data$SampleStepCode == .step_final)
+    )
+}
 
-```{r}
-#| label: validation-samples
 
-tab_counts <- fin_check_samples(
-  .tab     = tab_contracts,
-  .samples = .des_contract_samples,   # 30's contract-level sample names, ladder order
-  .ref     = .des_reference           # the revision's Table 2 Panel A
-)
-```
+# 3. Attaching what the other scripts found ------------------------------------------------------------------------------
 
-# Overview
+#' Attach the Item 1.01 extraction outcome from 01D
+#'
+#' A FLAG, NOT THE TEXT. Roughly a quarter of a million summaries is on the order of a gigabyte, and
+#' putting that in the register would make the one table nobody can load. The register says whether a
+#' summary exists; Item101.parquet holds it, one join away on DocID.
+#'
+#' HasSummary IS ABOUT THIS PIPELINE, NOT ABOUT THE FILING. It says 01D recovered an Item 1.01
+#' narrative from THIS DOCUMENT, which is a property of our extractor. Whether the parent filing
+#' REPORTS Item 1.01 is a different fact living in 01D's FilingItems tables, and it used to share
+#' this column's name -- HasItem101 -- which meant one name carried two meanings that disagree
+#' wherever both are defined: a filing can report the item while the extraction fails.
+#'
+#' It is zero rather than missing for a document that was never a candidate. A candidate is an 8-K
+#' whose filing reports the item, so a contract having no summary is not an absence of information --
+#' it is the wrong kind of document to have one.
+#'
+#' THE FILING'S ITEM LIST IS NO LONGER ATTACHED HERE. It was, as a pipe-joined string, and it was
+#' missing on every row that is not an Item 1.01 candidate -- which is every contract. A filing-level
+#' fact reaching documents through a document-level join is empty exactly where it would be useful,
+#' and 10 now joins 01D's per-filing table on HashIndex instead, where it lands on every row.
+#'
+#' @param .tab The register under construction.
+#' @param .path_item Path to 01D's Item101.parquet.
+#' @return .tab with HasSummary and Item101Outcome added.
+reg_attach_item101 <- function(.tab, .path_item) {
+  if (FALSE) {
+    .tab       <- tab_merged
+    .path_item <- .lP$Input$Item101
+  }
 
-```{r}
-#| label: overview-samples
+  itm_ <- arrow::open_dataset(sources = .path_item) |>
+    dplyr::select("DocID", Item101Outcome = "Outcome") |>
+    dplyr::collect()
 
-tbl_out(.tab = tab_samples, .title = "The named samples every exhibit cites")
+  ok_ <- c("extracted", "ambiguous-longest")
 
-tibble::tibble(
-  Parameter = names(.lP$Params),
-  Value     = as.character(unlist(.lP$Params))
-) |>
-  tbl_out(.title = "The choices this render made")
-```
+  .tab |>
+    dplyr::left_join(itm_, by = dplyr::join_by("DocID")) |>
+    dplyr::mutate(
+      HasSummary = dplyr::case_when(
+        is.na(.data$Item101Outcome)   ~ 0L,
+        .data$Item101Outcome %in% ok_ ~ 1L,
+        .default                      = 0L
+      )
+    )
+}
 
-# Next
+#' Derive the columns that are properties of other columns
+#'
+#' DocExt is the file extension of the document's URL, and cyear the calendar year of the Compustat
+#' observation. Neither is stored upstream because neither is a measurement: both are a restatement
+#' of something already present, and the place to restate it is once, here, rather than in whichever
+#' downstream script happens to need it first.
+#'
+#' The extension is read with stringi rather than tools::file_ext(), which builds a new string per
+#' element and allocates again through ifelse(), passing three times over a million URLs.
+#'
+#' @param .tab The register under construction.
+#' @return .tab with DocExt and cyear added.
+reg_derive <- function(.tab) {
+  if (FALSE) .tab <- tab_merged
 
-The exhibits, one block each in the order the manuscript prints them, starting with Table 2. Each
-block lands between Samples and Validation as it is decided; Deployment and the manuscript-facing
-manifest follow once the first figure exists.
+  .tab |>
+    dplyr::mutate(
+      DocExt = dplyr::coalesce(
+        stringi::stri_extract_last_regex(.data$UrlDocument, "(?<=\\.)[[:alnum:]]+$"), ""
+      ),
+      cyear = lubridate::year(.data$datadate)
+    )
+}
+
+
+# 4. Shaping the register ------------------------------------------------------------------------------------------------
+
+#' Put the register in its final shape
+#'
+#' SORTED BY GROUP, THEN DOCUMENT. Parquet keeps minimum and maximum values per row group, so a
+#' reader filtering on group skips the row groups that cannot contain a match rather than reading and
+#' discarding them. Sorting is what makes one file as cheap to slice as three separate ones.
+#'
+#' THE MACHINE PATH IS DROPPED, THE PUBLIC URL IS NOT. DocType and YQ determine the path together
+#' with DocID, and utils_doc_path() rebuilds it; an absolute path is correct on one machine and wrong
+#' on every other, which is what stops an archived table being usable. UrlDocument is a different
+#' thing entirely -- the document's address on EDGAR, identical everywhere and the only way a reader
+#' of the archive can fetch the original -- so it stays.
+#'
+#' @param .tab The register under construction.
+#' @return The register, ordered and with its columns in a stated order.
+reg_shape <- function(.tab) {
+  if (FALSE) .tab <- tab_merged
+
+  .tab |>
+    dplyr::select(-dplyr::any_of(c("DocPath", "Path", "nQuarters"))) |>
+    dplyr::relocate(dplyr::any_of(c(
+      # identity
+      "DocID", "HashDocument", "HashIndex", "CIK", "Group",
+      # where the document is, without saying where this machine keeps it
+      "DocType", "YQ",
+      # what it is
+      "DocTypeRaw", "DocTypeMod", "FormType", "DocExt", "DateFiled", "UrlDocument",
+      # what it contains
+      "nWords", "nWordsAdj", "nChars", "nNums", "pStopShort",
+      # whether it is usable
+      "Removed", "RemClass",
+      # whether it is a repeat
+      "nCIK", "MultFiler", "FilerCopiesAgree", "PrimaryFiler",
+      # who filed it
+      "gvkey", "datadate", "cyear", "fyear", "fqtr",
+      # which sample it is in
+      "SampleStepCode", "SampleStepDesc", "DescSample", "EstiSample",
+      # whether this document's own Item 1.01 summary was recovered
+      "HasSummary", "Item101Outcome"
+    ))) |>
+    dplyr::arrange(.data$Group, .data$DocID)
+}
+
+
+# 4b. Deployment ---------------------------------------------------------------------------------------------------------
+
+#' Write the register, if what produced it has moved
+#'
+#' THE REASON IS NOT DISK TIME. Five documents downstream -- 03A, 03F, 04A, 04C and any analysis --
+#' read this file, and a fingerprint downstream is only as stable as the modification time of the
+#' file it points at. Rewriting it unconditionally moves that timestamp on every render of this
+#' document, so every cache keyed on it misses although the bytes are identical. 01C produced
+#' exactly that failure for five documents before it was guarded.
+#'
+#' THE REGISTER IS BUILT EITHER WAY. Only the write is guarded, so every check below runs on the
+#' object in memory and a skipped write leaves nothing unverified.
+#'
+#' @param .tab The register.
+#' @param .path_out Destination parquet path.
+#' @param .stamp Character. Fingerprint of what determines it, from utils_dir_stamp().
+#' @param .path_stamp Parquet under Cache/ holding the fingerprint it was last written under.
+#' @param .rerun Logical. TRUE writes regardless of the fingerprint.
+#' @return .tab, invisibly.
+reg_write_register <- function(.tab, .path_out, .stamp, .path_stamp, .rerun = FALSE) {
+  if (FALSE) {
+    .tab        <- tab_register
+    .path_out   <- .lP$Output$Documents
+    .stamp      <- stamp_register
+    .path_stamp <- .lP$Cache$OutputStamp
+    .rerun      <- FALSE
+  }
+
+  fresh_ <- !.rerun &&
+    fs::file_exists(.path_out) &&
+    identical(utils_stamp_read(.path = .path_stamp), .stamp)
+
+  if (fresh_) {
+    cli::cli_alert_info("Inputs unchanged: {fs::path_file(.path_out)} was left as it stands.")
+    return(invisible(.tab))
+  }
+
+  arrow::write_parquet(.tab, .path_out)
+  arrow::write_parquet(tibble::tibble(Stamp = .stamp), .path_stamp)
+  cli::cli_alert_success(
+    "Written: {format(nrow(.tab), big.mark = ',')} rows, {ncol(.tab)} columns."
+  )
+
+  invisible(.tab)
+}
+
+
+# 5. Reports -------------------------------------------------------------------------------------------------------------
+
+#' The sample selection table, as it appears in the paper
+#'
+#' One row per ladder step, showing what each step removes. Steps that remove documents are shown
+#' negative, because the table is read as a subtraction from the universe down to the final sample.
+#'
+#' FIRM COUNTS ARE SHOWN ONLY ON THE FINAL ROW. A firm count on an intermediate step would be the
+#' number of firms among the documents removed at that step, which is not the number of firms lost: a
+#' firm with a hundred documents loses one and remains in the sample. Leaving those cells empty is
+#' more honest than filling them with a number that invites the wrong reading, and that includes the
+#' descriptive-sample subtotal, where summing empty cells would give zero and zero firms is a claim.
+#'
+#' EVERY STEP APPEARS, INCLUDING THE ONES THAT REMOVED NOTHING. A step absent because it caught no
+#' document reads as an omission rather than as a zero, and the three groups would then have tables of
+#' different heights that cannot be set side by side.
+#'
+#' @param .tab The register.
+#' @param .group Character. Which group to report, or NULL for all of them pooled.
+#' @return A tibble, one row per step plus a descriptive-sample subtotal.
+reg_sample_table <- function(.tab, .group = NULL) {
+  if (FALSE) {
+    .tab   <- tab_register
+    .group <- "Exhibit10"
+  }
+
+  dat_ <- if (is.null(.group)) .tab else dplyr::filter(.tab, .data$Group == .group)
+
+  steps_ <- sort(unique(.tab$SampleStepDesc))
+  less_  <- steps_[grepl("Less", steps_)]
+
+  tmp_ <- dplyr::bind_rows(dplyr::mutate(dat_, SampleStepDesc = "00-SEC EDGAR Universe"), dat_) |>
+    dplyr::mutate(
+      FirmQtr  = paste0(.data$gvkey, .data$fyear, .data$fqtr),
+      FirmYear = paste0(.data$gvkey, .data$fyear)
+    ) |>
+    dplyr::summarise(
+      nFilesAll  = dplyr::n(),
+      nFilesUni  = dplyr::n_distinct(.data$HashDocument),
+      nFirmQtrs  = dplyr::n_distinct(.data$FirmQtr),
+      nFirmYears = dplyr::n_distinct(.data$FirmYear),
+      nFirms     = dplyr::n_distinct(.data$gvkey),
+      .by        = "SampleStepDesc"
+    ) |>
+    dplyr::mutate(dplyr::across(
+      .cols = c("nFirmQtrs", "nFirmYears", "nFirms"),
+      .fns  = \(.x) dplyr::if_else(grepl("Final", .data$SampleStepDesc), .x, NA_integer_)
+    )) |>
+    dplyr::mutate(dplyr::across(
+      .cols = -"SampleStepDesc",
+      .fns  = \(.x) dplyr::if_else(grepl("Less", .data$SampleStepDesc), -.x, .x)
+    )) |>
+    dplyr::bind_rows(tibble::tibble(SampleStepDesc = less_, nFilesAll = 0L, nFilesUni = 0L)) |>
+    dplyr::distinct(.data$SampleStepDesc, .keep_all = TRUE) |>
+    dplyr::arrange(.data$SampleStepDesc)
+
+  sub_ <- tmp_ |>
+    dplyr::filter(grepl("^0[012]", .data$SampleStepDesc)) |>
+    dplyr::summarise(dplyr::across(c("nFilesAll", "nFilesUni"), \(.x) sum(.x, na.rm = TRUE))) |>
+    dplyr::mutate(
+      SampleStepDesc = "Descriptive Sample",
+      nFirmQtrs = NA_integer_, nFirmYears = NA_integer_, nFirms = NA_integer_
+    )
+
+  dplyr::bind_rows(
+    dplyr::filter(tmp_, grepl("^0[012]", .data$SampleStepDesc)),
+    sub_,
+    dplyr::filter(tmp_, grepl("^0[3-9]", .data$SampleStepDesc))
+  ) |>
+    dplyr::mutate(SampleStepDesc = gsub("^\\d+-", "", .data$SampleStepDesc)) |>
+    dplyr::relocate("SampleStepDesc")
+}
+
+#' What the register contains, by group
+#'
+#' @param .tab The register.
+#' @return A tibble, one row per group.
+reg_group_summary <- function(.tab) {
+  if (FALSE) .tab <- tab_register
+
+  .tab |>
+    dplyr::summarise(
+      nDocs        = dplyr::n(),
+      nAttachments = dplyr::n_distinct(.data$HashDocument),
+      nFilings     = dplyr::n_distinct(.data$HashIndex),
+      nRemoved     = sum(.data$Removed),
+      nDesc        = sum(.data$DescSample),
+      nEsti        = sum(.data$EstiSample),
+      nSummary     = sum(.data$HasSummary),
+      .by          = "Group"
+    ) |>
+    dplyr::arrange(dplyr::desc(.data$nDocs))
+}
+
+#' Every report in this document, in order
+#'
+#' TAKES THE SUMMARIES, DOES NOT COMPUTE THEM. This block is shown twice, in Results and again in the
+#' Overview, and the sample table is derived once per group -- so computed in place it was eight
+#' traversals of the register producing answers that must agree by construction.
+#'
+#' @param .tab_grp Output of reg_group_summary().
+#' @param .tab_samples Named list of reg_sample_table() results, one per group.
+#' @return Invisibly NULL.
+reg_report_all <- function(.tab_grp, .tab_samples) {
+  if (FALSE) {
+    .tab_grp     <- tab_group_summary
+    .tab_samples <- lst_sample_tables
+  }
+
+  tbl_head("What the register contains")
+  tbl_out(
+    .tab   = .tab_grp,
+    .title = NULL,
+    .notes = c(
+      nAttachments = "Distinct attachments; a document fetched under several registrants counts once.",
+      nSummary     = "Only 8-K documents are candidates, so zero elsewhere is the right kind of zero."
+    )
+  )
+
+  purrr::iwalk(
+    .x = .tab_samples,
+    .f = function(.tab, .g) {
+      tbl_head("Sample selection: {(.g)}")
+      tbl_out(
+        .tab   = .tab,
+        .title = NULL,
+        .notes = c(
+          nFilesUni = "Distinct attachments; documents fetched under several registrants count once.",
+          nFirms    = "Shown only on the final row: a firm losing one document of many is not lost."
+        )
+      )
+    }
+  )
+
+  invisible(NULL)
+}
+
+
+# 6. Figures -------------------------------------------------------------------------------------------------------------
+# DEFINED HERE, WRITTEN NOWHERE. The document displays what this returns and the consolidated release
+# script writes the file the manuscript needs -- as it does the per-group sample-selection tables,
+# which reg_sample_table() produces and this script no longer writes to disk.
+
+#' Documents per year, by what they are in
+#'
+#' @param .tab The register, restricted to one group.
+#' @return A ggplot object.
+reg_plot_samples <- function(.tab) {
+  if (FALSE) .tab <- dplyr::filter(tab_register, .data$Group == "Exhibit10")
+
+  dat_ <- .tab |>
+    dplyr::mutate(
+      Year   = as.integer(format(.data$DateFiled, "%Y")),
+      Status = dplyr::case_when(
+        .data$EstiSample == 1L ~ "Estimation sample",
+        .data$DescSample == 1L ~ "Descriptive only",
+        .default               = "Excluded"
+      )
+    ) |>
+    dplyr::summarise(nDocs = dplyr::n(), .by = c("Year", "Status")) |>
+    dplyr::filter(.data$Year >= 1996L)
+
+  ggplot2::ggplot(dat_, ggplot2::aes(x = .data$Year, y = .data$nDocs, fill = .data$Status)) +
+    ggplot2::geom_col() +
+    plot_scale_fill_cat() +
+    plot_scale_y_count() +
+    ggplot2::labs(x = NULL, y = "Documents", fill = NULL) +
+    plot_theme(.grid = "y")
+}

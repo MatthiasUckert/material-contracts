@@ -1900,7 +1900,7 @@ fin_deploy_paper(
   .path_html = fs::path(.dir_main, "31-FinalExhibits.html"),
   .manifest  = tab_manifest,                               # refuses an incomplete set
   .release   = .lP$Params$ReleaseMin,                      # recorded in VERSION.txt
-  .run       = FALSE                                       # dry run until the consumers read 31
+  .run       = TRUE                                       # dry run until the consumers read 31
 )
 
 # AFTER THE RENDER, from the console, to put this render's html beside the exhibits:

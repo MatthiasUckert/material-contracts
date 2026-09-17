@@ -1,0 +1,375 @@
+---
+title: "Publish Code -- the published copy of the pipeline and its packages (50A)"
+author: "Matthias Uckert"
+date: "`r format(Sys.time(), '%Y-%m-%d %H:%M')`"
+format:
+  html: default
+---
+
+```{r}
+#| label: setup
+#| include: false
+#| purl: false
+
+here::i_am("1_code/_Commons/_Initialize.R")
+knitr::opts_knit$set(root.dir = here::here())
+
+# message = TRUE is required: cli writes through the message stream under knitr. comment = "" removes the "##"
+# prefix from console blocks so they can be copied verbatim.
+knitr::opts_chunk$set(
+  root.dir = here::here(),
+  message  = TRUE,
+  warning  = FALSE,
+  comment  = ""
+)
+
+options(
+  cli.num_colors = 1,
+  cli.width      = 120,
+  mc.table_mode  = "console"
+)
+```
+
+```{r}
+#| label: load-libraries
+
+# THE COMMONS THIS DOCUMENT NEEDS, AND ITS OWN LIBRARY. _Initialize.R resolves this document's output directory and
+# function file; _Tables.R prints every console table. Nothing of the pipeline itself is sourced: this document reads
+# git, not data.
+.path_libs <- purrr::map_chr(
+  c("_Initialize", "_Utils", "_Tables"),
+  \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
+)
+purrr::walk(
+  .x = .path_libs,
+  .f = \(.p) source(file = .p, encoding = "UTF-8")
+)
+
+.name_script <- "50A-PublishCode"
+
+cat("Main Directory: ")
+(.dir_main <- init_create_script_dir(
+  .dir_here    = here::here(),  # the repository root
+  .name_script = .name_script   # this document's stem
+))
+
+cat("Function File:  ")
+(.path_fun <- init_create_script_fun(
+  .dir_here    = here::here(),  # the repository root
+  .name_script = .name_script   # this document's stem
+))
+
+source(file = .path_fun, encoding = "UTF-8")
+```
+
+# Purpose
+
+This document produces the published copy of the code: the pipeline that builds the database, the Python tools the
+pipeline calls, and the two R packages behind retrieval and labelling. It writes that copy into the published
+repository, `matcon-data-and-methods`, under `pipeline/` and `packages/`, and touches nothing else there.
+
+Three decisions shape it.
+
+**What is published is a commit, not a folder.** The copy is taken with `git archive` from the commit each source is
+on. An edit that is not committed is therefore not published -- and it is listed below, so it is not missed either.
+The commit of every source is written into the copy, so each published file can be traced to the version it came
+from.
+
+**Every file is decided by a visible rule.** The rule tables below are the whole publication policy. Every committed
+file matches one rule, the first match decides, and a file that no rule matches stops the document. A new file is
+therefore decided about before it goes public, instead of being published or left out by accident.
+
+**What must never be public is searched for, not assumed absent.** Before anything reaches the published repository,
+the staged copy is scanned for paths into a home directory, credentials, data files, files GitHub refuses, code that
+does not parse, and references to files that are left out. While the published repository is private the findings
+are reported and the copy proceeds (`Strict = FALSE`); before it is made public, `Strict = TRUE` turns every
+violation into a stop.
+
+Committing and pushing stay manual. The document prepares the change in the published repository and shows it; the
+decision to publish is taken there, in the RStudio Git pane.
+
+# Configuration
+
+```{r}
+#| label: configure
+
+.lP <- list(
+  Source = list(
+    # THE PIPELINE is this repository.
+    DirPipeline = here::here(),
+    NamePipeline = "material-contracts",
+    # THE PACKAGES live in their own clones. The paths are built from this repository's location, so no home
+    # directory is written down.
+    DirPackages = c(
+      rGetEDGAR  = fs::path_norm(fs::path(here::here(), "..", "..", "Packages", "rGetEDGAR")),
+      rLabelDocs = fs::path_norm(fs::path(here::here(), "..", "..", "Packages", "rLabelDocs"))
+    )
+  ),
+  Target = list(
+    # THE PUBLISHED REPOSITORY, cloned beside this one.
+    DirRepo     = fs::path_norm(fs::path(here::here(), "..", "matcon-data-and-methods")),
+    # THE ONLY TWO DIRECTORIES THIS DOCUMENT WRITES THERE.
+    SubPipeline = "pipeline",
+    SubPackages = "packages"
+  ),
+  Output = list(
+    # THE STAGE is a temporary copy of the commits, where the checks run before anything reaches the published
+    # repository. It lives in this R session's temporary directory and disappears when the render ends, so nothing
+    # of it stays in this repository.
+    DirStage    = fs::path(tempdir(), "50A-PublishCode-Stage"),
+    FilManifest = utils_file_path(.dir_main, "Output", "Manifest.csv")
+  ),
+  Params = list(
+    Strict = FALSE,  # FALSE reports violations and copies anyway; set TRUE before the target is made public
+    Fetch  = TRUE,   # fetch every source first, so that "behind GitHub" is known
+    Apply  = TRUE,   # FALSE shows what the target would receive without changing it
+    WarnMB = 50,     # GitHub warns above this size
+    MaxMB  = 100     # GitHub refuses above this size
+  )
+)
+
+tibble::tibble(
+  Location = c(names(.lP$Source$DirPackages), "pipeline", "target"),
+  Path     = c(.lP$Source$DirPackages, .lP$Source$DirPipeline, .lP$Target$DirRepo),
+  IsClone  = fs::dir_exists(fs::path(c(.lP$Source$DirPackages, .lP$Source$DirPipeline, .lP$Target$DirRepo), ".git"))
+) |>
+  tbl_say(.title = "Every location is a git clone", .n = NULL)
+```
+
+Every row above must read `TRUE`. A `FALSE` means a clone is not where this document expects it, and nothing below
+can run.
+
+# Rules
+
+The rules are the publication policy, so they stand here rather than in a function. Each is a regular expression on
+the path within its repository; the first rule that matches decides. Exceptions therefore come first, above the
+broad rule they carve out of.
+
+**The pipeline.** Everything this repository needs to rebuild the database and the paper is published: the runbooks
+and their libraries, the shared functions, the templates, the Python tools, and the R environment. Left out are a
+runbook that belongs to another project, an empty leftover, the working probes, the LexNLP exploration scripts --
+`image_spec.py` records that they change no output -- and a backup the gazetteer rebuild writes beside the lookup it
+produces. Of the tests folder, the checks that published files cite are kept: the parse check, the 04D preflight,
+and the recogniser tests the LexNLP image and the benchmark refer to.
+
+```{r}
+#| label: rules-pipeline
+
+rules_pipeline <- tibble::tribble(
+  ~Pattern, ~Action, ~Reason,
+  # Exceptions first.
+  "^1_code/01B-EDGAR\\.qmd$",
+  "exclude", "a runbook of another project",
+  "^1_code/40-OnlineAppendix-B\\.R$",
+  "exclude", "empty leftover; the appendix chapters are the 42 pairs",
+  "^1_code/_Tests/(Parse-Check|04D-Preflight|Test-[A-Za-z-]+)\\.R$",
+  "include", "checks that published files cite",
+  "^1_code/_Tests/",
+  "exclude", "working probes and scratch",
+  "^contracts-lexnlp/probe_[a-z_]+\\.py$",
+  "exclude", "exploration probes; image_spec.py records that they change no output",
+  "^contracts-extract/src/matcon_extract/data/geo_lookup_pre_hierarchy\\.parquet$",
+  "exclude", "backup written by rebuild-geo-lookup.R; the package reads geo_lookup.parquet",
+  # The pipeline.
+  "^1_code/[^/]+\\.(qmd|R)$",
+  "include", "runbooks and their function libraries",
+  "^1_code/(_Commons|_Templates)/",
+  "include", "shared functions and the appendix templates",
+  "^1_code/(_quarto\\.yml|_styles\\.css|\\.gitignore)$",
+  "include", "runbook project settings",
+  "^contracts-(classify|extract|lexnlp|spacy)/",
+  "include", "the Python tools the pipeline calls",
+  "^(renv\\.lock|\\.Rprofile|\\.here|\\.renvignore|\\.gitignore|material-contracts\\.Rproj)$|^renv/",
+  "include", "the R environment and the project root"
+)
+```
+
+**The packages.** Each package is published as committed, without the folder metadata macOS writes, superseded code
+kept beside the package, and a template figure.
+
+```{r}
+#| label: rules-packages
+
+rules_packages <- tibble::tribble(
+  ~Pattern, ~Action, ~Reason,
+  "(^|/)\\.DS_Store$",
+  "exclude", "macOS folder metadata",
+  "^_old/",
+  "exclude", "superseded code kept beside the package",
+  "^man/figures/README-pressure-1\\.png$",
+  "exclude", "template figure left by usethis",
+  ".",
+  "include", "the package as committed"
+)
+```
+
+# Input
+
+Where each source stands. The commit in each row is what gets published.
+
+```{r}
+#| label: input-state
+
+tab_state <- pub_repo_states(
+  .dirs  = c(
+    purrr::set_names(.lP$Source$DirPipeline, .lP$Source$NamePipeline),  # the pipeline, first
+    .lP$Source$DirPackages                                             # then the packages
+  ),
+  .fetch = .lP$Params$Fetch  # fetch first, so that "behind GitHub" means something
+)
+pub_report_state(.tab = tab_state)
+```
+
+An uncommitted change is the one to read carefully: the published copy will not have it. A source that is behind
+GitHub publishes an older state than GitHub holds, and one that is ahead names a commit GitHub cannot show. Both are
+fixed in the source, with a pull or a push, before rendering again.
+
+```{r}
+#| label: input-files
+
+tab_files <- purrr::map2(
+  tab_state$Repo,
+  tab_state$Dir,
+  \(.n, .d) pub_repo_files(
+    .name = .n,  # the repository, as named above
+    .dir  = .d   # its clone
+  )
+) |>
+  purrr::list_rbind()
+
+tab_files |>
+  dplyr::count(.data$Repo, name = "Files") |>
+  tbl_say(.title = "Files in each commit", .n = NULL)
+```
+
+# Selection
+
+The rules applied: the pipeline's to this repository, the package rules to each package. The document stops here if
+any file is undecided.
+
+```{r}
+#| label: select-files
+
+tab_sel <- dplyr::bind_rows(
+  pub_classify(
+    .files = dplyr::filter(tab_files, .data$Repo == .lP$Source$NamePipeline),  # the pipeline's files
+    .rules = rules_pipeline                                                  # decided by its rules
+  ),
+  pub_classify(
+    .files = dplyr::filter(tab_files, .data$Repo != .lP$Source$NamePipeline),  # the packages' files
+    .rules = rules_packages                                                  # decided by theirs
+  )
+)
+pub_require_decided(.tab = tab_sel)
+pub_report_selection(.tab = tab_sel)
+```
+
+The list of left-out files is complete by construction. A file that should be public but appears there needs a rule,
+not a manual copy.
+
+# Staging
+
+The published files are copied out of their commits into a temporary stage: the pipeline under `pipeline/`, each package
+under `packages/<name>/`, each subtree with a note naming the commits it comes from.
+
+```{r}
+#| label: stage-copy
+
+tab_staged <- pub_stage(
+  .tab           = tab_sel,                      # what the rules decided
+  .state         = tab_state,                    # which commit each repository is on
+  .dir_stage     = .lP$Output$DirStage,          # emptied and rebuilt
+  .name_pipeline = .lP$Source$NamePipeline,      # which source is the pipeline
+  .sub_pipeline  = .lP$Target$SubPipeline,       # where the pipeline goes
+  .sub_packages  = .lP$Target$SubPackages        # where the packages go
+)
+cli::cli_alert_success("{nrow(tab_staged)} files staged in {.path {(.lP$Output$DirStage)}}")
+```
+
+# Validation
+
+The staged copy is what would be published, so it is what the checks read. One left-out file may be named by a
+published one: the gazetteer rebuild writes its backup under that name, so a reader of the rebuild script is not
+pointed at anything missing.
+
+```{r}
+#| label: validate-checks
+
+tab_checks <- pub_checks(
+  .tab      = tab_staged,                                                          # the staged copy
+  .excluded = unique(fs::path_file(tab_sel$Path[tab_sel$Action %in% "exclude"])),  # names that must not be cited
+  .refs_ok  = "geo_lookup_pre_hierarchy.parquet",                                  # written, not read, by the rebuild
+  .warn_mb  = .lP$Params$WarnMB,                                                   # GitHub warns above
+  .max_mb   = .lP$Params$MaxMB                                                     # GitHub refuses above
+)
+pub_report_checks(.tab = tab_checks)
+pub_require_clean(
+  .tab    = tab_checks,          # the findings
+  .strict = .lP$Params$Strict    # stop on a violation only when strict
+)
+```
+
+A path into a home directory is the violation to expect while the pipeline still writes to shared folders by
+absolute path; it is fixed in the source by building the path from `here::here()` or from a setting. A credential is
+never acceptable, strict or not.
+
+# Deployment
+
+The owned subtrees of the published repository are made to match the stage: new files added, changed files
+replaced, dropped files deleted. Files that git ignores there -- local state of that clone -- are left alone.
+
+```{r}
+#| label: deploy-mirror
+
+tab_mirror <- pub_mirror(
+  .dir_stage  = .lP$Output$DirStage,                                   # the staged copy
+  .dir_target = .lP$Target$DirRepo,                                    # the published repository
+  .subtrees   = c(.lP$Target$SubPipeline, .lP$Target$SubPackages),     # the only directories written
+  .apply      = .lP$Params$Apply                                       # FALSE only reports
+)
+pub_report_mirror(
+  .tab     = tab_mirror,          # the plan
+  .applied = .lP$Params$Apply     # whether it was carried out
+)
+```
+
+```{r}
+#| label: deploy-manifest
+
+tab_manifest <- pub_write_manifest(
+  .tab   = tab_staged,                  # the staged copy
+  .state = tab_state,                   # the commits
+  .path  = .lP$Output$FilManifest       # one row per published file
+)
+cli::cli_alert_success("Manifest: {nrow(tab_manifest)} files, {.path {(.lP$Output$FilManifest)}}")
+```
+
+```{r}
+#| label: deploy-target-status
+
+tab_target <- pub_report_target(
+  .dir_target = .lP$Target$DirRepo,                                 # the published repository
+  .subtrees   = c(.lP$Target$SubPipeline, .lP$Target$SubPackages)  # what this document owns there
+)
+```
+
+This is what a commit in the published repository would contain. To publish it, open that repository's project in
+RStudio, tick the files in the Git pane, commit, and push.
+
+# Overview
+
+```{r}
+#| label: overview-summary
+
+pub_report_overview(
+  .state  = tab_state,    # where each source stands
+  .sel    = tab_sel,      # what the rules decided
+  .checks = tab_checks,   # what the checks found
+  .mirror = tab_mirror    # what the target received
+)
+```
+
+# Next
+
+`50B-PublishData` assembles the data package -- the release, the entity spans, the texts, the models and the
+replication inputs -- and deploys it to the shared Drive folder the published repository links to.
