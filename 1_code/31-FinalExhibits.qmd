@@ -1900,7 +1900,7 @@ fin_deploy_paper(
   .path_html = fs::path(.dir_main, "31-FinalExhibits.html"),
   .manifest  = tab_manifest,                               # refuses an incomplete set
   .release   = .lP$Params$ReleaseMin,                      # recorded in VERSION.txt
-  .run       = TRUE                                       # dry run until the consumers read 31
+  .run       = FALSE                                       # dry run until the consumers read 31
 )
 
 # AFTER THE RENDER, from the console, to put this render's html beside the exhibits:
@@ -2173,6 +2173,30 @@ device is opened, the manifest and the deployment count a figure complete with i
 render left in `Output/Figures` is not deployed.
 
 Decision: PNG only.
+
+## Which mean the amounts row reports (opened 18 September)
+
+The content readings table checks the means two builders compute apart, and they part on the amounts: 4.74 figures
+read per contract against 6.53, and 4.40 kept in dollars against 6.06. The first pair counts a contract without an
+amount as zero, as the paper counts every other content measure; the second is the mean over the contracts on which
+an amount was read, which is what `ContentValues` computes and what the appendix prints today. The readings table
+prints the first pair. Chapter D's sentence -- amounts falling from 6.53 to 6.06 -- is the second and has to say
+which it means, or change.
+
+Decision: open.
+
+## The contract table is wider than the text block (opened 17 September)
+
+Every fragment now carries the manuscript's frame: row spacing 1.2, a `tabular*` filling `\columnwidth`, `\hline`
+rules, centred headers, no size command. Nothing is scaled; the frame cuts the column padding instead, and reports
+a table that does not fit even at the tightest. Measured in the class at `\footnotesize`, the text block is 408 pt
+and the content table with its eleven number columns wants about 500 pt, 414 pt at the tightest padding. It is
+scaled for now, and the render names it. Three ways out: the means alone, without the five SD columns (about
+349 pt); the table split in two, words and duration over parties and places (317 pt and 342 pt); or scaling this
+one table. Ann-Kristin's own descriptive table has the same trouble on a smaller scale -- 435 pt as it stands, which
+the frame's padding step would fix.
+
+Decision: open.
 
 ## Two switches for one redaction rule (opened 16 September)
 

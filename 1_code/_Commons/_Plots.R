@@ -213,7 +213,7 @@ plot_theme <- function(.base = .plot_base, .grid = c("none", "y", "x", "both"),
       panel.grid.minor   = ggplot2::element_blank(),
       panel.border       = ggplot2::element_blank(),
       panel.spacing      = ggplot2::unit(0.4, "cm"),
-      strip.background   = ggplot2::element_rect(fill = "white", colour = "black", linewidth = .plot_line),
+      strip.background   = ggplot2::element_blank(),                    # no box around a panel header (17 Sep)
       strip.text         = ggplot2::element_text(family = .plot_font, face = "bold", size = .base - 1),
       plot.title         = if (.title) {
         ggplot2::element_text(family = .plot_font, face = "bold", hjust = 0.5, size = .base + 1)

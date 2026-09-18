@@ -96,6 +96,61 @@ pbd_sql_copy <- function(.query, .path, .row_group) {
 
 # 2. Stamps and small helpers --------------------------------------------------------------------------------------------
 
+#' The stamp of an output's inputs, listed without fs
+#'
+#' A stamp is a hash of three numbers -- how many files the inputs hold, how many bytes, and the newest modification
+#' time among them -- together with whatever the caller adds. utils_dir_stamp() gets those numbers from fs, and fs is
+#' not safe on this machine for directories of this size: it errors inconsistently and has crashed the session
+#' outright (r-lib/fs#281). The listing is therefore done with base R, which is slower and reliable, and the key is
+#' assembled exactly as utils_dir_stamp() assembles it.
+#'
+#' THE VALUE IS THE SAME, which is the point: an output stamped by the old function is not rebuilt by the new one.
+#' Where the two differ, it is because fs had miscounted, and one rebuild puts that right for good.
+#'
+#' Hidden files are skipped and directories are not counted, which is what fs::dir_info(type = "file") does; a tree
+#' holding symbolic links would count differently, and none of the inputs here holds any.
+#'
+#' @param .dirs Character. Directories or files whose state the stamp covers.
+#' @param .extra List or NULL. Anything else it must cover, such as the statement that builds the output.
+#' @return Character, the stamp.
+pbd_stamp <- function(.dirs, .extra = NULL) {
+  if (FALSE) {
+    .dirs  <- fs::path(.lP$Input$DirRelease, "Contracts.parquet")
+    .extra <- list(Query = "SELECT 1")
+  }
+  paths_ <- as.character(.dirs)
+  paths_ <- paths_[file.exists(paths_)]
+  isdir_ <- dir.exists(paths_)
+  files_ <- c(
+    if (any(isdir_)) {
+      unlist(
+        lapply(
+          X   = paths_[isdir_],
+          FUN = \(.d) list.files(
+            path         = .d,      # one input directory
+            all.files    = FALSE,   # hidden entries are not part of the data
+            full.names   = TRUE,    # file.info() needs the whole path
+            recursive    = TRUE,    # the quarter folders hold the documents
+            include.dirs = FALSE,   # directories are not files
+            no..         = TRUE
+          )
+        ),
+        use.names = FALSE
+      )
+    },
+    paths_[!isdir_]
+  )
+  inf_ <- if (length(files_) > 0L) file.info(files_, extra_cols = FALSE) else NULL
+  any_ <- !is.null(inf_) && nrow(inf_) > 0L
+  key_ <- list(
+    nFiles = if (any_) nrow(inf_) else 0L,
+    nBytes = if (any_) sum(as.numeric(inf_$size)) else 0,
+    Latest = if (any_) round(as.numeric(max(inf_$mtime))) else 0,
+    Extra  = .extra
+  )
+  stringi::stri_sub(str = rlang::hash(key_), from = 1L, to = 16L)
+}
+
 #' Where the stamp of an output lives
 #'
 #' @param .dir_stamps Character. The stamp directory.
@@ -250,6 +305,81 @@ pbd_copy_dir <- function(.dir_in, .dir_out) {
     purrr::list_rbind()
 }
 
+#' The release's contract file, with its EDGAR links repaired
+#'
+#' THE RELEASE IS PUBLISHED AS WRITTEN, WITH ONE EXCEPTION. Every `UrlIndexPage` the pipeline writes carries a
+#' single slash after the scheme -- `https:/www.sec.gov/...` -- which no browser and no client resolves. The repair
+#' collapses the slashes after the scheme back to two, in both link columns, and the counts it reports say how many
+#' rows each column needed. Nothing else about the file is touched, and the fault is fixed upstream for the next
+#' version.
+#'
+#' The file is written by DuckDB rather than copied, so its row groups and compression are DuckDB's; the rows, the
+#' columns and their types are those of the release.
+#'
+#' @param .con A DBI connection.
+#' @param .path_src Character. The release file.
+#' @param .path_out Character. Destination.
+#' @param .path_stamp Character. Its stamp; rebuilt only when the release or the statement changed.
+#' @return Tibble: Rows, FixedIndexPage, FixedDocument, LeftBroken, Status.
+pbd_contracts <- function(.con, .path_src, .path_out, .path_stamp) {
+  if (FALSE) {
+    .con        <- con
+    .path_src   <- fs::path(.lP$Input$DirRelease, "Contracts.parquet")
+    .path_out   <- fs::path(.lP$Output$DirPackage, "core", "Contracts.parquet")
+    .path_stamp <- pbd_stamp_path(.lP$Output$DirStamps, "core/Contracts.parquet")
+  }
+  # ^https:/+ collapses one slash or two back to exactly two, so a repaired row and a correct one look the same.
+  query_ <- sprintf(
+    paste(
+      "SELECT * REPLACE (",
+      "regexp_replace(UrlIndexPage, '^https:/+', 'https://') AS UrlIndexPage,",
+      "regexp_replace(UrlDocument, '^https:/+', 'https://') AS UrlDocument",
+      ") FROM read_parquet(%s)"
+    ),
+    pbd_lit(.path_src)
+  )
+  before_ <- pbd_query(
+    .con = .con,
+    .sql = sprintf(
+      paste(
+        "SELECT count(*) AS Rows,",
+        "count(*) FILTER (WHERE UrlIndexPage NOT LIKE 'https://%%') AS FixedIndexPage,",
+        "count(*) FILTER (WHERE UrlDocument NOT LIKE 'https://%%') AS FixedDocument",
+        "FROM read_parquet(%s)"
+      ),
+      pbd_lit(.path_src)
+    )
+  )
+  stamp_ <- pbd_stamp(.dirs = .path_src, .extra = list(Query = query_))
+  status_ <- "current"
+  if (!pbd_is_current(.path_out = .path_out, .path_stamp = .path_stamp, .stamp = stamp_)) {
+    tmp_ <- paste0(.path_out, ".tmp")
+    fs::dir_create(fs::path_dir(.path_out))
+    pbd_exec(.con = .con, .sql = pbd_sql_copy(.query = query_, .path = tmp_, .row_group = 100000L))
+    pbd_promote(.tmp = tmp_, .path = .path_out)
+    pbd_stamp_write(.path_stamp = .path_stamp, .stamp = stamp_)
+    status_ <- "built"
+  }
+  after_ <- pbd_query(
+    .con = .con,
+    .sql = sprintf(
+      paste(
+        "SELECT count(*) AS Rows,",
+        "count(*) FILTER (WHERE UrlIndexPage NOT LIKE 'https://%%' OR UrlDocument NOT LIKE 'https://%%')",
+        "AS LeftBroken FROM read_parquet(%s)"
+      ),
+      pbd_lit(.path_out)
+    )
+  )
+  tibble::tibble(
+    Rows           = as.integer(after_$Rows),
+    FixedIndexPage = as.integer(before_$FixedIndexPage),
+    FixedDocument  = as.integer(before_$FixedDocument),
+    LeftBroken     = as.integer(after_$LeftBroken),
+    Status         = status_
+  )
+}
+
 #' The contract index: one row per contract copy, for readers who want a list rather than a database
 #'
 #' The columns are the ones a reader needs to find a contract and to decide whether it concerns them: who filed it,
@@ -258,7 +388,7 @@ pbd_copy_dir <- function(.dir_in, .dir_out) {
 #' it empty and is counted by the validation.
 #'
 #' @param .con A DBI connection.
-#' @param .path_contracts Character. The release file.
+#' @param .path_contracts Character. The published contract file, whose links are already repaired.
 #' @param .path_out Character. The gzipped csv to write.
 #' @param .path_stamp Character. Its stamp; the file is rebuilt only when the release or the query changed.
 #' @return Invisibly, a one-row tibble: Rows, NoAccession.
@@ -280,7 +410,7 @@ pbd_contract_index <- function(.con, .path_contracts, .path_out, .path_stamp) {
     ),
     pbd_lit(.path_contracts)
   )
-  stamp_ <- utils_dir_stamp(.dirs = .path_contracts, .extra = list(Query = query_))
+  stamp_ <- pbd_stamp(.dirs = .path_contracts, .extra = list(Query = query_))
   if (!pbd_is_current(.path_out = .path_out, .path_stamp = .path_stamp, .stamp = stamp_)) {
     tmp_ <- paste0(.path_out, ".tmp.csv.gz")
     fs::dir_create(fs::path_dir(.path_out))
@@ -316,7 +446,7 @@ pbd_labels <- function(.con, .path_prepared, .path_out, .path_stamp) {
     .path_stamp    <- pbd_stamp_path(.lP$Output$DirStamps, "core/ClassificationLabels.parquet")
   }
   query_ <- sprintf("SELECT * EXCLUDE (Text) FROM read_parquet(%s)", pbd_lit(.path_prepared))
-  stamp_ <- utils_dir_stamp(.dirs = .path_prepared, .extra = list(Query = query_))
+  stamp_ <- pbd_stamp(.dirs = .path_prepared, .extra = list(Query = query_))
   if (!pbd_is_current(.path_out = .path_out, .path_stamp = .path_stamp, .stamp = stamp_)) {
     tmp_ <- paste0(.path_out, ".tmp")
     fs::dir_create(fs::path_dir(.path_out))
@@ -370,7 +500,7 @@ pbd_spans <- function(.con, .specs, .dir_out, .dir_stamps, .rel_out, .rerun = FA
     )
     path_out_ <- fs::path(.dir_out, paste0(Stem, ".parquet"))
     path_stamp_ <- pbd_stamp_path(.dir_stamps = .dir_stamps, .rel = fs::path(.rel_out, fs::path_file(path_out_)))
-    stamp_ <- utils_dir_stamp(.dirs = files_, .extra = list(Query = query_))
+    stamp_ <- pbd_stamp(.dirs = files_, .extra = list(Query = query_))
     rows_in_ <- pbd_query(
       .con = .con,
       .sql = sprintf("SELECT count(*) AS n FROM read_parquet(%s, union_by_name = true)", pbd_lit(glob_))
@@ -475,9 +605,12 @@ pbd_text_keys <- function(.con, .specs) {
 #' @param .rel_out Character. .dir_out relative to the stage.
 #' @param .extra List. Anything else the stamp must cover (the release stamps).
 #' @param .row_group Integer. Rows per row group; documents are large.
+#' @param .years Character or NULL. Only these years; NULL builds every year, character(0) none. A test run
+#'   builds one; none republishes what is already built without reading the documents again.
 #' @param .rerun Logical. TRUE rebuilds regardless of the stamps.
 #' @return Tibble: Type, Year, Quarters, RowsIn, RowsOut, Bytes, Seconds, Status.
-pbd_text <- function(.con, .specs, .dir_out, .dir_stamps, .rel_out, .extra, .row_group = 1000L, .rerun = FALSE) {
+pbd_text <- function(.con, .specs, .dir_out, .dir_stamps, .rel_out, .extra, .row_group = 1000L, .years = NULL,
+                     .rerun = FALSE) {
   if (FALSE) {
     .con        <- con
     .specs      <- specs_text
@@ -486,11 +619,13 @@ pbd_text <- function(.con, .specs, .dir_out, .dir_stamps, .rel_out, .extra, .row
     .rel_out    <- "text"
     .extra      <- list()
     .row_group  <- 1000L
+    .years      <- "2012"
     .rerun      <- FALSE
   }
   purrr::pmap(.specs, \(Type, Dir, Slug, Table, ...) {
     dirs_yq_ <- sort(fs::dir_ls(path = Dir, type = "directory", regexp = "/[0-9]{4}-[1-4]$"))
     years_ <- unique(stringi::stri_sub(fs::path_file(dirs_yq_), from = 1L, to = 4L))
+    if (!is.null(.years)) years_ <- intersect(years_, as.character(.years))
     purrr::map(years_, \(.year) {
       t0_ <- Sys.time()
       dirs_ <- dirs_yq_[startsWith(fs::path_file(dirs_yq_), paste0(.year, "-"))]
@@ -507,7 +642,7 @@ pbd_text <- function(.con, .specs, .dir_out, .dir_stamps, .rel_out, .extra, .row
       rel_ <- fs::path(.rel_out, Slug, paste0(Slug, "_", .year, ".parquet"))
       path_out_ <- fs::path(.dir_out, Slug, paste0(Slug, "_", .year, ".parquet"))
       path_stamp_ <- pbd_stamp_path(.dir_stamps = .dir_stamps, .rel = rel_)
-      stamp_ <- utils_dir_stamp(.dirs = dirs_, .extra = c(.extra, list(Query = query_)))
+      stamp_ <- pbd_stamp(.dirs = dirs_, .extra = c(.extra, list(Query = query_)))
       rows_in_ <- pbd_query(
         .con = .con,
         .sql = sprintf("SELECT count(*) AS n FROM read_parquet(%s, union_by_name = true)", pbd_lit(glob_))
@@ -555,7 +690,16 @@ pbd_text <- function(.con, .specs, .dir_out, .dir_stamps, .rel_out, .extra, .row
     }) |>
       purrr::list_rbind()
   }) |>
-    purrr::list_rbind()
+    purrr::list_rbind() |>
+    (\(.t) dplyr::bind_rows(
+      # The skeleton keeps the columns when no year is built at all (.years = character(0) publishes the text that is
+      # already there without touching it), so every report and check below still finds them.
+      tibble::tibble(
+        Type = character(0), Year = character(0), Quarters = integer(0), RowsIn = integer(0), RowsOut = integer(0),
+        Bytes = numeric(0), Seconds = numeric(0), Status = character(0)
+      ),
+      .t
+    ))()
 }
 
 #' Release documents that have no text in the package
@@ -641,7 +785,7 @@ pbd_models <- function(.dir_models, .dir_out, .dir_stamps, .rel_out, .rerun = FA
     zip_ <- paste0(task_, "_L", ctx_, ".zip")
     path_zip_ <- fs::path(.dir_out, zip_)
     path_stamp_ <- pbd_stamp_path(.dir_stamps = .dir_stamps, .rel = fs::path(.rel_out, zip_))
-    stamp_ <- utils_dir_stamp(.dirs = .d, .extra = list(Zip = zip_))
+    stamp_ <- pbd_stamp(.dirs = .d, .extra = list(Zip = zip_))
     status_ <- "current"
     if (.rerun || !pbd_is_current(.path_out = path_zip_, .path_stamp = path_stamp_, .stamp = stamp_)) {
       tmp_ <- fs::path(.dir_out, paste0(zip_, ".tmp"))
@@ -738,7 +882,7 @@ pbd_replication <- function(.specs, .dir_output_root, .dir_out, .dir_stamps, .re
     }))
     path_zip_ <- fs::path(.dir_out, Zip)
     path_stamp_ <- pbd_stamp_path(.dir_stamps = .dir_stamps, .rel = fs::path(.rel_out, Zip))
-    stamp_ <- utils_dir_stamp(.dirs = full_, .extra = list(Paths = Paths))
+    stamp_ <- pbd_stamp(.dirs = full_, .extra = list(Paths = Paths))
     status_ <- "current"
     if (.rerun || !pbd_is_current(.path_out = path_zip_, .path_stamp = path_stamp_, .stamp = stamp_)) {
       tmp_ <- fs::path(.dir_out, paste0(Zip, ".tmp"))
@@ -751,6 +895,227 @@ pbd_replication <- function(.specs, .dir_output_root, .dir_out, .dir_stamps, .re
     tibble::tibble(Zip = Zip, Files = length(files_), Bytes = as.numeric(fs::file_size(path_zip_)), Status = status_)
   }) |>
     purrr::list_rbind()
+}
+
+
+# 6b. The sample that travels with the site --------------------------------------------------------------------------
+
+#' Which documents the sample is built from
+#'
+#' THE SAMPLE IS CUT FROM THE LABELLED CONTRACTS, so every example on the site can be scored against a label a human
+#' gave. Within each category the documents richest in entities come first -- the ones where an example of an
+#' organisation, a place, a date, an amount and a redaction can all be shown -- and ties are broken by DocID, so the
+#' pick is the same on every machine and no seed is needed.
+#'
+#' @param .con A DBI connection.
+#' @param .dir_package Character. The published package; the sample is cut from what is published, not from the
+#'   pipeline, so it is a subset of exactly the files a reader downloads.
+#' @param .n_per_class Integer. Documents per detailed category.
+#' @return Tibble: DocID, ClassDetailed, SpanTypes, Chars.
+pbd_sample_pick <- function(.con, .dir_package, .n_per_class = 15L) {
+  if (FALSE) {
+    .con          <- con
+    .dir_package  <- .lP$Output$DirPackage
+    .n_per_class  <- 15L
+  }
+  stems_ <- c("org_mentions", "places_geo", "law_clauses", "date_spans", "term_spans", "money_spans", "redact_spans")
+  have_ <- purrr::keep(stems_, \(.s) fs::file_exists(fs::path(.dir_package, "spans", paste0(.s, ".parquet"))))
+  spans_ <- paste(
+    purrr::map_chr(have_, \(.s) sprintf(
+      "SELECT DISTINCT DocID, %s AS Kind FROM read_parquet(%s)",
+      pbd_lit(.s), pbd_lit(fs::path(.dir_package, "spans", paste0(.s, ".parquet")))
+    )),
+    collapse = " UNION ALL "
+  )
+  sql_ <- sprintf(
+    paste(
+      "WITH lab AS (SELECT DocID, ClassDetailed FROM read_parquet(%s)),",
+      "txt AS (SELECT DocID, length(TextRaw) AS Chars FROM read_parquet(%s)),",
+      "spn AS (SELECT DocID, count(DISTINCT Kind) AS SpanTypes FROM (%s) GROUP BY DocID)",
+      "SELECT lab.DocID, lab.ClassDetailed, coalesce(spn.SpanTypes, 0) AS SpanTypes, txt.Chars",
+      "FROM lab JOIN txt ON lab.DocID = txt.DocID LEFT JOIN spn ON lab.DocID = spn.DocID",
+      "QUALIFY row_number() OVER (",
+      "  PARTITION BY lab.ClassDetailed ORDER BY coalesce(spn.SpanTypes, 0) DESC, txt.Chars, lab.DocID",
+      ") <= %d",
+      "ORDER BY lab.ClassDetailed, lab.DocID"
+    ),
+    pbd_lit(fs::path(.dir_package, "core", "ClassificationLabels.parquet")),
+    pbd_lit(fs::path(.dir_package, "text", "exhibit10", "*.parquet")),
+    spans_,
+    as.integer(.n_per_class)
+  )
+  pbd_query(.con = .con, .sql = sql_)
+}
+
+#' Cut every published table down to the sampled documents
+#'
+#' THE SAMPLE IS A SUBSET, NOT A SUMMARY: same file names, same columns, same types as the package, so a script
+#' written against the sample runs against the full data by changing one path. The markup column is the exception --
+#' it is left out, because it would make a few megabytes into a few dozen, and the site needs a repository a reader
+#' can clone.
+#'
+#' @param .con A DBI connection.
+#' @param .specs Tibble: File (written), Source (package-relative), Key ("DocID", "HashIndex" or "" to copy whole).
+#' @param .ids Tibble from pbd_sample_pick().
+#' @param .dir_package Character. The published package.
+#' @param .dir_out Character. The sample directory.
+#' @return Tibble: File, Rows, Bytes.
+pbd_sample_write <- function(.con, .specs, .ids, .dir_package, .dir_out) {
+  if (FALSE) {
+    .con         <- con
+    .specs       <- specs_sample
+    .ids         <- tab_pick
+    .dir_package <- .lP$Output$DirPackage
+    .dir_out     <- .lP$Output$DirSample
+  }
+  fs::dir_create(.dir_out)
+  ids_ <- paste(pbd_lit(.ids$DocID), collapse = ", ")
+  # The filing key is only looked up when a table is cut on it; Summaries is keyed on the filing, not the document.
+  hashes_ <- if (any(.specs$Key == "HashIndex")) {
+    pbd_query(
+      .con = .con,
+      .sql = sprintf(
+        "SELECT DISTINCT HashIndex FROM read_parquet(%s) WHERE DocID IN (%s)",
+        pbd_lit(fs::path(.dir_package, "core", "Contracts.parquet")), ids_
+      )
+    )$HashIndex
+  } else {
+    character(0)
+  }
+  purrr::pmap(.specs, \(File, Source, Key, ...) {
+    src_ <- fs::path(.dir_package, Source)
+    out_ <- fs::path(.dir_out, File)
+    fs::dir_create(fs::path_dir(out_))
+    if (!any(fs::file_exists(fs::path(.dir_package, fs::path_dir(Source))))) {
+      cli::cli_abort("Missing source for the sample: {.path {Source}}")
+    }
+    if (Key == "") {
+      pbd_copy(.paths = src_, .dir_out = fs::path_dir(out_))
+      return(tibble::tibble(File = File, Rows = NA_integer_, Bytes = as.numeric(fs::file_size(out_))))
+    }
+    where_ <- if (Key == "HashIndex") {
+      sprintf("HashIndex IN (%s)", paste(pbd_lit(hashes_), collapse = ", "))
+    } else {
+      sprintf("%s IN (%s)", Key, ids_)
+    }
+    # The markup is dropped here and only here; every other column travels as published.
+    cols_ <- pbd_query(.con = .con, .sql = sprintf("DESCRIBE SELECT * FROM read_parquet(%s)", pbd_lit(src_)))$column_name
+    select_ <- if ("HTML" %in% cols_) "* EXCLUDE (HTML)" else "*"
+    tmp_ <- paste0(out_, ".tmp")
+    pbd_exec(
+      .con = .con,
+      .sql = pbd_sql_copy(
+        .query     = sprintf("SELECT %s FROM read_parquet(%s) WHERE %s", select_, pbd_lit(src_), where_),
+        .path      = tmp_,
+        .row_group = 10000L
+      )
+    )
+    pbd_promote(.tmp = tmp_, .path = out_)
+    n_ <- pbd_query(.con = .con, .sql = sprintf("SELECT count(*) AS n FROM read_parquet(%s)", pbd_lit(out_)))$n
+    tibble::tibble(File = File, Rows = as.integer(n_), Bytes = as.numeric(fs::file_size(out_)))
+  }) |>
+    purrr::list_rbind()
+}
+
+#' The figures the site quotes, as one table it reads instead of repeating them
+#'
+#' A page that types a size or a row count by hand disagrees with the data the moment either changes. These are
+#' written from the manifest and from the published files themselves.
+#'
+#' @param .con A DBI connection.
+#' @param .dir_package Character. The published package.
+#' @param .manifest Tibble from pbd_manifest().
+#' @param .spans,.text,.coverage,.models Tibbles from the steps above.
+#' @param .version Character. The package version.
+#' @param .path_out Character. The csv to write.
+#' @return Tibble: Key, Value.
+pbd_site_numbers <- function(.con, .dir_package, .manifest, .spans, .text, .coverage, .models, .version, .path_out) {
+  if (FALSE) {
+    .con         <- con
+    .dir_package <- .lP$Output$DirPackage
+    .manifest    <- tab_manifest
+    .spans       <- tab_spans
+    .text        <- tab_text
+    .coverage    <- tab_coverage
+    .models      <- tab_models
+    .version     <- .lP$Params$Version
+    .path_out    <- fs::path(.lP$Output$DirSample, "package_numbers.csv")
+  }
+  folders_ <- .manifest |>
+    dplyr::mutate(Folder = ifelse(grepl("/", .data$Path), sub("/.*$", "", .data$Path), "root")) |>
+    dplyr::summarise(Files = dplyr::n(), Bytes = sum(.data$Bytes), .by = "Folder")
+  core_ <- purrr::map(c("Contracts", "Summaries", "Places", "TermDocs", "CtoOrders"), \(.s) {
+    n_ <- pbd_query(
+      .con = .con,
+      .sql = sprintf("SELECT count(*) AS n FROM read_parquet(%s)",
+                     pbd_lit(fs::path(.dir_package, "core", paste0(.s, ".parquet"))))
+    )$n
+    tibble::tibble(Key = paste0("rows.", tolower(.s)), Value = as.character(as.integer(n_)))
+  }) |>
+    purrr::list_rbind()
+  dplyr::bind_rows(
+    tibble::tibble(Key = "package.version", Value = .version),
+    tibble::tibble(Key = "package.files", Value = as.character(nrow(.manifest))),
+    tibble::tibble(Key = "package.bytes", Value = as.character(sum(.manifest$Bytes))),
+    tibble::tibble(Key = paste0("folder.files.", folders_$Folder), Value = as.character(folders_$Files)),
+    tibble::tibble(Key = paste0("folder.bytes.", folders_$Folder), Value = as.character(folders_$Bytes)),
+    core_,
+    tibble::tibble(Key = paste0("spans.", .spans$Stem), Value = as.character(.spans$RowsOut)),
+    tibble::tibble(Key = "spans.total", Value = as.character(sum(.spans$RowsOut))),
+    tibble::tibble(
+      Key   = paste0("text.documents.", tolower(gsub("[^A-Za-z0-9]", "", unique(.text$Type)))),
+      Value = as.character(purrr::map_int(unique(.text$Type), \(.t) sum(.text$RowsOut[.text$Type == .t])))
+    ),
+    tibble::tibble(Key = "text.years.exhibit10", Value = as.character(sum(.text$Type == "Exhibit10" & .text$RowsOut > 0))),
+    tibble::tibble(Key = "models.count", Value = as.character(nrow(.models)))
+  ) |>
+    (\(.t) {
+      pbd_write_csv(.tab = .t, .path = .path_out)
+      .t
+    })()
+}
+
+#' Make one folder of the published repository match a folder here
+#'
+#' The site repository holds its own pages; this writes only the folder it is given, and inside it adds, replaces and
+#' deletes, so a sample that shrinks does not leave stale files behind. Committing stays with the author.
+#'
+#' @param .dir_from,.dir_to Character. Source and destination folder.
+#' @param .apply Logical. FALSE reports the plan only.
+#' @return Tibble: Path, Action.
+pbd_mirror_repo <- function(.dir_from, .dir_to, .apply = TRUE) {
+  if (FALSE) {
+    .dir_from <- .lP$Output$DirSample
+    .dir_to   <- fs::path(.lP$Output$DirRepo, "sample")
+    .apply    <- TRUE
+  }
+  list_ <- function(.root) {
+    if (!fs::dir_exists(.root)) return(character(0))
+    as.character(fs::path_rel(fs::dir_ls(path = .root, recurse = TRUE, type = "file", all = TRUE), start = .root))
+  }
+  src_ <- list_(.dir_from)
+  dst_ <- list_(.dir_to)
+  both_ <- intersect(src_, dst_)
+  same_ <- if (length(both_) == 0L) {
+    logical(0)
+  } else {
+    unname(tools::md5sum(fs::path(.dir_from, both_)) == tools::md5sum(fs::path(.dir_to, both_)))
+  }
+  plan_ <- dplyr::bind_rows(
+    tibble::tibble(Path = setdiff(src_, dst_), Action = "add"),
+    tibble::tibble(Path = both_, Action = dplyr::if_else(same_, "same", "update")),
+    tibble::tibble(Path = setdiff(dst_, src_), Action = "delete")
+  )
+  if (.apply && nrow(plan_) > 0L) {
+    put_ <- plan_[plan_$Action %in% c("add", "update"), ]
+    if (nrow(put_) > 0L) {
+      fs::dir_create(unique(fs::path_dir(fs::path(.dir_to, put_$Path))))
+      fs::file_copy(path = fs::path(.dir_from, put_$Path), new_path = fs::path(.dir_to, put_$Path), overwrite = TRUE)
+    }
+    del_ <- plan_[plan_$Action == "delete", ]
+    if (nrow(del_) > 0L) fs::file_delete(fs::path(.dir_to, del_$Path))
+  }
+  dplyr::arrange(plan_, factor(.data$Action, levels = c("add", "update", "delete", "same")), .data$Path)
 }
 
 
@@ -858,6 +1223,12 @@ pbd_readme <- function(.dir_package, .version, .repo_url) {
     "- Stata 19.5 and later: `import parquet using core/Contracts.parquet, clear`; earlier versions: convert with R",
     "  or Python, using the `StataName` column of the codebook.",
     "",
+    "## Note on the links",
+    "",
+    "`Contracts.parquet` and `ContractIndex.csv.gz` carry `UrlDocument` and `UrlIndexPage` with the scheme repaired:",
+    "the pipeline writes the index-page link with a single slash after `https:`, which no client resolves. Everything",
+    "else in the release files is published as the pipeline wrote it.",
+    "",
     "## Licences",
     "",
     "Data: CC BY 4.0. Models: CC BY-SA 4.0, the licence of their base model. The LexNLP image contains software under",
@@ -931,15 +1302,16 @@ pbd_deploy <- function(.dir_package, .dir_target, .manifest, .apply = TRUE, .ski
 
 #' Compare every output with its source
 #'
-#' @param .core,.index,.labels,.spans,.text,.coverage,.models,.replication Tibbles from the steps above.
+#' @param .core,.contracts,.index,.labels,.spans,.text,.coverage,.models,.replication Tibbles from the steps above.
 #' @param .n_prepared Numeric. Rows of 03A's prepared file.
 #' @param .n_contracts Numeric. Rows of the release.
 #' @param .n_models Integer. Model directories expected.
 #' @return Tibble: Check, Expected, Found, Ok.
-pbd_validate <- function(.core, .index, .labels, .spans, .text, .coverage, .models, .replication,
+pbd_validate <- function(.core, .contracts, .index, .labels, .spans, .text, .coverage, .models, .replication,
                          .n_prepared, .n_contracts, .n_models = 6L) {
   if (FALSE) {
     .core        <- tab_core
+    .contracts   <- tab_contracts
     .index       <- tab_index
     .labels      <- tab_labels
     .spans       <- tab_spans
@@ -957,6 +1329,8 @@ pbd_validate <- function(.core, .index, .labels, .spans, .text, .coverage, .mode
   }
   dplyr::bind_rows(
     chk_("core: release files copied", nrow(.core), sum(.core$Status %in% c("copied", "current"))),
+    chk_("contracts: one row per release row", .n_contracts, .contracts$Rows),
+    chk_("contracts: links left broken", 0, .contracts$LeftBroken),
     chk_("index: one row per release row", .n_contracts, .index$Rows),
     chk_("index: rows without an accession number", 0, .index$NoAccession),
     chk_("labels: one row per labelled document", .n_prepared, .labels$Rows),

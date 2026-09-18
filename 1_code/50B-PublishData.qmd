@@ -118,14 +118,20 @@ span files carry every span a rule used, with its offsets and context.
     Threads      = 16L,       # DuckDB worker threads
     Memory       = "96GB",    # DuckDB memory limit; it spills to Temp beyond this
     TextRowGroup = 1000L,     # documents per row group in text/; markup makes rows large
+    TextYears    = NULL,      # every year; a single year, e.g. "2012", tests the whole document in minutes
     Rerun        = FALSE,     # TRUE rebuilds every output regardless of its stamp
     Deploy       = TRUE,      # FALSE builds and checks the package without copying it to Drive
-    SkipDeploy   = character(0)  # top-level folders to leave out of this copy, e.g. "text"
+    SkipDeploy   = character(0),  # top-level folders to leave out of this copy, e.g. "text"
+    SampleN      = 15L,       # sample documents per detailed category
+    SampleWrite  = TRUE       # FALSE stages the sample without writing it into the site repository
   )
 )
 
 .lP$Output <- list(
   DirPackage       = fs::path(.dir_main, "Stage", "matcon-data", .lP$Params$Version),
+  # THE SAMPLE travels with the site, so it is staged separately and mirrored into the site repository.
+  DirSample        = fs::path(.dir_main, "Stage", "sample"),
+  DirRepo          = fs::path_norm(fs::path(here::here(), "..", "matcon-data-and-methods")),
   DirStamps        = utils_file_path(.dir_main, "Stamps"),
   DirTemp          = utils_file_path(.dir_main, "Temp"),
   FilManifestCache = utils_file_path(.dir_main, "Output", "manifest_cache.csv"),
@@ -226,17 +232,33 @@ con <- pbd_connect(
 
 # Core
 
-The release files and their codebooks are copied as 10 wrote them. The Stata files are not.
+The release files and their codebooks are copied as 10 wrote them, with one exception. Every `UrlIndexPage` in the
+release carries a single slash after the scheme, so the link resolves nowhere; the contract file is therefore written
+through DuckDB with both link columns repaired, and the repair is counted and checked below. The Stata files are not
+published.
 
 ```{r}
 #| label: core-release
 
-stems_release <- c("Contracts", "Summaries", "Places", "TermDocs", "CtoOrders")
+stems_copy <- c("Summaries", "Places", "TermDocs", "CtoOrders")
+stems_book <- c("Contracts", stems_copy)
 tab_core <- pbd_copy(
-  .paths   = fs::path(.lP$Input$DirRelease, c(paste0(stems_release, ".parquet"), paste0(stems_release, "_Codebook.csv"))),
+  .paths   = fs::path(.lP$Input$DirRelease, c(paste0(stems_copy, ".parquet"), paste0(stems_book, "_Codebook.csv"))),
   .dir_out = fs::path(.lP$Output$DirPackage, "core")   # destination
 )
+tab_contracts <- pbd_contracts(
+  .con        = con,                                                      # DuckDB
+  .path_src   = fs::path(.lP$Input$DirRelease, "Contracts.parquet"),      # the release
+  .path_out   = fs::path(.lP$Output$DirPackage, "core", "Contracts.parquet"),
+  .path_stamp = pbd_stamp_path(.lP$Output$DirStamps, "core/Contracts.parquet")
+)
 pbd_report(.tab = tab_core, .title = "Release files", .note = NULL, .n = NULL)
+pbd_report(
+  .tab   = tab_contracts,
+  .title = "Contract file",
+  .note  = "FixedIndexPage and FixedDocument count the rows whose link needed the scheme repaired; LeftBroken must be 0.",
+  .n     = NULL
+)
 ```
 
 The contract index is the release reduced to what a reader needs to find a contract: filer, filing, accession
@@ -248,7 +270,7 @@ spreadsheet.
 
 tab_index <- pbd_contract_index(
   .con            = con,                                                  # DuckDB
-  .path_contracts = fs::path(.lP$Input$DirRelease, "Contracts.parquet"),  # the release
+  .path_contracts = fs::path(.lP$Output$DirPackage, "core", "Contracts.parquet"),  # the published file
   .path_out       = fs::path(.lP$Output$DirPackage, "core", "ContractIndex.csv.gz"),
   .path_stamp     = pbd_stamp_path(.lP$Output$DirStamps, "core/ContractIndex.csv.gz")  # rebuilt when the release moves
 )
@@ -322,8 +344,10 @@ tab_keys <- pbd_text_keys(
 pbd_report(.tab = tab_keys, .title = "Release documents per key table", .note = NULL, .n = NULL)
 ```
 
-Then one file per document type and year. The first run reads every document once and takes hours; later runs
-rebuild only years whose documents or release keys changed.
+Then one file per document type and year. The first full run reads every document once and takes hours; later
+runs rebuild only years whose documents or release keys changed. With `TextYears` set, only those years are built,
+which tests the whole document in minutes; the coverage check below then counts the documents of every other year as
+missing, as it should.
 
 ```{r}
 #| label: text-build
@@ -334,8 +358,9 @@ tab_text <- pbd_text(
   .dir_out    = fs::path(.lP$Output$DirPackage, "text"),              # destination
   .dir_stamps = .lP$Output$DirStamps,                                 # stamps
   .rel_out    = "text",                                               # destination, relative to the package
-  .extra      = list(Release = utils_dir_stamp(.dirs = unique(specs_text$File), .extra = NULL)),  # keys changed?
+  .extra      = list(Release = pbd_stamp(.dirs = unique(specs_text$File), .extra = NULL)),  # keys changed?
   .row_group  = .lP$Params$TextRowGroup,                              # documents per row group
+  .years      = .lP$Params$TextYears,                                 # NULL builds every year
   .rerun      = .lP$Params$Rerun                                      # FALSE skips unchanged years
 )
 tab_coverage <- pbd_text_coverage(
@@ -400,6 +425,73 @@ pbd_report(
 )
 ```
 
+# The sample for the site
+
+The site of the published repository shows what the data look like and how the methods are used, and its examples
+have to run when the pages are rendered. They run on a sample that lives in the repository itself: a slice of the
+published files, cut to a few hundred labelled contracts, with the same file names, columns and types as the full
+data. A script written against the sample therefore runs against the whole database by changing one path.
+
+The documents come from the labelled contracts, so every example can be scored against a label a human gave, and
+within each category the ones richest in entities come first, so an organisation, a place, a date, an amount and a
+redaction can all be shown. Only the markup column is left out, to keep the repository small.
+
+```{r}
+#| label: sample-pick
+
+tab_pick <- pbd_sample_pick(
+  .con          = con,                       # DuckDB
+  .dir_package  = .lP$Output$DirPackage,     # cut from what is published
+  .n_per_class  = .lP$Params$SampleN         # documents per detailed category
+)
+tab_pick |>
+  dplyr::summarise(Documents = dplyr::n(), SpanTypes = round(mean(.data$SpanTypes), 1), .by = "ClassDetailed") |>
+  dplyr::arrange(.data$ClassDetailed) |>
+  pbd_report(.title = "The sample, by category", .note = NULL, .n = NULL)
+```
+
+```{r}
+#| label: sample-specs
+
+specs_sample <- tibble::tribble(
+  ~File,                         ~Source,                                  ~Key,
+  "contracts.parquet",           "core/Contracts.parquet",                 "DocID",
+  "summaries.parquet",           "core/Summaries.parquet",                 "HashIndex",
+  "places.parquet",              "core/Places.parquet",                    "DocID",
+  "termdocs.parquet",            "core/TermDocs.parquet",                  "DocID",
+  "cto_orders.parquet",          "core/CtoOrders.parquet",                 "DocID",
+  "labels.parquet",              "core/ClassificationLabels.parquet",      "DocID",
+  "text.parquet",                "text/exhibit10/*.parquet",               "DocID",
+  "spans/org_mentions.parquet",  "spans/org_mentions.parquet",             "DocID",
+  "spans/places_geo.parquet",    "spans/places_geo.parquet",               "DocID",
+  "spans/law_clauses.parquet",   "spans/law_clauses.parquet",              "DocID",
+  "spans/date_spans.parquet",    "spans/date_spans.parquet",               "DocID",
+  "spans/term_spans.parquet",    "spans/term_spans.parquet",               "DocID",
+  "spans/money_spans.parquet",   "spans/money_spans.parquet",              "DocID",
+  "spans/redact_spans.parquet",  "spans/redact_spans.parquet",             "DocID",
+  "codebooks/Contracts_Codebook.csv", "core/Contracts_Codebook.csv",       "",
+  "codebooks/Summaries_Codebook.csv", "core/Summaries_Codebook.csv",       "",
+  "codebooks/Places_Codebook.csv",    "core/Places_Codebook.csv",          "",
+  "codebooks/TermDocs_Codebook.csv",  "core/TermDocs_Codebook.csv",        "",
+  "codebooks/CtoOrders_Codebook.csv", "core/CtoOrders_Codebook.csv",       "",
+  "codebooks/Spans_Codebook.csv",     "spans/Spans_Codebook.csv",          ""
+)
+
+tab_sample <- pbd_sample_write(
+  .con         = con,                      # DuckDB
+  .specs       = specs_sample,             # which file is cut on which key
+  .ids         = tab_pick,                 # the documents
+  .dir_package = .lP$Output$DirPackage,    # the published files
+  .dir_out     = .lP$Output$DirSample      # the staged sample
+)
+pbd_report(
+  .tab   = tab_sample,
+  .title = "The sample, file by file",
+  .note  = "Same names, columns and types as the package; only the markup column is left out.",
+  .n     = NULL
+)
+```
+
 # Validation
 
 Every output against its source. A row with `Ok = FALSE` names the step to look at.
@@ -418,6 +510,7 @@ n_prepared <- pbd_query(
 
 tab_valid <- pbd_validate(
   .core        = tab_core,          # release copies
+  .contracts   = tab_contracts,     # the repaired contract file
   .index       = tab_index,         # contract index
   .labels      = tab_labels,        # labelled sample
   .spans       = tab_spans,         # span files
@@ -458,6 +551,43 @@ tab_manifest |>
   pbd_report(.title = "The package", .note = NULL, .n = NULL)
 ```
 
+The figures the site quotes come from the same source as the package, so a page cannot fall out of step with the
+data it describes.
+
+```{r}
+#| label: deploy-site-numbers
+
+tab_numbers <- pbd_site_numbers(
+  .con         = con,                                                  # DuckDB
+  .dir_package = .lP$Output$DirPackage,                                # the published files
+  .manifest    = tab_manifest,                                         # sizes and counts
+  .spans       = tab_spans,
+  .text        = tab_text,
+  .coverage    = tab_coverage,
+  .models      = tab_models,
+  .version     = .lP$Params$Version,
+  .path_out    = fs::path(.lP$Output$DirSample, "package_numbers.csv")  # read by the site
+)
+pbd_report(.tab = tab_numbers, .title = "Figures for the site", .note = NULL, .n = 12L)
+```
+
+```{r}
+#| label: deploy-sample
+
+tab_sample_repo <- pbd_mirror_repo(
+  .dir_from = .lP$Output$DirSample,                       # the staged sample
+  .dir_to   = fs::path(.lP$Output$DirRepo, "sample"),     # the only folder this writes in the site repository
+  .apply    = .lP$Params$SampleWrite                      # FALSE reports the plan only
+)
+tab_sample_repo |>
+  dplyr::count(.data$Action, name = "Files") |>
+  pbd_report(
+    .title = "The sample in the site repository",
+    .note  = "Commit and push happen there, in the Git pane; this document only writes the folder.",
+    .n     = NULL
+  )
+```
+
 ```{r}
 #| label: deploy-drive
 
@@ -496,10 +626,12 @@ that link goes into `DATA.md` of the published repository.
 
 tibble::tibble(
   Part    = c("core", "spans", "text", "models", "lexnlp", "replication"),
-  Built   = c(sum(tab_core$Status == "copied"), sum(tab_spans$Status == "built"), sum(tab_text$Status == "built"),
+  Built   = c(sum(tab_core$Status == "copied") + sum(tab_contracts$Status == "built"),
+              sum(tab_spans$Status == "built"), sum(tab_text$Status == "built"),
               sum(tab_models$Status == "built"), sum(tab_lexnlp$Status == "copied"),
               sum(tab_replication$Status == "built")),
-  Current = c(sum(tab_core$Status == "current"), sum(tab_spans$Status == "current"),
+  Current = c(sum(tab_core$Status == "current") + sum(tab_contracts$Status == "current"),
+              sum(tab_spans$Status == "current"),
               sum(tab_text$Status == "current"), sum(tab_models$Status == "current"),
               sum(tab_lexnlp$Status == "current"), sum(tab_replication$Status == "current"))
 ) |>

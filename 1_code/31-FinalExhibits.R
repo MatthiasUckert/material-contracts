@@ -2135,62 +2135,327 @@ fin_tex_escape <- function(.x) {
 #' @param .max_natural Integer. Number columns beyond which the table is scaled.
 #' @param .text_mm Numeric. The text width assumed for the arithmetic, millimetres.
 #' @return Invisibly, the path.
-fin_tex_write <- function(.lines, .path, .stretch = 1.5, .col_mm = 20, .col_min = 14, .label_min = 50,
-                          .max_natural = 8L, .text_mm = 160) {
+# -- 5.1 The frame every tabular is written in --------------------------------------------------------------------
+# THE PAPER'S FRAME (17 September, from Ann-Kristin's note): row spacing 1.2, a tabular* that fills \columnwidth,
+# \hline rules only, headers centred, and no size command in the file -- the float sets \footnotesize. Nothing is
+# scaled: a table that would run past the text block has its column padding cut first, and it is reported when even
+# the tightest padding does not bring it inside. The widths below are the character widths of the manuscript's font
+# at \footnotesize, measured in the interact class; a table's width is estimated from them before it is written,
+# and the estimate runs one to four percent under the truth, which the margin covers.
+.fin_tex_target <- 408      # \columnwidth of the manuscript, in points
+.fin_tex_margin <- 0.04     # the safety margin on the estimate, which runs up to four percent under
+.fin_tex_pads   <- c(6, 4, 3, 2)   # \tabcolsep in points, from LaTeX's default down
+.fin_tex_lab_min <- 55      # the narrowest a wrapped column may become, in points
+.fin_tex_mm      <- 2.845   # points per millimetre, where a specification names one
+.fin_tex_em     <- 8.50     # 1em at \footnotesize, in points
+
+# Character widths in points, upright.
+.fin_tex_pt <- c(
+  "0" = 4.25, "1" = 4.25, "2" = 4.25, "3" = 4.25, "4" = 4.25, "5" = 4.25, "6" = 4.25, "7" = 4.25, "8" = 4.25,
+  "9" = 4.25, "," = 2.36, "." = 2.36, "%" = 7.08, "(" = 3.31, ")" = 3.31, "/" = 4.25, "-" = 2.83, "+" = 6.61,
+  " " = 2.83, "a" = 4.25, "b" = 4.72, "c" = 3.78, "d" = 4.72, "e" = 3.78, "f" = 2.60, "g" = 4.25, "h" = 4.72,
+  "i" = 2.36, "j" = 2.60, "k" = 4.49, "l" = 2.36, "m" = 7.08, "n" = 4.72, "o" = 4.25, "p" = 4.72, "q" = 4.49,
+  "r" = 3.31, "s" = 3.35, "t" = 3.31, "u" = 4.72, "v" = 4.49, "w" = 6.14, "x" = 4.49, "y" = 4.49, "z" = 3.78,
+  "A" = 6.37, "B" = 6.02, "C" = 6.14, "D" = 6.49, "E" = 5.78, "F" = 5.54, "G" = 6.67, "H" = 6.37, "I" = 3.06,
+  "J" = 4.36, "K" = 6.60, "L" = 5.31, "M" = 7.78, "N" = 6.37, "O" = 6.61, "P" = 5.78, "Q" = 6.61, "R" = 6.25,
+  "S" = 4.72, "T" = 6.14, "U" = 6.37, "V" = 6.37, "W" = 8.73, "X" = 6.37, "Y" = 6.37, "Z" = 5.19
+)
+
+# The same, bold: category and total rows are set in bold.
+.fin_tex_pt_bold <- c(
+  "0" = 4.90, "1" = 4.90, "2" = 4.90, "3" = 4.90, "4" = 4.90, "5" = 4.90, "6" = 4.90, "7" = 4.90, "8" = 4.90,
+  "9" = 4.90, "," = 2.72, "." = 2.72, "%" = 8.17, "(" = 3.81, ")" = 3.81, "/" = 4.90, "-" = 3.27, "+" = 7.62,
+  " " = 3.27, "a" = 4.76, "b" = 5.44, "c" = 4.36, "d" = 5.44, "e" = 4.49, "f" = 3.94, "g" = 5.04, "h" = 5.44,
+  "i" = 2.72, "j" = 2.99, "k" = 5.17, "l" = 2.72, "m" = 8.17, "n" = 5.44, "o" = 4.90, "p" = 5.44, "q" = 5.17,
+  "r" = 4.05, "s" = 3.87, "t" = 3.81, "u" = 5.44, "v" = 5.31, "w" = 7.21, "x" = 5.17, "y" = 5.31, "z" = 4.36,
+  "A" = 7.38, "B" = 6.96, "C" = 7.08, "D" = 7.50, "E" = 6.42, "F" = 6.15, "G" = 7.70, "H" = 7.64, "I" = 3.67,
+  "J" = 5.05, "K" = 7.65, "L" = 5.88, "M" = 9.27, "N" = 7.64, "O" = 7.36, "P" = 6.68, "Q" = 7.36, "R" = 7.32,
+  "S" = 5.44, "T" = 6.82, "U" = 7.51, "V" = 7.51, "W" = 10.24, "X" = 7.38, "Y" = 7.62, "Z" = 5.99
+)
+
+.fin_tex_pt_other      <- mean(.fin_tex_pt[letters])        # what an unlisted character is taken to be
+.fin_tex_pt_other_bold <- mean(.fin_tex_pt_bold[letters])
+
+#' The width one cell asks for, in points
+#'
+#' The cell's LaTeX is reduced to the characters that print: \\textbf{} sets the bold metrics, \\hspace{1em} adds an
+#' em, escapes become their character, and every other macro is dropped.
+#'
+#' @param .cell Character. One cell of a row, as it stands in the fragment.
+#' @param .longest Logical. TRUE returns the widest word in the cell rather than the width of all of it.
+#' @return Numeric. The width in points.
+fin_tex_cell_pt <- function(.cell, .longest = FALSE) {
   if (FALSE) {
-    .lines       <- c("\\begin{tabular}{l r}", "\\toprule", "a & 1 \\\\", "\\bottomrule", "\\end{tabular}")
-    .path        <- fs::path(.lP$Output$DirTables, "Test.tex")
-    .stretch     <- 1.5
-    .col_mm      <- 20
-    .col_min     <- 14
-    .label_min   <- 50
-    .max_natural <- 8L
-    .text_mm     <- 160
+    .cell    <- "\\hspace{1em}Customer / Supplier"
+    .longest <- FALSE
+  }
+  s_     <- trimws(.cell)
+  bold_  <- grepl("\\\\textbf\\{", s_)
+  n_em_  <- length(gregexpr("\\\\hspace\\{1em\\}", s_)[[1L]][gregexpr("\\\\hspace\\{1em\\}", s_)[[1L]] > 0L])
+  s_     <- gsub("\\\\hspace\\{1em\\}", "", s_)
+  s_     <- gsub("\\\\(%|&|\\$|#|_)", "\\1", s_)
+  s_     <- gsub("\\\\[a-zA-Z]+\\*?", "", s_)
+  s_     <- gsub("[{}]", "", s_)
+  chars_ <- strsplit(s_, "")[[1L]]
+  if (length(chars_) == 0L) return(n_em_ * .fin_tex_em)
+  tab_   <- if (bold_) .fin_tex_pt_bold else .fin_tex_pt
+  w_     <- unname(tab_[chars_])
+  w_[is.na(w_)] <- if (bold_) .fin_tex_pt_other_bold else .fin_tex_pt_other
+  if (!.longest) return(sum(w_) + n_em_ * .fin_tex_em)
+  # THE WIDEST WORD is what a column can never be narrower than: a word does not break across lines.
+  runs_ <- split(w_, cumsum(chars_ == " "))
+  max(vapply(runs_, sum, numeric(1L))) + n_em_ * .fin_tex_em
+}
+
+#' The width a tabular asks for, in points
+#'
+#' Every column is as wide as its widest cell; a \\multicolumn wider than the columns it spans pushes them apart.
+#' The padding is LaTeX's, twice per column.
+#'
+#' @param .rows Character. The body rows of the tabular, rules included; rules are skipped.
+#' @param .ncol Integer. Columns in the tabular, the label column counted.
+#' @param .pad Numeric. \\tabcolsep in points.
+#' @param .fixed Numeric or NULL. The width a specification fixes for a column, NA where the column is free.
+#' @param .columns Logical. TRUE returns the column widths instead of their sum with the padding.
+#' @param .longest Logical. TRUE measures the widest word of a cell rather than the whole cell.
+#' @return Numeric. The width in points.
+fin_tex_est_width <- function(.rows, .ncol, .pad, .fixed = NULL, .columns = FALSE, .longest = FALSE) {
+  if (FALSE) {
+    .rows    <- c("a & 1 \\\\", "b & 2 \\\\")
+    .ncol    <- 2L
+    .pad     <- 6
+    .fixed   <- NULL
+    .columns <- FALSE
+    .longest <- FALSE
+  }
+  cols_  <- rep(0, .ncol)
+  spans_ <- list()
+  for (row_ in .rows) {
+    if (grepl("^\\\\\\\\(hline|midrule|toprule|bottomrule|cmidrule|addlinespace)", trimws(row_))) next
+    cells_ <- strsplit(sub("\\\\\\\\\\s*$", "", row_), "(?<!\\\\)&", perl = TRUE)[[1L]]
+    j_ <- 1L
+    for (cell_ in cells_) {
+      mc_ <- regmatches(cell_, regexec("^\\s*\\\\multicolumn\\{([0-9]+)\\}\\{[^}]*\\}\\{(.*)\\}\\s*$", cell_))[[1L]]
+      if (length(mc_) == 3L) {
+        spans_[[length(spans_) + 1L]] <- list(
+          J = j_,
+          K = as.integer(mc_[2L]),
+          W = fin_tex_cell_pt(.cell = mc_[3L], .longest = .longest)
+        )
+        j_ <- j_ + as.integer(mc_[2L])
+      } else {
+        if (j_ <= .ncol) cols_[j_] <- max(cols_[j_], fin_tex_cell_pt(.cell = cell_, .longest = .longest))
+        j_ <- j_ + 1L
+      }
+    }
+  }
+  for (s_ in spans_) {
+    idx_  <- seq.int(s_$J, min(s_$J + s_$K - 1L, .ncol))
+    have_ <- sum(cols_[idx_]) + (s_$K - 1L) * 2 * .pad
+    if (s_$W > have_) cols_[idx_] <- cols_[idx_] + (s_$W - have_) / s_$K
+  }
+  # A FIXED COLUMN IS AS WIDE AS IT SAYS, whatever its cells hold: what does not fit wraps inside it.
+  if (!is.null(.fixed)) cols_[!is.na(.fixed)] <- .fixed[!is.na(.fixed)]
+  if (.columns) return(cols_)
+  sum(cols_) + 2 * .pad * .ncol
+}
+
+#' A tabular put into the paper's frame, with the padding that brings it inside the text block
+#'
+#' Rules become \\hline, the rules under a spanning header go, every header cell is centred, and the tabular becomes
+#' a tabular* that fills \\columnwidth. The padding is the widest of .fin_tex_pads the table fits in. A table that
+#' fits in none is scaled as a last resort and named in a warning: it has to lose columns or be split.
+#'
+#' @param .lines Character. One tabular, rules and all, as a fragment builder writes it.
+#' @param .name Character. The stem, for the warning.
+#' @return Character. The framed fragment.
+fin_tex_fit <- function(.lines, .name = "table") {
+  if (FALSE) {
+    .lines <- c("\\begin{tabular}{l r}", "\\toprule", " & N \\\\", "\\midrule", "a & 1 \\\\",
+                "\\bottomrule", "\\end{tabular}")
+    .name  <- "Test"
   }
   body_ <- .lines[!grepl("^\\\\begingroup\\\\[a-z]+$", .lines) & !grepl("^\\\\endgroup$", .lines)]
   i_ <- grep("^\\\\begin\\{tabular\\}\\{", body_)
   j_ <- grep("^\\\\end\\{tabular\\}$", body_)
-  if (length(i_) != 1L || length(j_) != 1L) cli::cli_abort("The fragment for {.path {(.path)}} is not one tabular.")
-  spec_ <- sub("^\\\\begin\\{tabular\\}\\{(.*)\\}$", "\\1", body_[i_])
-
-  # THE COLUMNS, read from the specification: l, c, r, or p{width}; spaces between them are free.
-  toks_  <- regmatches(spec_, gregexpr("p\\{[^}]*\\}|[lcr]", spec_))[[1L]]
+  if (length(i_) != 1L || length(j_) != 1L) cli::cli_abort("The fragment for {(.name)} is not one tabular.")
+  spec_  <- sub("^\\\\begin\\{tabular\\}\\{(.*)\\}$", "\\1", body_[i_])
+  # THE COLUMNS, as the specification gives them: l, c and r take the width of their widest cell, while a p column
+  # has its width written into it and wraps what does not fit, which is how a column of prose stays narrow.
+  toks_  <- regmatches(spec_, gregexpr(">\\{[^}]*\\}p\\{[^}]*\\}|p\\{[^}]*\\}|[lcr]", spec_))[[1L]]
   n_     <- length(toks_)
-  n_num_ <- sum(toks_ %in% c("r", "c"))
-  n_lab_ <- sum(toks_ == "l")
-  p_w_   <- as.numeric(sub("^p\\{([0-9.]+)(mm|cm).*$", "\\1", toks_[grepl("^p\\{", toks_)])) *
-    ifelse(grepl("cm", toks_[grepl("^p\\{", toks_)]), 10, 1)
-  pad_mm_ <- 2 * n_ * 2.1                                            # \tabcolsep is 6pt, 2.1 mm, twice per column
-  # THE WIDTH A NUMBER COLUMN CAN HAVE, given the label its minimum: the target, or less down to the
-  # floor; below the floor fixed widths do not fit.
-  room_  <- .text_mm - pad_mm_ - sum(p_w_, na.rm = TRUE) - n_lab_ * .label_min
-  col_w_ <- if (n_num_ > 0L) min(.col_mm, room_ / n_num_) else .col_mm
-  mode_  <- if (n_num_ > .max_natural) "scaled" else if (col_w_ >= .col_min || n_num_ == 0L) "fixed" else "natural"
-
-  body_[j_] <- "\\end{tabular}"
+  fixed_ <- vapply(toks_, \(.t) {
+    if (!grepl("^(>\\{[^}]*\\})?p\\{", .t)) return(NA_real_)
+    share_ <- suppressWarnings(as.numeric(sub("^.*?([0-9.]+)\\\\(text|column)width.*$", "\\1", .t)))
+    mm_    <- suppressWarnings(as.numeric(sub("^.*?([0-9.]+)mm.*$", "\\1", .t)))
+    cm_    <- suppressWarnings(as.numeric(sub("^.*?([0-9.]+)cm.*$", "\\1", .t)))
+    pt_ <- if (!is.na(share_)) share_ * .fin_tex_target else if (!is.na(cm_)) cm_ * 10 * .fin_tex_mm else
+      if (!is.na(mm_)) mm_ * .fin_tex_mm else NA_real_
+    pt_
+  }, numeric(1L))
+  # THE RULES ARE \hline, AS HER TABLES HAVE THEM, and the rules under a spanning header go.
   body_ <- sub("^\\\\toprule$", "\\\\hline\\\\hline", body_)
+  body_ <- sub("^\\\\midrule$", "\\\\hline", body_)
   body_ <- sub("^\\\\bottomrule$", "\\\\hline", body_)
-  head_ <- paste0("\\renewcommand*{\\arraystretch}{", .stretch, "}")
-  if (mode_ == "fixed") {
-    col_w_ <- round(col_w_, 1)
-    taken_ <- n_num_ * col_w_ + sum(p_w_, na.rm = TRUE)
-    lab_w_ <- paste0("\\dimexpr(\\textwidth-", taken_, "mm-", 2L * n_, "\\tabcolsep)/", max(n_lab_, 1L), "\\relax")
-    cols_ <- vapply(toks_, \(.t) switch(
-      .t,
-      r = paste0(">{\\raggedleft\\arraybackslash}p{", col_w_, "mm}"),
-      c = paste0(">{\\centering\\arraybackslash}p{", col_w_, "mm}"),
-      l = paste0("p{", lab_w_, "}"),
-      .t
-    ), character(1))
-    body_[i_] <- paste0("\\begin{tabular}{", paste(cols_, collapse = " "), "}")
-    out_ <- c(head_, body_)
-  } else if (mode_ == "natural") {
-    body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
-    out_ <- c(head_, body_)
-  } else {
-    body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
-    out_ <- c(head_, "\\resizebox{\\textwidth}{!}{%", body_, "}")
+  drop_ <- grepl("^\\\\cmidrule", body_)
+  body_ <- body_[!drop_]
+  i_ <- grep("^\\\\begin\\{tabular\\}\\{", body_)
+  j_ <- grep("^\\\\end\\{tabular\\}$", body_)
+  # THE HEADER IS CENTRED over its column, which is where the header rows are: between the double rule and the
+  # first single rule under it.
+  top_  <- grep("^\\\\hline\\\\hline$", body_)
+  mid_  <- grep("^\\\\hline$", body_)
+  head_ <- if (length(top_) == 1L && any(mid_ > top_)) seq.int(top_ + 1L, min(mid_[mid_ > top_]) - 1L) else integer()
+  for (k_ in head_) {
+    cells_ <- strsplit(sub("\\\\\\\\\\s*$", "", body_[k_]), "(?<!\\\\)&", perl = TRUE)[[1L]]
+    cells_ <- vapply(cells_, \(.c) {
+      if (trimws(.c) == "" || grepl("^\\s*\\\\multicolumn", .c)) .c else paste0("\\multicolumn{1}{c}{", trimws(.c), "}")
+    }, character(1L))
+    body_[k_] <- paste0(paste(cells_, collapse = " & "), " \\\\")
   }
+  rows_ <- body_[seq.int(i_ + 1L, j_ - 1L)]
+  cols_ <- fin_tex_est_width(.rows = rows_, .ncol = n_, .pad = 0, .fixed = fixed_, .columns = TRUE)
+  words_ <- fin_tex_est_width(.rows = rows_, .ncol = n_, .pad = 0, .columns = TRUE, .longest = TRUE)
+  est_  <- vapply(.fin_tex_pads, \(.p) sum(cols_) + 2 * .p * n_, numeric(1L))
+  fits_ <- which(est_ * (1 + .fin_tex_margin) <= .fin_tex_target)
+  # COLUMNS OF PROSE WRAP BEFORE ANYTHING IS SCALED: the number columns keep the width they need, and what is left
+  # is shared between the free text columns in proportion to the width each would have taken.
+  wraps_ <- rep(NA_real_, n_)
+  # A TEXT COLUMN MAY WRAP, whether the specification names its width or leaves it free; a number column never
+  # does, so a figure is not broken across lines.
+  free_  <- which((is.na(fixed_) & toks_ == "l") | (!is.na(fixed_) & !grepl("raggedleft|centering", toks_)))
+  if (length(fits_) == 0L && length(free_) > 0L) {
+    for (k_ in seq_along(.fin_tex_pads)) {
+      room_ <- .fin_tex_target - sum(cols_[-free_]) * (1 + .fin_tex_margin) - 2 * .fin_tex_pads[[k_]] * n_
+      if (room_ <= 0) next
+      # A COLUMN NARROWER THAN THE FLOOR KEEPS THE WIDTH IT ASKS FOR; the wide ones share what is left, so a
+      # narrow column is not starved by a proportional share.
+      # EVERY COLUMN KEEPS ITS WIDEST WORD, or its whole width where that is narrower; what is left over goes to
+      # the columns that would still like to be wider, in proportion to what they are missing.
+      nat_  <- cols_[free_]
+      min_  <- pmin(nat_, pmax(.fin_tex_lab_min, words_[free_]))
+      if (sum(min_) <= room_) {
+        want_  <- min_
+        gap_   <- nat_ - min_
+        extra_ <- room_ - sum(min_)
+        if (extra_ > 0 && sum(gap_) > 0) want_ <- min_ + pmin(gap_, extra_ * gap_ / sum(gap_))
+        wraps_[free_] <- round(want_, 1)
+        fits_ <- k_
+        break
+      }
+    }
+  }
+  pad_  <- if (length(fits_) > 0L) .fin_tex_pads[[min(fits_)]] else utils::tail(.fin_tex_pads, 1L)
+  open_ <- c("\\begingroup",
+             if (pad_ != 6) paste0("\\setlength{\\tabcolsep}{", pad_, "pt}"),
+             "\\renewcommand*{\\arraystretch}{1.2}")
+  for (k_ in which(!is.na(wraps_))) {
+    toks_[[k_]] <- paste0(">{\\raggedright\\arraybackslash}p{", wraps_[[k_]], "pt}")
+  }
+  if (length(fits_) == 0L) {
+    cli::cli_alert_warning(paste0(
+      "{(.name)}: about {round(min(est_))} pt wide against {(.fin_tex_target)} pt of text block, even at the ",
+      "tightest padding; scaled to fit. It has to lose columns or be split."
+    ))
+    # WHAT THE FRAME READ, so a table that scales unexpectedly can be traced without opening the fragment.
+    cli::cli_alert_info(paste0(
+      "{(.name)}: columns {paste(round(cols_), collapse = \' + \')} pt, of which ",
+      "{sum(!is.na(fixed_))} of {n_} declared in the specification."
+    ))
+    body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
+    out_ <- c(open_, "\\resizebox{\\columnwidth}{!}{%", body_, "}", "\\endgroup")
+  } else {
+    body_[i_] <- paste0("\\begin{tabular*}{\\columnwidth}{", toks_[1L], "@{\\extracolsep{\\fill}}",
+                        paste(toks_[-1L], collapse = ""), "}")
+    body_[j_] <- "\\end{tabular*}"
+    out_ <- c(open_, body_, "\\endgroup")
+  }
+  out_
+}
+
+#' A tibble of cells put into the paper's frame, for the builders that hand over cells rather than lines
+#'
+#' The specification only says which columns are text and which are numbers; the widths are the frame's business. A
+#' column named Panel is not a column: it opens an italic row across the table wherever its value changes, as the
+#' appendix's own frame has it, and never reaches the cells. A long table is left to that frame, which breaks it
+#' across pages.
+#'
+#' @param .tab Tibble. Character cells, in table order; a Panel column opens the groups.
+#' @param .header Character. One header cell per column, the Panel column aside.
+#' @param .spec Character or NULL. The old column specification; a raggedleft or centering column is a number.
+#' @param .long Logical. TRUE hands the table to the appendix frame, which sets it as a longtable.
+#' @param .name Character. The stem, for the warning.
+#' @return Character. The framed fragment.
+fin_tex_frame <- function(.tab, .header, .spec = NULL, .long = FALSE, .name = "table") {
+  if (FALSE) {
+    .tab    <- tibble::tibble(Row = "a", N = "1")
+    .header <- c("", "N")
+    .spec   <- NULL
+    .long   <- FALSE
+    .name   <- "Test"
+  }
+  if (isTRUE(.long)) {
+    return(oa_frame_table(
+      .tab    = .tab,
+      .header = .header,
+      .spec   = .spec,
+      .long   = TRUE
+    ))
+  }
+  panel_ <- if ("Panel" %in% names(.tab)) .tab$Panel else rep(NA_character_, nrow(.tab))
+  cells_ <- dplyr::select(.tab, -dplyr::any_of("Panel"))
+  if (length(.header) != ncol(cells_) || (!is.null(.spec) && length(.spec) != ncol(cells_))) {
+    cli::cli_abort("{(.name)}: the specification, the header and the cells disagree on the number of columns.")
+  }
+  # A NUMBER COLUMN IS r; A COLUMN OF PROSE KEEPS THE WIDTH ITS SPECIFICATION GIVES IT, so running text wraps
+  # inside it instead of stretching the table.
+  toks_ <- if (is.null(.spec)) {
+    c("l", rep("r", ncol(cells_) - 1L))
+  } else {
+    ifelse(grepl("raggedleft|centering", .spec), "r", .spec)
+  }
+  rows_ <- purrr::map_chr(seq_len(nrow(cells_)), \(.i) {
+    paste0(paste(unlist(cells_[.i, ]), collapse = " & "), " \\\\")
+  })
+  # THE PANEL OPENS A ROW OF ITS OWN wherever it changes, spanning every column.
+  open_ <- !is.na(panel_) & (seq_along(panel_) == 1L | panel_ != dplyr::lag(panel_, default = ""))
+  body_ <- unlist(purrr::map(seq_along(rows_), \(.i) {
+    if (open_[.i]) {
+      c(paste0("\\multicolumn{", ncol(cells_), "}{l}{\\textit{", panel_[.i], "}} \\\\"), rows_[.i])
+    } else {
+      rows_[.i]
+    }
+  }))
+  fin_tex_fit(
+    .lines = c(
+      paste0("\\begin{tabular}{", paste(toks_, collapse = " "), "}"),
+      "\\toprule",
+      paste0(paste(.header, collapse = " & "), " \\\\"),
+      "\\midrule",
+      body_,
+      "\\bottomrule",
+      "\\end{tabular}"
+    ),
+    .name  = .name
+  )
+}
+
+#' Write a tabular into the paper's frame
+#'
+#' The frame is fin_tex_fit()'s; this writes it to disk under the exhibit's stem.
+#'
+#' @param .lines Character. One tabular, rules and all.
+#' @param .path Path. Where the fragment goes.
+#' @return Invisibly, the path.
+fin_tex_write <- function(.lines, .path) {
+  if (FALSE) {
+    .lines <- c("\\begin{tabular}{l r}", "\\toprule", "a & 1 \\\\", "\\bottomrule", "\\end{tabular}")
+    .path  <- fs::path(.lP$Output$DirTables, "Test.tex")
+  }
+  out_ <- fin_tex_fit(
+    .lines = .lines,
+    .name  = fs::path_ext_remove(fs::path_file(.path))
+  )
   fs::dir_create(fs::path_dir(.path))
   writeLines(out_, .path)
   invisible(.path)
@@ -9289,7 +9554,8 @@ oaa_build_coverage <- function(.dir_master, .path_contracts, .dir_own, .force, .
                                                              \(.x) paste0("\\textbf{", .x, "}"))
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("Group", "EDGAR form types", "Years", "Filings", "Contracts", "Basis"),
       .spec   = c(oa_col_text(.share = 0.19), oa_col_text(.share = 0.21), "l",
@@ -9582,7 +9848,8 @@ oaa_build_cto <- function(.path_orders, .path_contracts, .dir_own, .force, .path
   cells_[tot_, c("Step", "N")] <- lapply(cells_[tot_, c("Step", "N")], \(.x) paste0("\\textbf{", .x, "}"))
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("", "N", "\\% of references"),
       .spec   = c(oa_col_text(.share = 0.66), oa_col_num(.mm = 18), oa_col_num(.mm = 22))
@@ -9776,7 +10043,8 @@ oaa_build_files <- function(.dir_links, .from, .to, .dir_own, .force, .path_lib)
     )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("Quarter", "Exhibit 10s listed", "Of which files", "\\%"),
       .spec   = c("l", oa_col_num(.mm = 24), oa_col_num(.mm = 22), oa_col_num(.mm = 14))
@@ -10032,7 +10300,8 @@ oaa_build_exhibit_table <- function(.dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("Form", "Exhibit 10 required", "In the database", "Note"),
       .spec   = c(oa_col_text(.share = 0.12), oa_col_num(.mm = 30), oa_col_num(.mm = 26), oa_col_text(.share = 0.40))
@@ -10116,7 +10385,8 @@ oaa_build_form_descriptions <- function(.dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("Form", "Established in", "What the form is for"),
       .spec   = c(oa_col_text(.share = 0.10), oa_col_text(.share = 0.20), oa_col_text(.share = 0.62))
@@ -10217,7 +10487,8 @@ oab_build_stages <- function(.dir_own, .force, .path_lib) {
     )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("Stage", "What it does", "What it produces", "Described in"),
       .spec   = c(oa_col_text(.share = 0.14), oa_col_text(.share = 0.40), oa_col_text(.share = 0.28),
@@ -10473,7 +10744,8 @@ oac_build_titles <- function(.path_contracts, .n, .dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("Category", paste("The", .n, "most frequent descriptions (contracts)"), "\\% described"),
       .spec   = c(oa_col_text(.share = 0.22), oa_col_text(.share = 0.62), oa_col_num(.mm = 18))
@@ -10611,7 +10883,8 @@ oac_build_labelled <- function(.dir_data, .dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("", "N", "\\%", "Second label"),
       .spec   = c(oa_col_text(.share = 0.52), oa_col_num(.mm = 18), oa_col_num(.mm = 14), oa_col_num(.mm = 24))
@@ -10666,7 +10939,8 @@ oac_build_deployed <- function(.dir_data, .dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("Task", "Encoder", "Context", "Accuracy", "Macro-F1", ""),
       .spec   = c(oa_col_text(.share = 0.20), oa_col_text(.share = 0.30), oa_col_num(.mm = 16), oa_col_num(.mm = 20),
@@ -10721,7 +10995,8 @@ oac_build_scores <- function(.name, .columns, .header, .note, .dir_data, .dir_ow
   )
   oa_write_exhibit(
     .name    = .name,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = .name,
       .tab    = cells_,
       .header = c("", "N", .header),
       .spec   = c(oa_col_text(.share = 0.34), oa_col_num(.mm = 16), rep(oa_col_num(.mm = 18), length(.columns)))
@@ -10767,7 +11042,8 @@ oac_build_confusion <- function(.dir_data, .dir_own, .force, .path_lib) {
     tibble::tibble(True = oac_label(.class = tab_$True)),
     tibble::as_tibble(chr_, .name_repair = \(.x) cols_)
   )
-  lines_ <- oa_frame_table(
+  lines_ <- fin_tex_frame(
+    .name   = name_,
     .tab    = cells_,
     .header = c("True category", paste0("(", .oac_categories$Number, ")")),
     .spec   = c(oa_col_text(.share = 0.22), rep(oa_col_num(.mm = 9), k_))
@@ -10828,7 +11104,8 @@ oac_build_amendment <- function(.dir_data, .dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("", "N", "Predicted", "Precision", "Recall", "F1"),
       .spec   = c(oa_col_text(.share = 0.30), rep(oa_col_num(.mm = 18), 5L))
@@ -10887,7 +11164,8 @@ oac_build_arms <- function(.dir_data, .dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = dplyr::bind_rows(a_, c_),
       .header = c("", "Coverage", "Accuracy", "Accuracy where committed", "Macro-F1"),
       .spec   = c(oa_col_text(.share = 0.36), oa_col_num(.mm = 18), oa_col_num(.mm = 18), oa_col_num(.mm = 30),
@@ -11017,7 +11295,8 @@ oac_build_second <- function(.path_class, .dir_own, .force, .path_lib) {
     tibble::tibble(Primary = oac_label(.class = pairs_$Primary)),
     tibble::as_tibble(chr_, .name_repair = \(.x) .oac_categories$Short)
   )
-  lines_p_ <- oa_frame_table(
+  lines_p_ <- fin_tex_frame(
+    .name   = names_[1L],
     .tab    = cells_p_,
     .header = c("Primary label", paste0("(", .oac_categories$Number, ")")),
     .spec   = c(oa_col_text(.share = 0.22), rep(oa_col_num(.mm = 9), k_))
@@ -11060,7 +11339,8 @@ oac_build_second <- function(.path_class, .dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = names_[2L],
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = names_[2L],
       .tab    = cells_h_,
       .header = c("Primary label", "Two labels", "First choice is the primary (\\%)",
                   "Runner-up is the second label (\\%)", "Both (\\%)"),
@@ -11237,7 +11517,8 @@ oad_build_coverage <- function(.dir_store, .path_sample, .spacy_model, .dir_own,
   })
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("", "LexNLP", "\\%", "spaCy", "\\%", "Patterns", "\\%"),
       .spec   = c(oa_col_text(.share = 0.28), rep(oa_col_num(.mm = 17), 6L))
@@ -11390,7 +11671,8 @@ oad_build_duration <- function(.path_contracts, .dir_own, .force, .path_lib) {
     )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("Source", "Contracts", "Share", "Defined", "25th", "Median", "75th"),
       .spec   = c(oa_col_text(.share = 0.25), oa_col_num(.mm = 16), oa_col_num(.mm = 12),
@@ -11894,7 +12176,8 @@ oad_build_values <- function(.path_contracts, .dir_own, .force, .path_lib) {
   )
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
+    .lines   = fin_tex_frame(
+      .name   = name_,
       .tab    = cells_,
       .header = c("", "Naive", "Rule", "Naive", "Rule", "Naive", "Reg.", "Cpty.", "Naive", "Reg.", "Cpty.",
                   "Naive", "Rule"),
@@ -11971,7 +12254,13 @@ fin_show_built <- function(.names, .dirs, .rows = 10L) {
         .pandoc   = pandoc_
       )$Html
       if (is.na(html_)) {
-        cli::cli_alert_warning("{(.n)}: pandoc could not convert the table; read Tables/{(.n)}.tex instead.")
+        cli::cli_alert_warning("{(.n)}: pandoc could not convert the table; the tibble is shown instead.")
+        if (fs::file_exists(data_)) {
+          fin_show_table(
+            .tab   = utils::head(arrow::read_parquet(data_), .rows),
+            .title = .n
+          )
+        }
       } else {
         cat(
           "\n```{=html}\n",
@@ -12171,12 +12460,12 @@ fin_table_content_readings <- function(.dirs, .name = "ContentReadings") {
   n_ <- unname(ns_[[1L]])
 
   # COMPUTED TWICE, CHECKED HERE. The values table recomputes from the release what the content and money tables
-  # compute from the prepared contracts; printed side by side, the two have to agree.
+  # compute from the prepared contracts. Amounts are left out: the values table drops the contracts on which no
+  # amount was read, while the paper counts those as zero, which is the money table's mean and the one printed.
   twice_ <- tibble::tibble(
-    Quantity = c("Parties, naive", "Parties, rule-based", "Countries, naive", "States, naive", "Amounts, naive",
-                 "Amounts, rule-based"),
-    Content  = c(nai_$PartMean, rul_$PartMean, nai_$CtryMean, nai_$StateMean, mon_$NaiveMean, mon_$UsdMean),
-    Values   = c(val_$PartNaive, val_$PartRule, val_$CtryNaive, val_$StateNaive, val_$AmtNaive, val_$AmtRule)
+    Quantity = c("Parties, naive", "Parties, rule-based", "Countries, naive", "States, naive"),
+    Content  = c(nai_$PartMean, rul_$PartMean, nai_$CtryMean, nai_$StateMean),
+    Values   = c(val_$PartNaive, val_$PartRule, val_$CtryNaive, val_$StateNaive)
   ) |>
     dplyr::mutate(Agree = abs(.data$Content - .data$Values) < 1e-9)
   if (all(twice_$Agree)) {
@@ -12425,7 +12714,15 @@ fin_plot_firm_forms <- function(.size, .industry, .panels = c("stack", "size", "
     title_
   switch(
     .panels,
-    stack    = patchwork::wrap_plots(a_, b_, ncol = 1L, heights = c(1, 1.1)),
+    # EACH PANEL KEEPS ITS OWN MARGINS. Stacked, patchwork lines the two plot areas up, and Panel B's industry
+    # names are wide enough that the alignment pushes Panel A's axis title away from its own axis. Wrapped as
+    # elements, the panels are laid out side by side without that alignment: the title sits by the axis it names.
+    stack    = patchwork::wrap_plots(
+      patchwork::wrap_elements(full = a_),
+      patchwork::wrap_elements(full = b_),
+      ncol    = 1L,
+      heights = c(1, 1.1)
+    ),
     size     = a_,
     industry = b_
   )
