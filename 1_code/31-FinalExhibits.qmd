@@ -1634,6 +1634,44 @@ fig_redactions_time <- fin_figure_redactions_time(
 )
 ```
 
+## Redactions by category over time
+
+Ann-Kristin's ask of 18 September: the redaction share per contract type over the years, in the shape the contract
+types already have. The old draft drew twelve lines in one frame. Two forms, as for the types: a panel per category,
+or a panel per super-category with its sub-categories as lines. Once one is chosen it takes the stem
+`RedactionsTypes` and the other goes. The measure is the paper's, so the dashed line sits on 2019, the year it
+changes from orders to markers.
+
+### A. One panel per category
+
+```{r}
+#| label: fig-redactions-types-a
+#| fig-cap: "Share of contracts redacted per year and category, a panel per category, contracts from 2008."
+#| fig-height: !expr plot_height(18L)
+
+fig_redactions_types_a <- fin_figure_redactions_types(
+  .ds_contracts = lst_ds$Contracts,
+  .form         = "a",                      # twelve panels, four to a row
+  .dirs         = .lP$Output,
+  .name         = "RedactionsTypesA"
+)
+```
+
+### B. One panel per super-category, sub-categories as lines
+
+```{r}
+#| label: fig-redactions-types-b
+#| fig-cap: "Share of contracts redacted per year, a panel per super-category, contracts from 2008."
+#| fig-height: !expr plot_height(12L)
+
+fig_redactions_types_b <- fin_figure_redactions_types(
+  .ds_contracts = lst_ds$Contracts,
+  .form         = "b",                      # seven panels, the sub-categories labelled at the line's end
+  .dirs         = .lP$Output,
+  .name         = "RedactionsTypesB"
+)
+```
+
 ## Redactions by industry and category
 
 The cell is the share redacted among the contracts of that industry and category, which is what
@@ -1900,7 +1938,7 @@ fin_deploy_paper(
   .path_html = fs::path(.dir_main, "31-FinalExhibits.html"),
   .manifest  = tab_manifest,                               # refuses an incomplete set
   .release   = .lP$Params$ReleaseMin,                      # recorded in VERSION.txt
-  .run       = FALSE                                       # dry run until the consumers read 31
+  .run       = TRUE                                       # dry run until the consumers read 31
 )
 
 # AFTER THE RENDER, from the console, to put this render's html beside the exhibits:

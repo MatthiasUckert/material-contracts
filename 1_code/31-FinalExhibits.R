@@ -814,6 +814,9 @@ fin_report_f01 <- function(.tab_data, .ref = .fin_reference_f01) {
 }
 
 .fin_regime_years <- c(Reform2004 = 2004 + 235 / 366, Fast2019 = 2019 + 92 / 365)
+# THE FAST ACT ON THE YEAR IT TOOK EFFECT, for the figures whose axis counts whole years and whose measure
+# changes with that year rather than with the April date.
+.fin_regime_fast <- c(Fast2019 = 2019)
 
 #' Lines over years, one per group, optionally faceted, with the regime years marked
 #'
@@ -6978,8 +6981,13 @@ fin_plot_types_time_a <- function(.rows) {
 #' @param .colour Character or NULL. A column keyed to at most three colours; NULL draws in ink.
 #' @param .labels_end Logical. Name each line at its right end.
 #' @param .ncol Integer. Panels per row.
+#' @param .y_lab Character. The y axis's title.
+#' @param .breaks Numeric. The years the x axis names.
+#' @param .regimes Named numeric. The years a dashed line marks, kept where the data reach them.
 #' @return A ggplot.
-fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .labels_end = FALSE, .ncol = 4L) {
+fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .labels_end = FALSE, .ncol = 4L,
+                             .y_lab = "Share of contracts (in %)", .breaks = c(2004, 2012, 2020),
+                             .regimes = .fin_regime_years) {
   if (FALSE) {
     .tab        <- rows_
     .facet      <- "Panel"
@@ -6987,6 +6995,9 @@ fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .label
     .colour     <- NULL
     .labels_end <- FALSE
     .ncol       <- 4L
+    .y_lab      <- "Share of contracts (in %)"
+    .breaks     <- c(2004, 2012, 2020)
+    .regimes    <- .fin_regime_years
   }
   dat_ <- .tab |>
     dplyr::mutate(
@@ -6994,7 +7005,7 @@ fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .label
       PlotC = if (is.null(.colour)) "all" else as.character(.data[[.colour]])
     )
   cols_ <- if (is.null(.colour)) c(all = .plot_ink) else purrr::set_names(plot_pal_cat(3L), c("1", "2", "3"))
-  regimes_ <- .fin_regime_years[.fin_regime_years >= min(dat_$Year) - 0.5 & .fin_regime_years <= max(dat_$Year) + 0.5]
+  regimes_ <- .regimes[.regimes >= min(dat_$Year) - 0.5 & .regimes <= max(dat_$Year) + 0.5]
   p_ <- ggplot2::ggplot(dat_, ggplot2::aes(x = .data$Year, y = .data$Share, colour = .data$PlotC, group = .data$PlotG)) +
     ggplot2::geom_vline(
       xintercept = unname(regimes_),
@@ -7020,10 +7031,10 @@ fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .label
     ggplot2::scale_colour_manual(values = cols_, guide = "none") +
     plot_scale_y_pct(.accuracy = 1, .expand = c(0.02, 0.05)) +
     ggplot2::scale_x_continuous(
-      breaks = c(2004, 2012, 2020),
+      breaks = .breaks,
       expand = ggplot2::expansion(mult = c(0.03, if (.labels_end) 0.45 else 0.03))
     ) +
-    ggplot2::labs(x = NULL, y = "Share of contracts (in %)") +
+    ggplot2::labs(x = NULL, y = .y_lab) +
     plot_theme(.grid = "y", .legend = "none") +
     ggplot2::theme(panel.spacing.x = ggplot2::unit(8, "pt"), strip.text = ggplot2::element_text(lineheight = 0.9))
 }
@@ -7031,15 +7042,19 @@ fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .label
 #' Alternative B: one panel per category, the twelve in the Categories order, one y scale
 #' @param .rows Tibble from fin_types_time_rows().
 #' @return A ggplot.
-fin_plot_types_time_b <- function(.rows) {
+fin_plot_types_time_b <- function(.rows, .y_lab = "Share of contracts (in %)", .breaks = c(2004, 2012, 2020),
+                                  .regimes = .fin_regime_years) {
   if (FALSE) .rows <- rows_
   dat_ <- .rows |>
     dplyr::mutate(Panel2 = factor(gsub(": ", "\n", as.character(.data$Panel), fixed = TRUE),
                                   levels = gsub(": ", "\n", levels(.data$Panel), fixed = TRUE)))
   fin_lines_panels(
-    .tab   = dat_,
-    .facet = "Panel2",
-    .ncol  = 4L
+    .tab     = dat_,
+    .facet   = "Panel2",
+    .ncol    = 4L,
+    .y_lab   = .y_lab,
+    .breaks  = .breaks,
+    .regimes = .regimes
   )
 }
 
@@ -7050,7 +7065,8 @@ fin_plot_types_time_b <- function(.rows) {
 #'
 #' @param .rows Tibble from fin_types_time_rows().
 #' @return A ggplot.
-fin_plot_types_time_c <- function(.rows) {
+fin_plot_types_time_c <- function(.rows, .y_lab = "Share of contracts (in %)", .breaks = c(2004, 2012, 2020),
+                                  .regimes = .fin_regime_years) {
   if (FALSE) .rows <- rows_
   dat_ <- .rows |>
     dplyr::mutate(Pos = match(.data$Class, levels(.data$Class))) |>
@@ -7064,7 +7080,10 @@ fin_plot_types_time_c <- function(.rows) {
     .group      = "Bar",
     .colour     = "Rank",
     .labels_end = TRUE,
-    .ncol       = 3L
+    .ncol       = 3L,
+    .y_lab      = .y_lab,
+    .breaks  = .breaks,
+    .regimes = .regimes
   )
 }
 
@@ -8380,6 +8399,132 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
 }
 
 
+
+# -- 19.12 Figure: redactions by category over time --------------------------------------------------------------------
+# Ann-Kristin's ask (18 September): the redaction share by contract type over the years, in the shape the contract
+# types already have -- a panel per category, or a panel per super-category with its sub-categories as lines. The old
+# draft drew the same thing as twelve lines in one frame, which nobody could read.
+
+#' The share of contracts redacted in each year, by category
+#'
+#' The measure is the paper's: a confidential treatment order through 2018, an order or a redaction marker from 2019.
+#' Every category is a share of its own contracts, so the categories do not add to a total.
+#'
+#' @param .tab Tibble. Year, Class and RedactedText on the redaction sample.
+#' @param .sample Character. The sample's name, kept in the tibble.
+#' @return Tibble: Year, Class, N, Share, Sample.
+fin_data_redactions_types <- function(.tab, .sample) {
+  if (FALSE) {
+    .tab    <- rows0_
+    .sample <- "S6_Redaction"
+  }
+  .tab |>
+    dplyr::filter(.data$Year >= 2008L, !is.na(.data$Class)) |>
+    dplyr::summarise(
+      N     = dplyr::n(),
+      Share = mean(.data$RedactedText),
+      .by   = c("Year", "Class")
+    ) |>
+    dplyr::mutate(Sample = .sample) |>
+    dplyr::arrange(.data$Year, match(.data$Class, .fin_class_levels))
+}
+
+#' The redaction shares with the categories table's names and order
+#'
+#' @param .tab_data Tibble from fin_data_redactions_types().
+#' @return The tibble with Level1, Level2, Bar and Panel, each a factor in the categories table's order.
+fin_redactions_types_rows <- function(.tab_data) {
+  if (FALSE) .tab_data <- dat_
+  cat_ <- fin_tab_categories() |>
+    dplyr::mutate(
+      Bar   = dplyr::if_else(nzchar(.data$Level2), .data$Level2, .data$Level1),
+      Panel = dplyr::if_else(nzchar(.data$Level2), paste0(.data$Level1, ": ", .data$Level2), .data$Level1)
+    ) |>
+    dplyr::select("Class", "Level1", "Level2", "Bar", "Panel")
+  .tab_data |>
+    dplyr::inner_join(
+      cat_,
+      by = dplyr::join_by(Class)
+    ) |>
+    dplyr::mutate(
+      Level1 = factor(.data$Level1, levels = unique(cat_$Level1)),
+      Class  = factor(.data$Class, levels = cat_$Class),
+      Bar    = factor(.data$Bar, levels = cat_$Bar),
+      Panel  = factor(.data$Panel, levels = cat_$Panel)
+    )
+}
+
+#' Redactions by category over time, in the shape the contract types have
+#'
+#' Form "a" gives a panel per category, form "b" a panel per super-category with its sub-categories as lines; both on
+#' one scale, with the FAST Act on the 2019 point, where the measure changes.
+#'
+#' @param .ds_contracts The prepared Contracts dataset.
+#' @param .form Character. "a" (a panel per category) or "b" (a panel per super-category).
+#' @param .dirs List. .lP$Output.
+#' @param .name Character or NULL. The stem; NULL takes the form's own.
+#' @return Invisibly, a list: Plot, Data, Files.
+fin_figure_redactions_types <- function(.ds_contracts, .form = c("a", "b"), .dirs, .name = NULL) {
+  if (FALSE) {
+    .ds_contracts <- lst_ds$Contracts
+    .form         <- "a"
+    .dirs         <- .lP$Output
+    .name         <- NULL
+  }
+  .form  <- match.arg(.form)
+  name_  <- if (is.null(.name)) paste0("RedactionsTypes", toupper(.form)) else .name
+  rows0_ <- .ds_contracts |>
+    dplyr::filter(.data$S6_Redaction) |>
+    dplyr::select("Year", "Class", "RedactedText") |>
+    dplyr::collect()
+  dat_  <- fin_data_redactions_types(
+    .tab    = rows0_,
+    .sample = "S6_Redaction"
+  )
+  rows_ <- fin_redactions_types_rows(.tab_data = dat_)
+  n_    <- sum(dat_$N)
+  top_  <- rows_ |>
+    dplyr::summarise(Share = sum(.data$N * .data$Share) / sum(.data$N), .by = "Bar") |>
+    dplyr::slice_max(.data$Share, n = 1L, with_ties = FALSE)
+  base_ <- c(
+    paste0("This figure shows the share of contracts redacted in each year, by category, on the unique contracts",
+           " filed from 2008 (N = ", format(n_, big.mark = ","), "; contracts without a category are left out)."),
+    "A contract counts as redacted where a confidential treatment order covers it, through 2018, and where it",
+    "carries a redaction marker, from 2019; the dashed line marks the FAST Act, on the year the measure changes.",
+    paste0("Every category is a share of its own contracts, so the panels do not add to a total; ",
+           as.character(top_$Bar[[1L]]), " is the most redacted over the window, at ",
+           fin_fmt_num(100 * top_$Share[[1L]], 0L), " percent of its contracts.")
+  )
+  form_note_ <- switch(
+    .form,
+    a = "One panel per category, all panels on one scale.",
+    b = "One panel per super-category, its sub-categories as lines, all panels on one scale."
+  )
+  plot_ <- switch(
+    .form,
+    a = fin_plot_types_time_b(
+      .rows    = rows_,
+      .y_lab   = "Share redacted (in %)",
+      .breaks  = c(2008, 2014, 2020),
+      .regimes = .fin_regime_fast
+    ),
+    b = fin_plot_types_time_c(
+      .rows    = rows_,
+      .y_lab   = "Share redacted (in %)",
+      .breaks  = c(2008, 2014, 2020),
+      .regimes = .fin_regime_fast
+    )
+  )
+  fin_figure_save(
+    .plot   = plot_,
+    .data   = rows_,
+    .note   = c(base_, form_note_),
+    .name   = name_,
+    .dirs   = .dirs,
+    .height = switch(.form, a = plot_height(18L), b = plot_height(12L))
+  )
+}
+
 # 20. Manifest -----------------------------------------------------------------------------------------------------------
 # Every exhibit this document writes, by the name its files take: what it is, the sample it is drawn
 # on, and which files exist under Output/. The registry names the stems; the disk says what is
@@ -8564,7 +8709,11 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
   "FirmSize", "Figure", "S5_Quarter",
   "Firm fundamentals under choice, split: size quartile and channel, fiscal-year means",
   "FirmIndustry", "Figure", "S5_Quarter",
-  "Firm fundamentals under choice, split: contracts per firm-quarter by industry"
+  "Firm fundamentals under choice, split: contracts per firm-quarter by industry",
+  "RedactionsTypesA", "Figure", "S6_Redaction",
+  "Redaction share by category over time: a panel per category",
+  "RedactionsTypesB", "Figure", "S6_Redaction",
+  "Redaction share by category over time: a panel per super-category, sub-categories as lines"
 )
 
 .fin_renamed <- c(
@@ -8598,7 +8747,8 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
   Geography      = c("MapStatesCounterparty", "MapStatesRecital", "MapCountriesCounterparty",
                      "MapCountriesRecital", "FlowsStates", "FlowsCountries", "Diversity"),
   Redactions     = c("CtoLinkage", "CtoAhci", "CtoMarkers", "RedactionsDetail", "RedactionsTime",
-                     "RedactionsIndustryAll", "RedactionsIndustryPre", "RedactionsIndustryPost"),
+                     "RedactionsIndustryAll", "RedactionsIndustryPre", "RedactionsIndustryPost",
+                     "RedactionsTypesA", "RedactionsTypesB"),
   Announcements  = c("SummarySample", "SummaryLag", "SummaryVariables", "Summaries", "SummariesText",
                      "SummariesRegression", "SummariesTextRegression")
 )

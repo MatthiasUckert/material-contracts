@@ -1,0 +1,305 @@
+Table,File,Order,Column,Action,Type,Block,Meaning,Missing,StataName
+Contracts,core/Contracts.parquet,1,DocID,keep,VARCHAR,Identification,"One registrant's copy of an Exhibit 10 attachment: the registrant's CIK and a hash of the attachment, joined by a hyphen. Unique in this table and the key every other table joins on.",never,DocID
+Contracts,core/Contracts.parquet,2,HashDocument,keep,VARCHAR,Identification,"Hash of the attachment's content. Shared by all registrant copies of one document, so it groups the copies of one contract.",never,HashDocument
+Contracts,core/Contracts.parquet,3,HashIndex,keep,VARCHAR,Identification,The filing that carried the attachment. Joins to Summaries (the filing's announcement) and CtoOrders.,never,HashIndex
+Contracts,core/Contracts.parquet,4,CIK,keep,VARCHAR,Identification,"The registrant's Central Index Key on EDGAR. With DateFiled, the key for matching other databases.",never,CIK
+Contracts,core/Contracts.parquet,5,CompanyName,keep,VARCHAR,Identification,The registrant's name as EDGAR recorded it for this filing.,never,CompanyName
+Contracts,core/Contracts.parquet,6,DocName,keep,VARCHAR,Identification,EDGAR's file name of the attachment. With the CIK and the accession number it locates the document on EDGAR.,never,DocName
+Contracts,core/Contracts.parquet,7,DocSeq,keep,INTEGER,Identification,Position of the attachment in the filing's list of documents.,never,DocSeq
+Contracts,core/Contracts.parquet,8,UrlDocument,keep,VARCHAR,Identification,Address of the attachment on EDGAR.,never,UrlDocument
+Contracts,core/Contracts.parquet,9,UrlIndexPage,keep,VARCHAR,Identification,"Address of the filing's index page on EDGAR, which lists every document of the filing and contains the accession number.",never,UrlIndexPage
+Contracts,core/Contracts.parquet,10,DocTypeRaw,keep,VARCHAR,Identification,"The exhibit type as filed, such as EX-10.1 or EX-10.23.",never,DocTypeRaw
+Contracts,core/Contracts.parquet,11,DocTypeMod,keep,VARCHAR,Identification,The exhibit type reduced to its family: Exhibit10 on every row of this table.,never,DocTypeMod
+Contracts,core/Contracts.parquet,12,DocDesc,keep,VARCHAR,Identification,"The filer's own description of the exhibit, as free text.",the filer gave none,DocDesc
+Contracts,core/Contracts.parquet,13,FormType,keep,VARCHAR,Identification,"The form the attachment was filed with: 8-K, 10-K, 10-Q, S-1 and so on.",never,FormType
+Contracts,core/Contracts.parquet,14,DocExt,keep,VARCHAR,Identification,"File type of the attachment: htm, html, txt or pdf; a few are written in upper case.",never,DocExt
+Contracts,core/Contracts.parquet,15,DateFiled,keep,DATE,Identification,The day EDGAR accepted the filing.,never,DateFiled
+Contracts,core/Contracts.parquet,16,nWords,keep,INTEGER,Text,Words in the attachment's text.,the attachment holds no readable text,nWords
+Contracts,core/Contracts.parquet,17,nWordsAdj,keep,INTEGER,Text,nWords without the words of EDGAR's document header.,the attachment holds no readable text,nWordsAdj
+Contracts,core/Contracts.parquet,18,nChars,keep,INTEGER,Text,Characters in the attachment's text (TextRaw in text/). Every span offset counts characters of this text.,the attachment holds no readable text,nChars
+Contracts,core/Contracts.parquet,19,nNums,keep,INTEGER,Text,Numeric tokens in the text.,the attachment holds no readable text,nNums
+Contracts,core/Contracts.parquet,20,pStopShort,keep,DOUBLE,Text,Share of tokens that are short function words. A low value marks a document that is not running prose.,the attachment holds no readable text,pStopShort
+Contracts,core/Contracts.parquet,21,Removed,keep,BOOLEAN,Screening,"TRUE where the attachment failed the screen for usable text (reason in RemClass). These attachments stay in the table, flagged, so that what was set aside remains visible.",never,Removed
+Contracts,core/Contracts.parquet,22,RemClass,keep,VARCHAR,Screening,"Why the attachment was set aside: too short, not prose, mostly digits, or no readable text.",Removed is FALSE,RemClass
+Contracts,core/Contracts.parquet,23,nCIK,keep,INTEGER,Copies,Number of registrants the filing names.,never,nCIK
+Contracts,core/Contracts.parquet,24,MultFiler,keep,INTEGER,Copies,"1 where the filing names more than one registrant, so that the attachment appears once per registrant.",never,MultFiler
+Contracts,core/Contracts.parquet,25,FilerCopiesAgree,keep,INTEGER,Copies,"1 where all registrant copies of the attachment have the same length. Where they differ (one attachment in the corpus), the entity variables describe the primary copy.",never,FilerCopiesAgree
+Contracts,core/Contracts.parquet,26,PrimaryFiler,keep,INTEGER,Copies,1 on the one copy of each attachment the entity variables were computed from; the other copies carry the same values. Count contracts on PrimaryFiler == 1.,never,PrimaryFiler
+Contracts,core/Contracts.parquet,27,gvkey,drop,VARCHAR,Compustat,Compustat company identifier. Not published: Compustat is licensed. The match can be rebuilt from CIK and DateFiled.,never,gvkey
+Contracts,core/Contracts.parquet,28,datadate,drop,DATE,Compustat,Compustat fiscal period end. Not published.,never,datadate
+Contracts,core/Contracts.parquet,29,cyear,drop,DOUBLE,Compustat,Calendar year of datadate. Not published.,never,cyear
+Contracts,core/Contracts.parquet,30,fyear,drop,INTEGER,Compustat,Compustat fiscal year. Not published.,never,fyear
+Contracts,core/Contracts.parquet,31,fqtr,drop,INTEGER,Compustat,Compustat fiscal quarter. Not published.,never,fqtr
+Contracts,core/Contracts.parquet,32,SampleStepCode,keep,INTEGER,Sample,"The step of the paper's sample selection at which the attachment leaves the sample, as a sortable code; 6 is the final sample.",never,SampleStepCode
+Contracts,core/Contracts.parquet,33,SampleStepDesc,keep,VARCHAR,Sample,"The same step in words: outside 2001-2024, malformed document, CIK not in Compustat, several Compustat quarters matched, no Compustat match on the filing date, or final sample.",never,SampleStepDesc
+Contracts,core/Contracts.parquet,34,DescSample,keep,INTEGER,Sample,1 where the attachment is in the paper's descriptive sample.,never,DescSample
+Contracts,core/Contracts.parquet,35,EstiSample,keep,INTEGER,Sample,"1 where the attachment is in the paper's estimation sample, which requires a Compustat match on CIK and filing date. The matched Compustat data are not published.",never,EstiSample
+Contracts,core/Contracts.parquet,36,HasCto,keep,INTEGER,Orders,1 where a confidential treatment order granted treatment for this contract. Orders that denied or revoked treatment do not count.,never,HasCto
+Contracts,core/Contracts.parquet,37,nCtoOrders,keep,INTEGER,Orders,"Number of granting confidential treatment orders that name the contract, extensions included.",never,nCtoOrders
+Contracts,core/Contracts.parquet,38,CtoReleaseFirst,keep,DATE,Orders,"Earliest date on which the granted treatment ends, across those orders.","no granting order names the contract, or none states an end date (common after 2019)",CtoReleaseFirst
+Contracts,core/Contracts.parquet,39,CtoReleaseLast,keep,DATE,Orders,"Latest date on which the granted treatment ends, across those orders.",as CtoReleaseFirst,CtoReleaseLast
+Contracts,core/Contracts.parquet,40,CtoIsExtension,keep,INTEGER,Orders,1 where any of those orders extends an earlier grant.,never,CtoIsExtension
+Contracts,core/Contracts.parquet,41,nItems,keep,INTEGER,Items,Number of items the filing that carried the attachment reports (8-K filings).,"the filing reports no items (10-K, 10-Q and other forms)",nItems
+Contracts,core/Contracts.parquet,42,nItemsDotted,keep,INTEGER,Items,"How many of those items use the numbering introduced in 2004 (1.01, 2.02, ...).","the filing reports no items (10-K, 10-Q and other forms)",nItemsDotted
+Contracts,core/Contracts.parquet,43,nItemsVoluntary,keep,INTEGER,Items,"Items the registrant chose to report: 2.02, 7.01 and 8.01 from 2004, and their predecessors 12, 9 and 5 before.","the filing reports no items (10-K, 10-Q and other forms)",nItemsVoluntary
+Contracts,core/Contracts.parquet,44,nItemsMandatory,keep,INTEGER,Items,"Items the registrant had to report, triggered by an event.","the filing reports no items (10-K, 10-Q and other forms)",nItemsMandatory
+Contracts,core/Contracts.parquet,45,nItemsUnknown,keep,INTEGER,Items,Items whose code belongs to neither numbering; zero on every row of this table.,"the filing reports no items (10-K, 10-Q and other forms)",nItemsUnknown
+Contracts,core/Contracts.parquet,46,ItemEra,keep,VARCHAR,Items,"Which numbering the filing uses: Post (from 2004), Pre, or Mixed. Read from the codes, not the date.","the filing reports no items (10-K, 10-Q and other forms)",ItemEra
+Contracts,core/Contracts.parquet,47,ItemCodes,keep,VARCHAR,Items,"Every item the filing reports, separated by |, in the order reported.","the filing reports no items (10-K, 10-Q and other forms)",ItemCodes
+Contracts,core/Contracts.parquet,48,ReportsItem101,keep,INTEGER,Items,"1 where the filing reports Item 1.01, entry into a material definitive agreement.","the filing reports no items (10-K, 10-Q and other forms)",ReportsItem101
+Contracts,core/Contracts.parquet,49,ReportsItem202,keep,INTEGER,Items,"1 where the filing reports Item 2.02, results of operations (Item 12 before 2004).","the filing reports no items (10-K, 10-Q and other forms)",ReportsItem202
+Contracts,core/Contracts.parquet,50,ReportsItem701,keep,INTEGER,Items,"1 where the filing reports Item 7.01, Regulation FD disclosure (Item 9 before 2004).","the filing reports no items (10-K, 10-Q and other forms)",ReportsItem701
+Contracts,core/Contracts.parquet,51,ReportsItem801,keep,INTEGER,Items,"1 where the filing reports Item 8.01, other events (Item 5 before 2004).","the filing reports no items (10-K, 10-Q and other forms)",ReportsItem801
+Contracts,core/Contracts.parquet,52,ReportsItem901,keep,INTEGER,Items,"1 where the filing reports Item 9.01, financial statements and exhibits (Item 7 before 2004).","the filing reports no items (10-K, 10-Q and other forms)",ReportsItem901
+Contracts,core/Contracts.parquet,53,SumDates,keep,INTEGER,Announcement,Distinct agreement dates at the start of the filing's Item 1.01 text: a proxy for the number of agreements it announces.,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumDates
+Contracts,core/Contracts.parquet,54,SumIsSingle,keep,INTEGER,Announcement,1 where that text names exactly one agreement date.,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumIsSingle
+Contracts,core/Contracts.parquet,55,SumWords,keep,INTEGER,Announcement,"Words in the Item 1.01 text, without its heading and title.","the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumWords
+Contracts,core/Contracts.parquet,56,SumSentences,keep,INTEGER,Announcement,Sentences in that text.,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumSentences
+Contracts,core/Contracts.parquet,57,SumComplex,keep,INTEGER,Announcement,Words of three or more syllables in that text.,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumComplex
+Contracts,core/Contracts.parquet,58,SumFog,keep,DOUBLE,Announcement,Gunning Fog index of that text: 0.4 x (words per sentence + 100 x share of complex words).,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumFog
+Contracts,core/Contracts.parquet,59,SumUncertain,keep,INTEGER,Announcement,Words of the Loughran-McDonald uncertainty list in that text.,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumUncertain
+Contracts,core/Contracts.parquet,60,SumNumbers,keep,INTEGER,Announcement,Numeric tokens in that text.,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumNumbers
+Contracts,core/Contracts.parquet,61,SumDollars,keep,INTEGER,Announcement,"Dollar figures in that text: a currency sign, a number and an optional scale word.","the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumDollars
+Contracts,core/Contracts.parquet,62,SumPercents,keep,INTEGER,Announcement,Percentages in that text.,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumPercents
+Contracts,core/Contracts.parquet,63,SumAttached,keep,INTEGER,Announcement,1 where the filing carried an Exhibit 10: 1 on every row of this table. Summaries holds the announcements without one.,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumAttached
+Contracts,core/Contracts.parquet,64,SumBoiler,keep,DOUBLE,Announcement,Share of the text's four-word phrases that occur in the filings of at least one in a hundred distinct filers (after Lang and Stice-Lawrence 2015).,"the filing is not an 8-K, or its Item 1.01 text could not be recovered",SumBoiler
+Contracts,core/Contracts.parquet,65,SumLagDays,keep,INTEGER,Announcement,"Filing date minus the first agreement date in that text, in calendar days; negative where the filing precedes the date.",the text names no agreement date,SumLagDays
+Contracts,core/Contracts.parquet,66,BertClassDetailed,keep,VARCHAR,Classification,"Contract type, twelve categories, from the fine-tuned Legal-BERT classifier (256-token model). Identical to Class.",the attachment holds no text the classifiers could read (741 attachments),BertClassDetailed
+Contracts,core/Contracts.parquet,67,BertClassDetailedProb,keep,DOUBLE,Classification,The classifier's probability for that category.,the attachment holds no text the classifiers could read (741 attachments),BertClassDetailedProb
+Contracts,core/Contracts.parquet,68,BertClassDetailed2,keep,VARCHAR,Classification,The classifier's second most likely category.,the attachment holds no text the classifiers could read (741 attachments),BertClassDetailed2
+Contracts,core/Contracts.parquet,69,BertClassDetailed2Prob,keep,DOUBLE,Classification,Its probability.,the attachment holds no text the classifiers could read (741 attachments),BertClassDetailed2Prob
+Contracts,core/Contracts.parquet,70,KwClassDetailed,keep,VARCHAR,Classification,"Contract type from the keyword classifier, an independent second instrument.","no keyword applied, or two categories tied",KwClassDetailed
+Contracts,core/Contracts.parquet,71,KwClassDetailedPower,keep,DOUBLE,Classification,Strength of the keyword that decided it: the lower bound of the Wilson interval of its precision in the labelled sample.,as KwClassDetailed,KwClassDetailedPower
+Contracts,core/Contracts.parquet,72,KwClassDetailedTerm,keep,VARCHAR,Classification,The keyword that decided it.,as KwClassDetailed,KwClassDetailedTerm
+Contracts,core/Contracts.parquet,73,ClassDetailedFlag,keep,VARCHAR,Classification,"confirmed where the keyword classifier agrees with the transformer, contradicted where it disagrees, unchecked where it gave no category.",the attachment holds no text the classifiers could read (741 attachments),ClassDetailedFlag
+Contracts,core/Contracts.parquet,74,BertClassBroad,keep,VARCHAR,Classification,"Broad contract type, seven categories, from an additional classifier trained on the broad labels directly (256-token model). Identical to ClassBroad. The paper uses ClassRollup.",the attachment holds no text the classifiers could read (741 attachments),BertClassBroad
+Contracts,core/Contracts.parquet,75,BertClassBroadProb,keep,DOUBLE,Classification,That classifier's probability for its category.,the attachment holds no text the classifiers could read (741 attachments),BertClassBroadProb
+Contracts,core/Contracts.parquet,76,BertClassBroad2,keep,VARCHAR,Classification,Its second most likely broad category.,the attachment holds no text the classifiers could read (741 attachments),BertClassBroad2
+Contracts,core/Contracts.parquet,77,BertClassBroad2Prob,keep,DOUBLE,Classification,Its probability.,the attachment holds no text the classifiers could read (741 attachments),BertClassBroad2Prob
+Contracts,core/Contracts.parquet,78,KwClassBroad,keep,VARCHAR,Classification,Broad contract type from the keyword classifier.,"no keyword applied, or two categories tied",KwClassBroad
+Contracts,core/Contracts.parquet,79,KwClassBroadPower,keep,DOUBLE,Classification,Strength of the deciding keyword (Wilson lower bound of its precision).,as KwClassBroad,KwClassBroadPower
+Contracts,core/Contracts.parquet,80,KwClassBroadTerm,keep,VARCHAR,Classification,The deciding keyword.,as KwClassBroad,KwClassBroadTerm
+Contracts,core/Contracts.parquet,81,ClassBroadFlag,keep,VARCHAR,Classification,"confirmed, contradicted or unchecked, as ClassDetailedFlag, for the broad categories.",the attachment holds no text the classifiers could read (741 attachments),ClassBroadFlag
+Contracts,core/Contracts.parquet,82,BertAmendType,keep,VARCHAR,Classification,"Original or Amended, from the fine-tuned classifier (256-token model). Identical to AmendType.",the attachment holds no text the classifiers could read (741 attachments),BertAmendType
+Contracts,core/Contracts.parquet,83,BertAmendTypeProb,keep,DOUBLE,Classification,The classifier's probability for that call.,the attachment holds no text the classifiers could read (741 attachments),BertAmendTypeProb
+Contracts,core/Contracts.parquet,84,BertAmendType2,keep,VARCHAR,Classification,The other of the two categories.,the attachment holds no text the classifiers could read (741 attachments),BertAmendType2
+Contracts,core/Contracts.parquet,85,BertAmendType2Prob,keep,DOUBLE,Classification,Its probability: one minus BertAmendTypeProb.,the attachment holds no text the classifiers could read (741 attachments),BertAmendType2Prob
+Contracts,core/Contracts.parquet,86,KwAmendType,keep,VARCHAR,Classification,"Original or Amended from the keyword classifier: Amended where an amendment term applies, Original otherwise.",the attachment holds no text the classifiers could read (741 attachments),KwAmendType
+Contracts,core/Contracts.parquet,87,KwAmendTypePower,keep,DOUBLE,Classification,Strength of the deciding term (Wilson lower bound of its precision); 0 where no amendment term applies.,the attachment holds no text the classifiers could read (741 attachments),KwAmendTypePower
+Contracts,core/Contracts.parquet,88,KwAmendTypeTerm,keep,VARCHAR,Classification,The deciding term.,no amendment term applies,KwAmendTypeTerm
+Contracts,core/Contracts.parquet,89,AmendTypeFlag,keep,VARCHAR,Classification,"confirmed or contradicted, as ClassDetailedFlag, for original against amendment.",the attachment holds no text the classifiers could read (741 attachments),AmendTypeFlag
+Contracts,core/Contracts.parquet,90,HierConsistent,keep,BOOLEAN,Classification,TRUE where ClassRollup equals ClassBroad: the two classifiers agree on the broad category.,the attachment holds no text the classifiers could read (741 attachments),HierConsistent
+Contracts,core/Contracts.parquet,91,Class,keep,VARCHAR,Classification,"Contract type, twelve categories: the label the paper uses.",the attachment holds no text the classifiers could read (741 attachments),Class
+Contracts,core/Contracts.parquet,92,ClassRollup,add,VARCHAR,Classification,"Broad contract type, seven categories: the broad category of Class, as the paper uses it. The part of Class before the colon; Customer / Supplier and R&D roll up to Purchases and Sales; Leases, Licenses and Other stand alone.",the attachment holds no text the classifiers could read (741 attachments),ClassRollup
+Contracts,core/Contracts.parquet,93,ClassBroad,keep,VARCHAR,Classification,"Broad contract type from the additional broad classifier (see BertClassBroad). Where it differs from ClassRollup, HierConsistent is FALSE.",the attachment holds no text the classifiers could read (741 attachments),ClassBroad
+Contracts,core/Contracts.parquet,94,AmendType,keep,VARCHAR,Classification,Original or Amended: the label the paper uses.,the attachment holds no text the classifiers could read (741 attachments),AmendType
+Contracts,core/Contracts.parquet,95,nUniSpellingsNaive,keep,INTEGER,Parties,"Distinct organisation names found in the contract, before the spellings of one party were merged.",never,nUniSpellingsNaive
+Contracts,core/Contracts.parquet,96,nUniRegistrant,keep,INTEGER,Parties,"Parties identified as the registrant: 1 where the registrant was found, 0 otherwise.",never,nUniRegistrant
+Contracts,core/Contracts.parquet,97,nUniCofiler,keep,INTEGER,Parties,Parties identified as another registrant of the same filing.,never,nUniCofiler
+Contracts,core/Contracts.parquet,98,nUniCounterparty,keep,INTEGER,Parties,Distinct counterparties: parties named near the registrant that are not the registrant.,never,nUniCounterparty
+Contracts,core/Contracts.parquet,99,nUniSignatory,keep,INTEGER,Parties,"Distinct parties that appear only in the last tenth of the contract, typically its signature pages.",never,nUniSignatory
+Contracts,core/Contracts.parquet,100,nUniOther,keep,INTEGER,Parties,Distinct parties named elsewhere in the contract.,never,nUniOther
+Contracts,core/Contracts.parquet,101,HasNoParty,keep,INTEGER,Parties,1 where no organisation was found in the contract; every party count is 0 then.,never,HasNoParty
+Contracts,core/Contracts.parquet,102,nUniStateNaive,keep,INTEGER,Geography,"Distinct US states named anywhere outside governing-law clauses, attached to a party or not.",never,nUniStateNaive
+Contracts,core/Contracts.parquet,103,nUniCountryNaive,keep,INTEGER,Geography,"Distinct countries, on the same basis. See the known issue on Columbia.",never,nUniCountryNaive
+Contracts,core/Contracts.parquet,104,nUniStateRegistrant,keep,INTEGER,Geography,"Distinct US states near the registrant's mentions. Above 1 means several candidate places, not several registrants.",never,nUniStateRegistrant
+Contracts,core/Contracts.parquet,105,nUniCountryRegistrant,keep,INTEGER,Geography,Distinct countries near the registrant's mentions.,never,nUniCountryRegistrant
+Contracts,core/Contracts.parquet,106,nUniStateCounterparty,keep,INTEGER,Geography,Distinct US states near any counterparty's mentions.,never,nUniStateCounterparty
+Contracts,core/Contracts.parquet,107,nUniCountryCounterparty,keep,INTEGER,Geography,Distinct countries near any counterparty's mentions.,never,nUniCountryCounterparty
+Contracts,core/Contracts.parquet,108,LawJurisdiction,keep,VARCHAR,Law,"Every jurisdiction the contract's law clauses name, separated by |, in document order. None is picked as the governing one.",no law clause names a place,LawJurisdiction
+Contracts,core/Contracts.parquet,109,LawJurisdictionLevel,keep,VARCHAR,Law,"State or Country for each jurisdiction, in the same order.",as LawJurisdiction,LawJurisdictionLevel
+Contracts,core/Contracts.parquet,110,LawKind,keep,VARCHAR,Law,"The wording that identified each clause, in the same order: GovernedBy, GovernedByConstrued, ConstruedAccordance, GoverningLaw, LawsOfState, LawsOfCommonwealth or SubmitJurisdiction. LawsOfState also matches 'organized under the laws of', which states incorporation rather than governing law.",as LawJurisdiction,LawKind
+Contracts,core/Contracts.parquet,111,nLawClause,keep,INTEGER,Law,"Law clauses found, whether or not they name a place.",never,nLawClause
+Contracts,core/Contracts.parquet,112,nLawSelfRef,keep,INTEGER,Law,"Law clauses that name no place by design, such as 'the laws of the state in which the premises are located'.",never,nLawSelfRef
+Contracts,core/Contracts.parquet,113,nUniJurisdiction,keep,INTEGER,Law,Distinct jurisdictions named.,never,nUniJurisdiction
+Contracts,core/Contracts.parquet,114,DateStart,keep,DATE,Dates,"Start of the contract: the latest date in the text on or before the filing date, or the filing date where there is none.",the attachment holds no readable text,DateStart
+Contracts,core/Contracts.parquet,115,StartSource,keep,VARCHAR,Dates,"signed where DateStart is a date from the text, filed where it is the filing date.",as DateStart,StartSource
+Contracts,core/Contracts.parquet,116,DateEnd,keep,DATE,Dates,"End of the contract, from the first rule that applies: a stated term, an open-ended clause, a date next to an end cue (expires, through, maturity), or the latest future date.",no rule applies,DateEnd
+Contracts,core/Contracts.parquet,117,DurationYears,keep,DOUBLE,Dates,DateEnd minus DateStart in years. A duration above 30 years is left missing rather than capped; DurationDropped says so.,"no end, or longer than 30 years (see DurationDropped)",DurationYears
+Contracts,core/Contracts.parquet,118,DurationSource,keep,VARCHAR,Dates,"Which rule set DateEnd: term, open, cue, maxdate, or none.",as DateStart,DurationSource
+Contracts,core/Contracts.parquet,119,DurationDropped,keep,VARCHAR,Dates,"kept, capped (longer than 30 years) or no end: why DurationYears is present or missing.",as DateStart,DurationDropped
+Contracts,core/Contracts.parquet,120,TermYears,keep,DOUBLE,Dates,"The longest term the contract states, in years. Not capped.",the contract states no term,TermYears
+Contracts,core/Contracts.parquet,121,TermKind,keep,VARCHAR,Dates,"The phrasing of that term: UnitPeriod, PeriodOf, Anniversary, ContinueFor or UnitTerm (see term_spans).",the contract states no term,TermKind
+Contracts,core/Contracts.parquet,122,DateEndNaive,keep,DATE,Dates,"The latest future date the contract mentions, whatever it is mentioned for.",the contract names no future date,DateEndNaive
+Contracts,core/Contracts.parquet,123,NaiveYears,keep,DOUBLE,Dates,DateEndNaive minus DateStart in years. Not capped.,as DateEndNaive,NaiveYears
+Contracts,core/Contracts.parquet,124,nUniAmountNaive,drop,INTEGER,Money,Amounts: not published.,never,nUniAmountNaive
+Contracts,core/Contracts.parquet,125,nUniAmountUSD,drop,INTEGER,Money,Amounts: not published.,never,nUniAmountUSD
+Contracts,core/Contracts.parquet,126,nUniAmountOther,drop,INTEGER,Money,Amounts: not published.,never,nUniAmountOther
+Contracts,core/Contracts.parquet,127,MoneyMaxUSD,drop,DOUBLE,Money,Amounts: not published.,never,MoneyMaxUSD
+Contracts,core/Contracts.parquet,128,MoneyMedUSD,drop,DOUBLE,Money,Amounts: not published.,never,MoneyMedUSD
+Contracts,core/Contracts.parquet,129,MoneyMaxOther,drop,DOUBLE,Money,Amounts: not published.,never,MoneyMaxOther
+Contracts,core/Contracts.parquet,130,MoneyMedOther,drop,DOUBLE,Money,Amounts: not published.,never,MoneyMedOther
+Contracts,core/Contracts.parquet,131,nRedactExplicit,keep,INTEGER,Redactions,"Bracketed markers that name confidential treatment, such as [Confidential Treatment Requested].",never,nRedactExplicit
+Contracts,core/Contracts.parquet,132,nRedactSymbol,keep,INTEGER,Redactions,"Bracketed markers holding a symbol, such as [*] or [ ].",never,nRedactSymbol
+Contracts,core/Contracts.parquet,133,nRedactBlank,keep,INTEGER,Redactions,Empty brackets.,never,nRedactBlank
+Contracts,core/Contracts.parquet,134,nOmitExplicit,keep,INTEGER,Redactions,"[Intentionally Omitted] and its variants: sections left out on purpose, not text withheld from a reader.",never,nOmitExplicit
+Contracts,core/Contracts.parquet,135,nOmitSymbol,keep,INTEGER,Redactions,"The same kind of omission in symbol form, such as [.].",never,nOmitSymbol
+Contracts,core/Contracts.parquet,136,nRedactBare,keep,INTEGER,Redactions,"Runs of asterisks without brackets. The least reliable marker, since a row of asterisks can also be a separator line.",never,nRedactBare
+Contracts,core/Contracts.parquet,137,nRedactMoney,drop,INTEGER,Redactions,Redactions matched to a withheld amount: not published with the amounts.,never,nRedactMoney
+Summaries,core/Summaries.parquet,1,HashIndex,keep,VARCHAR,Identification,The 8-K filing. Joins to Contracts where the filing carried a contract.,never,HashIndex
+Summaries,core/Summaries.parquet,2,DocID,keep,VARCHAR,Identification,The 8-K document the Item 1.01 text was read from; its text is in text/8k or text/8ka.,never,DocID
+Summaries,core/Summaries.parquet,3,CIK,keep,VARCHAR,Identification,The filer's Central Index Key on EDGAR.,never,CIK
+Summaries,core/Summaries.parquet,4,DateFiled,keep,DATE,Identification,The day EDGAR accepted the filing.,never,DateFiled
+Summaries,core/Summaries.parquet,5,FormType,keep,VARCHAR,Identification,8-K or 8-K/A.,never,FormType
+Summaries,core/Summaries.parquet,6,SumAttached,keep,INTEGER,Announcement,1 where the filing carried an Exhibit 10; 0 where the agreement was announced without the contract.,never,SumAttached
+Summaries,core/Summaries.parquet,7,SumDates,keep,INTEGER,Announcement,Distinct agreement dates at the start of the Item 1.01 text: a proxy for the number of agreements announced.,the Item 1.01 text could not be recovered,SumDates
+Summaries,core/Summaries.parquet,8,SumDateFirst,keep,DATE,Announcement,The first of those dates: the agreement date.,the text names no agreement date,SumDateFirst
+Summaries,core/Summaries.parquet,9,SumIsSingle,keep,INTEGER,Announcement,1 where the text names exactly one agreement date.,the Item 1.01 text could not be recovered,SumIsSingle
+Summaries,core/Summaries.parquet,10,SumLagDays,keep,INTEGER,Announcement,"DateFiled minus SumDateFirst, in calendar days; negative where the filing precedes the date. Item 1.01 allows four business days.",as SumDateFirst,SumLagDays
+Summaries,core/Summaries.parquet,11,SumWords,keep,INTEGER,Announcement,"Words in the Item 1.01 text, without its heading and title.",never,SumWords
+Summaries,core/Summaries.parquet,12,SumSentences,keep,INTEGER,Announcement,Sentences in that text.,never,SumSentences
+Summaries,core/Summaries.parquet,13,SumComplex,keep,INTEGER,Announcement,Words of three or more syllables in that text.,never,SumComplex
+Summaries,core/Summaries.parquet,14,SumFog,keep,DOUBLE,Announcement,Gunning Fog index: 0.4 x (words per sentence + 100 x share of complex words).,never,SumFog
+Summaries,core/Summaries.parquet,15,SumUncertain,keep,INTEGER,Announcement,Words of the Loughran-McDonald uncertainty list.,never,SumUncertain
+Summaries,core/Summaries.parquet,16,SumNumbers,keep,INTEGER,Announcement,Numeric tokens.,never,SumNumbers
+Summaries,core/Summaries.parquet,17,SumDollars,keep,INTEGER,Announcement,"Dollar figures: a currency sign, a number and an optional scale word.",never,SumDollars
+Summaries,core/Summaries.parquet,18,SumPercents,keep,INTEGER,Announcement,Percentages.,never,SumPercents
+Summaries,core/Summaries.parquet,19,SumBoiler,keep,DOUBLE,Announcement,Share of the text's four-word phrases that occur in the filings of at least one in a hundred distinct filers (after Lang and Stice-Lawrence 2015).,never,SumBoiler
+Places,core/Places.parquet,1,DocID,keep,VARCHAR,Place,The contract (its primary copy). Joins to Contracts on DocID.,never,DocID
+Places,core/Places.parquet,2,HashDocument,keep,VARCHAR,Place,The attachment; joins to every registrant copy in Contracts.,never,HashDocument
+Places,core/Places.parquet,3,GeoLevel,keep,VARCHAR,Place,"What the place name resolved to: Country, State, County or City.",never,GeoLevel
+Places,core/Places.parquet,4,GeoState,keep,VARCHAR,Place,"The US state, where the place gives one.",the place is outside the US or names no state,GeoState
+Places,core/Places.parquet,5,GeoCountryIso,keep,VARCHAR,Place,ISO 3166 alpha-3 country code; USA for US places. Count countries on this column.,the place resolved to no country,GeoCountryIso
+Places,core/Places.parquet,6,GeoCountry,keep,VARCHAR,Place,"The country's name as found in the text. One country can appear under several spellings, including other languages.",as GeoCountryIso,GeoCountry
+Places,core/Places.parquet,7,PartyRole,keep,VARCHAR,Place,"The party the place was attached to: registrant, cofiler, counterparty, signatory, other, or none.",never,PartyRole
+Places,core/Places.parquet,8,InLawClause,keep,INTEGER,Place,"1 where the place sits in a governing-law clause, so it is a jurisdiction rather than a location.",never,InLawClause
+Places,core/Places.parquet,9,nMentions,keep,INTEGER,Place,How often the contract mentions this place in this role.,never,nMentions
+TermDocs,core/TermDocs.parquet,1,DocID,keep,VARCHAR,Term,The contract (its primary copy). Joins to Contracts on DocID.,never,DocID
+TermDocs,core/TermDocs.parquet,2,HashDocument,keep,VARCHAR,Term,The attachment; joins to every registrant copy in Contracts.,never,HashDocument
+TermDocs,core/TermDocs.parquet,3,Family,keep,VARCHAR,Term,"The term family searched for: Pandemic, Disruption, RateReform, Regulation or Boilerplate.",never,Family
+TermDocs,core/TermDocs.parquet,4,nHits,keep,INTEGER,Term,Occurrences of any term of the family; a term found twice counts twice.,never,nHits
+TermDocs,core/TermDocs.parquet,5,nTerms,keep,INTEGER,Term,Distinct terms of the family found.,never,nTerms
+TermDocs,core/TermDocs.parquet,6,HasTerm,keep,INTEGER,Term,1 where nHits is positive.,never,HasTerm
+TermDocs,core/TermDocs.parquet,7,FirstPos,keep,DOUBLE,Term,"Relative position of the first hit: 0 at the start of the text, 1 at its end.",nHits is 0,FirstPos
+TermDocs,core/TermDocs.parquet,8,PerKWords,keep,DOUBLE,Term,nHits per thousand words of the contract.,the contract has no word count,PerKWords
+CtoOrders,core/CtoOrders.parquet,1,OrderDocID,keep,VARCHAR,Order,The order's own document on EDGAR; its text is in text/cto.,never,OrderDocID
+CtoOrders,core/CtoOrders.parquet,2,OrderCIK,keep,VARCHAR,Order,The filer the order was addressed to.,never,OrderCIK
+CtoOrders,core/CtoOrders.parquet,3,OrderDate,keep,DATE,Order,The day the order was filed.,never,OrderDate
+CtoOrders,core/CtoOrders.parquet,4,Status,keep,VARCHAR,Order,"GRANTING, DENYING or REVOKING, as the order's title states.",the order's text is empty,Status
+CtoOrders,core/CtoOrders.parquet,5,IsExtension,keep,INTEGER,Order,1 where the order extends an earlier grant.,never,IsExtension
+CtoOrders,core/CtoOrders.parquet,6,ExhibitNo,keep,VARCHAR,Reference,"The exhibit number the order names, such as 10.1.",no reference could be read,ExhibitNo
+CtoOrders,core/CtoOrders.parquet,7,SourceForm,keep,VARCHAR,Reference,"The form the order says the exhibit was filed with, as written; a few values are truncated.",the order names none,SourceForm
+CtoOrders,core/CtoOrders.parquet,8,SourceFiledOn,keep,DATE,Reference,The filing date the order gives for that form.,the order names none,SourceFiledOn
+CtoOrders,core/CtoOrders.parquet,9,ReleaseDate,keep,DATE,Order,When the granted treatment ends.,the order states none,ReleaseDate
+CtoOrders,core/CtoOrders.parquet,10,HashIndex,keep,VARCHAR,Link,The filing the reference was resolved to.,the filing was not found,HashIndex
+CtoOrders,core/CtoOrders.parquet,11,DocID,keep,VARCHAR,Link,The contract the reference was resolved to. Joins to Contracts on DocID.,the link failed (see LinkStatus),DocID
+CtoOrders,core/CtoOrders.parquet,12,LinkStatus,keep,VARCHAR,Link,"A-linked where the order was linked to a contract; otherwise the numbered step at which linking failed (1 no reference read, 2 not an Exhibit 10, 3 source filing not named, 4 filing not on EDGAR, 5 filing ambiguous, 6 no exhibit retrieved from that filing, 7 exhibit ambiguous, 8 lettered exhibit number, 9 exhibit not among those retrieved).",never,LinkStatus
+Labels,core/Labels.parquet,1,DocID,keep,VARCHAR,Label,The labelled contract. Joins to Contracts on DocID.,never,DocID
+Labels,core/Labels.parquet,2,DocDesc,keep,VARCHAR,Label,"The filer's description of the exhibit, as in Contracts.",the filer gave none,DocDesc
+Labels,core/Labels.parquet,3,DocName,keep,VARCHAR,Label,"EDGAR's file name of the attachment, as in Contracts.",never,DocName
+Labels,core/Labels.parquet,4,ClassBroad,keep,VARCHAR,Label,The broad category the annotators gave: the roll-up of ClassDetailed.,never,ClassBroad
+Labels,core/Labels.parquet,5,ClassDetailed,keep,VARCHAR,Label,"The detailed category the annotators gave, one of twelve.",never,ClassDetailed
+Labels,core/Labels.parquet,6,ClassDetailed2,keep,VARCHAR,Label,"A second detailed category, where the annotators judged the contract to belong to two.",the contract has one category,ClassDetailed2
+Labels,core/Labels.parquet,7,AmendType,keep,VARCHAR,Label,"Original or Amended, as the annotators judged.",never,AmendType
+Labels,core/Labels.parquet,8,LabelRound,keep,VARCHAR,Label,"The labelling round, Round1 or Round2 (Online Appendix C).",never,LabelRound
+Labels,core/Labels.parquet,9,Fold,keep,INTEGER,Label,"The cross-validation fold, 1 to 5, in which the contract was held out when the classifiers were scored.",never,Fold
+Labels,core/Labels.parquet,10,Text,drop,VARCHAR,Label,"The contract's text as the classifiers read it: not repeated here, it is in text/.",never,Text
+KeywordTerms,core/KeywordTerms.parquet,1,Task,add,VARCHAR,Keyword,"The classification task: ClassDetailed, ClassBroad or AmendType.",never,Task
+KeywordTerms,core/KeywordTerms.parquet,2,Class,keep,VARCHAR,Keyword,The category the term points to.,never,Class
+KeywordTerms,core/KeywordTerms.parquet,3,Rank,keep,INTEGER,Keyword,"Rank of the term within its category, by Power.",never,Rank
+KeywordTerms,core/KeywordTerms.parquet,4,Term,keep,VARCHAR,Keyword,"The keyword: one to three lower-case words, searched in the first 256 words of a document.",never,Term
+KeywordTerms,core/KeywordTerms.parquet,5,Power,keep,DOUBLE,Keyword,The term's strength: the lower bound of the Wilson interval of its precision.,never,Power
+KeywordTerms,core/KeywordTerms.parquet,6,Precision,keep,DOUBLE,Keyword,Share of the labelled documents containing the term that belong to the category.,never,Precision
+KeywordTerms,core/KeywordTerms.parquet,7,HitsPos,keep,INTEGER,Keyword,Labelled documents of the category that contain the term.,never,HitsPos
+KeywordTerms,core/KeywordTerms.parquet,8,HitsTot,keep,INTEGER,Keyword,Labelled documents that contain the term.,never,HitsTot
+KeywordTerms,core/KeywordTerms.parquet,9,NFilers,keep,INTEGER,Keyword,Distinct filers among those documents.,never,NFilers
+KeywordTerms,core/KeywordTerms.parquet,10,FilerRatio,keep,DOUBLE,Keyword,NFilers relative to HitsPos: low where one filer's boilerplate carries the term.,never,FilerRatio
+KeywordTerms,core/KeywordTerms.parquet,11,MarginalReach,keep,DOUBLE,Keyword,Share of the category's labelled documents the term reaches that no higher-ranked term reached.,never,MarginalReach
+KeywordTerms,core/KeywordTerms.parquet,12,CumReach,keep,DOUBLE,Keyword,Share reached by this term and all higher-ranked ones together.,never,CumReach
+KeywordTerms,core/KeywordTerms.parquet,13,Folds,keep,INTEGER,Keyword,"Cross-validation folds, of five, in which the term was selected.",never,Folds
+ContractIndex,core/ContractIndex.csv.gz,1,DocID,keep,VARCHAR,Identification,"One registrant's copy of an Exhibit 10 attachment: the registrant's CIK and a hash of the attachment, joined by a hyphen. Unique in this table and the key every other table joins on.",never,DocID
+ContractIndex,core/ContractIndex.csv.gz,2,AccessionNumber,add,VARCHAR,Identification,"The filing's accession number, read from UrlIndexPage.",never,AccessionNumber
+ContractIndex,core/ContractIndex.csv.gz,3,CIK,keep,VARCHAR,Identification,"The registrant's Central Index Key on EDGAR. With DateFiled, the key for matching other databases.",never,CIK
+ContractIndex,core/ContractIndex.csv.gz,4,CompanyName,keep,VARCHAR,Identification,The registrant's name as EDGAR recorded it for this filing.,never,CompanyName
+ContractIndex,core/ContractIndex.csv.gz,5,FormType,keep,VARCHAR,Identification,"The form the attachment was filed with: 8-K, 10-K, 10-Q, S-1 and so on.",never,FormType
+ContractIndex,core/ContractIndex.csv.gz,6,DateFiled,keep,DATE,Identification,The day EDGAR accepted the filing.,never,DateFiled
+ContractIndex,core/ContractIndex.csv.gz,7,DocName,keep,VARCHAR,Identification,EDGAR's file name of the attachment. With the CIK and the accession number it locates the document on EDGAR.,never,DocName
+ContractIndex,core/ContractIndex.csv.gz,8,DocSeq,keep,INTEGER,Identification,Position of the attachment in the filing's list of documents.,never,DocSeq
+ContractIndex,core/ContractIndex.csv.gz,9,DocDesc,keep,VARCHAR,Identification,"The filer's own description of the exhibit, as free text.",the filer gave none,DocDesc
+ContractIndex,core/ContractIndex.csv.gz,10,Class,keep,VARCHAR,Classification,"Contract type, twelve categories: the label the paper uses.",the attachment holds no text the classifiers could read (741 attachments),Class
+ContractIndex,core/ContractIndex.csv.gz,11,ClassRollup,keep,VARCHAR,Classification,"Broad contract type, seven categories: the broad category of Class, as the paper uses it. The part of Class before the colon; Customer / Supplier and R&D roll up to Purchases and Sales; Leases, Licenses and Other stand alone.",the attachment holds no text the classifiers could read (741 attachments),ClassRollup
+ContractIndex,core/ContractIndex.csv.gz,12,ClassBroad,keep,VARCHAR,Classification,"Broad contract type from the additional broad classifier (see BertClassBroad). Where it differs from ClassRollup, HierConsistent is FALSE.",the attachment holds no text the classifiers could read (741 attachments),ClassBroad
+ContractIndex,core/ContractIndex.csv.gz,13,AmendType,keep,VARCHAR,Classification,Original or Amended: the label the paper uses.,the attachment holds no text the classifiers could read (741 attachments),AmendType
+ContractIndex,core/ContractIndex.csv.gz,14,HasCto,keep,INTEGER,Orders,1 where a confidential treatment order granted treatment for this contract. Orders that denied or revoked treatment do not count.,never,HasCto
+ContractIndex,core/ContractIndex.csv.gz,15,nRedactExplicit,keep,INTEGER,Redactions,"Bracketed markers that name confidential treatment, such as [Confidential Treatment Requested].",never,nRedactExplicit
+ContractIndex,core/ContractIndex.csv.gz,16,nRedactSymbol,keep,INTEGER,Redactions,"Bracketed markers holding a symbol, such as [*] or [ ].",never,nRedactSymbol
+ContractIndex,core/ContractIndex.csv.gz,17,nRedactBlank,keep,INTEGER,Redactions,Empty brackets.,never,nRedactBlank
+ContractIndex,core/ContractIndex.csv.gz,18,PrimaryFiler,keep,INTEGER,Copies,1 on the one copy of each attachment the entity variables were computed from; the other copies carry the same values. Count contracts on PrimaryFiler == 1.,never,PrimaryFiler
+ContractIndex,core/ContractIndex.csv.gz,19,Removed,keep,BOOLEAN,Screening,"TRUE where the attachment failed the screen for usable text (reason in RemClass). These attachments stay in the table, flagged, so that what was set aside remains visible.",never,Removed
+ContractIndex,core/ContractIndex.csv.gz,20,RemClass,keep,VARCHAR,Screening,"Why the attachment was set aside: too short, not prose, mostly digits, or no readable text.",Removed is FALSE,RemClass
+ContractIndex,core/ContractIndex.csv.gz,21,UrlDocument,keep,VARCHAR,Identification,Address of the attachment on EDGAR.,never,UrlDocument
+ContractIndex,core/ContractIndex.csv.gz,22,UrlIndexPage,keep,VARCHAR,Identification,"Address of the filing's index page on EDGAR, which lists every document of the filing and contains the accession number.",never,UrlIndexPage
+Text,text/<type>/<type>_<year>.parquet,1,DocID,keep,VARCHAR,Document,"The document: DocID of Contracts for Exhibit 10 attachments, DocID of Summaries for 8-K and 8-K/A reports, OrderDocID of CtoOrders for confidential treatment orders.",never,DocID
+Text,text/<type>/<type>_<year>.parquet,2,YQ,keep,VARCHAR,Document,"Filing year and quarter, such as 2012-1.",never,YQ
+Text,text/<type>/<type>_<year>.parquet,3,DocExt,keep,VARCHAR,Document,"File type as filed: htm, html, txt or pdf; a few in upper case.",never,DocExt
+Text,text/<type>/<type>_<year>.parquet,4,ErrParse,keep,BOOLEAN,Document,TRUE where the text could not be extracted (two PDF attachments).,never,ErrParse
+Text,text/<type>/<type>_<year>.parquet,5,MsgParse,keep,VARCHAR,Document,The parser's error message.,ErrParse is FALSE,MsgParse
+Text,text/<type>/<type>_<year>.parquet,6,HTML,keep,VARCHAR,Document,"The document as retrieved from EDGAR: the markup of an HTML filing, the plain text of a .txt filing.",see the README for PDF documents,HTML
+Text,text/<type>/<type>_<year>.parquet,7,TextRaw,keep,VARCHAR,Document,"The document's text, exactly as every variable, span offset and model read it. In some HTML documents, quotation marks, apostrophes and dashes appear as control characters (U+0080 to U+009F); the README gives a one-line repair that keeps every offset valid.",the document holds no text,TextRaw
+org_mentions,spans/org_mentions.parquet,1,DocID,keep,VARCHAR,Mention,The contract (its primary copy). Joins to Contracts on DocID.,never,DocID
+org_mentions,spans/org_mentions.parquet,2,PartyKey,keep,VARCHAR,Party,"Key of the party after the spellings of one organisation were merged: one party, one key.",placeholder row of a contract without organisation,PartyKey
+org_mentions,spans/org_mentions.parquet,3,PartyName,keep,VARCHAR,Party,"The party's name, in the spelling chosen to name it.",as PartyKey,PartyName
+org_mentions,spans/org_mentions.parquet,4,PartyRole,keep,VARCHAR,Party,"The party's role: registrant, cofiler, counterparty, signatory, other, or none on the placeholder row of a contract where no organisation was found.",never,PartyRole
+org_mentions,spans/org_mentions.parquet,5,MatchKind,keep,VARCHAR,Party,"How the party was matched to the registrant: exact, prefix, fallback, cofiler (another registrant of the filing), or none.",never,MatchKind
+org_mentions,spans/org_mentions.parquet,6,NameFrom,keep,VARCHAR,Party,Which spelling names the party: matched member (the spelling matched to the registrant) or most mentioned.,as PartyKey,NameFrom
+org_mentions,spans/org_mentions.parquet,7,MergeKind,keep,VARCHAR,Party,"How the spellings were merged into the party: alone, prefix or fragment.",as PartyKey,MergeKind
+org_mentions,spans/org_mentions.parquet,8,SpanKey,keep,VARCHAR,Mention,Normalised key of this spelling before merging; nUniSpellingsNaive in Contracts counts these.,as PartyKey,SpanKey
+org_mentions,spans/org_mentions.parquet,9,SpanText,keep,VARCHAR,Mention,The mention as written in TextRaw.,as PartyKey,SpanText
+org_mentions,spans/org_mentions.parquet,10,MentionStart,keep,INTEGER,Mention,0-based offset of the span's first character in TextRaw.,as PartyKey,MentionStart
+org_mentions,spans/org_mentions.parquet,11,MentionStop,keep,INTEGER,Mention,"Offset one past the span's last character, so the span is TextRaw[Start:Stop] in Python and stri_sub(TextRaw, Start + 1, Stop) in R.",as PartyKey,MentionStop
+org_mentions,spans/org_mentions.parquet,12,IsFirst,keep,BOOLEAN,Mention,TRUE on the party's first mention in the contract.,as PartyKey,IsFirst
+places_geo,spans/places_geo.parquet,1,DocID,keep,VARCHAR,Place,The contract (its primary copy). Joins to Contracts on DocID.,never,DocID
+places_geo,spans/places_geo.parquet,2,PlaceStart,keep,DOUBLE,Place,0-based offset of the span's first character in TextRaw. Stored as a whole-numbered double.,never,PlaceStart
+places_geo,spans/places_geo.parquet,3,PlaceStop,keep,INTEGER,Place,"Offset one past the span's last character, so the span is TextRaw[Start:Stop] in Python and stri_sub(TextRaw, Start + 1, Stop) in R.",never,PlaceStop
+places_geo,spans/places_geo.parquet,4,PlaceText,keep,VARCHAR,Place,The place name as written in TextRaw.,never,PlaceText
+places_geo,spans/places_geo.parquet,5,GeoUnit,keep,VARCHAR,Place,The gazetteer's name for what the place resolved to.,never,GeoUnit
+places_geo,spans/places_geo.parquet,6,GeoLevel,keep,VARCHAR,Place,"What it resolved to: Country, State, County or City.",never,GeoLevel
+places_geo,spans/places_geo.parquet,7,GeoState,keep,VARCHAR,Place,"The US state, where the place gives one.",the place is outside the US or names no state,GeoState
+places_geo,spans/places_geo.parquet,8,GeoCounty,keep,VARCHAR,Place,"The county of a US city, for reading.",the place is not a US city,GeoCounty
+places_geo,spans/places_geo.parquet,9,GeoCountryIso,keep,VARCHAR,Place,ISO 3166 alpha-3 country code; USA for US places.,the place resolved to no country,GeoCountryIso
+places_geo,spans/places_geo.parquet,10,GeoCountry,keep,VARCHAR,Place,"The country's name; spellings vary, count on GeoCountryIso.",as GeoCountryIso,GeoCountry
+places_geo,spans/places_geo.parquet,11,GeoStateFrom,keep,VARCHAR,Place,"How the US state was found: named (the place is a state), unique (a city in one state only), named nearby (a state named next to it), unresolved, or none.",never,GeoStateFrom
+places_geo,spans/places_geo.parquet,12,Ambiguous,keep,BOOLEAN,Place,"TRUE where the name exists under more than one parent in the gazetteer, such as a city name in several states.",never,Ambiguous
+places_geo,spans/places_geo.parquet,13,PartyKey,keep,VARCHAR,Party,"The party the place was attached to, as in org_mentions.",the place attached to no party,PartyKey
+places_geo,spans/places_geo.parquet,14,MentionStart,keep,INTEGER,Party,Offset of the party mention the place was attached through.,as PartyKey,MentionStart
+places_geo,spans/places_geo.parquet,15,MentionIsFirst,keep,BOOLEAN,Party,TRUE where that mention is the party's first.,as PartyKey,MentionIsFirst
+places_geo,spans/places_geo.parquet,16,DistToParty,keep,INTEGER,Party,Characters from the end of that mention to the place.,as PartyKey,DistToParty
+places_geo,spans/places_geo.parquet,17,Attached,keep,BOOLEAN,Party,TRUE where the place falls within reach of a party mention.,never,Attached
+places_geo,spans/places_geo.parquet,18,InLawClause,keep,BOOLEAN,Place,"TRUE where the place sits in a governing-law clause, so it is a jurisdiction and never attached to a party.",never,InLawClause
+law_clauses,spans/law_clauses.parquet,1,DocID,keep,VARCHAR,Clause,The contract (its primary copy). Joins to Contracts on DocID.,never,DocID
+law_clauses,spans/law_clauses.parquet,2,LawStart,keep,DOUBLE,Clause,0-based offset of the span's first character in TextRaw. Stored as a whole-numbered double.,never,LawStart
+law_clauses,spans/law_clauses.parquet,3,LawStop,keep,INTEGER,Clause,"Offset one past the span's last character, so the span is TextRaw[Start:Stop] in Python and stri_sub(TextRaw, Start + 1, Stop) in R.",never,LawStop
+law_clauses,spans/law_clauses.parquet,4,LawKind,keep,VARCHAR,Clause,"The wording that identified the clause: GoverningLaw (a heading), GovernedBy, GovernedByConstrued, ConstruedAccordance, LawsOfState, LawsOfCommonwealth, SubmitJurisdiction or SelfReferential.",never,LawKind
+law_clauses,spans/law_clauses.parquet,5,Jurisdiction,keep,VARCHAR,Clause,The state or country the clause names.,the clause names none,Jurisdiction
+law_clauses,spans/law_clauses.parquet,6,JurisdictionLevel,keep,VARCHAR,Clause,State or Country.,as Jurisdiction,JurisdictionLevel
+date_spans,spans/date_spans.parquet,1,DocID,keep,VARCHAR,Date,The contract (its primary copy). Joins to Contracts on DocID.,never,DocID
+date_spans,spans/date_spans.parquet,2,DateStart,keep,INTEGER,Date,0-based offset of the span's first character in TextRaw.,never,DateStart
+date_spans,spans/date_spans.parquet,3,DateStop,keep,INTEGER,Date,"Offset one past the span's last character, so the span is TextRaw[Start:Stop] in Python and stri_sub(TextRaw, Start + 1, Stop) in R.",never,DateStop
+date_spans,spans/date_spans.parquet,4,DateText,keep,VARCHAR,Date,The date as written in TextRaw.,never,DateText
+date_spans,spans/date_spans.parquet,5,DateValue,keep,DATE,Date,The calendar date it stands for.,never,DateValue
+date_spans,spans/date_spans.parquet,6,Parsed,keep,BOOLEAN,Date,TRUE on every row: only dates that could be read are kept.,never,Parsed
+date_spans,spans/date_spans.parquet,7,GapDays,keep,INTEGER,Date,Days from the filing date to this date; negative before it.,never,GapDays
+date_spans,spans/date_spans.parquet,8,Side,keep,VARCHAR,Date,"before filing, same day or after filing.",never,Side
+date_spans,spans/date_spans.parquet,9,HasEndCue,keep,BOOLEAN,Date,"TRUE where an end cue (ending, through, until, terminat..., expir..., maturit...) stands in the 160 characters before the date.",never,HasEndCue
+date_spans,spans/date_spans.parquet,10,CueHit,keep,VARCHAR,Date,Which cue it was.,HasEndCue is FALSE,CueHit
+term_spans,spans/term_spans.parquet,1,DocID,keep,VARCHAR,Period,The contract (its primary copy). Joins to Contracts on DocID.,never,DocID
+term_spans,spans/term_spans.parquet,2,TermStart,keep,INTEGER,Period,0-based offset of the span's first character in TextRaw.,never,TermStart
+term_spans,spans/term_spans.parquet,3,TermStop,keep,INTEGER,Period,"Offset one past the span's last character, so the span is TextRaw[Start:Stop] in Python and stri_sub(TextRaw, Start + 1, Stop) in R.",never,TermStop
+term_spans,spans/term_spans.parquet,4,TermText,keep,VARCHAR,Period,The period as written in TextRaw.,never,TermText
+term_spans,spans/term_spans.parquet,5,TermKind,keep,VARCHAR,Period,"The phrasing that matched: UnitPeriod ('five (5) years'), PeriodOf ('a period of five years'), Anniversary ('the fifth anniversary'), ContinueFor ('continue for five years'), UnitTerm ('a five-year term') or OpenEnded.",never,TermKind
+term_spans,spans/term_spans.parquet,6,TermN,keep,DOUBLE,Period,The number the contract wrote.,IsOpen is TRUE,TermN
+term_spans,spans/term_spans.parquet,7,TermUnit,keep,VARCHAR,Period,"The unit it wrote: day, week, month or year; open for an open-ended clause.",never,TermUnit
+term_spans,spans/term_spans.parquet,8,TermYears,keep,DOUBLE,Period,The period in years.,IsOpen is TRUE,TermYears
+term_spans,spans/term_spans.parquet,9,IsOpen,keep,BOOLEAN,Period,TRUE where the clause states the contract has no fixed length.,never,IsOpen
+term_spans,spans/term_spans.parquet,10,PeriodKind,keep,VARCHAR,Period,"What the period governs, from the word before it: term, notice, cure, survival or other. Descriptive only; no variable uses it.",never,PeriodKind
+term_spans,spans/term_spans.parquet,11,PeriodCue,keep,VARCHAR,Period,The word that set PeriodKind.,PeriodKind is other,PeriodCue
+redact_spans,spans/redact_spans.parquet,1,DocID,keep,VARCHAR,Marker,The contract (its primary copy). Joins to Contracts on DocID.,never,DocID
+redact_spans,spans/redact_spans.parquet,2,MarkStart,keep,INTEGER,Marker,0-based offset of the span's first character in TextRaw.,never,MarkStart
+redact_spans,spans/redact_spans.parquet,3,MarkStop,keep,INTEGER,Marker,"Offset one past the span's last character, so the span is TextRaw[Start:Stop] in Python and stri_sub(TextRaw, Start + 1, Stop) in R.",never,MarkStop
+redact_spans,spans/redact_spans.parquet,4,MarkText,keep,VARCHAR,Marker,The marker as written in TextRaw.,never,MarkText
+redact_spans,spans/redact_spans.parquet,5,Kind,keep,VARCHAR,Marker,"RedactExplicit, RedactSymbol, RedactBlank, RedactBare, OmitExplicit or OmitSymbol: the classes the redaction counts in Contracts use.",never,Kind
+redact_spans,spans/redact_spans.parquet,6,Bracketed,keep,BOOLEAN,Marker,"TRUE for the five bracketed kinds, FALSE for RedactBare.",never,Bracketed
+redact_spans,spans/redact_spans.parquet,7,Withheld,keep,BOOLEAN,Marker,"TRUE where text was withheld (a redaction), FALSE for an omission placeholder such as [Intentionally Omitted].",never,Withheld
+redact_spans,spans/redact_spans.parquet,8,RedactedEntity,drop,VARCHAR,Marker,Link to the amount a marker replaced: not published with the amounts.,never,RedactedEntity
+redact_spans,spans/redact_spans.parquet,9,RedactedRef,drop,INTEGER,Marker,Offset of that amount: not published.,never,RedactedRef
+redact_spans,spans/redact_spans.parquet,10,RedactedText,drop,VARCHAR,Marker,That amount as written: not published.,never,RedactedText

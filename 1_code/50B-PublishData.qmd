@@ -63,35 +63,37 @@ source(file = .path_fun, encoding = "UTF-8")
 
 # Purpose
 
-This document assembles the data package of the database: one versioned folder holding everything published as
-data, with a checksum for every file and a README, copied to the shared Drive folder the published repository links
-to. It changes nothing upstream; every file is built from what the pipeline stages wrote.
+This document builds the published data package of the database: one versioned folder with five parts, a checksum
+for every file and a README, copied to the shared Drive folder. It also cuts the sample the site's examples run on
+and writes it into the site repository. Nothing upstream changes; every file is built from what the pipeline stages
+wrote.
 
-The package has six parts. `core/` holds the release files and their codebooks, a contract index, the labelled
-sample and the keyword tables. `spans/` holds every entity span the extractors found. `text/` holds the retrieved
-documents. `models/` holds the fine-tuned classifiers, `lexnlp/` the image that extracted the entities, and
-`replication/` what the paper's exhibits, numbers and appendix read beyond `core/`.
+| Part | What it holds |
+|:--|:--|
+| `core/` | the release tables, the labelled sample, the keyword terms in use, the contract index, their codebooks |
+| `spans/` | the entity spans the rules kept, one file per kind |
+| `text/` | the documents, as filed and as read |
+| `models/` | the six fine-tuned classifiers, with a usage guide |
+| `lexnlp/` | the image that extracted the organisation candidates, with a usage guide |
 
-Four decisions shape it.
+Three decisions shape it.
 
-**Parquet throughout.** Parquet is an open, column-oriented format that R, Python, DuckDB and Stata 19.5 read
-directly, and it lets a reader download and open one table instead of a database. Stata files are not published:
-the release's Stata copy is ten times the size of its parquet, and the codebooks carry the Stata name of every
-column for readers who convert.
+**One public schema decides what is published.** `1_code/_Publish/PublicSchema.csv` lists every column of every
+published table -- kept, dropped or added -- with its type, its meaning and its Stata name. Every source is held
+against it before anything is written, and a column it does not list stops the build: nothing reaches the package
+without a decision, and nothing renamed upstream can vanish unnoticed. The codebooks are written from the same file,
+so they cannot disagree with the tables.
 
-**One file per span type, and per document type and year.** 04D wrote each span type in 476 chunks, and 01B wrote
-one file per document -- right for building the data, wrong for reading it. The package merges both into files a
-reader can list and download one at a time: seven span files, and one text file per document type and year.
+**What is published is what the paper used.** Two kinds of content come out: the Compustat fields, which are
+licensed, and everything about amounts, which the paper does not use. The EDGAR links are repaired, because the
+pipeline writes them with a missing slash, and one column is added, `ClassRollup`, the broad category as the paper
+uses it. Everything else is published as built. The text is published exactly as the classifiers and extractors
+read it, so every published label and span can be reproduced from it; the README gives the one-line repair for the
+quotation marks that some HTML documents carry as control characters.
 
-**The documents as filed and as text.** `text/` keeps each document's original markup (`HTML`) and the text
-extracted from it (`TextRaw`). The markup is what EDGAR serves and what a reader needs to re-parse a table or a
-signature block; the text is what every measure in the paper was computed from. The standardised text is not kept,
-because `rGetEDGAR::standardize_text()` derives it from `TextRaw`. Only documents the release refers to are
-published, and those left out are counted.
-
-**Nothing licensed, nothing that cannot be traced.** Compustat and everything computed from it stay out, so the
-Final Exhibits outputs are not part of `replication/`. The raw candidate spans behind 04D (28 GB) stay out too; the
-span files carry every span a rule used, with its offsets and context.
+**Every expensive output is stamped.** A stamp is a hash of an output's input files and of the statement that builds
+it; an output whose stamp matches is skipped. The text step is unchanged from the first build, so the 45 GB of text
+keep their stamps and are neither rebuilt nor copied again.
 
 # Configuration
 
@@ -102,7 +104,6 @@ span files carry every span a rule used, with its offsets and context.
   Input = list(
     DirRelease       = here::here("2_output", "10-ExportData", "Output"),
     FilPrepared      = here::here("2_output", "03A-ClassifyPrepare", "prepared.parquet"),
-    FilLabelsRaw     = here::here("0_data", "Labels", "ClassificationLabels.csv"),
     DirKeywordTables = here::here("2_output", "03C-ClassifyTrainKeyword", "table"),
     DirSpanStore     = here::here("2_output", "04D-EntityApply", "Store"),
     DirParsed        = here::here("2_output", "01B-EdgarDocuments", "GetEDGAR", "DocumentData", "Parsed"),
@@ -110,27 +111,34 @@ span files carry every span a rule used, with its offsets and context.
     # THE IMAGE THAT EXTRACTED THE CORPUS, archived on the external drive when it ran.
     FilLexnlpImage   = "/Volumes/Ext20TB/ContractsBackUp/contracts-lexnlp-17a366b025fe.tar.gz",
     FilLexnlpLock    = here::here("contracts-lexnlp", "requirements.lock.txt"),
-    DirOutputRoot    = here::here("2_output")
+    # THE PUBLICATION'S OWN FILES: the schema and the two usage guides.
+    FilSchema        = here::here("1_code", "_Publish", "PublicSchema.csv"),
+    FilModelsReadme  = here::here("1_code", "_Publish", "models-README.md"),
+    FilLexnlpReadme  = here::here("1_code", "_Publish", "lexnlp-README.md")
   ),
   Params = list(
-    Version      = "v1.0.0",                                                     # the package version
-    RepoUrl      = "https://github.com/MatthiasUckert/matcon-data-and-methods",  # code and documentation
-    Threads      = 16L,       # DuckDB worker threads
-    Memory       = "96GB",    # DuckDB memory limit; it spills to Temp beyond this
-    TextRowGroup = 1000L,     # documents per row group in text/; markup makes rows large
-    TextYears    = NULL,      # every year; a single year, e.g. "2012", tests the whole document in minutes
-    Rerun        = FALSE,     # TRUE rebuilds every output regardless of its stamp
-    Deploy       = TRUE,      # FALSE builds and checks the package without copying it to Drive
-    SkipDeploy   = character(0),  # top-level folders to leave out of this copy, e.g. "text"
-    SampleN      = 15L,       # sample documents per detailed category
-    SampleWrite  = TRUE       # FALSE stages the sample without writing it into the site repository
+    Version         = "v1.0.0",                                                       # the package version
+    SiteUrl         = "https://matthiasuckert.github.io/matcon-data-and-methods/",   # documentation
+    CodeUrl         = "https://github.com/MatthiasUckert/material-contracts",         # the pipeline
+    LexnlpCommit    = "e3f97216ef96d58d6001faf23bc2e5017eed5b7a",   # the commit the image was built from
+    LabelledContext = 256L,       # context length of the models that labelled the published data
+    Threads         = 16L,        # DuckDB worker threads
+    Memory          = "96GB",     # DuckDB memory limit; it spills to Temp beyond this
+    TextRowGroup    = 1000L,      # documents per row group in text/
+    TextYears       = NULL,       # every year; a single year, e.g. "2012", tests the document quickly
+    Rerun           = FALSE,      # TRUE rebuilds every output regardless of its stamp
+    Deploy          = TRUE,      # FALSE builds and checks the package without copying it to Drive
+    SampleN         = 15L,        # sample documents per detailed category
+    SampleExtras    = 3L,         # rejected attachments, and multi-registrant attachments, added to the sample
+    SampleWrite     = TRUE       # TRUE writes the new sample into the site repository; do that once the site is
+                                  # adapted to its layout (core/, spans/, text/ as in the package)
   )
 )
 
 .lP$Output <- list(
   DirPackage       = fs::path(.dir_main, "Stage", "matcon-data", .lP$Params$Version),
-  # THE SAMPLE travels with the site, so it is staged separately and mirrored into the site repository.
   DirSample        = fs::path(.dir_main, "Stage", "sample"),
+  DirSuperseded    = fs::path(.dir_main, "Superseded"),
   DirRepo          = fs::path_norm(fs::path(here::here(), "..", "matcon-data-and-methods")),
   DirStamps        = utils_file_path(.dir_main, "Stamps"),
   DirTemp          = utils_file_path(.dir_main, "Temp"),
@@ -143,20 +151,41 @@ fs::dir_create(.lP$Output$DirPackage)
 tibble::tibble(
   Input  = names(.lP$Input),
   Path   = unlist(.lP$Input),
-  Exists = fs::file_exists(unlist(.lP$Input))
+  Exists = file.exists(unlist(.lP$Input))
 ) |>
   tbl_say(.title = "Every input resolves before anything is read", .n = NULL)
 cli::cli_alert_info("Drive target: {.path {(.lP$Output$DirDrive)}}")
 ```
 
-Every input must exist. The LexNLP image is on the external drive, which has to be mounted for this document to run.
+Every input must exist. The LexNLP image is on the external drive, which has to be mounted.
 
-# Specifications
+# The public schema
 
-These three tables decide what the package holds, so they stand here rather than in a function.
+```{r}
+#| label: schema-read
 
-**Spans.** One file per span type. The hash in each row is the 04D policy the release was built with, the same one
-10 reads; a rehearsal directory beside it cannot be picked up by accident.
+schema <- pbd_schema_read(.path = .lP$Input$FilSchema)   # stops on a column without meaning, type or Stata name
+schema |>
+  dplyr::summarise(
+    Published = sum(.data$Action != "drop"),
+    Dropped   = sum(.data$Action == "drop"),
+    Added     = sum(.data$Action == "add"),
+    .by       = "Table"
+  ) |>
+  pbd_report(.title = "The public schema", .note = NULL, .n = NULL)
+```
+
+```{r}
+#| label: connect
+
+con <- pbd_connect(
+  .threads  = .lP$Params$Threads,    # worker threads
+  .memory   = .lP$Params$Memory,     # memory limit before spilling
+  .dir_temp = .lP$Output$DirTemp     # where it spills
+)
+```
+
+**Specifications.** The span files and the text types, as they are built. MONEY is not among the spans.
 
 ```{r}
 #| label: spec-spans
@@ -168,16 +197,11 @@ specs_spans <- tibble::tribble(
   "law_clauses",  "GPE",    "2374951841a7",
   "date_spans",   "DATE",   "79c379586f6a",
   "term_spans",   "DATE",   "79c379586f6a",
-  "money_spans",  "MONEY",  "58e9be52f1b9",
   "redact_spans", "REDACT", "7b84db9925eb"
 ) |>
   dplyr::mutate(DirHash = as.character(fs::path(.lP$Input$DirSpanStore, .data$Pass, .data$Hash))) |>
   dplyr::select("Stem", "Pass", "DirHash")
 ```
-
-**Texts.** One row per document type: where 01B keeps it, the file prefix in the package, and the release file whose
-key decides which documents are published. Current reports and their amendments share one key table, because the
-release lists both in `Summaries`.
 
 ```{r}
 #| label: spec-text
@@ -195,111 +219,159 @@ specs_text <- tibble::tribble(
   )
 ```
 
-**Replication.** One zip per stage, holding exactly what the exhibits (30), the numbers (40) and the appendix (42)
-read from it, in the layout they read it in. The master index is included and the per-filing link stores are not:
-the documents read the former, and the latter are rebuilt from it.
+Every source is now held against the schema. A column the schema does not list, or a listed column the source
+no longer has, stops the document here.
 
 ```{r}
-#| label: spec-replication
+#| label: schema-check
 
-specs_replication <- tibble::tribble(
-  ~Zip,                           ~Paths,
-  "01A-EdgarIndex.zip",           list(c("01A-EdgarIndex/GetEDGAR/MasterIndex",
-                                         "01A-EdgarIndex/Output/LandingPageAll.parquet")),
-  "03A-ClassifyPrepare.zip",      list("03A-ClassifyPrepare"),
-  "03B-ClassifyTrainBERT.zip",    list(c("03B-ClassifyTrainBERT/runs", "03B-ClassifyTrainBERT/classification")),
-  "03C-ClassifyTrainKeyword.zip", list("03C-ClassifyTrainKeyword"),
-  "03D-ClassifyLLM.zip",          list("03D-ClassifyLLM"),
-  "03F-ClassifyApply.zip",        list("03F-ClassifyApply/release"),
-  "04A-EntityExtract.zip",        list("04A-EntityExtract/Output"),
-  "04B-Rules.zip",                list(c("04B1-Rules-ORG", "04B2-Rules-GPE", "04B3-Rules-DATE", "04B4-Rules-MONEY",
-                                         "04B5-Rules-REDACT")),
-  "40-Numbers.zip",               list("40-Numbers")
+keywords <- pbd_keywords_from(
+  .con        = con,                              # DuckDB
+  .dir_tables = .lP$Input$DirKeywordTables        # 03C's tables and the catalogue that marks the ones in use
 )
-```
-
-# Connection
-
-```{r}
-#| label: connect
-
-con <- pbd_connect(
-  .threads  = .lP$Params$Threads,    # worker threads
-  .memory   = .lP$Params$Memory,     # memory limit before spilling
-  .dir_temp = .lP$Output$DirTemp     # where it spills
+rel_src <- function(.f) sprintf("read_parquet(%s)", pbd_lit(fs::path(.lP$Input$DirRelease, .f)))
+sources_schema <- dplyr::bind_rows(
+  tibble::tibble(
+    Table = c("Contracts", "Summaries", "Places", "TermDocs", "CtoOrders"),
+    From  = rel_src(paste0(c("Contracts", "Summaries", "Places", "TermDocs", "CtoOrders"), ".parquet"))
+  ),
+  tibble::tibble(Table = "Labels", From = sprintf("read_parquet(%s)", pbd_lit(.lP$Input$FilPrepared))),
+  tibble::tibble(Table = "KeywordTerms", From = sprintf("read_parquet(%s)", pbd_lit(keywords$Files[1]))),
+  tibble::tibble(
+    Table = specs_spans$Stem,
+    From  = sprintf("read_parquet(%s, union_by_name = true)",
+                    pbd_lit(fs::path(specs_spans$DirHash, "chunk-*", paste0(specs_spans$Stem, ".parquet"))))
+  )
+)
+tab_schema <- pbd_schema_check(
+  .con     = con,              # DuckDB
+  .schema  = schema,           # the decisions
+  .sources = sources_schema    # every source whose columns must all be decided
+)
+pbd_report(
+  .tab   = dplyr::select(tab_schema, -"Unlisted", -"Missing"),
+  .title = "Sources against the schema",
+  .note  = NULL,
+  .n     = NULL
 )
 ```
 
 # Core
 
-The release files and their codebooks are copied as 10 wrote them, with one exception. Every `UrlIndexPage` in the
-release carries a single slash after the scheme, so the link resolves nowhere; the contract file is therefore written
-through DuckDB with both link columns repaired, and the repair is counted and checked below. The Stata files are not
-published.
+The broad category the paper uses rolls up the detailed one. The labelled sample holds the map, since the annotators
+gave every contract both.
 
 ```{r}
-#| label: core-release
+#| label: core-rollup
 
-stems_copy <- c("Summaries", "Places", "TermDocs", "CtoOrders")
-stems_book <- c("Contracts", stems_copy)
-tab_core <- pbd_copy(
-  .paths   = fs::path(.lP$Input$DirRelease, c(paste0(stems_copy, ".parquet"), paste0(stems_book, "_Codebook.csv"))),
-  .dir_out = fs::path(.lP$Output$DirPackage, "core")   # destination
+rollup_map <- pbd_rollup_map(
+  .con         = con,                          # DuckDB
+  .path_labels = .lP$Input$FilPrepared         # the labelled sample
 )
-tab_contracts <- pbd_contracts(
-  .con        = con,                                                      # DuckDB
-  .path_src   = fs::path(.lP$Input$DirRelease, "Contracts.parquet"),      # the release
-  .path_out   = fs::path(.lP$Output$DirPackage, "core", "Contracts.parquet"),
-  .path_stamp = pbd_stamp_path(.lP$Output$DirStamps, "core/Contracts.parquet")
-)
-pbd_report(.tab = tab_core, .title = "Release files", .note = NULL, .n = NULL)
-pbd_report(
-  .tab   = tab_contracts,
-  .title = "Contract file",
-  .note  = "FixedIndexPage and FixedDocument count the rows whose link needed the scheme repaired; LeftBroken must be 0.",
-  .n     = NULL
-)
+pbd_report(.tab = rollup_map, .title = "Detailed to broad", .note = NULL, .n = NULL)
 ```
 
-The contract index is the release reduced to what a reader needs to find a contract: filer, filing, accession
-number, document, type, the redaction counts, and the links to EDGAR. It is a compressed csv, so it opens in a
-spreadsheet.
+Each table is written through the schema: the published columns in the published order, the computed ones through
+an expression. For the contract file that means the two repaired links and `ClassRollup`; the other release tables
+pass through as built.
 
 ```{r}
-#| label: core-index
+#| label: core-tables
 
-tab_index <- pbd_contract_index(
-  .con            = con,                                                  # DuckDB
-  .path_contracts = fs::path(.lP$Output$DirPackage, "core", "Contracts.parquet"),  # the published file
-  .path_out       = fs::path(.lP$Output$DirPackage, "core", "ContractIndex.csv.gz"),
-  .path_stamp     = pbd_stamp_path(.lP$Output$DirStamps, "core/ContractIndex.csv.gz")  # rebuilt when the release moves
+dir_core <- fs::path(.lP$Output$DirPackage, "core")
+stamp_core <- function(.f) pbd_stamp_path(.lP$Output$DirStamps, paste0("core/", .f))
+exprs_contracts <- c(
+  UrlDocument  = "regexp_replace(\"UrlDocument\", '^https:/+', 'https://')",    # one slash after the scheme, repaired
+  UrlIndexPage = "regexp_replace(\"UrlIndexPage\", '^https:/+', 'https://')",
+  ClassRollup  = pbd_rollup_sql(.map = rollup_map, .col = "Class")              # the paper's broad category
 )
-pbd_report(.tab = tab_index, .title = "Contract index", .note = "NoAccession must be 0.", .n = NULL)
+tab_core <- dplyr::bind_rows(
+  pbd_table(
+    .con        = con,
+    .schema     = schema,
+    .table      = "Contracts",
+    .from       = rel_src("Contracts.parquet"),
+    .sources    = fs::path(.lP$Input$DirRelease, "Contracts.parquet"),
+    .path_out   = fs::path(dir_core, "Contracts.parquet"),
+    .path_stamp = stamp_core("Contracts.parquet"),
+    .exprs      = exprs_contracts,
+    .rerun      = .lP$Params$Rerun
+  ),
+  purrr::map(c("Summaries", "Places", "TermDocs", "CtoOrders"), \(.t) pbd_table(
+    .con        = con,
+    .schema     = schema,
+    .table      = .t,
+    .from       = rel_src(paste0(.t, ".parquet")),
+    .sources    = fs::path(.lP$Input$DirRelease, paste0(.t, ".parquet")),
+    .path_out   = fs::path(dir_core, paste0(.t, ".parquet")),
+    .path_stamp = stamp_core(paste0(.t, ".parquet")),
+    .rerun      = .lP$Params$Rerun
+  )) |>
+    purrr::list_rbind(),
+  pbd_table(
+    .con        = con,
+    .schema     = schema,
+    .table      = "Labels",
+    .from       = sprintf("read_parquet(%s)", pbd_lit(.lP$Input$FilPrepared)),
+    .sources    = .lP$Input$FilPrepared,
+    .path_out   = fs::path(dir_core, "Labels.parquet"),
+    .path_stamp = stamp_core("Labels.parquet"),
+    .rerun      = .lP$Params$Rerun
+  ),
+  pbd_table(
+    .con        = con,
+    .schema     = schema,
+    .table      = "KeywordTerms",
+    .from       = keywords$From,
+    .sources    = keywords$Files,
+    .path_out   = fs::path(dir_core, "KeywordTerms.parquet"),
+    .path_stamp = stamp_core("KeywordTerms.parquet"),
+    .rerun      = .lP$Params$Rerun
+  )
+)
+tab_core <- dplyr::bind_rows(
+  tab_core,
+  pbd_table(
+    .con        = con,
+    .schema     = schema,
+    .table      = "ContractIndex",
+    .from       = sprintf("read_parquet(%s)", pbd_lit(fs::path(dir_core, "Contracts.parquet"))),
+    .sources    = fs::path(dir_core, "Contracts.parquet"),
+    .path_out   = fs::path(dir_core, "ContractIndex.csv.gz"),
+    .path_stamp = stamp_core("ContractIndex.csv.gz"),
+    .exprs      = c(   # the accession number, read off the index page's address
+      AccessionNumber = "NULLIF(regexp_extract(\"UrlIndexPage\", '([0-9]{10}-[0-9]{2}-[0-9]{6})', 1), '')"
+    ),
+    .format     = "csv",
+    .rerun      = .lP$Params$Rerun
+  )
+)
+pbd_report(.tab = tab_core, .title = "Core tables", .note = "RowsOut must equal RowsIn in every row.", .n = NULL)
+keywords$Windows |>
+  dplyr::mutate(File = fs::path_file(.data$File)) |>
+  pbd_report(.title = "Keyword terms: the window in use per task", .note = NULL, .n = NULL)
 ```
-
-The labelled sample is published twice: as the file every classifier was trained and scored on, with its folds, and
-as the labels as they were collected, which 03A reads.
 
 ```{r}
-#| label: core-labels
+#| label: core-contracts-check
 
-tab_labels <- pbd_labels(
-  .con           = con,                                                             # DuckDB
-  .path_prepared = .lP$Input$FilPrepared,                                           # 03A's file
-  .path_out      = fs::path(.lP$Output$DirPackage, "core", "ClassificationLabels.parquet"),
-  .path_stamp    = pbd_stamp_path(.lP$Output$DirStamps, "core/ClassificationLabels.parquet")  # rebuilt when 03A moves
+tab_contracts_check <- pbd_query(
+  .con = con,
+  .sql = sprintf(
+    paste(
+      "SELECT count(*) FILTER (WHERE UrlIndexPage NOT LIKE 'https://%%'",
+      "OR UrlDocument NOT LIKE 'https://%%') AS LinksBroken,",
+      "count(*) FILTER (WHERE Class IS NOT NULL AND ClassRollup IS NULL) AS RollupMissing,",
+      "count(*) FILTER (WHERE HierConsistent <> (ClassRollup = ClassBroad)) AS HierDisagrees",
+      "FROM read_parquet(%s)"
+    ),
+    pbd_lit(fs::path(dir_core, "Contracts.parquet"))
+  )
 )
-tab_labels_raw <- pbd_copy(
-  .paths   = .lP$Input$FilLabelsRaw,                                                # the collected labels
-  .dir_out = fs::path(.lP$Output$DirPackage, "core")
-)
-tab_keywords <- pbd_copy_dir(
-  .dir_in  = .lP$Input$DirKeywordTables,                                            # 03C's published tables
-  .dir_out = fs::path(.lP$Output$DirPackage, "core", "keyword_tables")
-)
-pbd_report(.tab = tab_labels, .title = "Labelled sample", .note = NULL, .n = NULL)
-pbd_report(.tab = tab_keywords, .title = "Keyword tables", .note = NULL, .n = NULL)
+pbd_report(.tab = tab_contracts_check, .title = "Contract file", .note = "All three must be 0.", .n = NULL)
 ```
+
+`HierDisagrees` checks that `ClassRollup` is the roll-up the classifier's consistency flag was computed against.
 
 # Spans
 
@@ -308,16 +380,12 @@ pbd_report(.tab = tab_keywords, .title = "Keyword tables", .note = NULL, .n = NU
 
 tab_spans <- pbd_spans(
   .con        = con,                                       # DuckDB
+  .schema     = schema,                                    # the columns each file publishes
   .specs      = specs_spans,                               # what to merge
   .dir_out    = fs::path(.lP$Output$DirPackage, "spans"),  # destination
   .dir_stamps = .lP$Output$DirStamps,                      # stamps
   .rel_out    = "spans",                                   # destination, relative to the package
   .rerun      = .lP$Params$Rerun                           # FALSE skips files whose inputs are unchanged
-)
-tab_spans_codebook <- pbd_codebook(
-  .con      = con,
-  .dir      = fs::path(.lP$Output$DirPackage, "spans"),
-  .path_out = fs::path(.lP$Output$DirPackage, "spans", "Spans_Codebook.csv")
 )
 pbd_report(
   .tab   = tab_spans,
@@ -327,12 +395,9 @@ pbd_report(
 )
 ```
 
-The span codebook lists every column with its type, read from the files. Its meaning column is completed in the
-documentation of the published repository.
-
 # Text
 
-The key tables first: which documents the release refers to.
+The text step is exactly the one of the first build, so its stamps still hold.
 
 ```{r}
 #| label: text-keys
@@ -371,22 +436,46 @@ tab_coverage <- pbd_text_coverage(
 pbd_report_text(.text = tab_text, .coverage = tab_coverage)
 ```
 
+# Codebooks
+
+```{r}
+#| label: codebooks
+
+tab_codebooks <- pbd_codebooks(
+  .schema      = schema,                                  # the one source of every meaning
+  .dir_package = .lP$Output$DirPackage,                   # the package
+  .core        = c("Contracts", "Summaries", "Places", "TermDocs", "CtoOrders", "Labels", "KeywordTerms",
+                   "ContractIndex"),
+  .spans       = specs_spans$Stem
+)
+pbd_report(.tab = tab_codebooks, .title = "Codebooks", .note = NULL, .n = NULL)
+```
+
 # Models
+
+Each model folder is copied, its run configuration and log have the machine's paths rewritten, and the copy is
+zipped; the selection record gets the same rewrite. The index says which archive labelled the published data and
+which one cross-validation selected.
 
 ```{r}
 #| label: models-build
 
 tab_models <- pbd_models(
-  .dir_models = .lP$Input$DirModels,                          # 03B's refits
-  .dir_out    = fs::path(.lP$Output$DirPackage, "models"),    # destination
-  .dir_stamps = .lP$Output$DirStamps,                         # stamps
-  .rel_out    = "models",                                     # destination, relative to the package
-  .rerun      = .lP$Params$Rerun                              # FALSE skips unchanged models
+  .con          = con,                                        # DuckDB
+  .dir_models   = .lP$Input$DirModels,                        # 03B's refits
+  .dir_out      = fs::path(.lP$Output$DirPackage, "models"),  # destination
+  .dir_stamps   = .lP$Output$DirStamps,                       # stamps
+  .rel_out      = "models",                                   # destination, relative to the package
+  .root         = here::here(),                               # the prefix rewritten out of every path
+  .labelled_ctx = .lP$Params$LabelledContext,                 # the models behind the published labels
+  .path_readme  = .lP$Input$FilModelsReadme,                  # the usage guide
+  .rerun        = .lP$Params$Rerun
 )
 pbd_report(
-  .tab   = dplyr::select(tab_models, "Zip", "Task", "Context", "Bytes", "Status"),
+  .tab   = dplyr::select(tab_models, "Zip", "Context", "LabelledPublished", "Selected", "MacroF1", "LocalPaths",
+                         "Bytes", "Status"),
   .title = "Models",
-  .note  = "models_index.csv maps each zip to the configuration it was trained with; deployed.parquet says which ship.",
+  .note  = "LocalPaths must be 0 in every row.",
   .n     = NULL
 )
 ```
@@ -397,141 +486,116 @@ pbd_report(
 #| label: lexnlp-copy
 
 tab_lexnlp <- pbd_lexnlp(
-  .path_image = .lP$Input$FilLexnlpImage,                    # the archived image
-  .path_lock  = .lP$Input$FilLexnlpLock,                     # its lockfile
-  .dir_out    = fs::path(.lP$Output$DirPackage, "lexnlp")    # destination
+  .path_image  = .lP$Input$FilLexnlpImage,                    # the archived image
+  .path_lock   = .lP$Input$FilLexnlpLock,                     # its lockfile
+  .path_readme = .lP$Input$FilLexnlpReadme,                   # the usage guide
+  .commit      = .lP$Params$LexnlpCommit,                     # the commit the image was built from
+  .dir_out     = fs::path(.lP$Output$DirPackage, "lexnlp")    # destination
 )
 pbd_report(.tab = tab_lexnlp, .title = "LexNLP image", .note = NULL, .n = NULL)
 ```
 
-# Replication
+# The package, exactly
+
+The package is these files and no others. Anything else in the stage -- a part that is no longer published, a file
+an earlier build wrote under another name -- is moved aside into `Superseded/`, dated, before the manifest is
+written.
 
 ```{r}
-#| label: replication-build
+#| label: package-define
 
-tab_replication <- pbd_replication(
-  .specs           = specs_replication,                            # what each zip holds
-  .dir_output_root = .lP$Input$DirOutputRoot,                      # 2_output
-  .dir_out         = fs::path(.lP$Output$DirPackage, "replication"),
-  .dir_stamps      = .lP$Output$DirStamps,                         # stamps
-  .rel_out         = "replication",                                # destination, relative to the package
-  .rerun           = .lP$Params$Rerun                              # FALSE skips unchanged zips
+files_text <- tab_text |>
+  dplyr::filter(.data$RowsOut > 0) |>
+  dplyr::left_join(dplyr::select(specs_text, "Type", "Slug"), by = dplyr::join_by("Type")) |>
+  dplyr::transmute(Path = as.character(fs::path("text", .data$Slug, paste0(.data$Slug, "_", .data$Year, ".parquet"))))
+expected <- c(
+  "README.md", "MANIFEST.sha256",
+  as.character(fs::path("core", c(
+    paste0(c("Contracts", "Summaries", "Places", "TermDocs", "CtoOrders", "Labels", "KeywordTerms"), ".parquet"),
+    "ContractIndex.csv.gz"
+  ))),
+  tab_codebooks$File,
+  as.character(fs::path("spans", c(paste0(specs_spans$Stem, ".parquet"), "Spans_Codebook.csv"))),
+  files_text$Path, "text/Text_Codebook.csv",
+  as.character(fs::path("models", c(tab_models$Zip, "models_index.csv", "deployed.parquet", "README.md"))),
+  as.character(fs::path("lexnlp", c(fs::path_file(.lP$Input$FilLexnlpImage), "requirements.lock.txt", "NOTICE.md",
+                                    "README.md")))
+)
+tab_aside <- pbd_supersede(
+  .dir_package = .lP$Output$DirPackage,     # the stage
+  .expected    = expected,                  # the package
+  .dir_aside   = .lP$Output$DirSuperseded   # where anything else goes
 )
 pbd_report(
-  .tab   = tab_replication,
-  .title = "Replication zips",
-  .note  = "Each zip unpacks into 2_output/ in the layout the pipeline reads.",
-  .n     = NULL
-)
-```
-
-# The sample for the site
-
-The site of the published repository shows what the data look like and how the methods are used, and its examples
-have to run when the pages are rendered. They run on a sample that lives in the repository itself: a slice of the
-published files, cut to a few hundred labelled contracts, with the same file names, columns and types as the full
-data. A script written against the sample therefore runs against the whole database by changing one path.
-
-The documents come from the labelled contracts, so every example can be scored against a label a human gave, and
-within each category the ones richest in entities come first, so an organisation, a place, a date, an amount and a
-redaction can all be shown. Only the markup column is left out, to keep the repository small.
-
-```{r}
-#| label: sample-pick
-
-tab_pick <- pbd_sample_pick(
-  .con          = con,                       # DuckDB
-  .dir_package  = .lP$Output$DirPackage,     # cut from what is published
-  .n_per_class  = .lP$Params$SampleN         # documents per detailed category
-)
-tab_pick |>
-  dplyr::summarise(Documents = dplyr::n(), SpanTypes = round(mean(.data$SpanTypes), 1), .by = "ClassDetailed") |>
-  dplyr::arrange(.data$ClassDetailed) |>
-  pbd_report(.title = "The sample, by category", .note = NULL, .n = NULL)
-```
-
-```{r}
-#| label: sample-specs
-
-specs_sample <- tibble::tribble(
-  ~File,                         ~Source,                                  ~Key,
-  "contracts.parquet",           "core/Contracts.parquet",                 "DocID",
-  "summaries.parquet",           "core/Summaries.parquet",                 "HashIndex",
-  "places.parquet",              "core/Places.parquet",                    "DocID",
-  "termdocs.parquet",            "core/TermDocs.parquet",                  "DocID",
-  "cto_orders.parquet",          "core/CtoOrders.parquet",                 "DocID",
-  "labels.parquet",              "core/ClassificationLabels.parquet",      "DocID",
-  "text.parquet",                "text/exhibit10/*.parquet",               "DocID",
-  "spans/org_mentions.parquet",  "spans/org_mentions.parquet",             "DocID",
-  "spans/places_geo.parquet",    "spans/places_geo.parquet",               "DocID",
-  "spans/law_clauses.parquet",   "spans/law_clauses.parquet",              "DocID",
-  "spans/date_spans.parquet",    "spans/date_spans.parquet",               "DocID",
-  "spans/term_spans.parquet",    "spans/term_spans.parquet",               "DocID",
-  "spans/money_spans.parquet",   "spans/money_spans.parquet",              "DocID",
-  "spans/redact_spans.parquet",  "spans/redact_spans.parquet",             "DocID",
-  "codebooks/Contracts_Codebook.csv", "core/Contracts_Codebook.csv",       "",
-  "codebooks/Summaries_Codebook.csv", "core/Summaries_Codebook.csv",       "",
-  "codebooks/Places_Codebook.csv",    "core/Places_Codebook.csv",          "",
-  "codebooks/TermDocs_Codebook.csv",  "core/TermDocs_Codebook.csv",        "",
-  "codebooks/CtoOrders_Codebook.csv", "core/CtoOrders_Codebook.csv",       "",
-  "codebooks/Spans_Codebook.csv",     "spans/Spans_Codebook.csv",          ""
-)
-
-tab_sample <- pbd_sample_write(
-  .con         = con,                      # DuckDB
-  .specs       = specs_sample,             # which file is cut on which key
-  .ids         = tab_pick,                 # the documents
-  .dir_package = .lP$Output$DirPackage,    # the published files
-  .dir_out     = .lP$Output$DirSample      # the staged sample
-)
-pbd_report(
-  .tab   = tab_sample,
-  .title = "The sample, file by file",
-  .note  = "Same names, columns and types as the package; only the markup column is left out.",
-  .n     = NULL
+  .tab   = tab_aside,
+  .title = "Moved aside",
+  .note  = "Files an earlier build left that the package no longer holds.",
+  .n     = 40L
 )
 ```
 
 # Validation
 
-Every output against its source. A row with `Ok = FALSE` names the step to look at.
+Every output against its source, every file against the schema, and the whole package against machine paths.
 
 ```{r}
 #| label: validate-package
 
-n_contracts <- pbd_query(
-  .con = con,
-  .sql = sprintf("SELECT count(*) AS n FROM read_parquet(%s)", pbd_lit(fs::path(.lP$Input$DirRelease, "Contracts.parquet")))
-)$n
-n_prepared <- pbd_query(
-  .con = con,
-  .sql = sprintf("SELECT count(*) AS n FROM read_parquet(%s)", pbd_lit(.lP$Input$FilPrepared))
-)$n
-
-tab_valid <- pbd_validate(
-  .core        = tab_core,          # release copies
-  .contracts   = tab_contracts,     # the repaired contract file
-  .index       = tab_index,         # contract index
-  .labels      = tab_labels,        # labelled sample
-  .spans       = tab_spans,         # span files
-  .text        = tab_text,          # text files
-  .coverage    = tab_coverage,      # release documents with text
-  .models      = tab_models,        # model zips
-  .replication = tab_replication,   # replication zips
-  .n_prepared  = n_prepared,        # rows the labels must have
-  .n_contracts = n_contracts,       # rows the index must have
-  .n_models    = 6L                 # refits in 03B
+targets_conform <- dplyr::bind_rows(
+  tibble::tibble(
+    Table  = c("Contracts", "Summaries", "Places", "TermDocs", "CtoOrders", "Labels", "KeywordTerms"),
+    Path   = as.character(fs::path(dir_core, paste0(c("Contracts", "Summaries", "Places", "TermDocs", "CtoOrders",
+                                                      "Labels", "KeywordTerms"), ".parquet"))),
+    Format = "parquet"
+  ),
+  tibble::tibble(
+    Table  = "ContractIndex",
+    Path   = as.character(fs::path(dir_core, "ContractIndex.csv.gz")),
+    Format = "csv"
+  ),
+  tibble::tibble(
+    Table  = specs_spans$Stem,
+    Path   = as.character(fs::path(.lP$Output$DirPackage, "spans", paste0(specs_spans$Stem, ".parquet"))),
+    Format = "parquet"
+  ),
+  tibble::tibble(
+    Table  = "Text",
+    Path   = as.character(fs::path(.lP$Output$DirPackage, "text", unique(fs::path_file(fs::path_dir(files_text$Path))),
+                                   "*.parquet")),
+    Format = "parquet"
+  )
 )
+tab_conform <- pbd_conform(.con = con, .schema = schema, .targets = targets_conform)
+tab_paths <- pbd_scan_paths(.con = con, .dir_package = .lP$Output$DirPackage)
+left_over <- setdiff(list.files(.lP$Output$DirPackage, recursive = TRUE, all.files = TRUE), expected)
+row_of <- function(.t) tab_core[tab_core$Table == .t, ]
+
+tab_valid <- pbd_validate(.checks = list(
+  pbd_check("schema: source columns not decided", 0, sum(nchar(tab_schema$Unlisted) > 0)),
+  pbd_check("schema: published files that do not conform", 0, sum(!tab_conform$Ok)),
+  pbd_check("contracts: one row per release row", row_of("Contracts")$RowsIn, row_of("Contracts")$RowsOut),
+  pbd_check("contracts: links left broken", 0, tab_contracts_check$LinksBroken),
+  pbd_check("contracts: ClassRollup missing where Class is set", 0, tab_contracts_check$RollupMissing),
+  pbd_check("contracts: HierConsistent disagrees with ClassRollup", 0, tab_contracts_check$HierDisagrees),
+  pbd_check("core: tables with rows lost or added", 0, sum(tab_core$RowsIn != tab_core$RowsOut)),
+  pbd_check("index: one row per contract row", row_of("Contracts")$RowsOut, row_of("ContractIndex")$RowsOut),
+  pbd_check("spans: rows out equal rows in", sum(tab_spans$RowsIn), sum(tab_spans$RowsOut)),
+  pbd_check("text: every year built or current", 0,
+            sum(!tab_text$Status %in% c("built", "current", "no release documents"))),
+  pbd_check("text: release documents without text", 0, sum(tab_coverage$WithoutText)),
+  pbd_check("text: every document published once", 0, sum(tab_coverage$Duplicates)),
+  pbd_check("models: one archive per model", 6L, nrow(tab_models)),
+  pbd_check("package: files with machine paths", 0, sum(tab_paths$Hits > 0)),
+  pbd_check("package: files outside the definition", 0, length(left_over))
+))
 pbd_report(.tab = tab_valid, .title = "Validation", .note = "Every row must read Ok = TRUE.", .n = NULL)
+pbd_report(.tab = tab_conform[!tab_conform$Ok, ], .title = "Files that do not conform", .note = NULL, .n = NULL)
+pbd_report(.tab = tab_paths[tab_paths$Hits > 0, ], .title = "Files with machine paths", .note = NULL, .n = NULL)
 ```
 
 # Deployment
 
-The README is written first, so the manifest covers it; the manifest last, so it covers everything. Then the package
-is copied to Drive, file by file, only where the copy there differs. Nothing on Drive is deleted.
-
-The text folder is the bulk of the package. Check the free space of the Drive account before the first copy; to copy
-everything else first, set `SkipDeploy = "text"`.
+The README is written first so the manifest covers it, the manifest last so it covers everything.
 
 ```{r}
 #| label: deploy-readme-manifest
@@ -539,7 +603,8 @@ everything else first, set `SkipDeploy = "text"`.
 pbd_readme(
   .dir_package = .lP$Output$DirPackage,  # the package
   .version     = .lP$Params$Version,     # its version
-  .repo_url    = .lP$Params$RepoUrl      # where the documentation is
+  .site_url    = .lP$Params$SiteUrl,     # the documentation
+  .code_url    = .lP$Params$CodeUrl      # the pipeline
 )
 tab_manifest <- pbd_manifest(
   .dir_package = .lP$Output$DirPackage,        # the package
@@ -548,14 +613,54 @@ tab_manifest <- pbd_manifest(
 tab_manifest |>
   dplyr::mutate(Folder = ifelse(grepl("/", .data$Path), sub("/.*$", "", .data$Path), ".")) |>
   dplyr::summarise(Files = dplyr::n(), Bytes = sum(.data$Bytes), .by = "Folder") |>
+  dplyr::mutate(Size = pbd_size(.data$Bytes)) |>
   pbd_report(.title = "The package", .note = NULL, .n = NULL)
 ```
 
-The figures the site quotes come from the same source as the package, so a page cannot fall out of step with the
-data it describes.
+**The sample for the site** keeps the package's layout, names and columns, cut to the labelled contracts richest in
+entities, plus a few rejected attachments and multi-registrant contracts so that `Removed` and `PrimaryFiler` can be
+shown at work. Only the markup column of the text is left out.
 
 ```{r}
-#| label: deploy-site-numbers
+#| label: deploy-sample
+
+sample_ids <- dplyr::bind_rows(
+  pbd_sample_pick(.con = con, .dir_package = .lP$Output$DirPackage, .n_per_class = .lP$Params$SampleN) |>
+    dplyr::transmute(.data$DocID, Why = "labelled"),
+  pbd_sample_extras(.con = con, .dir_package = .lP$Output$DirPackage, .n = .lP$Params$SampleExtras)
+)
+specs_sample <- tibble::tribble(
+  ~File,                                  ~Source,                                  ~Key,
+  "core/Contracts.parquet",               "core/Contracts.parquet",                 "DocID",
+  "core/Summaries.parquet",               "core/Summaries.parquet",                 "HashIndex",
+  "core/Places.parquet",                  "core/Places.parquet",                    "DocID",
+  "core/TermDocs.parquet",                "core/TermDocs.parquet",                  "DocID",
+  "core/CtoOrders.parquet",               "core/CtoOrders.parquet",                 "DocID",
+  "core/Labels.parquet",                  "core/Labels.parquet",                    "DocID",
+  "core/KeywordTerms.parquet",            "core/KeywordTerms.parquet",              "ALL",
+  "text/exhibit10/exhibit10_sample.parquet", "text/exhibit10/*.parquet",           "DocID"
+) |>
+  dplyr::bind_rows(
+    tibble::tibble(
+      File   = paste0("spans/", specs_spans$Stem, ".parquet"),   # every span file, cut to the documents
+      Source = paste0("spans/", specs_spans$Stem, ".parquet"),
+      Key    = "DocID"
+    ),
+    tibble::tibble(File = tab_codebooks$File, Source = tab_codebooks$File, Key = "")   # the codebooks, copied
+  )
+tab_sample <- pbd_sample_write(
+  .con         = con,                         # DuckDB
+  .specs       = specs_sample,                # which file is cut on which key
+  .ids         = sample_ids$DocID,            # the documents
+  .dir_package = .lP$Output$DirPackage,       # the published files
+  .dir_out     = .lP$Output$DirSample         # the staged sample, emptied first
+)
+pbd_report(.tab = dplyr::count(sample_ids, .data$Why, name = "Documents"), .title = "The sample", .note = NULL, .n = NULL)
+pbd_report(.tab = tab_sample, .title = "The sample, file by file", .note = NULL, .n = NULL)
+```
+
+```{r}
+#| label: deploy-site
 
 tab_numbers <- pbd_site_numbers(
   .con         = con,                                                  # DuckDB
@@ -563,17 +668,10 @@ tab_numbers <- pbd_site_numbers(
   .manifest    = tab_manifest,                                         # sizes and counts
   .spans       = tab_spans,
   .text        = tab_text,
-  .coverage    = tab_coverage,
   .models      = tab_models,
   .version     = .lP$Params$Version,
   .path_out    = fs::path(.lP$Output$DirSample, "package_numbers.csv")  # read by the site
 )
-pbd_report(.tab = tab_numbers, .title = "Figures for the site", .note = NULL, .n = 12L)
-```
-
-```{r}
-#| label: deploy-sample
-
 tab_sample_repo <- pbd_mirror_repo(
   .dir_from = .lP$Output$DirSample,                       # the staged sample
   .dir_to   = fs::path(.lP$Output$DirRepo, "sample"),     # the only folder this writes in the site repository
@@ -583,10 +681,13 @@ tab_sample_repo |>
   dplyr::count(.data$Action, name = "Files") |>
   pbd_report(
     .title = "The sample in the site repository",
-    .note  = "Commit and push happen there, in the Git pane; this document only writes the folder.",
+    .note  = "Commit and push happen there; this document only writes the folder sample/.",
     .n     = NULL
   )
 ```
+
+The package goes to Drive only when Drive holds nothing the package does not; files left there by an earlier build
+are listed, and the copy waits until they are deleted by hand. Nothing on Drive is ever deleted by this document.
 
 ```{r}
 #| label: deploy-drive
@@ -598,16 +699,18 @@ tab_deploy <- pbd_deploy(
   .dir_package = .lP$Output$DirPackage,   # the package
   .dir_target  = .lP$Output$DirDrive,     # the version folder on Drive
   .manifest    = tab_manifest,            # what the package holds
-  .apply       = .lP$Params$Deploy,       # FALSE only reports
-  .skip        = .lP$Params$SkipDeploy    # folders left for a later copy
+  .apply       = .lP$Params$Deploy        # FALSE only reports
 )
 tab_deploy |>
   dplyr::summarise(Files = dplyr::n(), Bytes = sum(.data$Bytes, na.rm = TRUE), .by = "Action") |>
+  dplyr::mutate(Size = pbd_size(.data$Bytes)) |>
   pbd_report(
     .title = if (.lP$Params$Deploy) "Copied to Drive" else "Would be copied to Drive",
-    .note  = "Drive for desktop uploads in the background; the files are online once its menu shows no pending uploads.",
+    .note  = "\"only on Drive\" files must be deleted by hand before Deploy = TRUE can copy.",
     .n     = NULL
   )
+pbd_report(.tab = tab_deploy[tab_deploy$Action == "only on Drive", "Path"], .title = "Only on Drive: delete these",
+           .note = NULL, .n = 60L)
 ```
 
 ```{r}
@@ -616,24 +719,18 @@ tab_deploy |>
 DBI::dbDisconnect(conn = con, shutdown = TRUE)
 ```
 
-Once the upload is complete, the folder `matcon-data` in Drive is shared as "Anyone with the link can view", and
-that link goes into `DATA.md` of the published repository.
-
 # Overview
 
 ```{r}
 #| label: overview-summary
 
 tibble::tibble(
-  Part    = c("core", "spans", "text", "models", "lexnlp", "replication"),
-  Built   = c(sum(tab_core$Status == "copied") + sum(tab_contracts$Status == "built"),
-              sum(tab_spans$Status == "built"), sum(tab_text$Status == "built"),
-              sum(tab_models$Status == "built"), sum(tab_lexnlp$Status == "copied"),
-              sum(tab_replication$Status == "built")),
-  Current = c(sum(tab_core$Status == "current") + sum(tab_contracts$Status == "current"),
-              sum(tab_spans$Status == "current"),
+  Part    = c("core", "spans", "text", "models", "lexnlp"),
+  Built   = c(sum(tab_core$Status == "built"), sum(tab_spans$Status == "built"), sum(tab_text$Status == "built"),
+              sum(tab_models$Status == "built"), sum(tab_lexnlp$Status %in% c("copied", "written"))),
+  Current = c(sum(tab_core$Status == "current"), sum(tab_spans$Status == "current"),
               sum(tab_text$Status == "current"), sum(tab_models$Status == "current"),
-              sum(tab_lexnlp$Status == "current"), sum(tab_replication$Status == "current"))
+              sum(tab_lexnlp$Status == "current"))
 ) |>
   tbl_say(.title = "What this render built, and what was already current", .n = NULL)
 tbl_say(.tab = tab_valid, .title = "Validation", .n = NULL)
@@ -641,5 +738,6 @@ tbl_say(.tab = tab_valid, .title = "Validation", .n = NULL)
 
 # Next
 
-The published repository documents the package: `DATA.md` gets the Drive link and the file list, and the codebooks
-get their meanings. Once the paper is accepted, the same folder is archived with a DOI.
+Once Drive holds the package, the version folder and each of the five parts are shared as "Anyone with the link can
+view", and the links go into the site repository: `data/parts.csv` for the parts, `_variables.yml` for the folder.
+The site is then rendered against the new sample.
