@@ -33,11 +33,9 @@ options(
 ```{r}
 #| label: load-libraries
 
-# THE COMMONS, AND THIS PAIR'S OWN. _Plots.R gives the figures built here the house theme; _OnlineAppendix.R holds the
-# number machinery every chapter shares -- one row of
-# the registry resolved over the tibble beside the exhibit that prints it -- and this document is now the one place
-# that machinery runs. No chapter's library is sourced: this document reads the files 30 and the chapters wrote and
-# calls none of their functions.
+# THE COMMONS, AND THIS PAIR'S OWN. _OnlineAppendix.R holds the number machinery -- one row of the registry
+# resolved over the tibble beside the exhibit that prints it -- and this document is the one place that machinery
+# runs. 30's library is not sourced: this document reads the tibbles 30 wrote and calls none of its functions.
 .path_libs <- purrr::map_chr(
   c("_Initialize", "_Utils", "_Tables", "_Plots", "_OnlineAppendix"),
   \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
@@ -69,9 +67,8 @@ source(file = .path_fun, encoding = "UTF-8")
 Every number the manuscript and the online appendix cite is resolved here, once, and written as one LaTeX file the
 Overleaf project inputs. A number is a row of the registry below: the tibble it is read from, the column, the rows,
 how several rows reduce to one value, how it is printed, the section of the paper it appears in, and one line saying
-what it is. The tibbles are the ones the exhibits are printed from -- 30's under `30-FinalExhibits/Output/Data`, the
-appendix chapters' under their own `Data/`, and two built here that no exhibit holds -- so a sentence and the table
-beside it cannot disagree.
+what it is. The tibbles are the ones the exhibits are printed from, 30's under `30-FinalExhibits/Output/Data`, plus
+the data package's report read here, so a sentence and the table beside it cannot disagree.
 
 ## Why one file
 
@@ -90,9 +87,9 @@ first to the paper folder beside the appendix fragments and says whether Overlea
 
 ## What is not here
 
-Prose. The manuscript's method chapter is `41-Methods`, the appendix chapters are `42-OnlineAppendix-A` to `-D`;
-they cite keys and format tibbles, and compute nothing. The regression numbers of Sections 5 and 6 are not in the
-registry yet; when they come, they come from the release through 30, not as typed values.
+Prose and exhibits. The manuscript and the online appendix live in Overleaf and cite keys; every exhibit and the
+tibble behind it is 30's. The regression numbers of Sections 5 and 6 are not in the registry yet; when they come,
+they come from the release through 30, not as typed values.
 
 # Configuration
 
@@ -102,38 +99,20 @@ registry yet; when they come, they come from the release through 30, not as type
   Root   = "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
   Params = list(
     Strict     = FALSE, # TRUE stops the render on a number that does not resolve or a citation without a key
-    Rebuild    = FALSE, # TRUE rebuilds this pair's own tibbles even where their inputs have not changed
-    MinMarkers = 1L,    # markers a contract needs to count as redacted by text; the paper's rule (5 = robustness)
-    AhciTo     = 2019L, # last order year of the Ahci (2025) comparison
-    # THE CHAPTERS' PARAMETERS, moved here with their builders.
-    FilesFrom  = 1998.1,           # A: the exhibit-files table's first quarter, as 01A writes year-quarters
-    FilesTo    = 2001.2,           # A: and its last
-    Titles     = 5L,               # C: descriptions per category in the titles table
-    SpacyModel = "en_core_web_trf" # D: the spaCy model 04A ran
+    Rebuild    = FALSE  # TRUE rebuilds this pair's own tibble even where its inputs have not changed
   )
 )
 
-.dirs_edgar <- rGetEDGAR::get_directories(here::here("2_output", "01A-EdgarIndex", "GetEDGAR"))
-
 .lP$Input <- list(
-  Contracts = fs::path(.lP$Root, "100_Data_Export", "Contracts.parquet"), # the release
-  Orders    = fs::path(.lP$Root, "100_Data_Export", "CtoOrders.parquet"), # one row per reference an order makes
-  Lib       = here::here("1_code", "50-Numbers.R"),                      # a changed builder rebuilds
-  # 30'S OUTPUT, read in place: Data/ for the tibbles its tables print from.
+  Lib         = here::here("1_code", "50-Numbers.R"),                   # a changed builder rebuilds
+  # 30'S OUTPUT, read in place: Data/ for the tibbles its exhibits print from, which is where every registry row
+  # but chapter F's resolves.
   DirExhibits = here::here("2_output", "30-FinalExhibits", "Output"),
-  DirData30   = here::here("2_output", "30-FinalExhibits", "Output", "Data"),
-  # THE CHAPTERS' INPUTS, moved here with their builders.
-  DirMaster = .dirs_edgar$MasterIndex$DirParquet,                            # A: the master index 01A mirrors
-  DirLinks  = .dirs_edgar$DocLinks$DirMain$Links,                            # A: the document lists 01A mirrors
-  Landing   = here::here("2_output", "01A-EdgarIndex", "Output", "LandingPageAll.parquet"), # A: SIC per filing
-  ClassFile = here::here("2_output", "03B-ClassifyTrainBERT", "classification",           # C: 03B's output
-                         "crowned_classification.parquet"),
-  DirStore  = here::here("2_output", "04A-EntityExtract", "Output"),                        # D: the span stores
-  Sample    = here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet"), # D: the documents
-  Package   = here::here("2_output", "40B-PublishData", "Stage", "sample", "package_numbers.csv"), # F: 50B's report
-  # THE DATA DIRECTORIES, in search order: 31's first (the moved builders write there), then 30's, then this pair's own.
-  DirData   = c(
-    here::here("2_output", "30-FinalExhibits", "Output", "Data"),   # the exhibits' data (A, C, D) live here
+  # 40B'S REPORT on the data package it published: chapter F's one input.
+  Package     = here::here("2_output", "40B-PublishData", "Stage", "sample", "package_numbers.csv"),
+  # THE DATA DIRECTORIES, in search order: 30's, then this pair's own (PackageNumbers).
+  DirData     = c(
+    here::here("2_output", "30-FinalExhibits", "Output", "Data"),
     here::here("2_output", "50-Numbers", "Output", "Data")
   ),
   # THE FILES THAT CITE KEYS, scanned under Validation: the manuscript's and the appendix's .tex files as exported
@@ -156,9 +135,8 @@ oa_state_reset()
 
 # Input
 
-30 is the one input the builders below do not make for themselves: the release readers and the classification
-tibbles its tables print from. The chapters' former inputs -- the master index, the document lists, 03B's
-classification file, 04A's span stores -- are listed above and opened by the builders that need them.
+30 is the input: every tibble its exhibits print from, under its `Output/Data`, is what the registry resolves
+over. The one file 30 does not hold is 40B's report on the data package, read under Build.
 
 ```{r}
 #| label: input-check
@@ -171,175 +149,17 @@ oa_report_inputs(
 
 # Build
 
-Every exhibit any chapter sets, and the two tibbles no exhibit holds. The builders came from the chapters unchanged
-and write in 30's layout -- `Tables/`, `Notes/`, `Figures/`, `Data/` -- under this document's output directory,
-which the chapters' sources tables name as their own. Each build compares its outputs with its inputs and with this
-library, and runs only where an output is missing or older; `Rebuild` forces them all.
-
-```{r}
-#| label: build-own
-st_own <- c(
-  CtoAhci = num_build(
-    .name    = "CtoAhci",                                                   # orders on the forms Ahci (2025) covers
-    .fun     = \() num_data_cto_ahci(
-      .path_orders = .lP$Input$Orders,
-      .to          = .lP$Params$AhciTo
-    ),
-    .inputs  = c(.lP$Input$Orders, .lP$Input$Lib),
-    .dir_own = .lP$Output$DirOwn,
-    .force   = .lP$Params$Rebuild
-  ),
-  CtoMarkers = num_build(
-    .name    = "CtoMarkers",                                                # orders against text markers, 2008-2018
-    .fun     = \() num_data_cto_markers(
-      .path_contracts = .lP$Input$Contracts,
-      .min_markers    = .lP$Params$MinMarkers
-    ),
-    .inputs  = c(.lP$Input$Contracts, .lP$Input$Lib),
-    .dir_own = .lP$Output$DirOwn,
-    .force   = .lP$Params$Rebuild
-  )
-)
-```
-
-```{r}
-#| label: build-appendix-a
-.b_a <- list(.dir_own = .lP$Output$DirOwn, .force = .lP$Params$Rebuild, .path_lib = .lP$Input$Lib)
-
-st_a <- c(
-  ExhibitRequired  = do.call(oaa_build_exhibit_table, .b_a),
-  FormDescriptions = do.call(oaa_build_form_descriptions, .b_a),
-  FormCoverage     = do.call(oaa_build_coverage, c(.b_a, list(
-    .dir_master     = .lP$Input$DirMaster,    # filings per form type
-    .path_contracts = .lP$Input$Contracts     # the contracts the database holds
-  ))),
-  FilingsWithinYear = do.call(oaa_build_within_year, c(.b_a, list(.path_contracts = .lP$Input$Contracts))),
-  CtoLinkage       = do.call(oaa_build_cto, c(.b_a, list(
-    .path_orders    = .lP$Input$Orders,       # one row per reference an order makes
-    .path_contracts = .lP$Input$Contracts     # the release's flag on the sample
-  ))),
-  TextCounts       = do.call(oaa_build_counts, c(.b_a, list(.path_contracts = .lP$Input$Contracts))),
-  ExhibitFiles     = do.call(oaa_build_files, c(.b_a, list(
-    .dir_links = .lP$Input$DirLinks,          # the document lists of the index pages, by quarter
-    .from      = .lP$Params$FilesFrom,
-    .to        = .lP$Params$FilesTo
-  ))),
-  SeasonedFilers   = do.call(oaa_build_seasoned, c(.b_a, list(
-    .path_contracts = .lP$Input$Contracts,    # the sample, its forms and its labels
-    .path_landing   = .lP$Input$Landing,      # the SIC code of each filing
-    .dir_master     = .lP$Input$DirMaster     # the first EDGAR filing of each CIK
-  )))
-)
-```
-
-```{r}
-#| label: build-appendix-b
-st_b <- c(
-  PipelineStages  = oab_build_stages(
-    .dir_own  = .lP$Output$DirOwn,  # the table's wording lives in the library
-    .force    = .lP$Params$Rebuild,
-    .path_lib = .lP$Input$Lib
-  ),
-  PackageVersions = oab_build_versions(
-    .dir_own = .lP$Output$DirOwn    # rebuilt on every render: the installed versions
-  )
-)
-```
-
-```{r}
-#| label: build-appendix-c
-.b_c <- list(.dir_data = .lP$Input$DirData30, .dir_own = .lP$Output$DirOwn, .force = .lP$Params$Rebuild,
-             .path_lib = .lP$Input$Lib)
-
-st_c <- c(
-  ClassLabelled    = do.call(oac_build_labelled, .b_c),  # 30's ClassLabelled, without round and words
-  ClassDeployed    = do.call(oac_build_deployed, .b_c),  # 30's ClassSweep, the crowned and deployed rows only
-  ClassTransformer = do.call(oac_build_scores, c(.b_c, list(
-    .name    = "ClassTransformer",
-    .columns = c("Precision", "Recall", "F1", "RecallLenient"),
-    .header  = c("Precision", "Recall", "F1", "Lenient recall"),
-    .note    = paste(
-      "Out-of-fold scores of the transformer that ships on the labelled sample. Sub-category rows score the",
-      "detailed prediction against the detailed label; parent rows score the same predictions rolled up to their",
-      "parent, so an error inside a parent does not count there. Precision, recall and F1 are per category; the",
-      "Total row reports their macro averages. Lenient recall credits a prediction that equals the contract's",
-      "second valid category."
-    )
-  ))),
-  ClassConfusion   = do.call(oac_build_confusion, .b_c),
-  ClassAmendment   = do.call(oac_build_amendment, .b_c),
-  ClassKeyword     = do.call(oac_build_scores, c(.b_c, list(
-    .name    = "ClassKeyword",
-    .columns = c("Coverage", "Precision", "RecallSel", "F1"),
-    .header  = c("Coverage", "Precision", "Recall where committed", "F1"),
-    .note    = paste(
-      "Out-of-fold scores of the published keyword table on the labelled sample. Coverage is the share of a",
-      "category's contracts on which a term of the table fired; the table abstains on the rest. Precision is",
-      "over the contracts assigned the category; recall where committed is over the contracts of the category on",
-      "which the table committed; F1 combines them. A dash marks a score that is undefined because the table never",
-      "assigned the category to any contract. The Total row reports the macro averages."
-    )
-  ))),
-  ClassArms        = do.call(oac_build_arms, .b_c),
-  CategoryTitles   = oac_build_titles(
-    .path_contracts = .lP$Input$Contracts,  # the filer's description of each contract
-    .n              = .lP$Params$Titles,    # descriptions per category
-    .dir_own        = .lP$Output$DirOwn,
-    .force          = .lP$Params$Rebuild,
-    .path_lib       = .lP$Input$Lib
-  ),
-  ClassSecond      = oac_build_second(      # writes ClassSecondPairs and ClassSecond together
-    .path_class = .lP$Input$ClassFile,      # first and second choice per labelled document
-    .dir_own    = .lP$Output$DirOwn,
-    .force      = .lP$Params$Rebuild,
-    .path_lib   = .lP$Input$Lib
-  )
-)
-```
-
-```{r}
-#| label: build-appendix-d
-st_d <- c(
-  EntityCoverage  = oad_build_coverage(
-    .dir_store   = .lP$Input$DirStore,      # 04A's three stores, opened read-only
-    .path_sample = .lP$Input$Sample,        # the documents every store indexes
-    .spacy_model = .lP$Params$SpacyModel,   # the spaCy model printed
-    .dir_own     = .lP$Output$DirOwn,
-    .force       = .lP$Params$Rebuild,
-    .path_lib    = .lP$Input$Lib
-  ),
-  EntityAlignment = oad_build_alignment(    # writes EntityPositions and EntityAgreement from one pass
-    .dir_store   = .lP$Input$DirStore,
-    .path_sample = .lP$Input$Sample,
-    .spacy_model = .lP$Params$SpacyModel,
-    .dir_own     = .lP$Output$DirOwn,
-    .force       = .lP$Params$Rebuild,
-    .path_lib    = .lP$Input$Lib
-  ),
-  ContentValues   = oad_build_values(
-    .path_contracts = .lP$Input$Contracts,  # the naive and rule-based content columns
-    .dir_own        = .lP$Output$DirOwn,
-    .force          = .lP$Params$Rebuild,
-    .path_lib       = .lP$Input$Lib
-  ),
-  DurationRungs   = oad_build_duration(
-    .path_contracts = .lP$Input$Contracts,  # DurationSource, DurationDropped and the two durations
-    .dir_own        = .lP$Output$DirOwn,
-    .force          = .lP$Params$Rebuild,
-    .path_lib       = .lP$Input$Lib
-  )
-)
-
-oa_report_builds(.status = c(st_own, st_a, st_b, st_c, st_d))
-```
+One tibble is built here: the data package's numbers, read from the report 40B writes beside the staged sample.
+Everything else the registry names is 30's, built when 30 renders. The build compares its output with its input and
+with this library, and runs only where the output is missing or older; `Rebuild` forces it.
 
 ```{r}
 #| label: build-appendix-f
-# CHAPTER F reads what 50B reported about the package it published. 50B runs after this document in the numbering
-# but before it in time: the package must exist for the appendix to describe it, so a missing report stops here.
+# CHAPTER F reads what 40B reported about the package it published: the package must exist for the appendix to
+# describe it, so a missing report stops here.
 st_f <- c(
   PackageNumbers = oaf_build_package(
-    .path_numbers = .lP$Input$Package,    # 50B's package_numbers.csv, beside the staged sample
+    .path_numbers = .lP$Input$Package,    # 40B's package_numbers.csv, beside the staged sample
     .dir_own      = .lP$Output$DirOwn,
     .force        = .lP$Params$Rebuild,
     .path_lib     = .lP$Input$Lib
@@ -356,8 +176,7 @@ matching rows to one value, and `one` demands exactly one matching row, which is
 matches two. `Column` names a column, or an expression over the tibble's columns where the text needs a share the
 tibble holds as two counts. `Section` is where the number first appears in the paper; `Note` is what it is.
 
-The rows are grouped by the section of the paper. The appendix chapters' rows are their former specifications,
-moved here unchanged; the manuscript's rows are new.
+The rows are grouped by the section of the paper: the manuscript's sections first, then the appendix chapters.
 
 ```{r}
 #| label: registry-manuscript
@@ -590,10 +409,10 @@ spec_c <- tibble::tribble(
   "F1Llm",        "ClassArms",        "MacroF1", "one",  "prop3", .where_llm,
   "AccLlm",       "ClassArms",        "Accuracy", "one", "prop3", .where_llm,
   "AccBert",      "ClassArms",        "Accuracy", "one", "prop3", .where_bert,
-  "AccCeiling",   "ClassArmsCeiling", "Accuracy", "max", "prop3", "TRUE",
-  "CeilGain512",  "ClassArmsCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512'",
-  "CeilGainKw",   "ClassArmsCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512 or Kw'",
-  "CeilGainLlm",  "ClassArmsCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512 or Kw or Llm'",
+  "AccCeiling",   "ClassArmsFullCeiling", "Accuracy", "max", "prop3", "TRUE",
+  "CeilGain512",  "ClassArmsFullCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512'",
+  "CeilGainKw",   "ClassArmsFullCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512 or Kw'",
+  "CeilGainLlm",  "ClassArmsFullCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512 or Kw or Llm'",
   "SecondDocs",   "ClassSecond",      "N",       "one",  "count", "Kind == 'total'",
   "SecondHit1",   "ClassSecond",      "Hit1 / N", "one", "pct1",  "Kind == 'total'",
   "SecondHit2",   "ClassSecond",      "Hit2 / N", "one", "pct1",  "Kind == 'total'",
@@ -681,7 +500,7 @@ spec_d <- tibble::tribble(
 
 ```{r}
 #| label: registry-appendix-f
-# CHAPTER F's rows: the package as 50B reported it. Rows the manuscript already owns (DocsRelease, Docs8K, OrderRefs,
+# CHAPTER F's rows: the package as 40B reported it. Rows the manuscript already owns (DocsRelease, Docs8K, OrderRefs,
 # NLabelled, Orders) are not repeated; the appendix cites those keys.
 .where_pkg <- \(.k) paste0("Key == '", .k, "'")
 
@@ -763,14 +582,19 @@ paths_numbers <- num_numbers_write(
 
 # Validation
 
-**Every citation resolves, and every key is cited.** The manuscript's section files, where a folder of them exists,
-and the appendix chapters' sources are scanned for `\pnum{}`, `\oanum{}` and `oa_n("")`. A cited key the registry
+**Every citation resolves, and every key is cited.** The manuscript's and the appendix's `.tex` files, where a
+folder of them exists, are scanned for `\pnum{}` and `\oanum{}`. A cited key the registry
 does not hold would print as `??Key`; a registered key cited nowhere is either dead weight or a chapter not yet
 written, and is listed so the registry stays honest.
 
 ```{r}
 #| label: validate-citations
-paths_cite <- if (fs::dir_exists(.lP$Input$DirManuscript)) fs::dir_ls(.lP$Input$DirManuscript, glob = "*.tex")
+paths_cite <- if (fs::dir_exists(.lP$Input$DirManuscript)) {
+  fs::dir_ls(.lP$Input$DirManuscript, glob = "*.tex")
+} else {
+  cli::cli_alert_warning("No manuscript folder at {.path {(.lP$Input$DirManuscript)}}; no citations scanned.")
+  character(0)
+}
 
 tab_cited <- num_cited_keys(.paths = paths_cite)
 

@@ -10080,9 +10080,14 @@ oaa_data_counts <- function(.path_contracts) {
   }
   n_flag_ <- sum(uni_$Flagged)
   n_rule_ <- pick_(.prefix = "1-") + pick_(.prefix = "2-") + pick_(.prefix = "3-")
+  # TWO GRAINS. DocsPre2001 and DocsFlagged count primary copies (uni_), which is what Appendix A's text cites.
+  # Appendix F describes the released file row by row, so RowsPre2001 and RowsFlagged count every row (all_):
+  # RowsPre2001 is what separates the file's row count from the manuscript's 2001-2024 count. DocsSample2008 is the
+  # unique-contract sample from 2008, the sample of the redaction figure.
   tibble::tibble(
     Key = c("DocsAll", "DocsUnique", "DocsSample", "DocsPre2001", "DocsFlagged", "RuleShort", "RuleStopwords",
-            "RuleNumeric", "Placeholders", "YearFirst", "YearLast"),
+            "RuleNumeric", "Placeholders", "YearFirst", "YearLast", "RowsPre2001", "RowsFlagged",
+            "DocsSample2008"),
     Value = c(
       nrow(all_),
       nrow(uni_),
@@ -10094,7 +10099,10 @@ oaa_data_counts <- function(.path_contracts) {
       pick_(.prefix = "3-"),
       max(n_flag_ - n_rule_, 0),
       min(uni_$Year[uni_$Sample], na.rm = TRUE),
-      max(uni_$Year[uni_$Sample], na.rm = TRUE)
+      max(uni_$Year[uni_$Sample], na.rm = TRUE),
+      sum(all_$Year < 2001L, na.rm = TRUE),
+      sum(all_$Flagged),
+      sum(uni_$Sample & uni_$Year >= 2008L, na.rm = TRUE)
     )
   )
 }
