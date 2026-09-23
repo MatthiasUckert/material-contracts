@@ -1,4 +1,4 @@
-# 40-Numbers: every number the paper and the online appendix cite, from one file --------------------------------------
+# 50-Numbers: every number the paper and the online appendix cite, from one file --------------------------------------
 #
 # WHAT THIS FILE DOES
 # The manuscript and the appendix chapters cite numbers -- counts of contracts, shares of filings, the accuracy of a
@@ -30,8 +30,8 @@ if (FALSE) {
     "Contracts.parquet"
   )
   .path_orders <- fs::path(fs::path_dir(.path_contracts), "CtoOrders.parquet")
-  .dir_own     <- here::here("2_output", "40-Numbers", "Output")
-  .path_lib    <- here::here("1_code", "40-Numbers.R")
+  .dir_own     <- here::here("2_output", "50-Numbers", "Output")
+  .path_lib    <- here::here("1_code", "50-Numbers.R")
 }
 
 
@@ -184,7 +184,7 @@ num_build <- function(.name, .fun, .inputs, .dir_own, .force) {
     .name    <- "CtoAhci"
     .fun     <- \() num_data_cto_ahci(.path_orders = .path_orders)
     .inputs  <- c(.path_orders, .path_lib)
-    .dir_own <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own <- here::here("2_output", "50-Numbers", "Output")
     .force   <- FALSE
   }
   out_ <- fs::path(.dir_own, "Data", paste0(.name, ".parquet"))
@@ -249,7 +249,7 @@ num_registry_check <- function(.spec, .sections) {
 num_numbers_tex <- function(.tab, .doc) {
   if (FALSE) {
     .tab <- tab_numbers
-    .doc <- "40-Numbers"
+    .doc <- "50-Numbers"
   }
   ok_  <- .tab[.tab$Status == "ok", , drop = FALSE]
   bad_ <- .tab$Key[.tab$Status != "ok"]
@@ -300,8 +300,8 @@ num_numbers_tex <- function(.tab, .doc) {
 num_numbers_write <- function(.tab, .dir_own, .doc) {
   if (FALSE) {
     .tab     <- tab_numbers
-    .dir_own <- here::here("2_output", "40-Numbers", "Output")
-    .doc     <- "40-Numbers"
+    .dir_own <- here::here("2_output", "50-Numbers", "Output")
+    .doc     <- "50-Numbers"
   }
   fs::dir_create(.dir_own)
   paths_ <- fs::path(.dir_own, c("Numbers.tex", "Numbers.csv", "Numbers-unresolved.txt"))
@@ -456,7 +456,7 @@ num_report_sources <- function(.spec, .dir_data) {
 #' @return Invisibly, TRUE where the deployed file changed.
 num_deploy <- function(.path_numbers, .dir_deploy) {
   if (FALSE) {
-    .path_numbers <- here::here("2_output", "40-Numbers", "Output", "Numbers.tex")
+    .path_numbers <- here::here("2_output", "50-Numbers", "Output", "Numbers.tex")
     .dir_deploy   <- fs::path(
       "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
       "200-Paper_figures",
@@ -505,12 +505,12 @@ num_deploy <- function(.path_numbers, .dir_deploy) {
 #' each chapter filled it by resolving its own specification; now it is filled from Numbers.csv, so a chapter renders
 #' on 40's last render and computes nothing.
 #'
-#' @param .path_register Character. 40-Numbers/Output/Numbers.csv.
+#' @param .path_register Character. 50-Numbers/Output/Numbers.csv.
 #' @return Invisibly, the register tibble.
 num_numbers_load <- function(.path_register) {
-  if (FALSE) .path_register <- here::here("2_output", "40-Numbers", "Output", "Numbers.csv")
+  if (FALSE) .path_register <- here::here("2_output", "50-Numbers", "Output", "Numbers.csv")
   if (!fs::file_exists(.path_register)) {
-    cli::cli_abort("No register at {.file {(.path_register)}}: render 40-Numbers first.")
+    cli::cli_abort("No register at {.file {(.path_register)}}: render 50-Numbers first.")
   }
   reg_ <- readr::read_csv(
     file           = .path_register,
@@ -734,9 +734,9 @@ oaa_build_coverage <- function(.dir_master, .path_contracts, .dir_own, .force, .
       "100_Data_Export",
       "Contracts.parquet"
     )
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "FormCoverage"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -888,9 +888,9 @@ oaa_build_within_year <- function(.path_contracts, .dir_own, .force, .path_lib) 
       "100_Data_Export",
       "Contracts.parquet"
     )
-    .dir_own        <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own        <- here::here("2_output", "50-Numbers", "Output")
     .force          <- FALSE
-    .path_lib       <- here::here("1_code", "40-Numbers.R")
+    .path_lib       <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "FilingsWithinYear"
   outs_ <- c(fs::path(.dir_own, "Figures", paste0(name_, c(".pdf", ".png"))),
@@ -1027,9 +1027,9 @@ oaa_build_cto <- function(.path_orders, .path_contracts, .dir_own, .force, .path
       "Contracts.parquet"
     )
     .path_orders <- fs::path(fs::path_dir(.path_contracts), "CtoOrders.parquet")
-    .dir_own     <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own     <- here::here("2_output", "50-Numbers", "Output")
     .force       <- FALSE
-    .path_lib    <- here::here("1_code", "40-Numbers.R")
+    .path_lib    <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "CtoLinkage"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -1117,9 +1117,14 @@ oaa_data_counts <- function(.path_contracts) {
   }
   n_flag_ <- sum(uni_$Flagged)
   n_rule_ <- pick_(.prefix = "1-") + pick_(.prefix = "2-") + pick_(.prefix = "3-")
+  # TWO GRAINS. DocsPre2001 and DocsFlagged count primary copies (uni_), which is what Appendix A's text cites.
+  # Appendix F describes the released file row by row, so RowsPre2001 and RowsFlagged count every row (all_):
+  # RowsPre2001 is what separates the file's row count from the manuscript's 2001-2024 count. DocsSample2008 is the
+  # unique-contract sample from 2008, the sample of the redaction figure.
   tibble::tibble(
     Key = c("DocsAll", "DocsUnique", "DocsSample", "DocsPre2001", "DocsFlagged", "RuleShort", "RuleStopwords",
-            "RuleNumeric", "Placeholders", "YearFirst", "YearLast"),
+            "RuleNumeric", "Placeholders", "YearFirst", "YearLast", "RowsPre2001", "RowsFlagged",
+            "DocsSample2008"),
     Value = c(
       nrow(all_),
       nrow(uni_),
@@ -1131,7 +1136,10 @@ oaa_data_counts <- function(.path_contracts) {
       pick_(.prefix = "3-"),
       max(n_flag_ - n_rule_, 0),
       min(uni_$Year[uni_$Sample], na.rm = TRUE),
-      max(uni_$Year[uni_$Sample], na.rm = TRUE)
+      max(uni_$Year[uni_$Sample], na.rm = TRUE),
+      sum(all_$Year < 2001L, na.rm = TRUE),
+      sum(all_$Flagged),
+      sum(uni_$Sample & uni_$Year >= 2008L, na.rm = TRUE)
     )
   )
 }
@@ -1150,9 +1158,9 @@ oaa_build_counts <- function(.path_contracts, .dir_own, .force, .path_lib) {
       "100_Data_Export",
       "Contracts.parquet"
     )
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "TextCounts"
   outs_ <- fs::path(.dir_own, "Data", paste0(name_, ".parquet"))
@@ -1225,9 +1233,9 @@ oaa_build_files <- function(.dir_links, .from, .to, .dir_own, .force, .path_lib)
     )$DocLinks$DirMain$Links
     .from     <- 1998.1
     .to       <- 2001.2
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "ExhibitFiles"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -1408,9 +1416,9 @@ oaa_build_seasoned <- function(.path_contracts, .path_landing, .dir_master, .dir
     .dir_master   <- rGetEDGAR::get_directories(
       here::here("2_output", "01A-EdgarIndex", "GetEDGAR")
     )$MasterIndex$DirParquet
-    .dir_own      <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own      <- here::here("2_output", "50-Numbers", "Output")
     .force        <- FALSE
-    .path_lib     <- here::here("1_code", "40-Numbers.R")
+    .path_lib     <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "SeasonedFilers"
   outs_ <- c(fs::path(.dir_own, "Figures", paste0(name_, c(".pdf", ".png"))),
@@ -1486,9 +1494,9 @@ oaa_data_exhibit_table <- function() {
 #' @return Invisibly, the build's status.
 oaa_build_exhibit_table <- function(.dir_own, .force, .path_lib) {
   if (FALSE) {
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "ExhibitRequired"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -1571,9 +1579,9 @@ oaa_data_form_descriptions <- function() {
 #' @return Invisibly, the build's status.
 oaa_build_form_descriptions <- function(.dir_own, .force, .path_lib) {
   if (FALSE) {
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "FormDescriptions"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -1775,9 +1783,9 @@ oac_build_titles <- function(.path_contracts, .n, .dir_own, .force, .path_lib) {
       "Contracts.parquet"
     )
     .n        <- 5L
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "CategoryTitles"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -1920,9 +1928,9 @@ oac_fmtn <- function(.x) format(.x, big.mark = ",", trim = TRUE, scientific = FA
 oac_build_labelled <- function(.dir_data, .dir_own, .force, .path_lib) {
   if (FALSE) {
     .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "ClassLabelled"
   p30_  <- fs::path(.dir_data, paste0(name_, ".parquet"))
@@ -1969,9 +1977,9 @@ oac_build_labelled <- function(.dir_data, .dir_own, .force, .path_lib) {
 oac_build_deployed <- function(.dir_data, .dir_own, .force, .path_lib) {
   if (FALSE) {
     .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "ClassDeployed"
   p30_  <- fs::path(.dir_data, "ClassSweep.parquet")
@@ -2033,9 +2041,9 @@ oac_build_scores <- function(.name, .columns, .header, .note, .dir_data, .dir_ow
     .header   <- c("Precision", "Recall", "F1", "Lenient recall")
     .note     <- "..."
     .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   p30_ <- fs::path(.dir_data, paste0(.name, ".parquet"))
   if (!oac_due(.dir_own = .dir_own, .name = .name, .path_30 = p30_, .path_lib = .path_lib, .force = .force)) {
@@ -2071,9 +2079,9 @@ oac_build_scores <- function(.name, .columns, .header, .note, .dir_data, .dir_ow
 oac_build_confusion <- function(.dir_data, .dir_own, .force, .path_lib) {
   if (FALSE) {
     .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "ClassConfusion"
   p30_  <- fs::path(.dir_data, paste0(name_, ".parquet"))
@@ -2117,9 +2125,9 @@ oac_build_confusion <- function(.dir_data, .dir_own, .force, .path_lib) {
 oac_build_amendment <- function(.dir_data, .dir_own, .force, .path_lib) {
   if (FALSE) {
     .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "ClassAmendment"
   p30_  <- fs::path(.dir_data, paste0(name_, ".parquet"))
@@ -2162,9 +2170,9 @@ oac_build_amendment <- function(.dir_data, .dir_own, .force, .path_lib) {
 oac_build_arms <- function(.dir_data, .dir_own, .force, .path_lib) {
   if (FALSE) {
     .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "ClassArms"
   p30_  <- fs::path(.dir_data, c("ClassArms.parquet", "ClassArmsCeiling.parquet"))
@@ -2295,9 +2303,9 @@ oac_second_summary <- function(.tab) {
 oac_build_second <- function(.path_class, .dir_own, .force, .path_lib) {
   if (FALSE) {
     .path_class <- here::here("2_output", "03B-ClassifyTrainBERT", "classification", "crowned_classification.parquet")
-    .dir_own    <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own    <- here::here("2_output", "50-Numbers", "Output")
     .force      <- FALSE
-    .path_lib   <- here::here("1_code", "40-Numbers.R")
+    .path_lib   <- here::here("1_code", "50-Numbers.R")
   }
   names_ <- c("ClassSecondPairs", "ClassSecond")
   outs_  <- unlist(purrr::map(names_, \(.n) fs::path(.dir_own, c("Tables", "Notes", "Data"),
@@ -2492,9 +2500,9 @@ oad_build_coverage <- function(.dir_store, .path_sample, .spacy_model, .dir_own,
     .dir_store   <- here::here("2_output", "04A-EntityExtract", "Output")
     .path_sample <- here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet")
     .spacy_model <- "en_core_web_trf"
-    .dir_own     <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own     <- here::here("2_output", "50-Numbers", "Output")
     .force       <- FALSE
-    .path_lib    <- here::here("1_code", "40-Numbers.R")
+    .path_lib    <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "EntityCoverage"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -2657,9 +2665,9 @@ oad_build_duration <- function(.path_contracts, .dir_own, .force, .path_lib) {
       "100_Data_Export",
       "Contracts.parquet"
     )
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "DurationRungs"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -2997,9 +3005,9 @@ oad_build_alignment <- function(.dir_store, .path_sample, .spacy_model, .dir_own
     .dir_store   <- here::here("2_output", "04A-EntityExtract", "Output")
     .path_sample <- here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet")
     .spacy_model <- "en_core_web_trf"
-    .dir_own     <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own     <- here::here("2_output", "50-Numbers", "Output")
     .force       <- FALSE
-    .path_lib    <- here::here("1_code", "40-Numbers.R")
+    .path_lib    <- here::here("1_code", "50-Numbers.R")
   }
   names_ <- c("EntityPositions", "EntityAgreement")
   outs_  <- unlist(purrr::map(names_, \(.n) c(
@@ -3157,9 +3165,9 @@ oad_build_values <- function(.path_contracts, .dir_own, .force, .path_lib) {
       "100_Data_Export",
       "Contracts.parquet"
     )
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "ContentValues"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -3291,9 +3299,9 @@ oab_data_stages <- function() {
 #' @return Invisibly, the build's status.
 oab_build_stages <- function(.dir_own, .force, .path_lib) {
   if (FALSE) {
-    .dir_own  <- here::here("2_output", "40-Numbers", "Output")
+    .dir_own  <- here::here("2_output", "50-Numbers", "Output")
     .force    <- FALSE
-    .path_lib <- here::here("1_code", "40-Numbers.R")
+    .path_lib <- here::here("1_code", "50-Numbers.R")
   }
   name_ <- "PipelineStages"
   outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
@@ -3353,11 +3361,90 @@ oab_data_versions <- function() {
 #' @param .dir_own Character. This chapter's output directory.
 #' @return Invisibly, the build's status.
 oab_build_versions <- function(.dir_own) {
-  if (FALSE) .dir_own <- here::here("2_output", "40-Numbers", "Output")
+  if (FALSE) .dir_own <- here::here("2_output", "50-Numbers", "Output")
   fs::dir_create(fs::path(.dir_own, "Data"))
   arrow::write_parquet(
     x    = oab_data_versions(),
     sink = fs::path(.dir_own, "Data", "PackageVersions.parquet")
+  )
+  invisible("built")
+}
+
+
+# ======================================================================================================================
+# CHAPTER F. The data package: the numbers 50B reports about what it published
+# ======================================================================================================================
+
+# 1. The package numbers, read from 50B's report --------------------------------------------------------------------
+
+#' The package numbers as a Key/Value tibble
+#'
+#' 50B writes package_numbers.csv beside the staged sample: one row per figure of the package (files and bytes per
+#' folder, rows per table, spans per kind, documents per text type). Every value is read as a number; the version
+#' is kept as text under its own key. Byte counts are also given in gigabytes, rounded to one decimal, since that is
+#' the unit the appendix prints.
+#'
+#' @param .path_numbers Character. 50B's package_numbers.csv.
+#' @return Tibble: Key, Value (numeric, NA for the version), Text (the version, NA elsewhere).
+oaf_data_package <- function(.path_numbers) {
+  if (FALSE) {
+    .path_numbers <- here::here("2_output", "40B-PublishData", "Stage", "sample", "package_numbers.csv")
+  }
+  raw_ <- readr::read_csv(
+    file           = .path_numbers,
+    col_types      = readr::cols(.default = readr::col_character()),
+    show_col_types = FALSE
+  )
+  need_ <- c("Key", "Value")
+  miss_ <- setdiff(need_, names(raw_))
+  if (length(miss_) > 0L) cli::cli_abort("package_numbers.csv lacks {.field {miss_}}.")
+  nums_ <- raw_ |>
+    dplyr::filter(.data$Key != "package.version") |>
+    dplyr::mutate(
+      Value = as.numeric(.data$Value),
+      Text  = NA_character_
+    )
+  bad_ <- nums_$Key[is.na(nums_$Value)]
+  if (length(bad_) > 0L) cli::cli_abort("Non-numeric package number{?s}: {.val {bad_}}.")
+  # GIGABYTES BESIDE THE BYTES, one key per byte key, so the appendix cites the unit it prints.
+  gb_ <- nums_ |>
+    dplyr::filter(grepl("\\.bytes", .data$Key, fixed = FALSE)) |>
+    dplyr::mutate(
+      Key   = sub(".bytes", ".gb", .data$Key, fixed = TRUE),
+      Value = round(.data$Value / 1e9, digits = 1L)
+    )
+  ver_ <- raw_ |>
+    dplyr::filter(.data$Key == "package.version") |>
+    dplyr::transmute(
+      Key   = .data$Key,
+      Value = NA_real_,
+      Text  = .data$Value
+    )
+  dplyr::bind_rows(nums_, gb_, ver_)
+}
+
+#' Build the package numbers tibble
+#'
+#' @param .path_numbers Character. 50B's package_numbers.csv.
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oaf_build_package <- function(.path_numbers, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_numbers <- here::here("2_output", "40B-PublishData", "Stage", "sample", "package_numbers.csv")
+    .dir_own      <- here::here("2_output", "50-Numbers", "Output")
+    .force        <- FALSE
+    .path_lib     <- here::here("1_code", "50-Numbers.R")
+  }
+  name_ <- "PackageNumbers"
+  outs_ <- fs::path(.dir_own, "Data", paste0(name_, ".parquet"))
+  ins_  <- c(.path_numbers, .path_lib)
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  fs::dir_create(fs::path(.dir_own, "Data"))
+  arrow::write_parquet(
+    x    = oaf_data_package(.path_numbers = .path_numbers),
+    sink = outs_
   )
   invisible("built")
 }

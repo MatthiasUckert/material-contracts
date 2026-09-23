@@ -1,4 +1,4 @@
-# 50A-PublishCode: the published copy of the pipeline and its packages ------------------------------------------------
+# 40A-PublishCode: the published copy of the pipeline and its packages ------------------------------------------------
 #
 # WHAT THIS FILE DOES
 # It decides which committed files of this repository and of the two package clones are published, checks them
@@ -262,7 +262,7 @@ pub_write_provenance <- function(.dir, .state) {
   lines_ <- c(
     "# Where this copy comes from",
     "",
-    "This directory is a published copy, written by `1_code/50A-PublishCode.qmd` of the pipeline repository.",
+    "This directory is a published copy, written by `1_code/40A-PublishCode.qmd` of the pipeline repository.",
     "Every file in it is taken from the commit named below; nothing here is edited by hand.",
     "",
     "| Source | Version | Commit | Date |",
@@ -396,7 +396,7 @@ pub_is_text <- function(.paths) {
 #' @return Character vector of code lines.
 pub_qmd_code <- function(.path) {
   if (FALSE) {
-    .path <- fs::path(here::here(), "1_code", "50A-PublishCode.qmd")
+    .path <- fs::path(here::here(), "1_code", "40A-PublishCode.qmd")
   }
   lines_ <- readLines(con = .path, warn = FALSE, encoding = "UTF-8")
   open_ <- grepl("^\\s*```+\\s*\\{r([\\s,}].*)?$", lines_, perl = TRUE)

@@ -70,7 +70,7 @@ if (nrow(bad) == 0L) {
 }
 
 cat("\n######## What the stamps stored by 50B say ########\n")
-dir_stamps <- here::here("2_output", "50B-PublishData", "Stamps")
+dir_stamps <- here::here("2_output", "40B-PublishData", "Stamps")
 for (year_ in out$Year) {
   path_ <- fs::path(dir_stamps, paste0("text__exhibit10__exhibit10_", year_, ".parquet.stamp"))
   cat(year_, ":", if (fs::file_exists(path_)) readLines(path_, warn = FALSE)[1] else "no stamp file", "\n")

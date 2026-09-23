@@ -1,5 +1,5 @@
 ---
-title: "Final Exhibits -- The Manuscript's Tables and Figures, from the Release (30)"
+title: "Final Exhibits -- Every Table and Figure of the Paper, in One Store (31)"
 author: "Matthias Uckert"
 date: "`r format(Sys.Date(), '%Y-%m-%d')`"
 ---
@@ -31,9 +31,10 @@ options(cli.num_colors = 1, cli.width = 120, mc.table_mode = "console")
 #| echo: false
 
 # THE COMMONS FIRST. _Plots.R rebuilds its level registry empty every time it is sourced, so every
-# library that registers a vocabulary must follow it.
+# library that registers a vocabulary must follow it. _OnlineAppendix.R carries what the builders moved from 40
+# use: their table frame, their writer, their staleness test and the pandoc conversion that shows their tables.
 .path_libs <- purrr::map_chr(
-  c("_Initialize", "_Utils", "_NER", "_Plots", "_Tables", "_Entity"),
+  c("_Initialize", "_Utils", "_NER", "_Plots", "_Tables", "_Entity", "_OnlineAppendix"),
   \(.s) here::here("1_code", "_Commons", paste0(.s, ".R"))
 )
 purrr::walk(.x = .path_libs, .f = \(.p) source(file = .p, encoding = "UTF-8"))
@@ -66,21 +67,43 @@ source(file = .path_fun, encoding = "UTF-8")
 
 # Purpose
 
-This document produces the exhibits of the manuscript in the form the manuscript prints them: one
-view per table or figure, on the sample the paper names, with the decided styling, and with the
-figure note written from the same tibble that drew the figure. `30-Descriptives` was the lab --
-every exhibit on every sample, reconciled against both manuscripts -- and was retired on 10
-September 2026 once every decision it produced lived here; its readers, vocabulary and reference
-numbers are now this document's own.
+This document is the one store of the paper's exhibits: every table and figure the manuscript, the online appendix
+and the response memo print, and every tibble a number is read from. It writes each under its name -- the tibble to
+`Output/Data`, the tabular to `Output/Tables`, the figure as png to `Output/Figures`, the note to
+`Output/Notes` -- and no other document is to write there: `50-Numbers` reads the tibbles, `41-Methods` and the
+`42-OnlineAppendix` chapters read the exhibits, and none of them builds one.
 
-## One source, and it is hers -- and this document stands alone
+## What moved in
 
-Every input is read through this document's own functions: the release `10-ExportData` deploys to
-her `MatContractPipeline` folder and the outputs of her `101` and `103` do-files. Nothing that
-another document rendered is read, and her `.dta` files are converted under this document's own
-cache. What this buys is that a number here and a number in one of her tables come from the same
-bytes, and a difference between them is a difference in definition rather than in data -- and that
-this document renders on a machine where nothing else ran.
+Everything `30-FinalExhibits` built, unchanged, and every exhibit `50-Numbers` built for the appendix chapters,
+together with the two tibbles only numbers read (`CtoAhci`, `CtoMarkers`). The moved builders keep their chapter
+prefixes (`oaa_`, `oab_`, `oac_`, `oad_`) and 40's (`num_`) until the clean-up; they write in the same layout under
+this document's output directory and rebuild only where an input or this library is newer than their files. 30 and
+40 still write their own copies until their consumers are pointed here, and Validation compares the two sets file by
+file. Exhibits first built here -- the content readings table, for one -- carry origin 31 and nothing to compare.
+
+## By topic, not by the paper's order
+
+The manuscript's structure is still moving, so the sections below follow the subject: data sources and software,
+sample selection, filing behaviour, contract types, classification performance, content variables, geography,
+redactions, and the Item 1.01 announcements. The registry's `Topic` column is this order; where an exhibit is
+printed -- manuscript, appendix chapter, memo, or nowhere -- is its `Where` column, decided separately.
+
+## One stem, one exhibit
+
+Six classification tables existed twice under one name: 30's full versions, with the fold scores the authors read,
+and the appendix's cuts of them, which the chapters print. In one folder a cut would overwrite the table it reads.
+The full versions are therefore `ClassLabelledFull`, `ClassTransformerFull`, `ClassAmendmentFull`,
+`ClassKeywordFull`, `ClassArmsFull` (with `ClassArmsFullCeiling`) and `ClassConfusionFull`; the cuts keep the plain
+names, which are the ones the appendix fragments input.
+
+## What is read
+
+The release on her Dropbox folder, the outputs of her `101` and `103` do-files (converted under this document's own
+cache), and the pipeline stage outputs the classification and appendix exhibits need: the run folders of `03A` to
+`03D`, `03B`'s crowned classification, `01A`'s index mirror and landing pages, and `04A`'s span stores. Nothing
+downstream of the release is an input; the one exception is the check of the move, which reads 30's and 40's output
+directories and goes with the move back to 30.
 
 ## Prepared once per render, read lazily ever after
 
@@ -96,13 +119,6 @@ through Arrow and DuckDB and pulls the columns and rows it needs; nothing else s
 The paper is written on the 9 September release, the first to carry the corrected state and country
 counts. Every parquet in the release is checked against that date before anything is read; an older
 file is named on the page and, for the manuscript render, aborts.
-
-## One exhibit at a time
-
-Each exhibit is added behind the samples as one block: the decision it implements, the sample it is
-drawn on, the tibble it computes from the prepared tables, its final plot or table function, and the
-note. The Overview at the end holds every figure once, in the order the manuscript prints them. This
-version holds the preparation and the checks only; the first exhibit follows the first decision.
 
 # Configuration
 
@@ -140,6 +156,33 @@ version holds the preparation and the checks only; the first exhibit follows the
   DtaConcentration = fs::path(.lP$Root, "101_Data_prep", "101_Output", "concentration.dta")
 )
 
+# THE PIPELINE'S OWN OUTPUTS, which the builders moved from 40 read: 01A's index mirror and landing pages, 03B's
+# crowned classification, 04A's span stores, and this library, a change in which rebuilds them. Kept apart from
+# .lP$Input, whose files the vintage check dates against the release.
+.dirs_edgar <- rGetEDGAR::get_directories(here::here("2_output", "01A-EdgarIndex", "GetEDGAR"))
+
+.lP$Pipeline <- list(
+  DirMaster = .dirs_edgar$MasterIndex$DirParquet,                                        # filings per form, first filings
+  DirLinks  = .dirs_edgar$DocLinks$DirMain$Links,                                        # the document lists, by quarter
+  Landing   = here::here("2_output", "01A-EdgarIndex", "Output", "LandingPageAll.parquet"), # SIC per filing
+  ClassFile = here::here("2_output", "03B-ClassifyTrainBERT", "classification",
+                         "crowned_classification.parquet"),                             # first and second choice
+  DirStore  = here::here("2_output", "04A-EntityExtract", "Output"),                     # the span stores
+  Sample    = here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet"), # the labelled documents
+  Lib       = here::here("1_code", "30-FinalExhibits.R")                                 # a changed builder rebuilds
+)
+
+# THE MOVED BUILDERS' SWITCHES, as 40 set them. Kept apart from Params, whose hash keys the prepared contract table.
+.lP$Build <- list(
+  Rebuild    = FALSE,             # TRUE rebuilds the moved exhibits even where their inputs have not changed
+  MinMarkers = 1L,                # markers a contract needs to count as redacted by text (CtoMarkers)
+  AhciTo     = 2019L,             # last order year of the Ahci (2025) comparison
+  FilesFrom  = 1998.1,            # the exhibit-files table's first quarter, as 01A writes year-quarters
+  FilesTo    = 2001.2,            # and its last
+  Titles     = 5L,                # descriptions per category in the titles table
+  SpacyModel = "en_core_web_trf"  # the spaCy model 04A ran
+)
+
 # THE CLASSIFICATION STAGES' OUTPUT DIRECTORIES, resolved the way 03E resolves them.
 .dir_03 <- purrr::map(
   purrr::set_names(c("03A-ClassifyPrepare", "03B-ClassifyTrainBERT", "03C-ClassifyTrainKeyword", "03D-ClassifyLLM"),
@@ -170,8 +213,14 @@ version holds the preparation and the checks only; the first exhibit follows the
 
 purrr::walk(.x = unlist(.lP$Output), .f = fs::dir_create)
 
+# WHERE THE MOVED BUILDERS WRITE: the parent of the four exhibit folders above, in the same layout.
+.lP$DirOwn <- fs::path(.dir_main, "Output")
+
 # ONE DUCKDB CONNECTION for the document, in memory; every prepared table is registered on it below.
 con <- DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+
+# THE APPENDIX MACHINERY'S STATE, fresh for this render: the moved builders report into it.
+oa_state_reset()
 ```
 
 # Input
@@ -217,6 +266,21 @@ fin_convert_dta(
   .cols       = NULL,                        # small; every column under its Stata name
   .rerun      = FALSE
 )
+```
+
+## The pipeline's own outputs
+
+The builders moved from 40 read four of the pipeline's stages directly; this table says which of their paths exist
+before any of them runs.
+
+```{r}
+#| label: input-pipeline
+tibble::tibble(
+  Input  = names(.lP$Pipeline),
+  Path   = unname(unlist(.lP$Pipeline)),
+  Exists = fs::file_exists(unname(unlist(.lP$Pipeline)))
+) |>
+  tbl_out(.title = "The pipeline outputs this document reads")
 ```
 
 # Prepare
@@ -344,7 +408,7 @@ tab_samples <- fin_table_samples(
 )
 ```
 
-# Validation
+## The ladder nests, and S2 is the paper's number
 
 Two checks, each stated before it is read. **The samples nest as the ladder says**: S00 holds S0 and
 S1, both hold S2, and S2 holds its subsets and the redaction window; a row outside its parent is a
@@ -362,31 +426,59 @@ tab_counts <- fin_check_samples(
 )
 ```
 
-# Tables
+# Data sources and software
 
-Each manuscript table is one call. The call builds the tibble, saves it under `Output/Data`, writes
-the booktabs tabular under `Output/Tables` and the note under `Output/Notes`, all under the table's
-name rather than a number, and renders the table into this document. The manuscript's table
-environment supplies the caption and the note around the tabular.
-
-## Contract categories
-
-The taxonomy's definition, hand-written. Rows in the revision's taxonomic order; `.order = "paper"`
-sorts them into the numbered order every other exhibit uses, which is the class-order question
-still open with Ann-Kristin.
+What the SEC requires and which forms carry material contracts, what the database holds of them, which Exhibit 10
+attachments exist as separate files, the counts the text cites that no table prints, and the software the database
+is built with. All seven come from the appendix chapters A and B; two of them are data only.
 
 ```{r}
-#| label: tbl-categories
-#| results: asis
+#| label: build-sources
 
-tab_categories <- fin_table_categories(
-  .order = "taxonomic",       # "paper" for the numbered order (1) M&A ... (12) Other
-  .dirs  = .lP$Output,        # Data, Tables, Notes
-  .name  = "Categories"       # the stem of every file written
+# THE MOVED BUILDERS' SHARED ARGUMENTS: where they write, whether to force, and the library a change in which
+# rebuilds them.
+.b_a <- list(
+  .dir_own  = .lP$DirOwn,
+  .force    = .lP$Build$Rebuild,
+  .path_lib = .lP$Pipeline$Lib
+)
+
+st_sources <- c(
+  ExhibitRequired  = do.call(oaa_build_exhibit_table, .b_a),
+  FormDescriptions = do.call(oaa_build_form_descriptions, .b_a),
+  FormCoverage     = do.call(oaa_build_coverage, c(.b_a, list(
+    .dir_master     = .lP$Pipeline$DirMaster,   # filings per form type
+    .path_contracts = .lP$Input$FilContracts    # the contracts the database holds
+  ))),
+  ExhibitFiles     = do.call(oaa_build_files, c(.b_a, list(
+    .dir_links = .lP$Pipeline$DirLinks,         # the document lists of the index pages, by quarter
+    .from      = .lP$Build$FilesFrom,
+    .to        = .lP$Build$FilesTo
+  ))),
+  TextCounts       = do.call(oaa_build_counts, c(.b_a, list(.path_contracts = .lP$Input$FilContracts))),
+  PipelineStages   = oab_build_stages(
+    .dir_own  = .lP$DirOwn,                     # the table's wording lives in the library
+    .force    = .lP$Build$Rebuild,
+    .path_lib = .lP$Pipeline$Lib
+  ),
+  PackageVersions  = oab_build_versions(
+    .dir_own = .lP$DirOwn                       # rebuilt on every render: the installed versions
+  )
+)
+
+oa_report_builds(.status = st_sources)
+```
+
+```{r}
+#| label: show-sources
+#| results: asis
+fin_show_built(
+  .names = names(st_sources),
+  .dirs  = .lP$Output
 )
 ```
 
-## Sample selection
+# Sample selection
 
 Panel A from the release's ladder columns, checked against the revision's Table 2 and aborting on
 any difference. Panel B as her `106` builds the estimation samples: every registrant copy, less the
@@ -443,396 +535,7 @@ tab_fluidity <- fin_table_fluidity(
 )
 ```
 
-## Content characteristics by category
-
-Words, duration, parties, countries and states by category on the unique-contract sample, in the Categories
-table's order: super-categories pooled and bold, sub-categories indented, Total last. Twice, from
-the same rows: the rule-based arm is what the pipeline's rules made of the extraction and is the
-manuscript's table; the naive arm is what the extractor proposed before any rule, and the pair
-shows where the rules move the level and the N. Duration carries its own N because it is undefined
-where no end was found; parties, countries and states are counts, so nothing extracted is a zero. The note
-states the sample and its size, and the function prints the size the revision assumed beside the
-size counted here.
-
-### Rule-based
-
-```{r}
-#| label: tbl-content-rule
-#| results: asis
-
-tab_content_rule <- fin_table_content(
-  .ds_contracts = lst_ds$Contracts,   # S2 rows, the raw columns of both arms
-  .con          = con,                # Places, for countries and states attached to a party
-  .arm          = "rule",             # the manuscript's table
-  .roles        = .fin_roles_recital, # registrant, co-filers, counterparties: parties, countries, states alike
-  .dirs         = .lP$Output,
-  .name         = NULL,               # ContentRule
-  .digits       = c(Mean = 0L, SD = 2L),
-  .ref          = .fin_reference      # the revision's unique-contract count
-)
-```
-
-### Naive
-
-```{r}
-#| label: tbl-content-naive
-#| results: asis
-
-tab_content_naive <- fin_table_content(
-  .ds_contracts = lst_ds$Contracts,
-  .con          = con,
-  .arm          = "naive",            # before the rules
-  .roles        = .fin_roles_recital, # unused on this arm; kept so both calls read alike
-  .dirs         = .lP$Output,
-  .name         = NULL,               # ContentNaive
-  .digits       = c(Mean = 0L, SD = 2L),
-  .ref          = .fin_reference
-)
-```
-
-### Observation contrast
-
-The same rows, N against N: on how many contracts each measure is defined or found something under
-each arm, and the difference. Words have no block because both arms define them on every contract.
-Duration is where the cascade adds coverage -- a stated term needs no future date in the text --
-and parties, countries and states are where the rules subtract: a recital party is a stricter thing
-than an organisation name, and a place attached to one is stricter than a place mentioned.
-
-```{r}
-#| label: tbl-content-contrast
-#| results: asis
-
-tab_content_contrast <- fin_table_content_contrast(
-  .tab_rule  = tab_content_rule,      # the two tables above, same rows
-  .tab_naive = tab_content_naive,
-  .dirs      = .lP$Output,
-  .name      = "ContentContrast"
-)
-```
-
-### Parties by role
-
-For the two of us, not the manuscript: where the party count comes from. The naive spellings, then
-the parties after grouping by the role the rules assigned, their sum, and the two shares that say
-how often the extractor found nothing and how often it found the registrant. The recital parties of
-the content tables are the first three role columns; signatory-block and other parties are what the
-rule-based count leaves out. The two extra role columns are not in the reader's column list and are read
-from the release by `DocID`.
-
-```{r}
-#| label: tbl-parties
-#| results: asis
-
-tab_parties <- fin_table_parties(
-  .ds_contracts = lst_ds$Contracts,
-  .path_release = .lP$Input$FilContracts,   # nUniSignatory, nUniOther
-  .dirs         = .lP$Output,
-  .name         = "PartiesDetail"
-)
-```
-
-### Classifier confidence by category
-
-The probability the transformer put on the category it assigned, by category: mean, SD and
-quartiles; beside them, how often the keyword-based classifier fired and confirmed or contradicted
-it. Labelled contracts only, so the 735 without text are outside the N (Open Issues).
-
-```{r}
-#| label: tbl-confidence
-#| results: asis
-
-tab_confidence <- fin_table_confidence(
-  .ds_contracts = lst_ds$Contracts,         # BertClassDetailedProb, ClassDetailedFlag
-  .dirs         = .lP$Output,
-  .name         = "ClassConfidence"
-)
-```
-
-### Money by category
-
-For the two of us. How often the extractor found a monetary amount and how many, before and after
-the zero and par-value filter, in USD and in other currencies; and the largest and the median USD
-amount as medians across contracts. Medians, because the release documents a defect in the amounts
-themselves -- flattened HTML tables glued adjacent cells into one figure on roughly 1,500 contracts --
-and a mean of maxima measures that defect. The money columns are not in the reader's column list and are
-read from the release by `DocID`.
-
-```{r}
-#| label: tbl-money
-#| results: asis
-
-tab_money <- fin_table_money(
-  .ds_contracts = lst_ds$Contracts,
-  .path_release = .lP$Input$FilContracts,   # the seven money columns
-  .dirs         = .lP$Output,
-  .name         = "MoneyDetail"
-)
-```
-
-### Redactions by category
-
-On the redaction window from 2008, two identifications side by side. The text: the share of
-contracts whose text carries at least one redaction marker (the manuscript's measure), and, among
-those contracts, how many markers they carry and how many carry five or more -- the threshold the
-notes record and `103` does not apply. The SEC: the share of the 2008-2018 contracts under a
-granted order. A contract can be in either, both or neither, which is why the two are columns and
-not one. The other marker kinds and the price-withholding count stay in the data file (decided 10
-September).
-
-```{r}
-#| label: tbl-redactions
-#| results: asis
-
-tab_redact <- fin_table_redactions(
-  .ds_contracts = lst_ds$Contracts,         # the marker counts, coalesced to zero at read time
-  .dirs         = .lP$Output,
-  .name         = "RedactionsDetail"
-)
-```
-
-## Item 1.01 summaries
-
-Three tables on the announcement sample: single-agreement Item 1.01 8-Ks carrying at most one
-Exhibit 10. Delayed means the 8-K carried no contract -- it came later, in a periodic filing;
-attached means it rode on the 8-K. First the measures, defined once; then the revision's
-comparison, replaced on the release with the three measures the export added; then the same nine
-measures as outcomes of a regression on the delay indicator, which asks what the comparison cannot:
-whether the same firm writes differently when it delays.
-
-### The announcement sample
-
-From every Item 1.01 8-K the pipeline recovered to the sample the tests run on. The single-agreement
-restriction is a proxy -- the number of distinct agreement-date openings in the narrative -- and the
-ladder shows what it costs on each side.
-
-```{r}
-#| label: tbl-summary-sample
-#| results: asis
-
-tab_summary_sample <- fin_table_summary_sample(
-  .ds_summaries = lst_ds$Summaries,
-  .dirs         = .lP$Output,
-  .name         = "SummarySample"
-)
-```
-
-### The announcement lag
-
-Its tails before winsorising, and the winsorised mean the tables report. For the authors; the
-manuscript carries the decision in the notes.
-
-```{r}
-#| label: tbl-summary-lag
-#| results: asis
-
-tab_summary_lag <- fin_table_summary_lag(
-  .ds_summaries = lst_ds$Summaries,
-  .sample       = "S7_Summaries",
-  .winsor       = c(0.01, 0.99),            # the clip points every summary table uses
-  .dirs         = .lP$Output,
-  .name         = "SummaryLag"
-)
-```
-
-### Summary measures
-
-```{r}
-#| label: tbl-summary-variables
-#| results: asis
-
-tab_summary_variables <- fin_table_summary_variables(
-  .dirs = .lP$Output,
-  .name = "SummaryVariables"
-)
-```
-
-### Delayed against attached
-
-```{r}
-#| label: tbl-summaries
-#| results: asis
-
-tab_summaries <- fin_table_summaries(
-  .ds_summaries = lst_ds$Summaries,
-  .sample       = "S7_Summaries",           # the paper's announcement sample
-  .dirs         = .lP$Output,
-  .name         = "Summaries"
-)
-```
-
-### Delayed against attached, the text measures only
-
-The same table without the announcement lag and the four-business-day indicator (decided 10
-September); the nine-row version above stays.
-
-```{r}
-#| label: tbl-summaries-text
-#| results: asis
-
-tab_summaries_text <- fin_table_summaries(
-  .ds_summaries = lst_ds$Summaries,
-  .sample       = "S7_Summaries",
-  .measures     = c("Words", "Fog", "Uncertainty", "Numbers", "Dollars", "Percents", "Boilerplate"),
-  .dirs         = .lP$Output,
-  .name         = "SummariesText"
-)
-```
-
-### The delay indicator in a regression
-
-Nine outcomes across, three specifications down: year effects; year and firm effects, which asks
-whether the same firm's delayed summaries differ from its attached ones; and the resubmission's
-firm-quarter controls on the announcements matched to a fiscal quarter. Delayed announcements
-carry no contract row and hence no Compustat key, so every announcement, delayed or attached, is
-matched by one rule -- the firm's first quarter ending on or after the filing, at most a hundred
-days later. Standard errors clustered by firm.
-
-```{r}
-#| label: tbl-summaries-regression
-#| results: asis
-
-tab_summaries_regression <- fin_table_summaries_regression(
-  .ds_summaries = lst_ds$Summaries,
-  .ds_quarter   = lst_ds$Quarter,           # the controls
-  .con          = con,                      # the quarter match
-  .sample       = "S7_Summaries",
-  .controls     = .fin_controls$Resubmission,
-  .dirs         = .lP$Output,
-  .name         = "SummariesRegression"
-)
-```
-
-### The delay indicator in a regression, the text measures only
-
-```{r}
-#| label: tbl-summaries-text-regression
-#| results: asis
-
-tab_summaries_text_regression <- fin_table_summaries_regression(
-  .ds_summaries = lst_ds$Summaries,
-  .ds_quarter   = lst_ds$Quarter,
-  .con          = con,
-  .sample       = "S7_Summaries",
-  .measures     = c("Words", "Fog", "Uncertainty", "Numbers", "Dollars", "Percents", "Boilerplate"),
-  .controls     = .fin_controls$Resubmission,
-  .dirs         = .lP$Output,
-  .name         = "SummariesTextRegression"
-)
-```
-
-## Classification
-
-Everything about the classifiers, for the authors, until the manuscript's set is chosen. Every
-score is out of fold: five folds dealt once in `03A` and shared by every arm, each document predicted
-once by a model that never saw it; there is no held-out test set, by design, because the rarest
-category has seventy-one documents. Tables by category follow the Categories order, the super rows
-scoring the detailed predictions rolled up to their parent.
-
-### The labelled sample
-
-```{r}
-#| label: tbl-class-sample
-#| results: asis
-
-tab_class_sample <- fin_table_class_sample(
-  .ds_sample = lst_ds_class$ClassSample,
-  .dirs      = .lP$Output,
-  .name      = "ClassLabelled"
-)
-```
-
-### The transformer, out of fold
-
-```{r}
-#| label: tbl-class-transformer
-#| results: asis
-
-tab_class_transformer <- fin_table_class_transformer(
-  .ds_panel   = lst_ds_class$ClassPanel,
-  .ds_sample  = lst_ds_class$ClassSample,   # the second label, for lenient recall
-  .ds_crowned = lst_ds_class$ClassCrowned,  # which length ships
-  .dirs       = .lP$Output,
-  .name       = "ClassTransformer"
-)
-```
-
-### The amendment classifier
-
-```{r}
-#| label: tbl-class-amendment
-#| results: asis
-
-tab_class_amendment <- fin_table_class_amendment(
-  .ds_panel   = lst_ds_class$ClassPanel,
-  .ds_crowned = lst_ds_class$ClassCrowned,
-  .dirs       = .lP$Output,
-  .name       = "ClassAmendment"
-)
-```
-
-### The keyword arm
-
-```{r}
-#| label: tbl-class-keyword
-#| results: asis
-
-tab_class_keyword <- fin_table_class_keyword(
-  .ds_panel  = lst_ds_class$ClassPanel,
-  .ds_sample = lst_ds_class$ClassSample,
-  .dirs      = .lP$Output,
-  .name      = "ClassKeyword"
-)
-```
-
-### The arms compared
-
-```{r}
-#| label: tbl-class-arms
-#| results: asis
-
-lst_class_arms <- fin_table_class_arms(
-  .ds_panel   = lst_ds_class$ClassPanel,
-  .ds_crowned = lst_ds_class$ClassCrowned,
-  .dirs       = .lP$Output,
-  .name       = "ClassArms"
-)
-```
-
-### Model selection
-
-```{r}
-#| label: tbl-class-sweep
-#| results: asis
-
-tab_class_sweep <- fin_table_class_sweep(
-  .ds_sweep   = lst_ds_class$ClassSweep,
-  .ds_crowned = lst_ds_class$ClassCrowned,
-  .dirs       = .lP$Output,
-  .name       = "ClassSweep"
-)
-```
-
-### The confusion matrix
-
-```{r}
-#| label: tbl-class-confusion
-#| results: asis
-
-tab_class_confusion <- fin_table_class_confusion(
-  .ds_panel   = lst_ds_class$ClassPanel,
-  .ds_sample  = lst_ds_class$ClassSample,
-  .ds_crowned = lst_ds_class$ClassCrowned,
-  .dirs       = .lP$Output,
-  .name       = "ClassConfusion"
-)
-```
-
-# Figures
-
-Each manuscript figure is one call, with the tables' contract: the tibble behind it to
-`Output/Data`, the figure as pdf and png to `Output/Figures`, the note to `Output/Notes`, all under
-the figure's name, and the figure printed here. The data functions behind the figures are the
-retired lab's, carried into this library; the runbook only picks the sample and writes the note.
+# Filing behaviour and filers
 
 ## Filing types
 
@@ -875,6 +578,28 @@ fig_filings_time <- fin_figure_filings_time(
 )
 ```
 
+## Within the year
+
+When in the calendar year contracts are filed; from the appendix's Chapter A.
+
+```{r}
+#| label: build-within-year
+st_within <- c(
+  FilingsWithinYear = do.call(oaa_build_within_year, c(.b_a, list(.path_contracts = .lP$Input$FilContracts)))
+)
+
+oa_report_builds(.status = st_within)
+```
+
+```{r}
+#| label: show-within-year
+#| results: asis
+fin_show_built(
+  .names = names(st_within),
+  .dirs  = .lP$Output
+)
+```
+
 ## Seasoned filers
 
 The referee's SPAC question in one figure: all filers against firms more than two years past their
@@ -891,6 +616,192 @@ fig_seasoned <- fin_figure_seasoned(
   .ds_contracts = lst_ds$Contracts,
   .dirs         = .lP$Output,
   .name         = "FilingsSeasoned"
+)
+```
+
+### Three panels, for the appendix
+
+The form Chapter A prints: all filers against seasoned filers in three panels, with the first EDGAR filing of each
+CIK from the master index and the industry from the landing pages.
+
+```{r}
+#| label: build-seasoned
+st_seasoned <- c(
+  SeasonedFilers = do.call(oaa_build_seasoned, c(.b_a, list(
+    .path_contracts = .lP$Input$FilContracts,   # the sample, its forms and its labels
+    .path_landing   = .lP$Pipeline$Landing,     # the SIC code of each filing
+    .dir_master     = .lP$Pipeline$DirMaster    # the first EDGAR filing of each CIK
+  )))
+)
+
+oa_report_builds(.status = st_seasoned)
+```
+
+```{r}
+#| label: show-seasoned
+#| results: asis
+fin_show_built(
+  .names = names(st_seasoned),
+  .dirs  = .lP$Output
+)
+```
+
+## Filing metrics by firm fundamentals
+
+Her `104` step for step, on the full quarter panel inside the window -- the sample restrictions
+written above the figure in `104` are commented out, so every firm-quarter of every ever-filing firm
+counts, non-filing quarters included. Panel A: smallest against largest size quartile, quartiles
+within fiscal year, periodic against current reports, by fiscal quarter. Panel B: contracts per
+firm-quarter by industry. "Current reports" is every non-periodic form, registration statements
+included, which her legend calls 8-K.
+
+```{r}
+#| label: fig-firm-fundamentals
+#| results: asis
+#| fig-cap: "Contracts per firm-quarter by size quartile and channel (A) and by industry (B), firm-quarter panel."
+#| fig-height: !expr plot_height(8L)
+#| fig-width: 10
+
+fig_firm_fundamentals <- fin_figure_firm_fundamentals(
+  .ds_quarter = lst_ds$Quarter,
+  .dirs       = .lP$Output,
+  .name       = "FirmFundamentals",
+  .ref        = .fin_reference_f08          # the revision's Panel B, checked on the render
+)
+```
+
+### Layouts under choice (16 September)
+
+The figure above is ten inches wide; set at the manuscript's text width of 5.65 inches, its 11-point type prints at
+about six points. The forms below use the standard 7.5-inch canvas. A to C stack the two panels and differ only in
+Panel A's time axis -- fiscal quarters as above, the mean of each complete fiscal year, or a trailing mean over four
+quarters; the saw-tooth in the periodic series is the 10-K quarter. D and E split the figure in two. Once a form is
+chosen it takes the stem `FirmFundamentals`, and the other forms go.
+
+#### A. Stacked, by fiscal quarter
+
+```{r}
+#| label: fig-firm-a
+#| results: asis
+#| fig-cap: "Firm fundamentals, stacked: size quartile and channel by fiscal quarter (A) and industry (B)."
+#| fig-height: !expr plot_height(18L)
+
+fig_firm_a <- fin_figure_firm_forms(
+  .ds_quarter = lst_ds$Quarter,
+  .form       = "a",                     # Panel A above Panel B, by fiscal quarter as today
+  .dirs       = .lP$Output,
+  .name       = "FirmFundamentalsA"
+)
+```
+
+#### B. Stacked, fiscal-year means
+
+```{r}
+#| label: fig-firm-b
+#| results: asis
+#| fig-cap: "Firm fundamentals, stacked: size quartile and channel as fiscal-year means (A) and industry (B)."
+#| fig-height: !expr plot_height(18L)
+
+fig_firm_b <- fin_figure_firm_forms(
+  .ds_quarter = lst_ds$Quarter,
+  .form       = "b",                     # the same layout, the four quarters of each fiscal year averaged
+  .dirs       = .lP$Output,
+  .name       = "FirmFundamentalsB"
+)
+```
+
+#### C. Stacked, trailing four-quarter means
+
+```{r}
+#| label: fig-firm-c
+#| results: asis
+#| fig-cap: "Firm fundamentals, stacked: size quartile and channel as trailing four-quarter means (A) and industry (B)."
+#| fig-height: !expr plot_height(18L)
+
+fig_firm_c <- fin_figure_firm_forms(
+  .ds_quarter = lst_ds$Quarter,
+  .form       = "c",                     # the same layout, quarterly resolution kept
+  .dirs       = .lP$Output,
+  .name       = "FirmFundamentalsC"
+)
+```
+
+#### D. Split, first half: size and channel
+
+```{r}
+#| label: fig-firm-size
+#| results: asis
+#| fig-cap: "Contracts per firm-quarter by size quartile and channel, fiscal-year means."
+#| fig-height: !expr plot_height(8L)
+
+fig_firm_size <- fin_figure_firm_forms(
+  .ds_quarter = lst_ds$Quarter,
+  .form       = "size",                  # Panel A alone, fiscal-year means
+  .dirs       = .lP$Output,
+  .name       = "FirmSize"
+)
+```
+
+#### E. Split, second half: industry
+
+```{r}
+#| label: fig-firm-industry
+#| results: asis
+#| fig-cap: "Contracts per firm-quarter by Fama-French 12 industry."
+#| fig-height: !expr plot_height(12L)
+
+fig_firm_industry <- fin_figure_firm_forms(
+  .ds_quarter = lst_ds$Quarter,
+  .form       = "industry",              # Panel B alone
+  .dirs       = .lP$Output,
+  .name       = "FirmIndustry"
+)
+```
+
+# Contract types
+
+## Contract categories
+
+The taxonomy's definition, hand-written. Rows in the revision's taxonomic order; `.order = "paper"`
+sorts them into the numbered order every other exhibit uses, which is the class-order question
+still open with Ann-Kristin.
+
+```{r}
+#| label: tbl-categories
+#| results: asis
+
+tab_categories <- fin_table_categories(
+  .order = "taxonomic",       # "paper" for the numbered order (1) M&A ... (12) Other
+  .dirs  = .lP$Output,        # Data, Tables, Notes
+  .name  = "Categories"       # the stem of every file written
+)
+```
+
+## What filers call their contracts
+
+The descriptions filers give their contracts, the most frequent per category; from the appendix's Chapter C.
+
+```{r}
+#| label: build-titles
+st_titles <- c(
+  CategoryTitles = oac_build_titles(
+    .path_contracts = .lP$Input$FilContracts,   # the filer's description of each contract
+    .n              = .lP$Build$Titles,         # descriptions per category
+    .dir_own        = .lP$DirOwn,
+    .force          = .lP$Build$Rebuild,
+    .path_lib       = .lP$Pipeline$Lib
+  )
+)
+
+oa_report_builds(.status = st_titles)
+```
+
+```{r}
+#| label: show-titles
+#| results: asis
+fin_show_built(
+  .names = names(st_titles),
+  .dirs  = .lP$Output
 )
 ```
 
@@ -985,6 +896,399 @@ fig_types_time_d <- fin_figure_types_time(
 )
 ```
 
+## Classifier confidence by category
+
+The probability the transformer put on the category it assigned, by category: mean, SD and
+quartiles; beside them, how often the keyword-based classifier fired and confirmed or contradicted
+it. Labelled contracts only, so the 735 without text are outside the N (Open Issues).
+
+```{r}
+#| label: tbl-confidence
+#| results: asis
+
+tab_confidence <- fin_table_confidence(
+  .ds_contracts = lst_ds$Contracts,         # BertClassDetailedProb, ClassDetailedFlag
+  .dirs         = .lP$Output,
+  .name         = "ClassConfidence"
+)
+```
+
+# Classification performance
+
+Everything about the classifiers, for the authors, until the manuscript's set is chosen. Every
+score is out of fold: five folds dealt once in `03A` and shared by every arm, each document predicted
+once by a model that never saw it; there is no held-out test set, by design, because the rarest
+category has seventy-one documents. Tables by category follow the Categories order, the super rows
+scoring the detailed predictions rolled up to their parent.
+
+## The labelled sample
+
+```{r}
+#| label: tbl-class-sample
+#| results: asis
+
+tab_class_sample <- fin_table_class_sample(
+  .ds_sample = lst_ds_class$ClassSample,
+  .dirs      = .lP$Output,
+  .name      = "ClassLabelledFull"
+)
+```
+
+## The transformer, out of fold
+
+```{r}
+#| label: tbl-class-transformer
+#| results: asis
+
+tab_class_transformer <- fin_table_class_transformer(
+  .ds_panel   = lst_ds_class$ClassPanel,
+  .ds_sample  = lst_ds_class$ClassSample,   # the second label, for lenient recall
+  .ds_crowned = lst_ds_class$ClassCrowned,  # which length ships
+  .dirs       = .lP$Output,
+  .name       = "ClassTransformerFull"
+)
+```
+
+## The amendment classifier
+
+```{r}
+#| label: tbl-class-amendment
+#| results: asis
+
+tab_class_amendment <- fin_table_class_amendment(
+  .ds_panel   = lst_ds_class$ClassPanel,
+  .ds_crowned = lst_ds_class$ClassCrowned,
+  .dirs       = .lP$Output,
+  .name       = "ClassAmendmentFull"
+)
+```
+
+## The keyword arm
+
+```{r}
+#| label: tbl-class-keyword
+#| results: asis
+
+tab_class_keyword <- fin_table_class_keyword(
+  .ds_panel  = lst_ds_class$ClassPanel,
+  .ds_sample = lst_ds_class$ClassSample,
+  .dirs      = .lP$Output,
+  .name      = "ClassKeywordFull"
+)
+```
+
+## The arms compared
+
+```{r}
+#| label: tbl-class-arms
+#| results: asis
+
+lst_class_arms <- fin_table_class_arms(
+  .ds_panel   = lst_ds_class$ClassPanel,
+  .ds_crowned = lst_ds_class$ClassCrowned,
+  .dirs       = .lP$Output,
+  .name       = "ClassArmsFull"
+)
+```
+
+## Model selection
+
+```{r}
+#| label: tbl-class-sweep
+#| results: asis
+
+tab_class_sweep <- fin_table_class_sweep(
+  .ds_sweep   = lst_ds_class$ClassSweep,
+  .ds_crowned = lst_ds_class$ClassCrowned,
+  .dirs       = .lP$Output,
+  .name       = "ClassSweep"
+)
+```
+
+## The confusion matrix
+
+```{r}
+#| label: tbl-class-confusion
+#| results: asis
+
+tab_class_confusion <- fin_table_class_confusion(
+  .ds_panel   = lst_ds_class$ClassPanel,
+  .ds_sample  = lst_ds_class$ClassSample,
+  .ds_crowned = lst_ds_class$ClassCrowned,
+  .dirs       = .lP$Output,
+  .name       = "ClassConfusionFull"
+)
+```
+
+## The appendix's cuts
+
+The tables Chapter C prints, each a cut of the full table above it: no fold scores, the categories numbered
+(1)-(12) in the taxonomic order, undefined scores as a dash. Each reads its `...Full` tibble from this document's
+`Data/` and writes under the plain name, which is the one the chapter inputs; the deployed-models table reads
+`ClassSweep`, and the second-label pair reads `03B`'s crowned classification.
+
+```{r}
+#| label: build-class-cuts
+.b_c <- c(
+  .b_a,
+  list(.dir_data = .lP$Output$DirData)   # the full tables above, written by this document
+)
+
+st_class <- c(
+  ClassLabelled    = do.call(oac_build_labelled, .b_c),  # ClassLabelledFull, without round and words
+  ClassDeployed    = do.call(oac_build_deployed, .b_c),  # ClassSweep, the crowned and deployed rows only
+  ClassTransformer = do.call(oac_build_scores, c(.b_c, list(
+    .name    = "ClassTransformer",
+    .columns = c("Precision", "Recall", "F1", "RecallLenient"),
+    .header  = c("Precision", "Recall", "F1", "Lenient recall"),
+    .note    = paste(
+      "Out-of-fold scores of the transformer that ships on the labeled sample. Sub-category rows score the",
+      "detailed prediction against the detailed label; parent rows score the same predictions rolled up to their",
+      "parent, so an error inside a parent does not count there. Precision, recall and F1 are per category; the",
+      "Total row reports their macro averages. Lenient recall credits a prediction that equals the contract's",
+      "second valid category; in the Total row it is overall accuracy under lenient scoring, the figure the main",
+      "text cites."
+    )
+  ))),
+  ClassConfusion   = do.call(oac_build_confusion, .b_c),
+  ClassAmendment   = do.call(oac_build_amendment, .b_c),
+  ClassKeyword     = do.call(oac_build_scores, c(.b_c, list(
+    .name    = "ClassKeyword",
+    .columns = c("Coverage", "Precision", "RecallSel", "F1"),
+    .header  = c("Coverage", "Precision", "Recall where committed", "F1"),
+    .note    = paste(
+      "Out-of-fold scores of the published keyword table on the labeled sample. Coverage is the share of a",
+      "category's contracts on which a term of the table fired; the table abstains on the rest. Precision is",
+      "over the contracts assigned the category; recall where committed is over the contracts of the category on",
+      "which the table committed; F1 combines precision with recall over all contracts of the category, so an",
+      "abstention counts as a miss. A dash marks a score that is undefined because the table never assigned the",
+      "category to any contract. The Total row reports the macro averages."
+    )
+  ))),
+  ClassArms        = do.call(oac_build_arms, .b_c),
+  ClassSecond      = oac_build_second(       # writes ClassSecondPairs and ClassSecond together
+    .path_class = .lP$Pipeline$ClassFile,    # first and second choice per labelled document
+    .dir_own    = .lP$DirOwn,
+    .force      = .lP$Build$Rebuild,
+    .path_lib   = .lP$Pipeline$Lib
+  )
+)
+
+oa_report_builds(.status = st_class)
+```
+
+```{r}
+#| label: show-class-cuts
+#| results: asis
+fin_show_built(
+  .names = c("ClassLabelled", "ClassDeployed", "ClassTransformer", "ClassConfusion", "ClassAmendment",
+             "ClassKeyword", "ClassArms", "ClassSecondPairs", "ClassSecond"),
+  .dirs  = .lP$Output
+)
+```
+
+# Content variables
+
+## The extractors on the labelled sample
+
+What each extractor proposed on the labelled sample, where in the contract its candidates fall, and how far the
+extractors agree; from the appendix's Chapter D, computed from `04A`'s span stores, opened read-only.
+
+```{r}
+#| label: build-entities
+st_entities <- c(
+  EntityCoverage  = oad_build_coverage(
+    .dir_store   = .lP$Pipeline$DirStore,   # 04A's three stores, opened read-only
+    .path_sample = .lP$Pipeline$Sample,     # the documents every store indexes
+    .spacy_model = .lP$Build$SpacyModel,    # the spaCy model printed
+    .dir_own     = .lP$DirOwn,
+    .force       = .lP$Build$Rebuild,
+    .path_lib    = .lP$Pipeline$Lib
+  ),
+  EntityAlignment = oad_build_alignment(    # writes EntityPositions and EntityAgreement from one pass
+    .dir_store   = .lP$Pipeline$DirStore,
+    .path_sample = .lP$Pipeline$Sample,
+    .spacy_model = .lP$Build$SpacyModel,
+    .dir_own     = .lP$DirOwn,
+    .force       = .lP$Build$Rebuild,
+    .path_lib    = .lP$Pipeline$Lib
+  )
+)
+
+oa_report_builds(.status = st_entities)
+```
+
+```{r}
+#| label: show-entities
+#| results: asis
+fin_show_built(
+  .names = c("EntityCoverage", "EntityPositions", "EntityAgreement"),
+  .dirs  = .lP$Output
+)
+```
+
+## Content characteristics by category
+
+Words, duration, parties, countries and states by category on the unique-contract sample, in the Categories
+table's order: super-categories pooled and bold, sub-categories indented, Total last. Twice, from
+the same rows: the rule-based arm is what the pipeline's rules made of the extraction and is the
+manuscript's table; the naive arm is what the extractor proposed before any rule, and the pair
+shows where the rules move the level and the N. Duration carries its own N because it is undefined
+where no end was found; parties, countries and states are counts, so nothing extracted is a zero. The note
+states the sample and its size, and the function prints the size the revision assumed beside the
+size counted here.
+
+### Rule-based
+
+```{r}
+#| label: tbl-content-rule
+#| results: asis
+
+tab_content_rule <- fin_table_content(
+  .ds_contracts = lst_ds$Contracts,   # S2 rows, the raw columns of both arms
+  .con          = con,                # Places, for countries and states attached to a party
+  .arm          = "rule",             # the manuscript's table
+  .roles        = .fin_roles_recital, # registrant, co-filers, counterparties: parties, countries, states alike
+  .dirs         = .lP$Output,
+  .name         = NULL,               # ContentRule
+  .digits       = c(Mean = 2L, SD = 2L),  # two decimals throughout (decided 16 September)
+  .words_scale  = 1000,                   # words in thousands, as the header says
+  .ref          = .fin_reference      # the revision's unique-contract count
+)
+```
+
+### Naive
+
+```{r}
+#| label: tbl-content-naive
+#| results: asis
+
+tab_content_naive <- fin_table_content(
+  .ds_contracts = lst_ds$Contracts,
+  .con          = con,
+  .arm          = "naive",            # before the rules
+  .roles        = .fin_roles_recital, # unused on this arm; kept so both calls read alike
+  .dirs         = .lP$Output,
+  .name         = NULL,               # ContentNaive
+  .digits       = c(Mean = 2L, SD = 2L),  # two decimals throughout (decided 16 September)
+  .words_scale  = 1000,                   # words in thousands, as the header says
+  .ref          = .fin_reference
+)
+```
+
+## Observation contrast
+
+The same rows, N against N: on how many contracts each measure is defined or found something under
+each arm, and the difference. Words have no block because both arms define them on every contract.
+Duration is where the cascade adds coverage -- a stated term needs no future date in the text --
+and parties, countries and states are where the rules subtract: a recital party is a stricter thing
+than an organisation name, and a place attached to one is stricter than a place mentioned.
+
+```{r}
+#| label: tbl-content-contrast
+#| results: asis
+
+tab_content_contrast <- fin_table_content_contrast(
+  .tab_rule  = tab_content_rule,      # the two tables above, same rows
+  .tab_naive = tab_content_naive,
+  .dirs      = .lP$Output,
+  .name      = "ContentContrast"
+)
+```
+
+## Parties by role
+
+For the two of us, not the manuscript: where the party count comes from. The naive spellings, then
+the parties after grouping by the role the rules assigned, their sum, and the two shares that say
+how often the extractor found nothing and how often it found the registrant. The recital parties of
+the content tables are the first three role columns; signatory-block and other parties are what the
+rule-based count leaves out. The two extra role columns are not in the reader's column list and are read
+from the release by `DocID`.
+
+```{r}
+#| label: tbl-parties
+#| results: asis
+
+tab_parties <- fin_table_parties(
+  .ds_contracts = lst_ds$Contracts,
+  .path_release = .lP$Input$FilContracts,   # nUniSignatory, nUniOther
+  .dirs         = .lP$Output,
+  .name         = "PartiesDetail"
+)
+```
+
+## Money by category
+
+For the two of us. How often the extractor found a monetary amount and how many, before and after
+the zero and par-value filter, in USD and in other currencies; and the largest and the median USD
+amount as medians across contracts. Medians, because the release documents a defect in the amounts
+themselves -- flattened HTML tables glued adjacent cells into one figure on roughly 1,500 contracts --
+and a mean of maxima measures that defect. The money columns are not in the reader's column list and are
+read from the release by `DocID`.
+
+```{r}
+#| label: tbl-money
+#| results: asis
+
+tab_money <- fin_table_money(
+  .ds_contracts = lst_ds$Contracts,
+  .path_release = .lP$Input$FilContracts,   # the seven money columns
+  .dirs         = .lP$Output,
+  .name         = "MoneyDetail"
+)
+```
+
+## Values, and where each end date comes from
+
+What each content measure is worth under the naive and the rule-based reading, and which rung of the duration
+cascade answered; from the appendix's Chapter D, read from the release.
+
+```{r}
+#| label: build-values
+st_values <- c(
+  ContentValues = oad_build_values(
+    .path_contracts = .lP$Input$FilContracts,   # the naive and rule-based content columns
+    .dir_own        = .lP$DirOwn,
+    .force          = .lP$Build$Rebuild,
+    .path_lib       = .lP$Pipeline$Lib
+  ),
+  DurationRungs = oad_build_duration(
+    .path_contracts = .lP$Input$FilContracts,   # DurationSource, DurationDropped and the two durations
+    .dir_own        = .lP$DirOwn,
+    .force          = .lP$Build$Rebuild,
+    .path_lib       = .lP$Pipeline$Lib
+  )
+)
+
+oa_report_builds(.status = st_values)
+```
+
+```{r}
+#| label: show-values
+#| results: asis
+fin_show_built(
+  .names = names(st_values),
+  .dirs  = .lP$Output
+)
+```
+
+## The two readings, at a glance
+
+The appendix's one content table (decided 16 September): it replaces the observation contrast and the values table
+there. For each measure, the share of contracts on which it takes a value and what it is worth, under the naive and
+the rule-based reading, totals only; the category rows stay in the tibbles above. Rule-based countries and states
+are the content table's -- places attached to any recital party -- with the registrant and counterparty split
+beneath. Nothing is computed anew, and the means two builders compute separately are checked against each other.
+
+```{r}
+#| label: tbl-content-readings
+#| results: asis
+tab_content_readings <- fin_table_content_readings(
+  .dirs = .lP$Output,
+  .name = "ContentReadings"
+)
+```
+
 ## Content characteristics over time
 
 Mean per year of duration, countries, parties and words. Decided on 9 September: the median goes
@@ -1072,26 +1376,7 @@ fig_content_time_index <- fin_figure_content_time(
 )
 ```
 
-## Redactions over time
-
-The two identifications as the revision draws them: orders through 2018, order-or-markers
-throughout. Unique contracts from 2008. The report prints the revision's readings beside the
-render; `.markers = TRUE` adds the marker-only line for an appendix version.
-
-```{r}
-#| label: fig-redactions-time
-#| results: asis
-#| fig-cap: "Share of contracts with redactions per year, two identifications, unique contracts from 2008."
-#| fig-height: !expr plot_height(5L)
-
-fig_redactions_time <- fin_figure_redactions_time(
-  .ds_contracts = lst_ds$Contracts,
-  .markers      = FALSE,                    # TRUE adds the marker-only series
-  .dirs         = .lP$Output,
-  .name         = "RedactionsTime",
-  .ref          = .fin_reference_f10       # the revision's readings, checked on the render
-)
-```
+# Geography
 
 ## Maps
 
@@ -1253,27 +1538,132 @@ fig_diversity <- fin_figure_diversity(
 )
 ```
 
-## Filing metrics by firm fundamentals
+# Redactions
 
-Her `104` step for step, on the full quarter panel inside the window -- the sample restrictions
-written above the figure in `104` are commented out, so every firm-quarter of every ever-filing firm
-counts, non-filing quarters included. Panel A: smallest against largest size quartile, quartiles
-within fiscal year, periodic against current reports, by fiscal quarter. Panel B: contracts per
-firm-quarter by industry. "Current reports" is every non-periodic form, registration statements
-included, which her legend calls 8-K.
+## Orders, their links, and the text markers
+
+Confidential treatment orders from the order to the contract it covers (the appendix's Chapter A), the orders on
+the forms Ahci (2025) covers, and the orders against the text markers from 2008 to 2018 -- the last two data only,
+for the numbers.
 
 ```{r}
-#| label: fig-firm-fundamentals
-#| results: asis
-#| fig-cap: "Contracts per firm-quarter by size quartile and channel (A) and by industry (B), firm-quarter panel."
-#| fig-height: !expr plot_height(8L)
-#| fig-width: 10
+#| label: build-orders
+st_orders <- c(
+  CtoLinkage = do.call(oaa_build_cto, c(.b_a, list(
+    .path_orders    = .lP$Input$FilCtoOrders,   # one row per reference an order makes
+    .path_contracts = .lP$Input$FilContracts    # the release's flag on the sample
+  ))),
+  CtoAhci    = num_build(
+    .name    = "CtoAhci",                       # orders on the forms Ahci (2025) covers
+    .fun     = \() num_data_cto_ahci(
+      .path_orders = .lP$Input$FilCtoOrders,
+      .to          = .lP$Build$AhciTo
+    ),
+    .inputs  = c(.lP$Input$FilCtoOrders, .lP$Pipeline$Lib),
+    .dir_own = .lP$DirOwn,
+    .force   = .lP$Build$Rebuild
+  ),
+  CtoMarkers = num_build(
+    .name    = "CtoMarkers",                    # orders against text markers, 2008-2018
+    .fun     = \() num_data_cto_markers(
+      .path_contracts = .lP$Input$FilContracts,
+      .min_markers    = .lP$Build$MinMarkers
+    ),
+    .inputs  = c(.lP$Input$FilContracts, .lP$Pipeline$Lib),
+    .dir_own = .lP$DirOwn,
+    .force   = .lP$Build$Rebuild
+  )
+)
 
-fig_firm_fundamentals <- fin_figure_firm_fundamentals(
-  .ds_quarter = lst_ds$Quarter,
-  .dirs       = .lP$Output,
-  .name       = "FirmFundamentals",
-  .ref        = .fin_reference_f08          # the revision's Panel B, checked on the render
+oa_report_builds(.status = st_orders)
+```
+
+```{r}
+#| label: show-orders
+#| results: asis
+fin_show_built(
+  .names = names(st_orders),
+  .dirs  = .lP$Output
+)
+```
+
+## Redactions by category
+
+On the redaction window from 2008, two identifications side by side. The text: the share of
+contracts whose text carries at least one redaction marker (the manuscript's measure), and, among
+those contracts, how many markers they carry and how many carry five or more -- the threshold the
+notes record and `103` does not apply. The SEC: the share of the 2008-2018 contracts under a
+granted order. A contract can be in either, both or neither, which is why the two are columns and
+not one. The other marker kinds and the price-withholding count stay in the data file (decided 10
+September).
+
+```{r}
+#| label: tbl-redactions
+#| results: asis
+
+tab_redact <- fin_table_redactions(
+  .ds_contracts = lst_ds$Contracts,         # the marker counts, coalesced to zero at read time
+  .dirs         = .lP$Output,
+  .name         = "RedactionsDetail"
+)
+```
+
+## Redactions over time
+
+The two identifications as the revision draws them: orders through 2018, order-or-markers
+throughout. Unique contracts from 2008. The report prints the revision's readings beside the
+render; `.markers = TRUE` adds the marker-only line for an appendix version.
+
+```{r}
+#| label: fig-redactions-time
+#| results: asis
+#| fig-cap: "Share of contracts with redactions per year, two identifications, unique contracts from 2008."
+#| fig-height: !expr plot_height(5L)
+
+fig_redactions_time <- fin_figure_redactions_time(
+  .ds_contracts = lst_ds$Contracts,
+  .markers      = FALSE,                    # TRUE adds the marker-only series
+  .dirs         = .lP$Output,
+  .name         = "RedactionsTime",
+  .ref          = .fin_reference_f10       # the revision's readings, checked on the render
+)
+```
+
+## Redactions by category over time
+
+Ann-Kristin's ask of 18 September: the redaction share per contract type over the years, in the shape the contract
+types already have. The old draft drew twelve lines in one frame. Two forms, as for the types: a panel per category,
+or a panel per super-category with its sub-categories as lines. Once one is chosen it takes the stem
+`RedactionsTypes` and the other goes. The measure is the paper's, so the dashed line sits on 2019, the year it
+changes from orders to markers.
+
+### A. One panel per category
+
+```{r}
+#| label: fig-redactions-types-a
+#| fig-cap: "Share of contracts redacted per year and category, a panel per category, contracts from 2008."
+#| fig-height: !expr plot_height(18L)
+
+fig_redactions_types_a <- fin_figure_redactions_types(
+  .ds_contracts = lst_ds$Contracts,
+  .form         = "a",                      # twelve panels, four to a row
+  .dirs         = .lP$Output,
+  .name         = "RedactionsTypesA"
+)
+```
+
+### B. One panel per super-category, sub-categories as lines
+
+```{r}
+#| label: fig-redactions-types-b
+#| fig-cap: "Share of contracts redacted per year, a panel per super-category, contracts from 2008."
+#| fig-height: !expr plot_height(12L)
+
+fig_redactions_types_b <- fin_figure_redactions_types(
+  .ds_contracts = lst_ds$Contracts,
+  .form         = "b",                      # seven panels, the sub-categories labelled at the line's end
+  .dirs         = .lP$Output,
+  .name         = "RedactionsTypesB"
 )
 ```
 
@@ -1299,8 +1689,10 @@ fig_redactions_heat_all <- fin_figure_redactions_heat(
   .ds_contracts = lst_ds$Contracts,
   .ds_quarter   = lst_ds$Quarter,           # the industry of the filing firm
   .period       = "all",
-  .min_n        = 30L,                      # cells below this are shaded but not labelled
+  .min_n        = 30L,                      # cells below this are grey with a dash
   .limit        = 0.8,                      # top of the fill, shared by the three
+  .accuracy     = 0.1,                      # one decimal in every cell
+  .strips       = "top",                    # super-categories above their columns, as text
   .dirs         = .lP$Output,
   .name         = NULL                      # RedactionsIndustryAll
 )
@@ -1321,6 +1713,8 @@ fig_redactions_heat_pre <- fin_figure_redactions_heat(
   .period       = "pre",
   .min_n        = 30L,
   .limit        = 0.8,
+  .accuracy     = 0.1,
+  .strips       = "top",
   .dirs         = .lP$Output,
   .name         = NULL                      # RedactionsIndustryPre
 )
@@ -1341,10 +1735,150 @@ fig_redactions_heat_post <- fin_figure_redactions_heat(
   .period       = "post",
   .min_n        = 30L,
   .limit        = 0.8,
+  .accuracy     = 0.1,
+  .strips       = "top",
   .dirs         = .lP$Output,
   .name         = NULL                      # RedactionsIndustryPost
 )
 ```
+
+# Item 1.01 announcements
+
+Three tables on the announcement sample: single-agreement Item 1.01 8-Ks carrying at most one
+Exhibit 10. Delayed means the 8-K carried no contract -- it came later, in a periodic filing;
+attached means it rode on the 8-K. First the measures, defined once; then the revision's
+comparison, replaced on the release with the three measures the export added; then the same nine
+measures as outcomes of a regression on the delay indicator, which asks what the comparison cannot:
+whether the same firm writes differently when it delays.
+
+## The announcement sample
+
+From every Item 1.01 8-K the pipeline recovered to the sample the tests run on. The single-agreement
+restriction is a proxy -- the number of distinct agreement-date openings in the narrative -- and the
+ladder shows what it costs on each side.
+
+```{r}
+#| label: tbl-summary-sample
+#| results: asis
+
+tab_summary_sample <- fin_table_summary_sample(
+  .ds_summaries = lst_ds$Summaries,
+  .dirs         = .lP$Output,
+  .name         = "SummarySample"
+)
+```
+
+## The announcement lag
+
+Its tails before winsorising, and the winsorised mean the tables report. For the authors; the
+manuscript carries the decision in the notes.
+
+```{r}
+#| label: tbl-summary-lag
+#| results: asis
+
+tab_summary_lag <- fin_table_summary_lag(
+  .ds_summaries = lst_ds$Summaries,
+  .sample       = "S7_Summaries",
+  .winsor       = c(0.01, 0.99),            # the clip points every summary table uses
+  .dirs         = .lP$Output,
+  .name         = "SummaryLag"
+)
+```
+
+## Summary measures
+
+```{r}
+#| label: tbl-summary-variables
+#| results: asis
+
+tab_summary_variables <- fin_table_summary_variables(
+  .dirs = .lP$Output,
+  .name = "SummaryVariables"
+)
+```
+
+## Delayed against attached
+
+```{r}
+#| label: tbl-summaries
+#| results: asis
+
+tab_summaries <- fin_table_summaries(
+  .ds_summaries = lst_ds$Summaries,
+  .sample       = "S7_Summaries",           # the paper's announcement sample
+  .dirs         = .lP$Output,
+  .name         = "Summaries"
+)
+```
+
+## Delayed against attached, the text measures only
+
+The same table without the announcement lag and the four-business-day indicator (decided 10
+September); the nine-row version above stays.
+
+```{r}
+#| label: tbl-summaries-text
+#| results: asis
+
+tab_summaries_text <- fin_table_summaries(
+  .ds_summaries = lst_ds$Summaries,
+  .sample       = "S7_Summaries",
+  .measures     = c("Words", "Fog", "Uncertainty", "Numbers", "Dollars", "Percents", "Boilerplate"),
+  .dirs         = .lP$Output,
+  .name         = "SummariesText"
+)
+```
+
+## The delay indicator in a regression
+
+Nine outcomes across, three specifications down: year effects; year and firm effects, which asks
+whether the same firm's delayed summaries differ from its attached ones; and the resubmission's
+firm-quarter controls on the announcements matched to a fiscal quarter. Delayed announcements
+carry no contract row and hence no Compustat key, so every announcement, delayed or attached, is
+matched by one rule -- the firm's first quarter ending on or after the filing, at most a hundred
+days later. Standard errors clustered by firm.
+
+```{r}
+#| label: tbl-summaries-regression
+#| results: asis
+
+tab_summaries_regression <- fin_table_summaries_regression(
+  .ds_summaries = lst_ds$Summaries,
+  .ds_quarter   = lst_ds$Quarter,           # the controls
+  .con          = con,                      # the quarter match
+  .sample       = "S7_Summaries",
+  .controls     = .fin_controls$Resubmission,
+  .dirs         = .lP$Output,
+  .name         = "SummariesRegression"
+)
+```
+
+## The delay indicator in a regression, the text measures only
+
+```{r}
+#| label: tbl-summaries-text-regression
+#| results: asis
+
+tab_summaries_text_regression <- fin_table_summaries_regression(
+  .ds_summaries = lst_ds$Summaries,
+  .ds_quarter   = lst_ds$Quarter,
+  .con          = con,
+  .sample       = "S7_Summaries",
+  .measures     = c("Words", "Fog", "Uncertainty", "Numbers", "Dollars", "Percents", "Boilerplate"),
+  .controls     = .fin_controls$Resubmission,
+  .dirs         = .lP$Output,
+  .name         = "SummariesTextRegression"
+)
+```
+
+# Validation
+
+The checks this document runs are the ones its exhibits carry: every table note states the sample it is drawn on
+and its N, written from the count, and the writer warns where the assumed N differs; the manifest under Deployment
+is checked on disk. Every number the paper cites from these exhibits is resolved and validated by `50-Numbers`,
+which reads `Output/Data` and reports any key the manuscript or the appendix cites without a definition. The
+comparison of this document against its two predecessors (30 and 40) was retired when it took the name 30.
 
 # Deployment
 
@@ -1361,6 +1895,10 @@ release date. The html of the render that is running cannot be copied from insid
 writes it last -- so the chunk copies the html that exists and records its time, and one line from
 the console after the render, `fin_deploy_html()`, refreshes it. The exhibit tibbles do not go to
 the paper folder; they are the replication site's business.
+
+While 30 and 40 still write their own exhibits and the consumers read theirs, the deployment from here is a dry
+run: it names what it would archive and copy and touches nothing. It is switched on once `50-Numbers` and the
+appendix chapters read this document's output.
 
 ```{r}
 #| label: deploy-manifest
@@ -1382,7 +1920,7 @@ fin_deploy_paper(
   .path_html = fs::path(.dir_main, "30-FinalExhibits.html"),
   .manifest  = tab_manifest,                               # refuses an incomplete set
   .release   = .lP$Params$ReleaseMin,                      # recorded in VERSION.txt
-  .run       = TRUE                                        # TRUE deploys; FALSE says what it would do
+  .run       = TRUE                                       # dry run until the consumers read 31
 )
 
 # AFTER THE RENDER, from the console, to put this render's html beside the exhibits:
@@ -1404,6 +1942,26 @@ tibble::tibble(
   Value     = as.character(unlist(.lP$Params))
 ) |>
   tbl_out(.title = "The choices this render made")
+```
+
+```{r}
+#| label: overview-topics
+.fin_registry |>
+  dplyr::mutate(
+    Topic = factor(.data$Topic, levels = names(.fin_topic_of)),   # the runbook's order
+    Kind  = factor(.data$Kind, levels = c("Table", "Figure", "Data"))
+  ) |>
+  dplyr::count(
+    dplyr::across(dplyr::all_of(c("Topic", "Kind"))),
+    name = "Exhibits"
+  ) |>
+  tidyr::pivot_wider(
+    names_from  = "Kind",
+    values_from = "Exhibits",
+    values_fill = 0L,
+    names_sort  = TRUE
+  ) |>
+  tbl_out(.title = "Exhibits by topic, as registered")
 ```
 
 # Explanations
@@ -1617,9 +2175,64 @@ here; until then no manuscript exhibit reports a mean amount.
 
 Decision: medians only; fix deferred.
 
+## One stem, one exhibit: what the renames leave to do (opened 16 September)
+
+The six full classification tables carry `Full` here, and 30's `ClassArmsCeiling` is `ClassArmsFullCeiling`. Five
+of the cuts write the full tibble as their own data, so the plain-named tibbles hold the rows `50-Numbers` reads
+today; the arms cut writes the arms and the ceiling rows together, with a `Block` column. When 40 is pointed here,
+its rows that read `ClassArmsCeiling` move to `ClassArmsFullCeiling`, and its rows that read `ClassArms` get their
+filter checked against the combined tibble.
+
+Decision: open, with the re-pointing of 40.
+
+## Every PDF came from the base pdf device (opened 16 September, decided 17 September)
+
+On this machine `cairo_pdf` left no file, so `plot_save()` fell back to the base `pdf` device for every figure,
+and the render warned once per figure. Overleaf reads the PNG, so the figures are now written as PNG only: no pdf
+device is opened, the manifest and the deployment count a figure complete with its png, and a pdf an earlier
+render left in `Output/Figures` is not deployed.
+
+Decision: PNG only.
+
+## Which mean the amounts row reports (opened 18 September)
+
+The content readings table checks the means two builders compute apart, and they part on the amounts: 4.74 figures
+read per contract against 6.53, and 4.40 kept in dollars against 6.06. The first pair counts a contract without an
+amount as zero, as the paper counts every other content measure; the second is the mean over the contracts on which
+an amount was read, which is what `ContentValues` computes and what the appendix prints today. The readings table
+prints the first pair. Chapter D's sentence -- amounts falling from 6.53 to 6.06 -- is the second and has to say
+which it means, or change.
+
+Decision: open.
+
+## The contract table is wider than the text block (opened 17 September)
+
+Every fragment now carries the manuscript's frame: row spacing 1.2, a `tabular*` filling `\columnwidth`, `\hline`
+rules, centred headers, no size command. Nothing is scaled; the frame cuts the column padding instead, and reports
+a table that does not fit even at the tightest. Measured in the class at `\footnotesize`, the text block is 408 pt
+and the content table with its eleven number columns wants about 500 pt, 414 pt at the tightest padding. It is
+scaled for now, and the render names it. Three ways out: the means alone, without the five SD columns (about
+349 pt); the table split in two, words and duration over parties and places (317 pt and 342 pt); or scaling this
+one table. Ann-Kristin's own descriptive table has the same trouble on a smaller scale -- 435 pt as it stands, which
+the frame's padding step would fix.
+
+Decision: open.
+
+## Two switches for one redaction rule (opened 16 September)
+
+`Params$RedactMin` (30's, the prepared contract table) and `Build$MinMarkers` (40's, `CtoMarkers`) state the same
+rule twice, both at one marker. One of them goes in the clean-up; the marker-threshold issue above decides the value.
+
+Decision: open.
+
 # Next
 
-The `Where` column of the manifest, once the manuscript / online appendix / memo split is decided
-with Ann-Kristin; the appendix figures the specification still names (the within-year timing
-figure, redaction by category over time, the ladder-loss figure) and the memo's pandemic panel;
-then `3_site` pulls `Output/Figures` and `Output/Tables`.
+1. Render, and read the table under Validation: every file "same", or a difference explained.
+2. Point `50-Numbers` at this document's `Output/Data` alone, remove its builders, and move its rows for the renamed
+   tibbles; `Numbers.tex` must come out unchanged apart from its date line.
+3. Point the `42-OnlineAppendix` chapters at this document's output, stop them sourcing 40's library for builders,
+   and let `oa_publish()` deploy the fragment alone. Chapter D then sets `ContentReadings` in place of
+   `ContentContrast` and `ContentValues`, whose tibbles stay for the numbers.
+4. Deploy from here (`.run = TRUE`) and give Overleaf one exhibits folder.
+5. The agreed standardization of figures and tables, topic by topic, in this document.
+6. Move this document back to `30-FinalExhibits`, and retire the old 30 and 40's exhibit outputs.

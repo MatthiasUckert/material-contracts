@@ -45,7 +45,7 @@ purrr::walk(
   .f = \(.p) source(file = .p, encoding = "UTF-8")
 )
 
-.name_script <- "50A-PublishCode"
+.name_script <- "40A-PublishCode"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
@@ -116,7 +116,7 @@ decision to publish is taken there, in the RStudio Git pane.
     # THE STAGE is a temporary copy of the commits, where the checks run before anything reaches the published
     # repository. It lives in this R session's temporary directory and disappears when the render ends, so nothing
     # of it stays in this repository.
-    DirStage    = fs::path(tempdir(), "50A-PublishCode-Stage"),
+    DirStage    = fs::path(tempdir(), "40A-PublishCode-Stage"),
     FilManifest = utils_file_path(.dir_main, "Output", "Manifest.csv")
   ),
   Params = list(
@@ -371,5 +371,5 @@ pub_report_overview(
 
 # Next
 
-`50B-PublishData` assembles the data package -- the release, the entity spans, the texts, the models and the
+`40B-PublishData` assembles the data package -- the release, the entity spans, the texts, the models and the
 replication inputs -- and deploys it to the shared Drive folder the published repository links to.

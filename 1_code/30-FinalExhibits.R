@@ -1,10 +1,20 @@
-# 30-FinalExhibits: the manuscript's exhibits in their final form, from the released files ---------------------------------
+# 30-FinalExhibits: every table, figure and cited tibble of the paper, in one store ----------------------------------------
 #
 # WHAT THIS FILE DOES
-# The paper's exhibits: one view per exhibit, on its manuscript sample, in the form the manuscript
-# prints, with the figure note written from the tibble that drew it. It reads the Dropbox release
-# and Ann-Kristin's 101/103 outputs through its own readers, so a number here and a number in one
-# of her tables come from the same bytes.
+# The one store of the paper's exhibits: the tables and figures of the manuscript, the online appendix and the
+# response memo, and the data-only tibbles 50-Numbers reads its numbers from. Each is written under its name --
+# Data/, Tables/, Notes/ and Figures/ under this document's Output -- and no other document is to write there.
+#
+# WHERE ITS PARTS CAME FROM (moved unchanged on 16 September 2026)
+# Sections 0-22 are 30-FinalExhibits' library: the release readers, the prepared tables, the samples, the
+# manuscript's exhibits, the manifest and the deployment. Its six full classification tables are registered here
+# as ...Full, because the appendix's cuts of them keep the plain names. Sections 23-27 are the builders
+# 50-Numbers ran: the two data-only tibbles with their build helper (num_), then the appendix chapters' exhibits,
+# chapter by chapter (oaa_, oab_, oac_, oad_). They keep their prefixes until the clean-up, write in the same
+# layout under this document's Output, and rebuild only where an input or this library is newer than their files.
+# Section 28 shows what those builders write and checks the move against the files 30 and 40 wrote. Section 29
+# holds the exhibits first built here, section 30 the firm-fundamentals layouts under choice. Figures are written
+# as PNG only (decided 17 September): Overleaf reads the png, and no pdf device is involved.
 #
 # PREPARED ONCE, READ LAZILY EVER AFTER
 # Every input is read through fin_read_*() once, given its derived and membership columns, and
@@ -16,10 +26,10 @@
 # it opens the prepared files with arrow::open_dataset() and registers them on one DuckDB connection,
 # so an exhibit pulls the columns and rows it needs and nothing else sits in memory.
 #
-# STAND-ALONE. This document reads the Dropbox folder and the classification stages' run folders,
-# and nothing that another document rendered. Her .dta files are converted under this document's
-# own Cache, keyed on their size. 30-Descriptives, the lab this grew out of, was retired on 10
-# September 2026; what this document used from it is section 0 of this library.
+# WHAT IS READ. The Dropbox release; Ann-Kristin's 101/103 outputs, converted under this document's own Cache and
+# keyed on their size; and the pipeline stage outputs the classification and appendix exhibits need: the run
+# folders of 03A-03D, 03B's crowned classification, 01A's index mirror and landing pages, and 04A's span stores.
+# Nothing downstream of the release is read, except by the migration check of section 28.
 #
 # House style: native pipe; explicit package::function; dot-prefixed args; underscore-suffixed
 # locals; .data$ for existing columns, bare CamelCase for new ones; if (FALSE) dev blocks; pure
@@ -431,7 +441,7 @@ fin_read_contracts <- function(.path, .redaction = "symbolexplicit", .redact_min
 
   cli::cli_alert_success(
     "{format(nrow(out_), big.mark = ',')} rows; {format(sum(out_$Keep), big.mark = ',')} descriptive-sample \\
-     primary copies; {sum(is.na(out_$ClassCode) & out_$Keep)} of them unlabelled."
+     primary copies; {sum(is.na(out_$ClassCode) & out_$Keep)} of them unlabeled."
   )
   out_
 }
@@ -473,7 +483,7 @@ fin_read_summaries <- function(.path, .tab_contracts) {
 #' The firm-quarter panel as 103 built it
 #'
 #' One row per gvkey-quarter for every firm that filed at least one contract, non-filing quarters
-#' included, with the winsorised variables the regressions use. Read from the parquet conversion,
+#' included, with the winsorized variables the regressions use. Read from the parquet conversion,
 #' under the names in .fin_quarter_cols. Nothing is recomputed: Table 4 has to show the same clipped
 #' values her regressions control for.
 #'
@@ -725,7 +735,7 @@ fin_slice <- function(.tab_data, .sample) {
 #' Contracts by form family and amendment status, with the form's share of the sample
 #'
 #' Counts, not means, so the tibble carries everything the figure, its labels and the report need.
-#' An unlabelled contract -- 03F could not classify it, or it is malformed and never reached 03F --
+#' An unlabeled contract -- 03F could not classify it, or it is malformed and never reached 03F --
 #' keeps its bar and is a third segment, so that a sample which includes the malformed rows shows
 #' them rather than silently shrinking.
 #'
@@ -804,6 +814,9 @@ fin_report_f01 <- function(.tab_data, .ref = .fin_reference_f01) {
 }
 
 .fin_regime_years <- c(Reform2004 = 2004 + 235 / 366, Fast2019 = 2019 + 92 / 365)
+# THE FAST ACT ON THE YEAR IT TOOK EFFECT, for the figures whose axis counts whole years and whose measure
+# changes with that year rather than with the April date.
+.fin_regime_fast <- c(Fast2019 = 2019)
 
 #' Lines over years, one per group, optionally faceted, with the regime years marked
 #'
@@ -2125,62 +2138,327 @@ fin_tex_escape <- function(.x) {
 #' @param .max_natural Integer. Number columns beyond which the table is scaled.
 #' @param .text_mm Numeric. The text width assumed for the arithmetic, millimetres.
 #' @return Invisibly, the path.
-fin_tex_write <- function(.lines, .path, .stretch = 1.5, .col_mm = 20, .col_min = 14, .label_min = 50,
-                          .max_natural = 8L, .text_mm = 160) {
+# -- 5.1 The frame every tabular is written in --------------------------------------------------------------------
+# THE PAPER'S FRAME (17 September, from Ann-Kristin's note): row spacing 1.2, a tabular* that fills \columnwidth,
+# \hline rules only, headers centred, and no size command in the file -- the float sets \footnotesize. Nothing is
+# scaled: a table that would run past the text block has its column padding cut first, and it is reported when even
+# the tightest padding does not bring it inside. The widths below are the character widths of the manuscript's font
+# at \footnotesize, measured in the interact class; a table's width is estimated from them before it is written,
+# and the estimate runs one to four percent under the truth, which the margin covers.
+.fin_tex_target <- 408      # \columnwidth of the manuscript, in points
+.fin_tex_margin <- 0.04     # the safety margin on the estimate, which runs up to four percent under
+.fin_tex_pads   <- c(6, 4, 3, 2)   # \tabcolsep in points, from LaTeX's default down
+.fin_tex_lab_min <- 55      # the narrowest a wrapped column may become, in points
+.fin_tex_mm      <- 2.845   # points per millimetre, where a specification names one
+.fin_tex_em     <- 8.50     # 1em at \footnotesize, in points
+
+# Character widths in points, upright.
+.fin_tex_pt <- c(
+  "0" = 4.25, "1" = 4.25, "2" = 4.25, "3" = 4.25, "4" = 4.25, "5" = 4.25, "6" = 4.25, "7" = 4.25, "8" = 4.25,
+  "9" = 4.25, "," = 2.36, "." = 2.36, "%" = 7.08, "(" = 3.31, ")" = 3.31, "/" = 4.25, "-" = 2.83, "+" = 6.61,
+  " " = 2.83, "a" = 4.25, "b" = 4.72, "c" = 3.78, "d" = 4.72, "e" = 3.78, "f" = 2.60, "g" = 4.25, "h" = 4.72,
+  "i" = 2.36, "j" = 2.60, "k" = 4.49, "l" = 2.36, "m" = 7.08, "n" = 4.72, "o" = 4.25, "p" = 4.72, "q" = 4.49,
+  "r" = 3.31, "s" = 3.35, "t" = 3.31, "u" = 4.72, "v" = 4.49, "w" = 6.14, "x" = 4.49, "y" = 4.49, "z" = 3.78,
+  "A" = 6.37, "B" = 6.02, "C" = 6.14, "D" = 6.49, "E" = 5.78, "F" = 5.54, "G" = 6.67, "H" = 6.37, "I" = 3.06,
+  "J" = 4.36, "K" = 6.60, "L" = 5.31, "M" = 7.78, "N" = 6.37, "O" = 6.61, "P" = 5.78, "Q" = 6.61, "R" = 6.25,
+  "S" = 4.72, "T" = 6.14, "U" = 6.37, "V" = 6.37, "W" = 8.73, "X" = 6.37, "Y" = 6.37, "Z" = 5.19
+)
+
+# The same, bold: category and total rows are set in bold.
+.fin_tex_pt_bold <- c(
+  "0" = 4.90, "1" = 4.90, "2" = 4.90, "3" = 4.90, "4" = 4.90, "5" = 4.90, "6" = 4.90, "7" = 4.90, "8" = 4.90,
+  "9" = 4.90, "," = 2.72, "." = 2.72, "%" = 8.17, "(" = 3.81, ")" = 3.81, "/" = 4.90, "-" = 3.27, "+" = 7.62,
+  " " = 3.27, "a" = 4.76, "b" = 5.44, "c" = 4.36, "d" = 5.44, "e" = 4.49, "f" = 3.94, "g" = 5.04, "h" = 5.44,
+  "i" = 2.72, "j" = 2.99, "k" = 5.17, "l" = 2.72, "m" = 8.17, "n" = 5.44, "o" = 4.90, "p" = 5.44, "q" = 5.17,
+  "r" = 4.05, "s" = 3.87, "t" = 3.81, "u" = 5.44, "v" = 5.31, "w" = 7.21, "x" = 5.17, "y" = 5.31, "z" = 4.36,
+  "A" = 7.38, "B" = 6.96, "C" = 7.08, "D" = 7.50, "E" = 6.42, "F" = 6.15, "G" = 7.70, "H" = 7.64, "I" = 3.67,
+  "J" = 5.05, "K" = 7.65, "L" = 5.88, "M" = 9.27, "N" = 7.64, "O" = 7.36, "P" = 6.68, "Q" = 7.36, "R" = 7.32,
+  "S" = 5.44, "T" = 6.82, "U" = 7.51, "V" = 7.51, "W" = 10.24, "X" = 7.38, "Y" = 7.62, "Z" = 5.99
+)
+
+.fin_tex_pt_other      <- mean(.fin_tex_pt[letters])        # what an unlisted character is taken to be
+.fin_tex_pt_other_bold <- mean(.fin_tex_pt_bold[letters])
+
+#' The width one cell asks for, in points
+#'
+#' The cell's LaTeX is reduced to the characters that print: \\textbf{} sets the bold metrics, \\hspace{1em} adds an
+#' em, escapes become their character, and every other macro is dropped.
+#'
+#' @param .cell Character. One cell of a row, as it stands in the fragment.
+#' @param .longest Logical. TRUE returns the widest word in the cell rather than the width of all of it.
+#' @return Numeric. The width in points.
+fin_tex_cell_pt <- function(.cell, .longest = FALSE) {
   if (FALSE) {
-    .lines       <- c("\\begin{tabular}{l r}", "\\toprule", "a & 1 \\\\", "\\bottomrule", "\\end{tabular}")
-    .path        <- fs::path(.lP$Output$DirTables, "Test.tex")
-    .stretch     <- 1.5
-    .col_mm      <- 20
-    .col_min     <- 14
-    .label_min   <- 50
-    .max_natural <- 8L
-    .text_mm     <- 160
+    .cell    <- "\\hspace{1em}Customer / Supplier"
+    .longest <- FALSE
+  }
+  s_     <- trimws(.cell)
+  bold_  <- grepl("\\\\textbf\\{", s_)
+  n_em_  <- length(gregexpr("\\\\hspace\\{1em\\}", s_)[[1L]][gregexpr("\\\\hspace\\{1em\\}", s_)[[1L]] > 0L])
+  s_     <- gsub("\\\\hspace\\{1em\\}", "", s_)
+  s_     <- gsub("\\\\(%|&|\\$|#|_)", "\\1", s_)
+  s_     <- gsub("\\\\[a-zA-Z]+\\*?", "", s_)
+  s_     <- gsub("[{}]", "", s_)
+  chars_ <- strsplit(s_, "")[[1L]]
+  if (length(chars_) == 0L) return(n_em_ * .fin_tex_em)
+  tab_   <- if (bold_) .fin_tex_pt_bold else .fin_tex_pt
+  w_     <- unname(tab_[chars_])
+  w_[is.na(w_)] <- if (bold_) .fin_tex_pt_other_bold else .fin_tex_pt_other
+  if (!.longest) return(sum(w_) + n_em_ * .fin_tex_em)
+  # THE WIDEST WORD is what a column can never be narrower than: a word does not break across lines.
+  runs_ <- split(w_, cumsum(chars_ == " "))
+  max(vapply(runs_, sum, numeric(1L))) + n_em_ * .fin_tex_em
+}
+
+#' The width a tabular asks for, in points
+#'
+#' Every column is as wide as its widest cell; a \\multicolumn wider than the columns it spans pushes them apart.
+#' The padding is LaTeX's, twice per column.
+#'
+#' @param .rows Character. The body rows of the tabular, rules included; rules are skipped.
+#' @param .ncol Integer. Columns in the tabular, the label column counted.
+#' @param .pad Numeric. \\tabcolsep in points.
+#' @param .fixed Numeric or NULL. The width a specification fixes for a column, NA where the column is free.
+#' @param .columns Logical. TRUE returns the column widths instead of their sum with the padding.
+#' @param .longest Logical. TRUE measures the widest word of a cell rather than the whole cell.
+#' @return Numeric. The width in points.
+fin_tex_est_width <- function(.rows, .ncol, .pad, .fixed = NULL, .columns = FALSE, .longest = FALSE) {
+  if (FALSE) {
+    .rows    <- c("a & 1 \\\\", "b & 2 \\\\")
+    .ncol    <- 2L
+    .pad     <- 6
+    .fixed   <- NULL
+    .columns <- FALSE
+    .longest <- FALSE
+  }
+  cols_  <- rep(0, .ncol)
+  spans_ <- list()
+  for (row_ in .rows) {
+    if (grepl("^\\\\\\\\(hline|midrule|toprule|bottomrule|cmidrule|addlinespace)", trimws(row_))) next
+    cells_ <- strsplit(sub("\\\\\\\\\\s*$", "", row_), "(?<!\\\\)&", perl = TRUE)[[1L]]
+    j_ <- 1L
+    for (cell_ in cells_) {
+      mc_ <- regmatches(cell_, regexec("^\\s*\\\\multicolumn\\{([0-9]+)\\}\\{[^}]*\\}\\{(.*)\\}\\s*$", cell_))[[1L]]
+      if (length(mc_) == 3L) {
+        spans_[[length(spans_) + 1L]] <- list(
+          J = j_,
+          K = as.integer(mc_[2L]),
+          W = fin_tex_cell_pt(.cell = mc_[3L], .longest = .longest)
+        )
+        j_ <- j_ + as.integer(mc_[2L])
+      } else {
+        if (j_ <= .ncol) cols_[j_] <- max(cols_[j_], fin_tex_cell_pt(.cell = cell_, .longest = .longest))
+        j_ <- j_ + 1L
+      }
+    }
+  }
+  for (s_ in spans_) {
+    idx_  <- seq.int(s_$J, min(s_$J + s_$K - 1L, .ncol))
+    have_ <- sum(cols_[idx_]) + (s_$K - 1L) * 2 * .pad
+    if (s_$W > have_) cols_[idx_] <- cols_[idx_] + (s_$W - have_) / s_$K
+  }
+  # A FIXED COLUMN IS AS WIDE AS IT SAYS, whatever its cells hold: what does not fit wraps inside it.
+  if (!is.null(.fixed)) cols_[!is.na(.fixed)] <- .fixed[!is.na(.fixed)]
+  if (.columns) return(cols_)
+  sum(cols_) + 2 * .pad * .ncol
+}
+
+#' A tabular put into the paper's frame, with the padding that brings it inside the text block
+#'
+#' Rules become \\hline, the rules under a spanning header go, every header cell is centred, and the tabular becomes
+#' a tabular* that fills \\columnwidth. The padding is the widest of .fin_tex_pads the table fits in. A table that
+#' fits in none is scaled as a last resort and named in a warning: it has to lose columns or be split.
+#'
+#' @param .lines Character. One tabular, rules and all, as a fragment builder writes it.
+#' @param .name Character. The stem, for the warning.
+#' @return Character. The framed fragment.
+fin_tex_fit <- function(.lines, .name = "table") {
+  if (FALSE) {
+    .lines <- c("\\begin{tabular}{l r}", "\\toprule", " & N \\\\", "\\midrule", "a & 1 \\\\",
+                "\\bottomrule", "\\end{tabular}")
+    .name  <- "Test"
   }
   body_ <- .lines[!grepl("^\\\\begingroup\\\\[a-z]+$", .lines) & !grepl("^\\\\endgroup$", .lines)]
   i_ <- grep("^\\\\begin\\{tabular\\}\\{", body_)
   j_ <- grep("^\\\\end\\{tabular\\}$", body_)
-  if (length(i_) != 1L || length(j_) != 1L) cli::cli_abort("The fragment for {.path {(.path)}} is not one tabular.")
-  spec_ <- sub("^\\\\begin\\{tabular\\}\\{(.*)\\}$", "\\1", body_[i_])
-
-  # THE COLUMNS, read from the specification: l, c, r, or p{width}; spaces between them are free.
-  toks_  <- regmatches(spec_, gregexpr("p\\{[^}]*\\}|[lcr]", spec_))[[1L]]
+  if (length(i_) != 1L || length(j_) != 1L) cli::cli_abort("The fragment for {(.name)} is not one tabular.")
+  spec_  <- sub("^\\\\begin\\{tabular\\}\\{(.*)\\}$", "\\1", body_[i_])
+  # THE COLUMNS, as the specification gives them: l, c and r take the width of their widest cell, while a p column
+  # has its width written into it and wraps what does not fit, which is how a column of prose stays narrow.
+  toks_  <- regmatches(spec_, gregexpr(">\\{[^}]*\\}p\\{[^}]*\\}|p\\{[^}]*\\}|[lcr]", spec_))[[1L]]
   n_     <- length(toks_)
-  n_num_ <- sum(toks_ %in% c("r", "c"))
-  n_lab_ <- sum(toks_ == "l")
-  p_w_   <- as.numeric(sub("^p\\{([0-9.]+)(mm|cm).*$", "\\1", toks_[grepl("^p\\{", toks_)])) *
-    ifelse(grepl("cm", toks_[grepl("^p\\{", toks_)]), 10, 1)
-  pad_mm_ <- 2 * n_ * 2.1                                            # \tabcolsep is 6pt, 2.1 mm, twice per column
-  # THE WIDTH A NUMBER COLUMN CAN HAVE, given the label its minimum: the target, or less down to the
-  # floor; below the floor fixed widths do not fit.
-  room_  <- .text_mm - pad_mm_ - sum(p_w_, na.rm = TRUE) - n_lab_ * .label_min
-  col_w_ <- if (n_num_ > 0L) min(.col_mm, room_ / n_num_) else .col_mm
-  mode_  <- if (n_num_ > .max_natural) "scaled" else if (col_w_ >= .col_min || n_num_ == 0L) "fixed" else "natural"
-
-  body_[j_] <- "\\end{tabular}"
+  fixed_ <- vapply(toks_, \(.t) {
+    if (!grepl("^(>\\{[^}]*\\})?p\\{", .t)) return(NA_real_)
+    share_ <- suppressWarnings(as.numeric(sub("^.*?([0-9.]+)\\\\(text|column)width.*$", "\\1", .t)))
+    mm_    <- suppressWarnings(as.numeric(sub("^.*?([0-9.]+)mm.*$", "\\1", .t)))
+    cm_    <- suppressWarnings(as.numeric(sub("^.*?([0-9.]+)cm.*$", "\\1", .t)))
+    pt_ <- if (!is.na(share_)) share_ * .fin_tex_target else if (!is.na(cm_)) cm_ * 10 * .fin_tex_mm else
+      if (!is.na(mm_)) mm_ * .fin_tex_mm else NA_real_
+    pt_
+  }, numeric(1L))
+  # THE RULES ARE \hline, AS HER TABLES HAVE THEM, and the rules under a spanning header go.
   body_ <- sub("^\\\\toprule$", "\\\\hline\\\\hline", body_)
+  body_ <- sub("^\\\\midrule$", "\\\\hline", body_)
   body_ <- sub("^\\\\bottomrule$", "\\\\hline", body_)
-  head_ <- paste0("\\renewcommand*{\\arraystretch}{", .stretch, "}")
-  if (mode_ == "fixed") {
-    col_w_ <- round(col_w_, 1)
-    taken_ <- n_num_ * col_w_ + sum(p_w_, na.rm = TRUE)
-    lab_w_ <- paste0("\\dimexpr(\\textwidth-", taken_, "mm-", 2L * n_, "\\tabcolsep)/", max(n_lab_, 1L), "\\relax")
-    cols_ <- vapply(toks_, \(.t) switch(
-      .t,
-      r = paste0(">{\\raggedleft\\arraybackslash}p{", col_w_, "mm}"),
-      c = paste0(">{\\centering\\arraybackslash}p{", col_w_, "mm}"),
-      l = paste0("p{", lab_w_, "}"),
-      .t
-    ), character(1))
-    body_[i_] <- paste0("\\begin{tabular}{", paste(cols_, collapse = " "), "}")
-    out_ <- c(head_, body_)
-  } else if (mode_ == "natural") {
-    body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
-    out_ <- c(head_, body_)
-  } else {
-    body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
-    out_ <- c(head_, "\\resizebox{\\textwidth}{!}{%", body_, "}")
+  drop_ <- grepl("^\\\\cmidrule", body_)
+  body_ <- body_[!drop_]
+  i_ <- grep("^\\\\begin\\{tabular\\}\\{", body_)
+  j_ <- grep("^\\\\end\\{tabular\\}$", body_)
+  # THE HEADER IS CENTRED over its column, which is where the header rows are: between the double rule and the
+  # first single rule under it.
+  top_  <- grep("^\\\\hline\\\\hline$", body_)
+  mid_  <- grep("^\\\\hline$", body_)
+  head_ <- if (length(top_) == 1L && any(mid_ > top_)) seq.int(top_ + 1L, min(mid_[mid_ > top_]) - 1L) else integer()
+  for (k_ in head_) {
+    cells_ <- strsplit(sub("\\\\\\\\\\s*$", "", body_[k_]), "(?<!\\\\)&", perl = TRUE)[[1L]]
+    cells_ <- vapply(cells_, \(.c) {
+      if (trimws(.c) == "" || grepl("^\\s*\\\\multicolumn", .c)) .c else paste0("\\multicolumn{1}{c}{", trimws(.c), "}")
+    }, character(1L))
+    body_[k_] <- paste0(paste(cells_, collapse = " & "), " \\\\")
   }
+  rows_ <- body_[seq.int(i_ + 1L, j_ - 1L)]
+  cols_ <- fin_tex_est_width(.rows = rows_, .ncol = n_, .pad = 0, .fixed = fixed_, .columns = TRUE)
+  words_ <- fin_tex_est_width(.rows = rows_, .ncol = n_, .pad = 0, .columns = TRUE, .longest = TRUE)
+  est_  <- vapply(.fin_tex_pads, \(.p) sum(cols_) + 2 * .p * n_, numeric(1L))
+  fits_ <- which(est_ * (1 + .fin_tex_margin) <= .fin_tex_target)
+  # COLUMNS OF PROSE WRAP BEFORE ANYTHING IS SCALED: the number columns keep the width they need, and what is left
+  # is shared between the free text columns in proportion to the width each would have taken.
+  wraps_ <- rep(NA_real_, n_)
+  # A TEXT COLUMN MAY WRAP, whether the specification names its width or leaves it free; a number column never
+  # does, so a figure is not broken across lines.
+  free_  <- which((is.na(fixed_) & toks_ == "l") | (!is.na(fixed_) & !grepl("raggedleft|centering", toks_)))
+  if (length(fits_) == 0L && length(free_) > 0L) {
+    for (k_ in seq_along(.fin_tex_pads)) {
+      room_ <- .fin_tex_target - sum(cols_[-free_]) * (1 + .fin_tex_margin) - 2 * .fin_tex_pads[[k_]] * n_
+      if (room_ <= 0) next
+      # A COLUMN NARROWER THAN THE FLOOR KEEPS THE WIDTH IT ASKS FOR; the wide ones share what is left, so a
+      # narrow column is not starved by a proportional share.
+      # EVERY COLUMN KEEPS ITS WIDEST WORD, or its whole width where that is narrower; what is left over goes to
+      # the columns that would still like to be wider, in proportion to what they are missing.
+      nat_  <- cols_[free_]
+      min_  <- pmin(nat_, pmax(.fin_tex_lab_min, words_[free_]))
+      if (sum(min_) <= room_) {
+        want_  <- min_
+        gap_   <- nat_ - min_
+        extra_ <- room_ - sum(min_)
+        if (extra_ > 0 && sum(gap_) > 0) want_ <- min_ + pmin(gap_, extra_ * gap_ / sum(gap_))
+        wraps_[free_] <- round(want_, 1)
+        fits_ <- k_
+        break
+      }
+    }
+  }
+  pad_  <- if (length(fits_) > 0L) .fin_tex_pads[[min(fits_)]] else utils::tail(.fin_tex_pads, 1L)
+  open_ <- c("\\begingroup",
+             if (pad_ != 6) paste0("\\setlength{\\tabcolsep}{", pad_, "pt}"),
+             "\\renewcommand*{\\arraystretch}{1.2}")
+  for (k_ in which(!is.na(wraps_))) {
+    toks_[[k_]] <- paste0(">{\\raggedright\\arraybackslash}p{", wraps_[[k_]], "pt}")
+  }
+  if (length(fits_) == 0L) {
+    cli::cli_alert_warning(paste0(
+      "{(.name)}: about {round(min(est_))} pt wide against {(.fin_tex_target)} pt of text block, even at the ",
+      "tightest padding; scaled to fit. It has to lose columns or be split."
+    ))
+    # WHAT THE FRAME READ, so a table that scales unexpectedly can be traced without opening the fragment.
+    cli::cli_alert_info(paste0(
+      "{(.name)}: columns {paste(round(cols_), collapse = \' + \')} pt, of which ",
+      "{sum(!is.na(fixed_))} of {n_} declared in the specification."
+    ))
+    body_[i_] <- paste0("\\begin{tabular}{", spec_, "}")
+    out_ <- c(open_, "\\resizebox{\\columnwidth}{!}{%", body_, "}", "\\endgroup")
+  } else {
+    body_[i_] <- paste0("\\begin{tabular*}{\\columnwidth}{", toks_[1L], "@{\\extracolsep{\\fill}}",
+                        paste(toks_[-1L], collapse = ""), "}")
+    body_[j_] <- "\\end{tabular*}"
+    out_ <- c(open_, body_, "\\endgroup")
+  }
+  out_
+}
+
+#' A tibble of cells put into the paper's frame, for the builders that hand over cells rather than lines
+#'
+#' The specification only says which columns are text and which are numbers; the widths are the frame's business. A
+#' column named Panel is not a column: it opens an italic row across the table wherever its value changes, as the
+#' appendix's own frame has it, and never reaches the cells. A long table is left to that frame, which breaks it
+#' across pages.
+#'
+#' @param .tab Tibble. Character cells, in table order; a Panel column opens the groups.
+#' @param .header Character. One header cell per column, the Panel column aside.
+#' @param .spec Character or NULL. The old column specification; a raggedleft or centering column is a number.
+#' @param .long Logical. TRUE hands the table to the appendix frame, which sets it as a longtable.
+#' @param .name Character. The stem, for the warning.
+#' @return Character. The framed fragment.
+fin_tex_frame <- function(.tab, .header, .spec = NULL, .long = FALSE, .name = "table") {
+  if (FALSE) {
+    .tab    <- tibble::tibble(Row = "a", N = "1")
+    .header <- c("", "N")
+    .spec   <- NULL
+    .long   <- FALSE
+    .name   <- "Test"
+  }
+  if (isTRUE(.long)) {
+    return(oa_frame_table(
+      .tab    = .tab,
+      .header = .header,
+      .spec   = .spec,
+      .long   = TRUE
+    ))
+  }
+  panel_ <- if ("Panel" %in% names(.tab)) .tab$Panel else rep(NA_character_, nrow(.tab))
+  cells_ <- dplyr::select(.tab, -dplyr::any_of("Panel"))
+  if (length(.header) != ncol(cells_) || (!is.null(.spec) && length(.spec) != ncol(cells_))) {
+    cli::cli_abort("{(.name)}: the specification, the header and the cells disagree on the number of columns.")
+  }
+  # A NUMBER COLUMN IS r; A COLUMN OF PROSE KEEPS THE WIDTH ITS SPECIFICATION GIVES IT, so running text wraps
+  # inside it instead of stretching the table.
+  toks_ <- if (is.null(.spec)) {
+    c("l", rep("r", ncol(cells_) - 1L))
+  } else {
+    ifelse(grepl("raggedleft|centering", .spec), "r", .spec)
+  }
+  rows_ <- purrr::map_chr(seq_len(nrow(cells_)), \(.i) {
+    paste0(paste(unlist(cells_[.i, ]), collapse = " & "), " \\\\")
+  })
+  # THE PANEL OPENS A ROW OF ITS OWN wherever it changes, spanning every column.
+  open_ <- !is.na(panel_) & (seq_along(panel_) == 1L | panel_ != dplyr::lag(panel_, default = ""))
+  body_ <- unlist(purrr::map(seq_along(rows_), \(.i) {
+    if (open_[.i]) {
+      c(paste0("\\multicolumn{", ncol(cells_), "}{l}{\\textit{", panel_[.i], "}} \\\\"), rows_[.i])
+    } else {
+      rows_[.i]
+    }
+  }))
+  fin_tex_fit(
+    .lines = c(
+      paste0("\\begin{tabular}{", paste(toks_, collapse = " "), "}"),
+      "\\toprule",
+      paste0(paste(.header, collapse = " & "), " \\\\"),
+      "\\midrule",
+      body_,
+      "\\bottomrule",
+      "\\end{tabular}"
+    ),
+    .name  = .name
+  )
+}
+
+#' Write a tabular into the paper's frame
+#'
+#' The frame is fin_tex_fit()'s; this writes it to disk under the exhibit's stem.
+#'
+#' @param .lines Character. One tabular, rules and all.
+#' @param .path Path. Where the fragment goes.
+#' @return Invisibly, the path.
+fin_tex_write <- function(.lines, .path) {
+  if (FALSE) {
+    .lines <- c("\\begin{tabular}{l r}", "\\toprule", "a & 1 \\\\", "\\bottomrule", "\\end{tabular}")
+    .path  <- fs::path(.lP$Output$DirTables, "Test.tex")
+  }
+  out_ <- fin_tex_fit(
+    .lines = .lines,
+    .name  = fs::path_ext_remove(fs::path_file(.path))
+  )
   fs::dir_create(fs::path_dir(.path))
   writeLines(out_, .path)
   invisible(.path)
@@ -2834,7 +3112,7 @@ fin_places_by_role <- function(.con, .roles = .fin_roles_recital) {
 #' @param .arm Character. "naive" or "rule".
 #' @param .roles Character. The party roles the rule-based parties, countries and states count.
 #' @return Tibble, one row per S2 contract: DocID, Year, Class, Level1, Level2, Words, Duration, Parties,
-#'   Countries, States. Class, Level1 and Level2 are NA on unlabelled contracts.
+#'   Countries, States. Class, Level1 and Level2 are NA on unlabeled contracts.
 fin_content_rows <- function(.ds_contracts, .con, .arm = c("rule", "naive"), .roles = .fin_roles_recital) {
   if (FALSE) {
     .ds_contracts <- lst_ds$Contracts
@@ -3063,26 +3341,42 @@ fin_show_category <- function(.cells, .kind, .groups, .title, .note, .font_size 
   invisible(NULL)
 }
 
-#' The content cells for the page: N and means with no decimals, SDs with two
+#' The unit the words columns are printed in: the header and the note's wording
 #'
-#' The duration N is not a column: it rides in the tibble and the note, so the table stays on one
-#' line per row.
+#' @param .scale Numeric. The divisor of the word counts: 1, or 1000 for thousands.
+#' @return A list: Header (the spanning header's text) and Note (the unit in words, or NA for plain counts).
+fin_words_unit <- function(.scale) {
+  if (FALSE) .scale <- 1000
+  if (.scale == 1) return(list(Header = "Words", Note = NA_character_))
+  list(
+    Header = paste0("Words (in ", format(.scale, big.mark = ",", scientific = FALSE), "s)"),
+    Note   = if (.scale == 1000) "thousands" else paste0("units of ", format(.scale, big.mark = ",", scientific = FALSE))
+  )
+}
+
+#' The content cells for the page: N as a count, every mean and SD with the decimals given
+#'
+#' Words are divided by .words_scale before they are formatted, so two decimals in thousands read as
+#' 14.31 rather than 14,311. The duration N is not a column: it rides in the tibble and the note, so
+#' the table stays on one line per row.
 #'
 #' @param .tab Tibble from fin_tab_by_category(.stats = fin_content_stats).
 #' @param .digits Named integer. Decimals for Mean and SD.
+#' @param .words_scale Numeric. The divisor of the word counts (1000: thousands).
 #' @return Tibble of character columns in table order, Row first.
-fin_content_cells <- function(.tab, .digits = c(Mean = 0L, SD = 2L)) {
+fin_content_cells <- function(.tab, .digits = c(Mean = 2L, SD = 2L), .words_scale = 1000) {
   if (FALSE) {
-    .tab    <- tab_content_rule
-    .digits <- c(Mean = 0L, SD = 2L)
+    .tab         <- tab_content_rule
+    .digits      <- c(Mean = 2L, SD = 2L)
+    .words_scale <- 1000
   }
   m_ <- .digits[["Mean"]]
   s_ <- .digits[["SD"]]
   tibble::tibble(
     Row       = .tab$Row,
     N         = fin_fmt_count(.tab$N),
-    WordsMean = fin_fmt_num(.tab$WordsMean, m_),
-    WordsSD   = fin_fmt_num(.tab$WordsSD,   s_),
+    WordsMean = fin_fmt_num(.tab$WordsMean / .words_scale, m_),
+    WordsSD   = fin_fmt_num(.tab$WordsSD / .words_scale,   s_),
     DurMean   = fin_fmt_num(.tab$DurMean,   m_),
     DurSD     = fin_fmt_num(.tab$DurSD,     s_),
     PartMean  = fin_fmt_num(.tab$PartMean,  m_),
@@ -3102,18 +3396,21 @@ fin_content_cells <- function(.tab, .digits = c(Mean = 0L, SD = 2L)) {
 #' @param .tab Tibble from fin_tab_by_category(.stats = fin_content_stats).
 #' @param .path Character. The .tex written.
 #' @param .digits Named integer. Passed to fin_content_cells().
+#' @param .words_scale Numeric. Passed to fin_content_cells(); the header names the unit.
 #' @param .size Character. A LaTeX size command without the backslash: "small", "footnotesize".
 #' @return Invisibly, the path.
-fin_tex_content <- function(.tab, .path, .digits = c(Mean = 0L, SD = 2L), .size = "small") {
+fin_tex_content <- function(.tab, .path, .digits = c(Mean = 2L, SD = 2L), .words_scale = 1000, .size = "small") {
   if (FALSE) {
-    .tab    <- tab_content_rule
-    .path   <- fs::path(.lP$Output$DirTables, "ContentRule.tex")
-    .digits <- c(Mean = 0L, SD = 2L)
-    .size   <- "small"
+    .tab         <- tab_content_rule
+    .path        <- fs::path(.lP$Output$DirTables, "ContentRule.tex")
+    .digits      <- c(Mean = 2L, SD = 2L)
+    .words_scale <- 1000
+    .size        <- "small"
   }
   cells_ <- fin_content_cells(
-    .tab    = .tab,
-    .digits = .digits
+    .tab         = .tab,
+    .digits      = .digits,
+    .words_scale = .words_scale
   )
   body_ <- fin_tex_category_body(
     .cells = cells_,
@@ -3123,7 +3420,8 @@ fin_tex_content <- function(.tab, .path, .digits = c(Mean = 0L, SD = 2L), .size 
     paste0("\\begingroup\\", .size),
     "\\begin{tabular}{l r rr rr rr rr rr}",
     "\\toprule",
-    " & Contracts & \\multicolumn{2}{c}{Words} & \\multicolumn{2}{c}{Duration (years)} &",
+    paste0(" & Contracts & \\multicolumn{2}{c}{", fin_words_unit(.scale = .words_scale)$Header,
+           "} & \\multicolumn{2}{c}{Duration (years)} &"),
     "   \\multicolumn{2}{c}{Parties} & \\multicolumn{2}{c}{Countries} & \\multicolumn{2}{c}{States} \\\\",
     paste("\\cmidrule(lr){2-2} \\cmidrule(lr){3-4} \\cmidrule(lr){5-6} \\cmidrule(lr){7-8}",
           "\\cmidrule(lr){9-10} \\cmidrule(lr){11-12}"),
@@ -3147,7 +3445,7 @@ fin_tex_content <- function(.tab, .path, .digits = c(Mean = 0L, SD = 2L), .size 
 #' THE N IS CHECKED, NOT ASSUMED. The note states the sample and its size; the function prints the
 #' size it was written on beside the size counted here and the sum of the category rows, and warns
 #' if the first two differ. The category rows sum to less than the sample because contracts the
-#' classifier left unlabelled are in the sample and in the Total row but in no category row.
+#' classifier left unlabeled are in the sample and in the Total row but in no category row.
 #'
 #' @param .ds_contracts The prepared Contracts dataset.
 #' @param .con A DuckDB connection with Places registered.
@@ -3156,10 +3454,12 @@ fin_tex_content <- function(.tab, .path, .digits = c(Mean = 0L, SD = 2L), .size 
 #' @param .dirs List. .lP$Output.
 #' @param .name Character or NULL. The stem every file takes; NULL derives it from the arm.
 #' @param .digits Named integer. Decimals for Mean and SD.
+#' @param .words_scale Numeric. The divisor of the word counts (1000: thousands), named in the header and the note.
 #' @param .ref Tibble. 30's .fin_reference; the sample size the note assumes.
 #' @return Invisibly, the table tibble with Arm and Sample columns.
 fin_table_content <- function(.ds_contracts, .con, .arm = c("rule", "naive"), .roles = .fin_roles_recital, .dirs,
-                              .name = NULL, .digits = c(Mean = 0L, SD = 2L), .ref = .fin_reference) {
+                              .name = NULL, .digits = c(Mean = 2L, SD = 2L), .words_scale = 1000,
+                              .ref = .fin_reference) {
   if (FALSE) {
     .ds_contracts <- lst_ds$Contracts
     .con          <- con
@@ -3167,7 +3467,8 @@ fin_table_content <- function(.ds_contracts, .con, .arm = c("rule", "naive"), .r
     .roles        <- .fin_roles_recital
     .dirs         <- .lP$Output
     .name         <- NULL
-    .digits       <- c(Mean = 0L, SD = 2L)
+    .digits       <- c(Mean = 2L, SD = 2L)
+    .words_scale  <- 1000
     .ref          <- .fin_reference
   }
   .arm  <- match.arg(.arm)
@@ -3200,7 +3501,7 @@ fin_table_content <- function(.ds_contracts, .con, .arm = c("rule", "naive"), .r
     cli::cli_alert_success("Unique contracts: {format(n_actual_, big.mark = ',')}, as the revision prints.")
   }
   cli::cli_alert_info(
-    "Category rows sum to {format(n_classed_, big.mark = ',')}; {format(n_unlab_, big.mark = ',')} unlabelled \\
+    "Category rows sum to {format(n_classed_, big.mark = ',')}; {format(n_unlab_, big.mark = ',')} unlabeled \\
      contracts are in the Total row only."
   )
   tot_   <- tab_[tab_$Kind == "total", , drop = FALSE]
@@ -3212,30 +3513,46 @@ fin_table_content <- function(.ds_contracts, .con, .arm = c("rule", "naive"), .r
     .dir  = .dirs$DirData
   )
   fin_tex_content(
-    .tab    = tab_,
-    .path   = fs::path(.dirs$DirTables, paste0(name_, ".tex")),
-    .digits = .digits
+    .tab         = tab_,
+    .path        = fs::path(.dirs$DirTables, paste0(name_, ".tex")),
+    .digits      = .digits,
+    .words_scale = .words_scale
   )
-  roles_txt_ <- paste(.roles, collapse = ", ")
+  unit_ <- fin_words_unit(.scale = .words_scale)
+  # THE LAST SENTENCE OF THE NOTE says what the cells are rounded to, and the words' unit where there is one.
+  spell_ <- c("no decimals", "one decimal", "two decimals", "three decimals")
+  dig_txt_ <- if (.digits[["Mean"]] == .digits[["SD"]]) {
+    paste0("means and standard deviations carry ", spell_[.digits[["Mean"]] + 1L], ".")
+  } else {
+    paste0("means carry ", spell_[.digits[["Mean"]] + 1L], " and standard deviations ",
+           spell_[.digits[["SD"]] + 1L], ".")
+  }
+  last_ <- if (is.na(unit_$Note)) dig_txt_ else paste0("Words are in ", unit_$Note, "; ", dig_txt_)
+  last_ <- paste0(toupper(stringi::stri_sub(last_, 1L, 1L)), stringi::stri_sub(last_, 2L))
+  # THE ROLE NAMES AS THE MANUSCRIPT WRITES THEM: the data say cofiler, the text says co-registrant.
+  roles_lab_ <- c(registrant = "registrant", cofiler = "co-registrant", counterparty = "counterparty")
+  roles_txt_ <- paste(unname(dplyr::coalesce(roles_lab_[.roles], .roles)), collapse = ", ")
   arm_note_ <- if (.arm == "rule") {
     c("Words exclude the filing header. Duration is the difference in years between the contract's start",
       "date and its end date as established by a cascade of rules (a stated term, an open-ended clause, a",
-      "cue-word date, or the farthest future date), capped at 30 years; it is undefined where no end could",
-      paste0("be established. Parties are the distinct organisations matched to a party of the roles ",
-             roles_txt_, ". Countries and states are the distinct countries and U.S. states attached to one"),
+      "cue-word date, or the farthest future date); durations above 30 years are dropped, and it is undefined",
+      paste0("where no end could be established. Parties are the distinct organizations matched to a party of ",
+             "the roles ", roles_txt_, ". Countries and states are the distinct countries and U.S. states attached to one"),
       "of those parties outside a governing-law clause.")
   } else {
     c("Words are counted on the flattened text including the filing header. Duration is the difference",
       "in years between the contract's start date and the farthest date after the filing, uncapped; it is",
-      "undefined where the contract names no future date. Parties are the distinct organisation names the",
+      "undefined where the contract names no future date. Parties are the distinct organization names the",
       "extractor proposed before grouping. Countries and states are the distinct countries and U.S. states",
       "named anywhere outside a governing-law clause, attached to a party or not.")
   }
   note_ <- c(
     "This table shows the number of words, the contract duration, the number of contract parties and the",
     "number of countries and U.S. states mentioned, by contract category, on the unique-contract sample",
-    paste0("(N = ", format(n_actual_, big.mark = ","), "); ", format(n_unlab_, big.mark = ","),
-           " contracts without a category label enter the Total row only."),
+    paste0("(N = ", format(n_actual_, big.mark = ","), ")."),
+    if (n_unlab_ > 0L) {
+      paste0(format(n_unlab_, big.mark = ","), " contracts without a category label enter the Total row only.")
+    },
     "Category rows report the pooled statistics of their sub-categories.",
     arm_note_,
     paste0("Duration is defined on ", format(tot_$DurN, big.mark = ","),
@@ -3244,22 +3561,24 @@ fin_table_content <- function(.ds_contracts, .con, .arm = c("rule", "naive"), .r
     paste0("at least one is extracted on ", pct_(tot_$PartN), " percent of contracts for parties, ",
            pct_(tot_$CtryN), " percent for countries and ", pct_(tot_$StateN), " percent for states."),
     "States are U.S. states, so foreign parties contribute none.",
-    "Means are rounded to whole numbers; standard deviations to two decimals."
+    last_
   )
   fin_note_write(
     .text = note_,
     .path = fs::path(.dirs$DirNotes, paste0(name_, ".tex"))
   )
   cells_ <- fin_content_cells(
-    .tab    = tab_,
-    .digits = .digits
+    .tab         = tab_,
+    .digits      = .digits,
+    .words_scale = .words_scale
   )
   names(cells_) <- c(" ", "N", rep(c("Mean", "SD"), 5L))
+  groups_ <- c(1, 1, 2, 2, 2, 2, 2)
+  names(groups_) <- c(" ", "Contracts", unit_$Header, "Duration (years)", "Parties", "Countries", "States")
   fin_show_category(
     .cells  = cells_,
     .kind   = tab_$Kind,
-    .groups = c(" " = 1, "Contracts" = 1, "Words" = 2, "Duration (years)" = 2, "Parties" = 2, "Countries" = 2,
-                "States" = 2),
+    .groups = groups_,
     .title  = paste0("Content characteristics by category (", if (.arm == "rule") "rule-based" else "naive", ")"),
     .note   = paste(note_, collapse = " ")
   )
@@ -3313,21 +3632,27 @@ fin_contrast_cells <- function(.tab) {
       .tab_naive = tab_content_naive
     )
   }
-  d_ <- function(.x) dplyr::if_else(is.na(.x), "", formatC(.x, format = "d", big.mark = ",", flag = "+"))
+  # COUNTS IN THOUSANDS, one decimal, so that fourteen columns of seven-digit counts fit the text block without
+  # scaling (decided 23 Sep 2026); the exact counts stay in the saved data.
+  k_ <- function(.x) dplyr::if_else(is.na(.x), "", formatC(.x / 1000, format = "f", digits = 1L, big.mark = ","))
+  d_ <- function(.x) {
+    dplyr::if_else(is.na(.x), "", formatC(.x / 1000, format = "f", digits = 1L, big.mark = ",", flag = "+"))
+  }
+  # NO N COLUMN: under the naive rule every contract carries at least one organization name, so the naive party
+  # count equals N on every row and the column would repeat it; the note says so (decided 23 Sep 2026).
   tibble::tibble(
     Row        = .tab$Row,
-    N          = fin_fmt_count(.tab$N),
-    DurNaive   = fin_fmt_count(.tab$DurNaive),
-    DurRule    = fin_fmt_count(.tab$DurRule),
+    DurNaive   = k_(.tab$DurNaive),
+    DurRule    = k_(.tab$DurRule),
     DurDelta   = d_(.tab$DurDelta),
-    PartNaive  = fin_fmt_count(.tab$PartNaive),
-    PartRule   = fin_fmt_count(.tab$PartRule),
+    PartNaive  = k_(.tab$PartNaive),
+    PartRule   = k_(.tab$PartRule),
     PartDelta  = d_(.tab$PartDelta),
-    CtryNaive  = fin_fmt_count(.tab$CtryNaive),
-    CtryRule   = fin_fmt_count(.tab$CtryRule),
+    CtryNaive  = k_(.tab$CtryNaive),
+    CtryRule   = k_(.tab$CtryRule),
     CtryDelta  = d_(.tab$CtryDelta),
-    StateNaive = fin_fmt_count(.tab$StateNaive),
-    StateRule  = fin_fmt_count(.tab$StateRule),
+    StateNaive = k_(.tab$StateNaive),
+    StateRule  = k_(.tab$StateRule),
     StateDelta = d_(.tab$StateDelta)
   )
 }
@@ -3351,14 +3676,19 @@ fin_tex_contrast <- function(.tab, .path, .size = "footnotesize") {
     .cells = cells_,
     .kind  = .tab$Kind
   )
+  # ONE STRING PER HEADER ROW: the frame appends the row end to every header line it sees, so a row split over
+  # two strings came out as two rows (the bug behind the unreadable OD3, found 23 Sep 2026).
+  groups_ <- paste0(
+    " & \\multicolumn{3}{c}{Duration defined} & \\multicolumn{3}{c}{Parties found} & ",
+    "\\multicolumn{3}{c}{Countries found} & \\multicolumn{3}{c}{States found} \\\\"
+  )
   lines_ <- c(
     paste0("\\begingroup\\", .size),
-    "\\begin{tabular}{l r rrr rrr rrr rrr}",
+    "\\begin{tabular}{l rrr rrr rrr rrr}",
     "\\toprule",
-    " & Contracts & \\multicolumn{3}{c}{Duration defined} & \\multicolumn{3}{c}{Parties found} &",
-    "   \\multicolumn{3}{c}{Countries found} & \\multicolumn{3}{c}{States found} \\\\",
-    "\\cmidrule(lr){2-2} \\cmidrule(lr){3-5} \\cmidrule(lr){6-8} \\cmidrule(lr){9-11} \\cmidrule(lr){12-14}",
-    " & N & Naive & Rule & Diff. & Naive & Rule & Diff. & Naive & Rule & Diff. & Naive & Rule & Diff. \\\\",
+    groups_,
+    "\\cmidrule(lr){2-4} \\cmidrule(lr){5-7} \\cmidrule(lr){8-10} \\cmidrule(lr){11-13}",
+    " & Naive & Rule & Diff. & Naive & Rule & Diff. & Naive & Rule & Diff. & Naive & Rule & Diff. \\\\",
     "\\midrule",
     body_,
     "\\bottomrule",
@@ -3401,7 +3731,8 @@ fin_table_content_contrast <- function(.tab_rule, .tab_naive, .dirs, .name = "Co
     .tab  = tab_,
     .path = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
   )
-  tot_ <- tab_[tab_$Kind == "total", , drop = FALSE]
+  tot_     <- tab_[tab_$Kind == "total", , drop = FALSE]
+  n_unlab_ <- tot_$N - fin_n_classed(.tab = .tab_rule)
   note_ <- c(
     "This table contrasts, by contract category and on the unique-contract sample",
     paste0("(N = ", format(tot_$N, big.mark = ","), "), the number of contracts on which each content measure"),
@@ -3409,23 +3740,25 @@ fin_table_content_contrast <- function(.tab_rule, .tab_naive, .dirs, .name = "Co
     "where an end date could be established: under the naive rule, where the contract names a date after",
     "the filing; under the rule-based cascade, where a stated term, an open-ended clause, a cue-word date",
     "or a future date establishes one. Parties, countries and states are found where at least one was",
-    "extracted: under the naive rule, any organisation name, or any country or state mention outside a",
+    "extracted: under the naive rule, any organization name, or any country or state mention outside a",
     "governing-law clause; under the rule-based extraction, a party in the recital, or a country or state",
-    "attached to one. Diff. is rule-based less naive. Category rows report the pooled counts of their",
-    paste0("sub-categories; ", format(tot_$N - fin_n_classed(.tab = .tab_rule), big.mark = ","),
-           " contracts without a category label enter the Total row only.")
+    "attached to one. Diff. is rule-based less naive. Counts are in thousands, rounded to one decimal. The",
+    "number of contracts per row is the naive party count, since every contract names at least one organization.",
+    "Category rows report the pooled counts of their sub-categories.",
+    if (n_unlab_ > 0L) {
+      paste0(format(n_unlab_, big.mark = ","), " contracts without a category label enter the Total row only.")
+    }
   )
   fin_note_write(
     .text = note_,
     .path = fs::path(.dirs$DirNotes, paste0(.name, ".tex"))
   )
   cells_ <- fin_contrast_cells(.tab = tab_)
-  names(cells_) <- c(" ", "N", rep(c("Naive", "Rule", "Diff."), 4L))
+  names(cells_) <- c(" ", rep(c("Naive", "Rule", "Diff."), 4L))
   fin_show_category(
     .cells  = cells_,
     .kind   = tab_$Kind,
-    .groups = c(" " = 1, "Contracts" = 1, "Duration defined" = 3, "Parties found" = 3, "Countries found" = 3,
-                "States found" = 3),
+    .groups = c(" " = 1, "Duration defined" = 3, "Parties found" = 3, "Countries found" = 3, "States found" = 3),
     .title  = "Observations by content measure, naive against rule-based",
     .note   = paste(note_, collapse = " ")
   )
@@ -3442,7 +3775,7 @@ fin_table_content_contrast <- function(.tab_rule, .tab_naive, .dirs, .name = "Co
 # 10. Table: parties by role, the granular view --------------------------------------------------------------------------
 # For the authors, not the manuscript: where the party count comes from. Per category, the naive
 # spellings, then the mean parties per role after grouping -- registrant, co-filer, counterparty,
-# signatory, other -- their sum, and two shares: contracts in which no organisation was found at all,
+# signatory, other -- their sum, and two shares: contracts in which no organization was found at all,
 # and contracts in which the registrant was matched. Two decimals throughout.
 
 #' The party columns per S2 contract, including the two roles the prepared table does not carry
@@ -3594,12 +3927,12 @@ fin_table_parties <- function(.ds_contracts, .path_release, .dirs, .name = "Part
   tot_  <- tab_[tab_$Kind == "total", , drop = FALSE]
   note_ <- c(
     "For the authors. Mean parties per contract by category on the unique-contract sample",
-    paste0("(N = ", format(tot_$N, big.mark = ","), "). Spellings are the distinct organisation names the"),
+    paste0("(N = ", format(tot_$N, big.mark = ","), "). Spellings are the distinct organization names the"),
     "extractor proposed before grouping. The role columns are the distinct parties after grouping,",
     "by the role the rules assigned: matched to the filing registrant, to another registrant of the same",
     "filing, a party in the recital window that is not the registrant, a party appearing only in the",
     "final tenth of the document, or a party named outside both. All is their sum. No party is the share",
-    "of contracts in which no organisation was found at all; Registrant matched is the share in which the",
+    "of contracts in which no organization was found at all; Registrant matched is the share in which the",
     "registrant was identified in the text. The recital parties of the content tables are the first three",
     "roles."
   )
@@ -3971,7 +4304,7 @@ fin_table_redactions <- function(.ds_contracts, .dirs, .name = "RedactionsDetail
 # Each function here is read-only and cheap, and exists so that an issue under discussion with
 # Ann-Kristin is a table in the render rather than a number remembered from a console.
 
-#' The unlabelled contracts in S2: how many, where in the ladder, what they are
+#' The unlabeled contracts in S2: how many, where in the ladder, what they are
 #'
 #' Every one of them has zero words: the exhibit is a placeholder for a PDF or an image, and no
 #' classifier, extractor or word count ever saw text. They pass 02B's malformed test because that
@@ -4041,9 +4374,9 @@ fin_issue_unlabelled <- function(.ds_contracts, .path_release) {
 # beside them, how often the keyword arm agreed with it. The 735 zero-word contracts carry no
 # probability and are not in this table (see Open Issues).
 
-#' The confidence columns per labelled S2 contract
+#' The confidence columns per labeled S2 contract
 #' @param .ds_contracts The prepared Contracts dataset.
-#' @return Tibble, one row per labelled S2 contract: DocID, Class, Level1, Level2, Prob, Flag.
+#' @return Tibble, one row per labeled S2 contract: DocID, Class, Level1, Level2, Prob, Flag.
 fin_confidence_rows <- function(.ds_contracts) {
   if (FALSE) .ds_contracts <- lst_ds$Contracts
   rows_ <- .ds_contracts |>
@@ -4118,7 +4451,7 @@ fin_table_confidence <- function(.ds_contracts, .dirs, .name = "ClassConfidence"
     .rows  = rows_,
     .stats = fin_confidence_stats
   ) |>
-    dplyr::mutate(Sample = "S2_Descriptive, labelled", .before = 1L)
+    dplyr::mutate(Sample = "S2_Descriptive, labeled", .before = 1L)
   fin_save_data(
     .tab  = tab_,
     .name = .name,
@@ -4150,7 +4483,7 @@ fin_table_confidence <- function(.ds_contracts, .dirs, .name = "ClassConfidence"
   tot_  <- tab_[tab_$Kind == "total", , drop = FALSE]
   note_ <- c(
     "This table shows the classifier's confidence in the assigned category, by category, on the",
-    paste0("labelled unique-contract sample (N = ", format(tot_$N, big.mark = ","), "; contracts without"),
+    paste0("labeled unique-contract sample (N = ", format(tot_$N, big.mark = ","), "; contracts without"),
     "readable text carry no label and are excluded). The probability is the fine-tuned transformer's",
     "softmax probability of the category it assigned. Confirms and Contradicts are the shares of",
     "contracts on which the keyword-based classifier fired and agreed, respectively disagreed, with the",
@@ -4204,7 +4537,7 @@ fin_table_confidence <- function(.ds_contracts, .dirs, .name = "ClassConfidence"
     paste("Share of the narrative's four-word phrases that appear in the Item 1.01 narratives of at least",
           "one in a hundred distinct filers."),
     paste("Calendar days from the agreement date the narrative states to the filing date of the 8-K,",
-          "winsorised at the first and ninety-ninth percentile of the sample."),
+          "winsorized at the first and ninety-ninth percentile of the sample."),
     paste("Indicator equal to one where the announcement lag is at most six calendar days, the longest span",
           "four business days can cover.")
   )
@@ -4250,7 +4583,7 @@ fin_table_summary_variables <- function(.dirs, .name = "SummaryVariables") {
 
 #' The announcement sample as rows: the nine measures, the delay indicator, the keys
 #'
-#' THE LAG IS WINSORISED, the on-time indicator is not. A misread agreement date makes a lag of
+#' THE LAG IS WINSORIZED, the on-time indicator is not. A misread agreement date makes a lag of
 #' minus three hundred days or of three thousand, and a handful of those move a mean by more than
 #' the difference between the groups; the lag is clipped at the sample's first and ninety-ninth
 #' percentile. The indicator is computed from the raw lag upstream and needs no clipping.
@@ -4405,7 +4738,7 @@ fin_table_summaries <- function(.ds_summaries, .sample = "S7_Summaries", .measur
     paste0("Exhibit 10 (N = ", format(n_d_ + n_a_, big.mark = ","), "; ", format(n_d_, big.mark = ","),
            " delayed, ", format(n_a_, big.mark = ","), " attached)."),
     if ("LagDays" %in% .measures) {
-      paste("The measures are defined in the summary measures table; the announcement lag is winsorised",
+      paste("The measures are defined in the summary measures table; the announcement lag is winsorized",
             "at the first and ninety-ninth percentile.")
     } else {
       "The measures are defined in the summary measures table."
@@ -4641,7 +4974,7 @@ fin_table_summaries_regression <- function(.ds_summaries, .ds_quarter, .con, .sa
     "and firm effects with the firm-quarter controls of the estimation tables, matched to the first",
     "fiscal quarter ending on or after the filing and at most one hundred days later.",
     if ("LagDays" %in% .measures) {
-      "The announcement lag is winsorised at the first and ninety-ninth percentile."
+      "The announcement lag is winsorized at the first and ninety-ninth percentile."
     } else {
       NULL
     },
@@ -4695,7 +5028,7 @@ fin_table_summaries_regression <- function(.ds_summaries, .ds_quarter, .con, .sa
 # 16. Tables: the announcement sample, before the tests --------------------------------------------------------------------
 # Two overviews that precede the summary tables: how the announcement sample is selected from every
 # Item 1.01 8-K the pipeline recovered, and what the announcement lag looks like before it is
-# winsorised. Both are the documentation of a choice, on the page, with the N's.
+# winsorized. Both are the documentation of a choice, on the page, with the N's.
 
 #' The announcement ladder: every recovered Item 1.01 8-K down to the sample, by attachment
 #'
@@ -4823,7 +5156,7 @@ fin_table_summary_sample <- function(.ds_summaries, .dirs, .name = "SummarySampl
   invisible(tab_)
 }
 
-#' The announcement lag before winsorising: its tails, by attachment
+#' The announcement lag before winsorizing: its tails, by attachment
 #'
 #' The lag is the filing date less the agreement date the narrative opens with, and a misread date
 #' puts a few announcements hundreds of days off in either direction. This is the evidence for
@@ -4892,11 +5225,11 @@ fin_table_summary_lag <- function(.ds_summaries, .sample = "S7_Summaries", .wins
       P99      = fin_fmt_num(.data$P99, 0L),
       Max      = fin_fmt_num(.data$Max, 0L),
       Mean     = fin_fmt_num(.data$Mean, 2L),
-      `Mean, winsorised` = fin_fmt_num(.data$MeanWin, 2L)
+      `Mean, winsorized` = fin_fmt_num(.data$MeanWin, 2L)
     )
   note_ <- paste(
     "Calendar days from the agreement date the narrative opens with to the filing date, on the",
-    "announcement sample, before winsorising. A negative lag is a filing dated before the agreement",
+    "announcement sample, before winsorizing. A negative lag is a filing dated before the agreement",
     "date it announces, which is a misread date. The last column clips at the sample's",
     paste0(100 * .winsor[[1L]], "th and ", 100 * .winsor[[2L]], "th percentile, as the tables do.")
   )
@@ -4913,7 +5246,7 @@ fin_table_summary_lag <- function(.ds_summaries, .sample = "S7_Summaries", .wins
     knitr::kable(
       format   = "html",
       escape   = TRUE,
-      caption  = "The announcement lag before winsorising",
+      caption  = "The announcement lag before winsorizing",
       align    = paste0("l", strrep("r", ncol(shown_) - 1L)),
       booktabs = TRUE
     ) |>
@@ -4944,7 +5277,7 @@ fin_table_summary_lag <- function(.ds_summaries, .sample = "S7_Summaries", .wins
 # 17. Prepare: the classification panel ---------------------------------------------------------------------------------
 # Nothing about the classifiers is in the release; it lives in the run folders of 03B, 03C and 03D
 # and in the crown records those stages wrote. This step builds what 03E builds at render -- one row
-# per labelled document and task, the truth beside every engine's out-of-fold prediction and score,
+# per labeled document and task, the truth beside every engine's out-of-fold prediction and score,
 # NA where an engine declined -- and writes it beside the other prepared tables, keyed on the run
 # folders and the crown records. Every classification table below is a group-by on it.
 
@@ -5034,7 +5367,7 @@ fin_class_crowned <- function(.dir_bert, .dir_kw, .dir_llm) {
 
 #' Prepare the four classification tables
 #'
-#' ClassSample: the labelled documents without their text, with a word count. ClassPanel: one row
+#' ClassSample: the labeled documents without their text, with a word count. ClassPanel: one row
 #' per task and document, the truth and every engine's out-of-fold prediction and score, wide by
 #' engine, NA where an engine declined; the keyword arm on AmendType is silenced outside Amended as
 #' 03E does. ClassCrowned: which configuration stands for each engine. ClassSweep: 03B's per-fold
@@ -5320,18 +5653,18 @@ fin_class_ships <- function(.ds_crowned, .task) {
   c_$Engine
 }
 
-# -- 18.1 The labelled sample -----------------------------------------------------------------------------------------
+# -- 18.1 The labeled sample -----------------------------------------------------------------------------------------
 
-#' The labelled sample by category, with the amendment label as a second block
+#' The labeled sample by category, with the amendment label as a second block
 #' @param .ds_sample The prepared ClassSample dataset.
 #' @param .dirs List. .lP$Output.
 #' @param .name Character. The stem.
 #' @return Invisibly, the tibble.
-fin_table_class_sample <- function(.ds_sample, .dirs, .name = "ClassLabelled") {
+fin_table_class_sample <- function(.ds_sample, .dirs, .name = "ClassLabelledFull") {
   if (FALSE) {
     .ds_sample <- lst_ds_class$ClassSample
     .dirs      <- .lP$Output
-    .name      <- "ClassLabelled"
+    .name      <- "ClassLabelledFull"
   }
   s_ <- dplyr::collect(.ds_sample)
   cat_ <- fin_tab_categories() |> dplyr::select("Class", "Level1", "Level2")
@@ -5392,9 +5725,9 @@ fin_table_class_sample <- function(.ds_sample, .dirs, .name = "ClassLabelled") {
     .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
   )
   note_ <- c(
-    paste0("The hand-labelled training sample (N = ", format(nrow(rows_), big.mark = ","), " documents with"),
+    paste0("The hand-labeled training sample (N = ", format(nrow(rows_), big.mark = ","), " documents with"),
     "readable text), by category and by amendment label. Second label counts documents carrying a second",
-    "valid category, which training never uses and lenient scoring credits. Round 1 is the share labelled",
+    "valid category, which training never uses and lenient scoring credits. Round 1 is the share labeled",
     "in the first labelling round. Folds for cross-validation are dealt once on this sample, stratified",
     "on the detailed category."
   )
@@ -5407,7 +5740,7 @@ fin_table_class_sample <- function(.ds_sample, .dirs, .name = "ClassLabelled") {
     .cells  = cells_,
     .kind   = tab_$Kind,
     .groups = c(" " = 1, "Labelled documents" = 5),
-    .title  = "The labelled sample",
+    .title  = "The labeled sample",
     .note   = paste(note_, collapse = " ")
   )
   invisible(tab_)
@@ -5424,7 +5757,7 @@ fin_class_show <- function(.tab, .cols, .name, .dirs, .title, .note) {
   if (FALSE) {
     .tab   <- tab_
     .cols  <- c(N = "Support", Precision = "Precision", Recall = "Recall", F1 = "F1")
-    .name  <- "ClassTransformer"
+    .name  <- "ClassTransformerFull"
     .dirs  <- .lP$Output
     .title <- "Transformer"
     .note  <- "A note."
@@ -5434,21 +5767,19 @@ fin_class_show <- function(.tab, .cols, .name, .dirs, .title, .note) {
     .name = .name,
     .dir  = .dirs$DirData
   )
-  # A SCORE WITH ITS SPREAD. Where the tibble carries the across-fold SD of a metric, the cell reads
-  # "pooled (sd)", as a regression table would; counts and shares stay as they are.
+  # THE POOLED SCORE ALONE. The tibble keeps each metric's across-fold SD (the columns suffixed SD) for the
+  # data file; the page prints the pooled score only, which keeps the table narrow (decided 17 September).
+  # Counts and shares stay as they are.
   cells_ <- tibble::tibble(Row = .tab$Row)
   for (i_ in seq_along(.cols)) {
     col_ <- .cols[[i_]]
     v_   <- .tab[[col_]]
-    sd_  <- .tab[[paste0(col_, "SD")]]
     cells_[[names(.cols)[i_]]] <- if (col_ %in% c("Support", "Predicted")) {
       fin_fmt_count(v_)
     } else if (grepl("\\(%\\)", names(.cols)[i_])) {
       fin_fmt_num(100 * v_, 1L)
-    } else if (is.null(sd_)) {
-      fin_fmt_num(v_, 3L)
     } else {
-      dplyr::if_else(is.na(v_), "", paste0(fin_fmt_num(v_, 3L), " (", fin_fmt_num(sd_, 3L), ")"))
+      dplyr::if_else(is.na(v_), "", fin_fmt_num(v_, 3L))
     }
   }
   body_ <- fin_tex_category_body(
@@ -5487,13 +5818,13 @@ fin_class_show <- function(.tab, .cols, .name, .dirs, .title, .note) {
 #' @param .dirs List. .lP$Output.
 #' @param .name Character. The stem.
 #' @return Invisibly, the tibble.
-fin_table_class_transformer <- function(.ds_panel, .ds_sample, .ds_crowned, .dirs, .name = "ClassTransformer") {
+fin_table_class_transformer <- function(.ds_panel, .ds_sample, .ds_crowned, .dirs, .name = "ClassTransformerFull") {
   if (FALSE) {
     .ds_panel   <- lst_ds_class$ClassPanel
     .ds_sample  <- lst_ds_class$ClassSample
     .ds_crowned <- lst_ds_class$ClassCrowned
     .dirs       <- .lP$Output
-    .name       <- "ClassTransformer"
+    .name       <- "ClassTransformerFull"
   }
   eng_ <- fin_class_ships(
     .ds_crowned = .ds_crowned,
@@ -5529,14 +5860,13 @@ fin_table_class_transformer <- function(.ds_panel, .ds_sample, .ds_crowned, .dir
   bt_  <- broad_[broad_$Label == "Total", , drop = FALSE]
   note_ <- c(
     paste0("Out-of-fold scores of the transformer that ships (", eng_, ": context length ",
-           sub("^Bert", "", eng_), " tokens) on the labelled sample (N = ", format(tot_$Support, big.mark = ","), ")."),
+           sub("^Bert", "", eng_), " tokens) on the labeled sample (N = ", format(tot_$Support, big.mark = ","), ")."),
     "Each document is predicted once by the fold model that did not see it. Sub-category rows score the",
     "detailed prediction against the detailed label; super-category rows score the same predictions",
     "rolled up to their parent, so an error inside a parent does not count there. Accuracy per row is",
     "one-vs-rest; precision, recall and F1 are per category, and the Total row reports overall accuracy",
     "with macro precision, recall and F1. Lenient recall credits a prediction that equals the document's",
-    "second valid category. In parentheses, the standard deviation of the score across the five folds,",
-    "each computed on that fold's held-out documents.",
+    "second valid category.",
     paste0("Overall: accuracy ", fin_fmt_num(tot_$Accuracy, 3L), " strict, ", fin_fmt_num(tot_$RecallLenient, 3L),
            " lenient; macro-F1 ", fin_fmt_num(tot_$F1, 3L), "; at the broad level accuracy ",
            fin_fmt_num(bt_$Accuracy, 3L), " and macro-F1 ", fin_fmt_num(bt_$F1, 3L), ".")
@@ -5564,12 +5894,12 @@ fin_table_class_transformer <- function(.ds_panel, .ds_sample, .ds_crowned, .dir
 #' @param .dirs List. .lP$Output.
 #' @param .name Character. The stem.
 #' @return Invisibly, the tibble.
-fin_table_class_amendment <- function(.ds_panel, .ds_crowned, .dirs, .name = "ClassAmendment") {
+fin_table_class_amendment <- function(.ds_panel, .ds_crowned, .dirs, .name = "ClassAmendmentFull") {
   if (FALSE) {
     .ds_panel   <- lst_ds_class$ClassPanel
     .ds_crowned <- lst_ds_class$ClassCrowned
     .dirs       <- .lP$Output
-    .name       <- "ClassAmendment"
+    .name       <- "ClassAmendmentFull"
   }
   eng_ <- fin_class_ships(
     .ds_crowned = .ds_crowned,
@@ -5594,15 +5924,16 @@ fin_table_class_amendment <- function(.ds_panel, .ds_crowned, .dirs, .name = "Cl
     .name = .name,
     .dir  = .dirs$DirData
   )
-  sdf_ <- function(.v, .s) dplyr::if_else(is.na(.v), "", paste0(fin_fmt_num(.v, 3L), " (", fin_fmt_num(.s, 3L), ")"))
+  # THE POOLED SCORE ALONE; the fold SDs stay in the data file (decided 17 September).
+  fmt3_ <- function(.v) dplyr::if_else(is.na(.v), "", fin_fmt_num(.v, 3L))
   cells_ <- tibble::tibble(
     Label     = m_$Label,
     N         = fin_fmt_count(m_$Support),
     Predicted = fin_fmt_count(m_$Predicted),
-    Accuracy  = sdf_(m_$Accuracy, m_$AccuracySD),
-    Precision = sdf_(m_$Precision, m_$PrecisionSD),
-    Recall    = sdf_(m_$Recall, m_$RecallSD),
-    F1        = sdf_(m_$F1, m_$F1SD)
+    Accuracy  = fmt3_(m_$Accuracy),
+    Precision = fmt3_(m_$Precision),
+    Recall    = fmt3_(m_$Recall),
+    F1        = fmt3_(m_$F1)
   )
   kind_ <- c("sub", "sub", "total")
   body_ <- fin_tex_category_body(
@@ -5620,10 +5951,9 @@ fin_table_class_amendment <- function(.ds_panel, .ds_crowned, .dirs, .name = "Cl
   )
   tot_ <- m_[m_$Label == "Total", , drop = FALSE]
   note_ <- c(
-    paste0("Out-of-fold scores of the amendment classifier that ships (", eng_, ") on the labelled sample"),
+    paste0("Out-of-fold scores of the amendment classifier that ships (", eng_, ") on the labeled sample"),
     paste0("(N = ", format(tot_$Support, big.mark = ","), "). Accuracy per row is one-vs-rest; the Total row"),
-    "reports overall accuracy with macro precision, recall and F1. In parentheses, the standard deviation",
-    "across the five folds."
+    "reports overall accuracy with macro precision, recall and F1."
   )
   fin_note_write(
     .text = note_,
@@ -5647,12 +5977,12 @@ fin_table_class_amendment <- function(.ds_panel, .ds_crowned, .dirs, .name = "Cl
 #' @param .dirs List. .lP$Output.
 #' @param .name Character. The stem.
 #' @return Invisibly, the tibble.
-fin_table_class_keyword <- function(.ds_panel, .ds_sample, .dirs, .name = "ClassKeyword") {
+fin_table_class_keyword <- function(.ds_panel, .ds_sample, .dirs, .name = "ClassKeywordFull") {
   if (FALSE) {
     .ds_panel  <- lst_ds_class$ClassPanel
     .ds_sample <- lst_ds_class$ClassSample
     .dirs      <- .lP$Output
-    .name      <- "ClassKeyword"
+    .name      <- "ClassKeywordFull"
   }
   if (!"Kw" %in% names(.ds_panel)) cli::cli_abort("The panel carries no keyword arm.")
   d_ <- fin_class_detailed(
@@ -5683,13 +6013,13 @@ fin_table_class_keyword <- function(.ds_panel, .ds_sample, .dirs, .name = "Class
     )
   tot_ <- tab_[tab_$Kind == "total", , drop = FALSE]
   note_ <- c(
-    paste0("Out-of-fold scores of the keyword table on the labelled sample (N = ",
+    paste0("Out-of-fold scores of the keyword table on the labeled sample (N = ",
            format(tot_$Support, big.mark = ","), "). The keyword arm commits only where a term it trusts"),
     "fires and declines the rest, so two recalls are reported: over every document, where a declined",
     "document is a miss, and over the committed ones. Coverage is the share of a category's documents",
     "the arm committed on; precision is computed over what it predicted. Super-category rows score the",
     "predictions rolled up to their parent. The Total row reports overall coverage and accuracy with",
-    "macro precision, recall and F1. In parentheses, the standard deviation across the five folds.",
+    "macro precision, recall and F1.",
     paste0("Overall: coverage ", fin_fmt_num(tot_$Coverage, 3L), ", accuracy ", fin_fmt_num(tot_$Accuracy, 3L),
            " over all documents and ", fin_fmt_num(tot_$RecallSel, 3L), " where it committed; macro-F1 ",
            fin_fmt_num(tot_$F1, 3L), ".")
@@ -5717,12 +6047,12 @@ fin_table_class_keyword <- function(.ds_panel, .ds_sample, .dirs, .name = "Class
 #' @param .dirs List. .lP$Output.
 #' @param .name Character. The stem.
 #' @return Invisibly, a list: Arms, Ceiling.
-fin_table_class_arms <- function(.ds_panel, .ds_crowned, .dirs, .name = "ClassArms") {
+fin_table_class_arms <- function(.ds_panel, .ds_crowned, .dirs, .name = "ClassArmsFull") {
   if (FALSE) {
     .ds_panel   <- lst_ds_class$ClassPanel
     .ds_crowned <- lst_ds_class$ClassCrowned
     .dirs       <- .lP$Output
-    .name       <- "ClassArms"
+    .name       <- "ClassArmsFull"
   }
   crowned_ <- dplyr::collect(.ds_crowned)
   panel_   <- dplyr::collect(.ds_panel)
@@ -5780,9 +6110,9 @@ fin_table_class_arms <- function(.ds_panel, .ds_crowned, .dirs, .name = "ClassAr
     Engine      = paste0(arms_$Engine, dplyr::if_else(arms_$Ships, " (ships)", "")),
     N           = fin_fmt_count(arms_$N),
     Coverage    = fin_fmt_num(arms_$Coverage, 3L),
-    Accuracy    = paste0(fin_fmt_num(arms_$Accuracy, 3L), " (", fin_fmt_num(arms_$AccuracySD, 3L), ")"),
+    Accuracy    = fin_fmt_num(arms_$Accuracy, 3L),
     AccuracySel = fin_fmt_num(arms_$AccuracySel, 3L),
-    MacroF1     = paste0(fin_fmt_num(arms_$MacroF1, 3L), " (", fin_fmt_num(arms_$MacroF1SD, 3L), ")"),
+    MacroF1     = fin_fmt_num(arms_$MacroF1, 3L),
     WeightedF1  = fin_fmt_num(arms_$WeightedF1, 3L)
   )
   ceil_cells_ <- tibble::tibble(
@@ -5808,10 +6138,9 @@ fin_table_class_arms <- function(.ds_panel, .ds_crowned, .dirs, .name = "ClassAr
     .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
   )
   note_ <- c(
-    "Every engine on every task, out of fold on the labelled sample. Coverage is the share of documents",
+    "Every engine on every task, out of fold on the labeled sample. Coverage is the share of documents",
     "the engine committed on; accuracy is over every document, a declined document counting as a miss,",
-    "and accuracy committed is over the committed ones; in parentheses, the standard deviation across",
-    "the five folds. Macro-F1 weights every category equally,",
+    "and accuracy committed is over the committed ones. Macro-F1 weights every category equally,",
     "weighted F1 by support. Ships marks the transformer length the training stage crowned. The ceiling",
     "rows take the shipping transformer and add the other engines in turn, counting a document correct",
     "if any engine in the set got it right: the accuracy a perfect router could reach, and what each",
@@ -5887,8 +6216,8 @@ fin_table_class_sweep <- function(.ds_sweep, .ds_crowned, .dirs, .name = "ClassS
     Model      = if ("Model" %in% names(tab_)) as.character(tab_$Model) else "",
     MaxLen     = if ("MaxLen" %in% names(tab_)) fin_fmt_count(as.integer(tab_$MaxLen)) else "",
     Folds      = fin_fmt_count(tab_$Folds),
-    Accuracy   = paste0(fin_fmt_num(tab_$Accuracy, 3L), " (", fin_fmt_num(tab_$AccuracySD, 3L), ")"),
-    MacroF1    = paste0(fin_fmt_num(tab_$MacroF1, 3L), " (", fin_fmt_num(tab_$MacroF1SD, 3L), ")"),
+    Accuracy   = fin_fmt_num(tab_$Accuracy, 3L),
+    MacroF1    = fin_fmt_num(tab_$MacroF1, 3L),
     WeightedF1 = fin_fmt_num(tab_$WeightedF1, 3L),
     Status     = dplyr::case_when(
       tab_$Crown ~ "ships",
@@ -5902,7 +6231,7 @@ fin_table_class_sweep <- function(.ds_sweep, .ds_crowned, .dirs, .name = "ClassS
     paste0(paste(r_, collapse = " & "), " \\\\")
   })
   lines_ <- c("\\begingroup\\footnotesize", "\\begin{tabular}{l l r r r r r l}", "\\toprule",
-              "Task & Model & Context & Folds & Accuracy (SD) & Macro-F1 (SD) & Weighted F1 & \\\\", "\\midrule", body_,
+              "Task & Model & Context & Folds & Accuracy & Macro-F1 & Weighted F1 & \\\\", "\\midrule", body_,
               "\\bottomrule", "\\end{tabular}", "\\endgroup")
   fs::dir_create(.dirs$DirTables)
   fin_tex_write(
@@ -5910,15 +6239,15 @@ fin_table_class_sweep <- function(.ds_sweep, .ds_crowned, .dirs, .name = "ClassS
     .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
   )
   note_ <- c(
-    "Every transformer configuration cross-validated, by task: the mean and standard deviation across",
-    "the five folds of out-of-fold accuracy and macro-F1. Selection is on macro-F1; deployed marks the",
+    "Every transformer configuration cross-validated, by task: the mean across the five folds of",
+    "out-of-fold accuracy and macro-F1. Selection is on macro-F1; deployed marks the",
     "configurations refitted on the full sample at each context length, ships the one the paper uses."
   )
   fin_note_write(
     .text = note_,
     .path = fs::path(.dirs$DirNotes, paste0(.name, ".tex"))
   )
-  names(cells_) <- c("Task", "Model", "Context", "Folds", "Accuracy (SD)", "Macro-F1 (SD)", "Weighted F1", " ")
+  names(cells_) <- c("Task", "Model", "Context", "Folds", "Accuracy", "Macro-F1", "Weighted F1", " ")
   k_ <- cells_ |>
     knitr::kable(format = "html", escape = TRUE, caption = "Model selection: the sweep", align = "llrrrrrl",
                  booktabs = TRUE) |>
@@ -5944,13 +6273,13 @@ fin_table_class_sweep <- function(.ds_sweep, .ds_crowned, .dirs, .name = "ClassS
 #' @param .dirs List. .lP$Output.
 #' @param .name Character. The stem.
 #' @return Invisibly, the count matrix as a tibble (rows true, columns predicted).
-fin_table_class_confusion <- function(.ds_panel, .ds_sample, .ds_crowned, .dirs, .name = "ClassConfusion") {
+fin_table_class_confusion <- function(.ds_panel, .ds_sample, .ds_crowned, .dirs, .name = "ClassConfusionFull") {
   if (FALSE) {
     .ds_panel   <- lst_ds_class$ClassPanel
     .ds_sample  <- lst_ds_class$ClassSample
     .ds_crowned <- lst_ds_class$ClassCrowned
     .dirs       <- .lP$Output
-    .name       <- "ClassConfusion"
+    .name       <- "ClassConfusionFull"
   }
   eng_ <- fin_class_ships(
     .ds_crowned = .ds_crowned,
@@ -5998,7 +6327,7 @@ fin_table_class_confusion <- function(.ds_panel, .ds_sample, .ds_crowned, .dirs,
     .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
   )
   note_ <- c(
-    paste0("Confusion matrix of the shipping transformer (", eng_, ") on the labelled sample, out of fold:"),
+    paste0("Confusion matrix of the shipping transformer (", eng_, ") on the labeled sample, out of fold:"),
     "rows are the true category, columns the predicted one, cells the number of documents. Categories",
     "are in the taxonomic order of the categories table, so an error that stays inside a parent sits",
     "next to the diagonal and one that crosses a parent sits further from it."
@@ -6029,7 +6358,7 @@ fin_table_class_confusion <- function(.ds_panel, .ds_sample, .ds_crowned, .dirs,
 
 # 19. Figures --------------------------------------------------------------------------------------------------------------
 # One function per figure, the same contract as the tables: the tibble behind the figure goes to
-# Data/<Name>.parquet, the figure to Figures/<Name>.pdf and .png through plot_save(), the note to
+# Data/<Name>.parquet, the figure to Figures/<Name>.png through plot_save(), the note to
 # Notes/<Name>.tex, and the figure is printed into the runbook. Where 30 already computes and draws
 # the exhibit in the decided form, its fin_data_*() and fin_plot_*() are reused; a figure whose
 # manuscript form differs gets a fin_plot_*() here.
@@ -6066,11 +6395,12 @@ fin_figure_save <- function(.plot, .data, .note, .name, .dirs, .height, .width =
   print(.plot)
   dev_ <- grDevices::dev.cur()
   files_ <- plot_save(
-    .plot   = .plot,
-    .name   = .name,
-    .dir    = .dirs$DirFigures,
-    .height = .height,
-    .width  = .width
+    .plot    = .plot,
+    .name    = .name,
+    .dir     = .dirs$DirFigures,
+    .height  = .height,
+    .width   = .width,
+    .formats = "png"            # Overleaf reads the png; no pdf is written (decided 17 September)
   )
   if (dev_ != 1L && dev_ %in% grDevices::dev.list() && grDevices::dev.cur() != dev_) grDevices::dev.set(dev_)
   fin_note_write(
@@ -6195,7 +6525,7 @@ fin_figure_filing_types <- function(.ds_contracts, .dirs, .name = "FilingTypes",
 #'
 #' The revision draws the total over the bars on a second axis, and the manuscript keeps that form;
 #' the second axis is scaled so the largest year sits just under the top of the bars. The two regime
-#' dates are dashed and labelled on the page. Both axes say their unit.
+#' dates are dashed and labeled on the page. Both axes say their unit.
 #'
 #' @param .tab_data Tibble from fin_report_f02() for one sample: Year, FilingGroup4, N, Total, Share.
 #' @param .line_colour Character. The total line's colour; a mid grey reads on the blue ramp.
@@ -6476,6 +6806,8 @@ fin_category_axis <- function() {
 }
 
 #' Contract types, two panels: count with the share, and contracts per firm-year, super-categories as header rows
+#'
+#' Each panel carries its letter above it, as the text cites them ("Panel A", "Panel B").
 #' @param .tab_data Tibble from fin_data_f03() for one sample.
 #' @return A patchwork.
 fin_plot_contract_types <- function(.tab_data) {
@@ -6490,6 +6822,17 @@ fin_plot_contract_types <- function(.tab_data) {
   # a warning it does not need to give; the levels run bottom-up, so the vector is reversed to match.
   faces_ <- rev(dplyr::if_else(axis_$Kind == "sub", "plain", "bold"))
   theme_ <- ggplot2::theme(axis.text.y = ggplot2::element_text(face = faces_, hjust = 0))
+  # THE PANEL TITLES start at the left edge of each panel's plot, so A's sits above the category labels.
+  title_ <- ggplot2::theme(
+    plot.title          = ggplot2::element_text(
+      family = .plot_font,
+      size   = .plot_base,
+      face   = "bold",
+      hjust  = 0,
+      margin = ggplot2::margin(b = 6)
+    ),
+    plot.title.position = "plot"
+  )
   a_ <- ggplot2::ggplot(dat_, ggplot2::aes(y = .data$Row, x = .data$N / 1000)) +
     ggplot2::geom_col(fill = .plot_ink, width = 0.7, na.rm = TRUE) +
     ggplot2::geom_text(
@@ -6501,9 +6844,14 @@ fin_plot_contract_types <- function(.tab_data) {
     ) +
     ggplot2::scale_y_discrete(drop = FALSE) +
     plot_scale_x_count(.expand = c(0, 0.25)) +
-    ggplot2::labs(x = "Contracts (in 1,000s)", y = NULL) +
+    ggplot2::labs(
+      title = "Panel A: Number of contracts and share of the sample",
+      x     = "Contracts (in 1,000s)",
+      y     = NULL
+    ) +
     plot_theme(.grid = "x", .legend = "none") +
-    suppressWarnings(theme_)
+    suppressWarnings(theme_) +
+    title_
   b_ <- ggplot2::ggplot(dat_, ggplot2::aes(y = .data$Row, x = .data$PerFirmYear)) +
     ggplot2::geom_col(fill = .plot_ref, width = 0.7, na.rm = TRUE) +
     ggplot2::geom_text(
@@ -6515,9 +6863,14 @@ fin_plot_contract_types <- function(.tab_data) {
     ) +
     ggplot2::scale_y_discrete(drop = FALSE) +
     ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.25))) +
-    ggplot2::labs(x = "Contracts per firm-year", y = NULL) +
+    ggplot2::labs(
+      title = "Panel B: Contracts per firm-year",
+      x     = "Contracts per firm-year",
+      y     = NULL
+    ) +
     plot_theme(.grid = "x", .legend = "none") +
-    ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank())
+    ggplot2::theme(axis.text.y = ggplot2::element_blank(), axis.ticks.y = ggplot2::element_blank()) +
+    title_
   patchwork::wrap_plots(a_, b_, ncol = 2L, widths = c(1.6, 1))
 }
 
@@ -6646,8 +6999,13 @@ fin_plot_types_time_a <- function(.rows) {
 #' @param .colour Character or NULL. A column keyed to at most three colours; NULL draws in ink.
 #' @param .labels_end Logical. Name each line at its right end.
 #' @param .ncol Integer. Panels per row.
+#' @param .y_lab Character. The y axis's title.
+#' @param .breaks Numeric. The years the x axis names.
+#' @param .regimes Named numeric. The years a dashed line marks, kept where the data reach them.
 #' @return A ggplot.
-fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .labels_end = FALSE, .ncol = 4L) {
+fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .labels_end = FALSE, .ncol = 4L,
+                             .y_lab = "Share of contracts (in %)", .breaks = c(2004, 2012, 2020),
+                             .regimes = .fin_regime_years) {
   if (FALSE) {
     .tab        <- rows_
     .facet      <- "Panel"
@@ -6655,6 +7013,9 @@ fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .label
     .colour     <- NULL
     .labels_end <- FALSE
     .ncol       <- 4L
+    .y_lab      <- "Share of contracts (in %)"
+    .breaks     <- c(2004, 2012, 2020)
+    .regimes    <- .fin_regime_years
   }
   dat_ <- .tab |>
     dplyr::mutate(
@@ -6662,7 +7023,7 @@ fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .label
       PlotC = if (is.null(.colour)) "all" else as.character(.data[[.colour]])
     )
   cols_ <- if (is.null(.colour)) c(all = .plot_ink) else purrr::set_names(plot_pal_cat(3L), c("1", "2", "3"))
-  regimes_ <- .fin_regime_years[.fin_regime_years >= min(dat_$Year) - 0.5 & .fin_regime_years <= max(dat_$Year) + 0.5]
+  regimes_ <- .regimes[.regimes >= min(dat_$Year) - 0.5 & .regimes <= max(dat_$Year) + 0.5]
   p_ <- ggplot2::ggplot(dat_, ggplot2::aes(x = .data$Year, y = .data$Share, colour = .data$PlotC, group = .data$PlotG)) +
     ggplot2::geom_vline(
       xintercept = unname(regimes_),
@@ -6688,10 +7049,10 @@ fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .label
     ggplot2::scale_colour_manual(values = cols_, guide = "none") +
     plot_scale_y_pct(.accuracy = 1, .expand = c(0.02, 0.05)) +
     ggplot2::scale_x_continuous(
-      breaks = c(2004, 2012, 2020),
+      breaks = .breaks,
       expand = ggplot2::expansion(mult = c(0.03, if (.labels_end) 0.45 else 0.03))
     ) +
-    ggplot2::labs(x = NULL, y = "Share of contracts (in %)") +
+    ggplot2::labs(x = NULL, y = .y_lab) +
     plot_theme(.grid = "y", .legend = "none") +
     ggplot2::theme(panel.spacing.x = ggplot2::unit(8, "pt"), strip.text = ggplot2::element_text(lineheight = 0.9))
 }
@@ -6699,15 +7060,19 @@ fin_lines_panels <- function(.tab, .facet, .group = NULL, .colour = NULL, .label
 #' Alternative B: one panel per category, the twelve in the Categories order, one y scale
 #' @param .rows Tibble from fin_types_time_rows().
 #' @return A ggplot.
-fin_plot_types_time_b <- function(.rows) {
+fin_plot_types_time_b <- function(.rows, .y_lab = "Share of contracts (in %)", .breaks = c(2004, 2012, 2020),
+                                  .regimes = .fin_regime_years) {
   if (FALSE) .rows <- rows_
   dat_ <- .rows |>
     dplyr::mutate(Panel2 = factor(gsub(": ", "\n", as.character(.data$Panel), fixed = TRUE),
                                   levels = gsub(": ", "\n", levels(.data$Panel), fixed = TRUE)))
   fin_lines_panels(
-    .tab   = dat_,
-    .facet = "Panel2",
-    .ncol  = 4L
+    .tab     = dat_,
+    .facet   = "Panel2",
+    .ncol    = 4L,
+    .y_lab   = .y_lab,
+    .breaks  = .breaks,
+    .regimes = .regimes
   )
 }
 
@@ -6718,7 +7083,8 @@ fin_plot_types_time_b <- function(.rows) {
 #'
 #' @param .rows Tibble from fin_types_time_rows().
 #' @return A ggplot.
-fin_plot_types_time_c <- function(.rows) {
+fin_plot_types_time_c <- function(.rows, .y_lab = "Share of contracts (in %)", .breaks = c(2004, 2012, 2020),
+                                  .regimes = .fin_regime_years) {
   if (FALSE) .rows <- rows_
   dat_ <- .rows |>
     dplyr::mutate(Pos = match(.data$Class, levels(.data$Class))) |>
@@ -6732,7 +7098,10 @@ fin_plot_types_time_c <- function(.rows) {
     .group      = "Bar",
     .colour     = "Rank",
     .labels_end = TRUE,
-    .ncol       = 3L
+    .ncol       = 3L,
+    .y_lab      = .y_lab,
+    .breaks  = .breaks,
+    .regimes = .regimes
   )
 }
 
@@ -7053,8 +7422,10 @@ fin_plot_redactions_time <- function(.tab_data, .markers = FALSE) {
   dat_ <- .tab_data |>
     dplyr::filter(.data$Series %in% keep_) |>
     dplyr::mutate(Series = factor(unname(labs_[.data$Series]), levels = unname(labs_[keep_])))
+  # THE LINE SITS ON THE 2019 POINT. The axis counts whole years, and the two identifications meet in 2019, the year
+  # orders end; the April date would put the line between two points (decided 17 September).
   reg_ <- tibble::tibble(
-    X     = unname(.fin_regime_years["Fast2019"]),
+    X     = 2019,
     Label = unname(.fin_regime_labels["Fast2019"])
   )
   ggplot2::ggplot(dat_, ggplot2::aes(x = .data$Year, y = .data$Share, colour = .data$Series, group = .data$Series)) +
@@ -7075,7 +7446,11 @@ fin_plot_redactions_time <- function(.tab_data, .markers = FALSE) {
     ) +
     ggplot2::geom_line(linewidth = 0.8) +
     ggplot2::scale_colour_manual(values = cols_[levels(dat_$Series)], name = NULL) +
-    plot_scale_y_pct(.accuracy = 1, .expand = c(0.02, 0.08)) +
+    plot_scale_y_pct(
+      .accuracy = 1,
+      .expand   = c(0.02, 0.08),
+      .breaks   = scales::breaks_width(0.02)   # whole-percent ticks: a 2.5-percent step printed as 2 and 8
+    ) +
     ggplot2::scale_x_continuous(breaks = scales::breaks_width(2), expand = ggplot2::expansion(mult = 0.02)) +
     ggplot2::labs(x = NULL, y = "Share of contracts with redactions (in %)") +
     plot_theme(.grid = "y", .legend = "bottom")
@@ -7221,7 +7596,7 @@ fin_places_area <- function(.con, .panel = c("State", "Country"), .roles = "coun
       Name       = if (.panel == "State") stringi::stri_trans_totitle(.data$Name) else .data$Name,
       Share      = .data$nContracts / n_
     ) |>
-    dplyr::arrange(dplyr::desc(.data$nContracts)) |>
+    dplyr::arrange(dplyr::desc(.data$nContracts), .data$Area) |>  # ties by area code: ranks stay put
     dplyr::mutate(Rank = dplyr::row_number())
 }
 
@@ -7264,7 +7639,7 @@ fin_places_flows <- function(.con, .panel = c("State", "Country"), .suppress = .
     tibble::as_tibble() |>
     dplyr::mutate(nContracts = as.integer(.data$nContracts)) |>
     dplyr::filter(!(.panel == "Country" & .data$To %in% .suppress)) |>
-    dplyr::arrange(dplyr::desc(.data$nContracts))
+    dplyr::arrange(dplyr::desc(.data$nContracts), .data$From, .data$To)  # ties by the two places
   within_ <- sum(out_$nContracts[out_$From == out_$To])
   out_ <- dplyr::filter(out_, .data$From != .data$To)
   attr(out_, "Within") <- within_
@@ -7680,7 +8055,7 @@ fin_figure_diversity <- function(.ds_contracts, .ds_concentration, .grain = c("f
     if (.trim == "drop") {
       "Firm-years in the top percentile of either variable are dropped."
     } else {
-      "Both variables are winsorised at the 99th percentile."
+      "Both variables are winsorized at the 99th percentile."
     },
     paste0("The dots are the means of ", .bins, " equal-count bins of diversity (N = ",
            format(b_$Fit$N, big.mark = ","), " firm-years; ", fin_fmt_num(100 * zero_, 0L),
@@ -7704,7 +8079,7 @@ fin_figure_diversity <- function(.ds_contracts, .ds_concentration, .grain = c("f
 #' Panel A's data: contracts per firm-quarter for the smallest and largest size quartile, by channel
 #'
 #' 104 step for step, on the full quarter panel inside the window -- the sample restrictions above
-#' the figure in 104 are commented out. Size quartiles of winsorised total assets within fiscal
+#' the figure in 104 are commented out. Size quartiles of winsorized total assets within fiscal
 #' year; fiscal quarters 2001q2 to 2024q1; the mean per quarter and quartile is the quartile's
 #' contracts divided by its distinct CIKs, non-filing quarters included. Periodic is 10-K, 10-Q and
 #' 20-F; current is every other form, registration statements included, which is what 103 calls
@@ -7839,7 +8214,7 @@ fin_figure_firm_fundamentals <- function(.ds_quarter, .dirs, .name = "FirmFundam
     paste0("quarter between 2001 and 2024 of every firm that filed at least one contract in the sample (",
            format(n_q_, big.mark = ","), " firm-quarters), non-filing quarters included."),
     "Panel A gives the mean number of contracts per firm-quarter for firms in the smallest and the",
-    "largest quartile of winsorised total assets, quartiles defined within each fiscal year, separately",
+    "largest quartile of winsorized total assets, quartiles defined within each fiscal year, separately",
     "for periodic filings (10-K, 10-Q, 20-F) and current reports (every other form, registration",
     "statements included), by fiscal quarter from 2001q2 to 2024q1.",
     "Panel B gives the mean number of contracts per firm-quarter by Fama-French 12 industry."
@@ -7863,27 +8238,33 @@ fin_figure_firm_fundamentals <- function(.ds_quarter, .dirs, .name = "FirmFundam
 #' The heat map: industries down, categories across under their super-category, one row per FAST period
 #'
 #' The cell is the share of contracts redacted among the contracts of that industry and category
-#' in that period, which is the quantity the referee asked for. Cells under .min_n contracts keep
-#' their fill and lose their label.
+#' in that period, which is the quantity the referee asked for. A cell under .min_n contracts, and a
+#' cell without any, is grey with a dash: a share on a handful of contracts is not reported.
 #'
 #' @param .tab_data Tibble from fin_data_f09() for one sample, one period (or "All").
-#' @param .min_n Integer. Cells with fewer contracts are not labelled.
+#' @param .min_n Integer. Cells with fewer contracts are grey with a dash.
 #' @param .limit Numeric. Top of the fill scale; one value across the three periods keeps them comparable.
+#' @param .accuracy Numeric. The precision of a cell's label, as scales::label_percent() takes it.
+#' @param .strips Character. "top" heads each super-category's columns with its name; "bottom" sets the name under
+#'   the category labels. Either way the name is text, without a box.
 #' @return A ggplot.
-fin_plot_redactions_heat <- function(.tab_data, .min_n = 30L, .limit = 1) {
+fin_plot_redactions_heat <- function(.tab_data, .min_n = 30L, .limit = 1, .accuracy = 0.1, .strips = c("top", "bottom")) {
   if (FALSE) {
     .tab_data <- dat_
     .min_n    <- 30L
     .limit    <- 1
+    .accuracy <- 0.1
+    .strips   <- "top"
   }
+  .strips <- match.arg(.strips)
   if (length(unique(.tab_data$Period)) != 1L) cli::cli_abort("One period per figure; the rows carry several.")
   cat_ <- fin_tab_categories() |>
     dplyr::mutate(Bar = dplyr::if_else(nzchar(.data$Level2), .data$Level2, .data$Level1)) |>
     dplyr::select("Class", "Level1", "Bar")
   # EVERY CELL IS DRAWN. An industry that filed no contract of a category in the period has no row,
   # and a missing row is a hole in the grid that reads as background; completed to N = 0, it is a
-  # grey cell with a dash, which is what "no contracts" looks like. Thin cells keep their fill and
-  # lose their label.
+  # grey cell with a dash, which is what "no contracts" looks like. A thin cell, under .min_n
+  # contracts, is set the same way: its share is not reported, so no cell is left without a label.
   dat_ <- .tab_data |>
     dplyr::select("Industry", "Class", "N", "Share") |>
     tidyr::complete(Industry = .fin_ff12_levels, Class = cat_$Class, fill = list(N = 0L, Share = NA_real_)) |>
@@ -7895,10 +8276,11 @@ fin_plot_redactions_heat <- function(.tab_data, .min_n = 30L, .limit = 1) {
       Level1   = factor(.data$Level1, levels = unique(cat_$Level1)),
       Bar      = factor(.data$Bar, levels = cat_$Bar),
       Industry = factor(.data$Industry, levels = rev(.fin_ff12_levels)),
-      Label    = dplyr::case_when(
-        .data$N == 0L       ~ "-",
-        .data$N >= .min_n   ~ scales::label_percent(accuracy = 1)(.data$Share),
-        .default            = ""
+      Share    = dplyr::if_else(.data$N >= .min_n, .data$Share, NA_real_),   # thin and empty cells: not reported
+      Label    = dplyr::if_else(
+        is.na(.data$Share),
+        "-",
+        scales::label_percent(accuracy = .accuracy)(.data$Share)
       ),
       Dark     = dplyr::coalesce(.data$Share > 0.4 * .limit, FALSE)
     )
@@ -7913,7 +8295,7 @@ fin_plot_redactions_heat <- function(.tab_data, .min_n = 30L, .limit = 1) {
       cols   = ggplot2::vars(.data$Level1),
       scales = "free_x",
       space  = "free_x",
-      switch = "x"                        # the super-category strip sits below the category labels
+      switch = if (.strips == "bottom") "x" else NULL   # "top": the super-category heads its columns
     ) +
     ggplot2::scale_fill_gradient(
       low    = "#DCE6F1",
@@ -7934,6 +8316,7 @@ fin_plot_redactions_heat <- function(.tab_data, .min_n = 30L, .limit = 1) {
       axis.ticks       = ggplot2::element_blank(),
       panel.spacing.x  = ggplot2::unit(3, "pt"),
       strip.placement  = "outside",
+      strip.background = ggplot2::element_blank(),                   # the super-category as text, no box
       strip.text.x     = ggplot2::element_text(size = .plot_base * 0.8, face = "bold"),
       legend.title     = ggplot2::element_text(family = .plot_font, size = .plot_base - 1)
     )
@@ -7948,19 +8331,23 @@ fin_plot_redactions_heat <- function(.tab_data, .min_n = 30L, .limit = 1) {
 #' @param .ds_contracts The prepared Contracts dataset.
 #' @param .ds_quarter The prepared Quarter dataset, for the industry.
 #' @param .period Character. "all", "pre" or "post".
-#' @param .min_n Integer. Cells with fewer contracts are not labelled.
+#' @param .min_n Integer. Cells with fewer contracts are grey with a dash.
 #' @param .limit Numeric. Top of the fill scale, shared across the three.
+#' @param .accuracy Numeric. The precision of a cell's label, as scales::label_percent() takes it.
+#' @param .strips Character. Where the super-category names go; see fin_plot_redactions_heat().
 #' @param .dirs List. .lP$Output.
 #' @param .name Character or NULL. The stem; NULL derives RedactionsIndustry<Period>.
 #' @return Invisibly, a list: Plot, Data, Files.
 fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("all", "pre", "post"), .min_n = 30L,
-                                       .limit = 0.8, .dirs, .name = NULL) {
+                                       .limit = 0.8, .accuracy = 0.1, .strips = "top", .dirs, .name = NULL) {
   if (FALSE) {
     .ds_contracts <- lst_ds$Contracts
     .ds_quarter   <- lst_ds$Quarter
     .period       <- "all"
     .min_n        <- 30L
     .limit        <- 0.8
+    .accuracy     <- 0.1
+    .strips       <- "top"
     .dirs         <- .lP$Output
     .name         <- NULL
   }
@@ -7994,6 +8381,7 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
   n_     <- sum(one_$N)
   thin_  <- sum(one_$N < .min_n)
   empty_ <- 12L * 12L - nrow(one_)
+  digits_ <- min(2L, max(0L, as.integer(round(-log10(.accuracy)))))
   when_ <- switch(.period,
     all  = "from 2008",
     pre  = "from 2008 to the FAST Act (April 2019)",
@@ -8005,13 +8393,20 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
            format(n_, big.mark = ","), " contracts with an industry, a category and a redaction measure)."),
     "A contract is redacted where it is covered by a granted confidential treatment order (through 2018)",
     "or its text carries a redaction marker (from 2019). Industries are the Fama-French 12 sectors of",
-    "the filing firm; categories are grouped by super-category as in the categories table. The fill runs",
-    paste0("from 0 to ", fin_fmt_num(100 * .limit, 0L), " percent on every version of this figure."),
-    paste0("Cells with fewer than ", .min_n, " contracts (", thin_, " of 144) are shaded but not labelled;"),
-    paste0("cells with no contracts (", empty_, ") are grey with a dash.")
+    "the filing firm; categories are grouped by super-category as in the categories table. The color",
+    paste0("scale runs from 0 to ", fin_fmt_num(100 * .limit, 0L), " percent."),
+    paste0("Shares are rounded to ", c("whole percent", "one decimal", "two decimals")[digits_ + 1L], "."),
+    paste0("Cells with fewer than ", .min_n, " contracts are grey with a dash: ", thin_, " with some contracts and ",
+           empty_, " with none, of 144.")
   )
   fin_figure_save(
-    .plot   = fin_plot_redactions_heat(.tab_data = one_, .min_n = .min_n, .limit = .limit),
+    .plot   = fin_plot_redactions_heat(
+      .tab_data = one_,
+      .min_n    = .min_n,
+      .limit    = .limit,
+      .accuracy = .accuracy,
+      .strips   = .strips
+    ),
     .data   = one_,
     .note   = note_,
     .name   = name_,
@@ -8021,6 +8416,132 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
   )
 }
 
+
+
+# -- 19.12 Figure: redactions by category over time --------------------------------------------------------------------
+# Ann-Kristin's ask (18 September): the redaction share by contract type over the years, in the shape the contract
+# types already have -- a panel per category, or a panel per super-category with its sub-categories as lines. The old
+# draft drew the same thing as twelve lines in one frame, which nobody could read.
+
+#' The share of contracts redacted in each year, by category
+#'
+#' The measure is the paper's: a confidential treatment order through 2018, an order or a redaction marker from 2019.
+#' Every category is a share of its own contracts, so the categories do not add to a total.
+#'
+#' @param .tab Tibble. Year, Class and RedactedText on the redaction sample.
+#' @param .sample Character. The sample's name, kept in the tibble.
+#' @return Tibble: Year, Class, N, Share, Sample.
+fin_data_redactions_types <- function(.tab, .sample) {
+  if (FALSE) {
+    .tab    <- rows0_
+    .sample <- "S6_Redaction"
+  }
+  .tab |>
+    dplyr::filter(.data$Year >= 2008L, !is.na(.data$Class)) |>
+    dplyr::summarise(
+      N     = dplyr::n(),
+      Share = mean(.data$RedactedText),
+      .by   = c("Year", "Class")
+    ) |>
+    dplyr::mutate(Sample = .sample) |>
+    dplyr::arrange(.data$Year, match(.data$Class, .fin_class_levels))
+}
+
+#' The redaction shares with the categories table's names and order
+#'
+#' @param .tab_data Tibble from fin_data_redactions_types().
+#' @return The tibble with Level1, Level2, Bar and Panel, each a factor in the categories table's order.
+fin_redactions_types_rows <- function(.tab_data) {
+  if (FALSE) .tab_data <- dat_
+  cat_ <- fin_tab_categories() |>
+    dplyr::mutate(
+      Bar   = dplyr::if_else(nzchar(.data$Level2), .data$Level2, .data$Level1),
+      Panel = dplyr::if_else(nzchar(.data$Level2), paste0(.data$Level1, ": ", .data$Level2), .data$Level1)
+    ) |>
+    dplyr::select("Class", "Level1", "Level2", "Bar", "Panel")
+  .tab_data |>
+    dplyr::inner_join(
+      cat_,
+      by = dplyr::join_by(Class)
+    ) |>
+    dplyr::mutate(
+      Level1 = factor(.data$Level1, levels = unique(cat_$Level1)),
+      Class  = factor(.data$Class, levels = cat_$Class),
+      Bar    = factor(.data$Bar, levels = cat_$Bar),
+      Panel  = factor(.data$Panel, levels = cat_$Panel)
+    )
+}
+
+#' Redactions by category over time, in the shape the contract types have
+#'
+#' Form "a" gives a panel per category, form "b" a panel per super-category with its sub-categories as lines; both on
+#' one scale, with the FAST Act on the 2019 point, where the measure changes.
+#'
+#' @param .ds_contracts The prepared Contracts dataset.
+#' @param .form Character. "a" (a panel per category) or "b" (a panel per super-category).
+#' @param .dirs List. .lP$Output.
+#' @param .name Character or NULL. The stem; NULL takes the form's own.
+#' @return Invisibly, a list: Plot, Data, Files.
+fin_figure_redactions_types <- function(.ds_contracts, .form = c("a", "b"), .dirs, .name = NULL) {
+  if (FALSE) {
+    .ds_contracts <- lst_ds$Contracts
+    .form         <- "a"
+    .dirs         <- .lP$Output
+    .name         <- NULL
+  }
+  .form  <- match.arg(.form)
+  name_  <- if (is.null(.name)) paste0("RedactionsTypes", toupper(.form)) else .name
+  rows0_ <- .ds_contracts |>
+    dplyr::filter(.data$S6_Redaction) |>
+    dplyr::select("Year", "Class", "RedactedText") |>
+    dplyr::collect()
+  dat_  <- fin_data_redactions_types(
+    .tab    = rows0_,
+    .sample = "S6_Redaction"
+  )
+  rows_ <- fin_redactions_types_rows(.tab_data = dat_)
+  n_    <- sum(dat_$N)
+  top_  <- rows_ |>
+    dplyr::summarise(Share = sum(.data$N * .data$Share) / sum(.data$N), .by = "Bar") |>
+    dplyr::slice_max(.data$Share, n = 1L, with_ties = FALSE)
+  base_ <- c(
+    paste0("This figure shows the share of contracts redacted in each year, by category, on the unique contracts",
+           " filed from 2008 (N = ", format(n_, big.mark = ","), "; contracts without a category are left out)."),
+    "A contract counts as redacted where a confidential treatment order covers it, through 2018, and where it",
+    "carries a redaction marker, from 2019; the dashed line marks the FAST Act, on the year the measure changes.",
+    paste0("Every category is a share of its own contracts, so the panels do not add to a total; ",
+           as.character(top_$Bar[[1L]]), " is the most redacted over the window, at ",
+           fin_fmt_num(100 * top_$Share[[1L]], 0L), " percent of its contracts.")
+  )
+  form_note_ <- switch(
+    .form,
+    a = "One panel per category, all panels on one scale.",
+    b = "One panel per super-category, its sub-categories as lines, all panels on one scale."
+  )
+  plot_ <- switch(
+    .form,
+    a = fin_plot_types_time_b(
+      .rows    = rows_,
+      .y_lab   = "Share redacted (in %)",
+      .breaks  = c(2008, 2014, 2020),
+      .regimes = .fin_regime_fast
+    ),
+    b = fin_plot_types_time_c(
+      .rows    = rows_,
+      .y_lab   = "Share redacted (in %)",
+      .breaks  = c(2008, 2014, 2020),
+      .regimes = .fin_regime_fast
+    )
+  )
+  fin_figure_save(
+    .plot   = plot_,
+    .data   = rows_,
+    .note   = c(base_, form_note_),
+    .name   = name_,
+    .dirs   = .dirs,
+    .height = switch(.form, a = plot_height(18L), b = plot_height(12L))
+  )
+}
 
 # 20. Manifest -----------------------------------------------------------------------------------------------------------
 # Every exhibit this document writes, by the name its files take: what it is, the sample it is drawn
@@ -8045,7 +8566,7 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
   "N per measure, naive against rule-based",
   "PartiesDetail", "Table", "S2_Descriptive",
   "Parties by role (authors)",
-  "ClassConfidence", "Table", "S2_Descriptive, labelled",
+  "ClassConfidence", "Table", "S2_Descriptive, labeled",
   "Transformer probability of the assigned category",
   "MoneyDetail", "Table", "S2_Descriptive",
   "Monetary amounts (authors)",
@@ -8056,7 +8577,7 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
   "SummarySample", "Table", "S7_All to S7_Summaries",
   "The announcement ladder",
   "SummaryLag", "Table", "S7_Summaries",
-  "Announcement lag before winsorising (authors)",
+  "Announcement lag before winsorizing (authors)",
   "Summaries", "Table", "S7_Summaries",
   "Item 1.01 summaries, delayed against attached",
   "SummariesRegression", "Table", "S7_Summaries",
@@ -8065,19 +8586,21 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
   "Delayed against attached, the seven text measures",
   "SummariesTextRegression", "Table", "S7_Summaries",
   "The delay indicator in a regression, seven outcomes",
-  "ClassLabelled", "Table", "labelled sample (03A)",
-  "The labelled sample by category",
-  "ClassTransformer", "Table", "labelled sample, out of fold",
+  "ClassLabelledFull", "Table", "labeled sample (03A)",
+  "The labeled sample by category",
+  "ClassTransformerFull", "Table", "labeled sample, out of fold",
   "Transformer scores by category",
-  "ClassAmendment", "Table", "labelled sample, out of fold",
+  "ClassAmendmentFull", "Table", "labeled sample, out of fold",
   "Amendment classifier scores",
-  "ClassKeyword", "Table", "labelled sample, out of fold",
+  "ClassKeywordFull", "Table", "labeled sample, out of fold",
   "Keyword arm scores by category",
-  "ClassArms", "Table", "labelled sample, out of fold",
+  "ClassArmsFull", "Table", "labeled sample, out of fold",
   "Every engine on every task, routing ceiling",
-  "ClassSweep", "Table", "labelled sample, out of fold",
+  "ClassArmsFullCeiling", "Data", "labeled sample, out of fold",
+  "The routing ceiling beside the arms, as its own tibble",
+  "ClassSweep", "Table", "labeled sample, out of fold",
   "Model selection: the sweep",
-  "ClassConfusion", "Table", "labelled sample, out of fold",
+  "ClassConfusionFull", "Table", "labeled sample, out of fold",
   "Confusion matrix, detailed",
   "FilingTypes", "Figure", "S2_Descriptive",
   "Distribution of filing types",
@@ -8129,6 +8652,150 @@ fin_figure_redactions_heat <- function(.ds_contracts, .ds_quarter, .period = c("
   "Redaction share by industry and category, after the FAST Act"
 )
 
+# 31: THE EXHIBITS MOVED FROM 40, and what every stem needs beyond the four columns above: its topic -- the section of
+# the runbook that builds it -- and its origin, the document whose output the move is checked against, under the
+# name the stem had there. The six full classification tables are ...Full here; the cuts keep the plain names.
+.fin_registry_moved <- tibble::tribble(
+  ~Stem, ~Kind, ~Sample, ~Description,
+  "ExhibitRequired", "Table", "--",
+  "Row (10) of the Item 601 exhibit table, with what the database covers",
+  "FormDescriptions", "Table", "--",
+  "The forms that carry material contracts and the CFR sections that establish them",
+  "FormCoverage", "Table", "master index; release",
+  "Filings per form type, and what the database holds of them",
+  "ExhibitFiles", "Table", "document lists, 1998-2001",
+  "Exhibit 10 attachments available as separate files, by quarter",
+  "TextCounts", "Data", "release",
+  "Counts the text cites that no table prints",
+  "PipelineStages", "Table", "--",
+  "The pipeline, stage by stage",
+  "PackageVersions", "Data", "--",
+  "The installed versions of the published packages",
+  "FilingsWithinYear", "Figure", "release",
+  "When in the year contracts are filed",
+  "SeasonedFilers", "Figure", "release; master index; landing pages",
+  "All filers against seasoned filers, three panels",
+  "CategoryTitles", "Table", "S2_Descriptive",
+  "What filers call their contracts, by category",
+  "ClassLabelled", "Table", "labeled sample (03A)",
+  "The labeled sample by category, the appendix's cut",
+  "ClassDeployed", "Table", "labeled sample, out of fold",
+  "The configurations that left the sweep",
+  "ClassTransformer", "Table", "labeled sample, out of fold",
+  "Transformer scores by category, the appendix's cut",
+  "ClassConfusion", "Table", "labeled sample, out of fold",
+  "Confusion matrix, the appendix's cut",
+  "ClassAmendment", "Table", "labeled sample, out of fold",
+  "Amendment classifier scores, the appendix's cut",
+  "ClassKeyword", "Table", "labeled sample, out of fold",
+  "Keyword table scores by category, the appendix's cut",
+  "ClassArms", "Table", "labeled sample, out of fold",
+  "Every engine on every task and the ceiling, the appendix's cut",
+  "ClassSecondPairs", "Table", "labeled sample, two labels",
+  "Primary against second label",
+  "ClassSecond", "Table", "labeled sample, two labels",
+  "The model's two choices against the two labels",
+  "EntityCoverage", "Table", "labeled sample (04A)",
+  "What each extractor found on the labeled sample",
+  "EntityPositions", "Figure", "labeled sample (04A)",
+  "Where in the contract each extractor's candidates fall",
+  "EntityAgreement", "Figure", "labeled sample (04A)",
+  "How far the extractors agree about what is there",
+  "DurationRungs", "Table", "S2_Descriptive",
+  "The source of each contract's end date",
+  "ContentValues", "Table", "S2_Descriptive",
+  "Naive and rule-based content values by category",
+  "CtoLinkage", "Table", "orders; release",
+  "From the order to the contract it covers",
+  "CtoAhci", "Data", "orders, new grants through 2019",
+  "Orders and exhibits on the forms Ahci (2025) covers",
+  "CtoMarkers", "Data", "release, 2008-2018",
+  "Orders against text markers"
+)
+
+# 31: EXHIBITS FIRST BUILT HERE, with no origin to check the move against.
+.fin_registry_new <- tibble::tribble(
+  ~Stem, ~Kind, ~Sample, ~Description,
+  "ContentReadings", "Table", "S2_Descriptive",
+  "Naive against rule-based reading per measure: share with a value and value, totals",
+  "FirmFundamentalsA", "Figure", "S5_Quarter",
+  "Firm fundamentals under choice: panels stacked, Panel A by fiscal quarter",
+  "FirmFundamentalsB", "Figure", "S5_Quarter",
+  "Firm fundamentals under choice: panels stacked, Panel A as fiscal-year means",
+  "FirmFundamentalsC", "Figure", "S5_Quarter",
+  "Firm fundamentals under choice: panels stacked, Panel A as trailing four-quarter means",
+  "FirmSize", "Figure", "S5_Quarter",
+  "Firm fundamentals under choice, split: size quartile and channel, fiscal-year means",
+  "FirmIndustry", "Figure", "S5_Quarter",
+  "Firm fundamentals under choice, split: contracts per firm-quarter by industry",
+  "RedactionsTypesA", "Figure", "S6_Redaction",
+  "Redaction share by category over time: a panel per category",
+  "RedactionsTypesB", "Figure", "S6_Redaction",
+  "Redaction share by category over time: a panel per super-category, sub-categories as lines"
+)
+
+.fin_renamed <- c(
+  ClassLabelledFull    = "ClassLabelled",
+  ClassTransformerFull = "ClassTransformer",
+  ClassAmendmentFull   = "ClassAmendment",
+  ClassKeywordFull     = "ClassKeyword",
+  ClassArmsFull        = "ClassArms",
+  ClassArmsFullCeiling = "ClassArmsCeiling",
+  ClassConfusionFull   = "ClassConfusion"
+)
+
+# THE TOPICS, in the runbook's order. The paper's own order is still moving, so the runbook follows the subject;
+# where an exhibit is printed is the manifest's Where column, decided apart from this.
+.fin_topic_of <- list(
+  Sources        = c("ExhibitRequired", "FormDescriptions", "FormCoverage", "ExhibitFiles", "TextCounts",
+                     "PipelineStages", "PackageVersions"),
+  Samples        = c("SampleSelection", "SampleAttrition", "FluidityMissing"),
+  Filing         = c("FilingTypes", "FilingsTime", "FilingsWithinYear", "FilingsSeasoned", "SeasonedFilers",
+                     "FirmFundamentals", "FirmFundamentalsA", "FirmFundamentalsB", "FirmFundamentalsC", "FirmSize",
+                     "FirmIndustry"),
+  Types          = c("Categories", "CategoryTitles", "ContractTypes", "TypesTimeA", "TypesTimeB", "TypesTimeC",
+                     "TypesTimeD", "ClassConfidence"),
+  Classification = c("ClassLabelledFull", "ClassTransformerFull", "ClassAmendmentFull", "ClassKeywordFull",
+                     "ClassArmsFull", "ClassArmsFullCeiling", "ClassSweep", "ClassConfusionFull", "ClassLabelled",
+                     "ClassDeployed", "ClassTransformer", "ClassConfusion", "ClassAmendment", "ClassKeyword",
+                     "ClassArms", "ClassSecondPairs", "ClassSecond"),
+  Content        = c("EntityCoverage", "EntityPositions", "EntityAgreement", "ContentRule", "ContentNaive",
+                     "ContentContrast", "PartiesDetail", "MoneyDetail", "ContentValues", "DurationRungs",
+                     "ContentReadings", "ContentTimeSD", "ContentTimeIQR", "ContentTimeCI", "ContentTimeIndex"),
+  Geography      = c("MapStatesCounterparty", "MapStatesRecital", "MapCountriesCounterparty",
+                     "MapCountriesRecital", "FlowsStates", "FlowsCountries", "Diversity"),
+  Redactions     = c("CtoLinkage", "CtoAhci", "CtoMarkers", "RedactionsDetail", "RedactionsTime",
+                     "RedactionsIndustryAll", "RedactionsIndustryPre", "RedactionsIndustryPost",
+                     "RedactionsTypesA", "RedactionsTypesB"),
+  Announcements  = c("SummarySample", "SummaryLag", "SummaryVariables", "Summaries", "SummariesText",
+                     "SummariesRegression", "SummariesTextRegression")
+)
+
+.fin_registry <- dplyr::bind_rows(
+  .fin_registry,
+  .fin_registry_moved,
+  .fin_registry_new
+) |>
+  dplyr::left_join(
+    tibble::tibble(
+      Stem  = unlist(.fin_topic_of, use.names = FALSE),
+      Topic = rep(names(.fin_topic_of), lengths(.fin_topic_of))
+    ),
+    by = "Stem"
+  ) |>
+  dplyr::mutate(
+    Origin     = dplyr::case_when(
+      .data$Stem %in% .fin_registry_moved$Stem ~ "40",
+      .data$Stem %in% .fin_registry_new$Stem   ~ "31",
+      .default                                 = "30"
+    ),
+    OriginStem = dplyr::coalesce(unname(.fin_renamed[.data$Stem]), .data$Stem)
+  )
+
+if (anyNA(.fin_registry$Topic) || anyDuplicated(.fin_registry$Stem) > 0L) {
+  cli::cli_abort("The exhibit registry needs exactly one row and one topic per stem.")
+}
+
 #' The manifest: every registered stem with the files it has on disk, written as csv and shown
 #'
 #' The registry says what an exhibit is and what it is drawn on; the disk says which files exist.
@@ -8165,22 +8832,22 @@ fin_manifest <- function(.dirs, .registry = .fin_registry, .path) {
         paste(stats::na.omit(c(...)), collapse = ", ")
       })
     )
-  missing_ <- out_$Stem[is.na(out_$Data) & is.na(out_$Tex) & is.na(out_$Pdf)]
+  missing_ <- out_$Stem[is.na(out_$Data) & is.na(out_$Tex) & is.na(out_$Png)]
   if (length(missing_) > 0L) cli::cli_alert_warning("Registered without files on disk: {missing_}.")
   on_disk_ <- c(
     fs::path_ext_remove(fs::path_file(fs::dir_ls(.dirs$DirTables, glob = "*.tex"))),
-    fs::path_ext_remove(fs::path_file(fs::dir_ls(.dirs$DirFigures, glob = "*.pdf")))
+    fs::path_ext_remove(fs::path_file(fs::dir_ls(.dirs$DirFigures, glob = "*.png")))
   )
   stray_ <- setdiff(unique(on_disk_), .registry$Stem)
   if (length(stray_) > 0L) cli::cli_alert_warning("On disk but not registered: {stray_}.")
   readr::write_csv(out_, .path)
-  shown_ <- dplyr::select(out_, "Stem", "Kind", "Where", "Sample", "Description", "Files")
+  shown_ <- dplyr::select(out_, "Topic", "Stem", "Kind", "Where", "Sample", "Description", "Files")
   k_ <- shown_ |>
     knitr::kable(
       format   = "html",
       escape   = TRUE,
       caption  = "Every exhibit this document writes",
-      align    = "llllll",
+      align    = "lllllll",
       booktabs = TRUE
     ) |>
     kableExtra::kable_styling(
@@ -8474,7 +9141,7 @@ fin_table_fluidity <- function(.ds_quarter, .dirs, .name = "FluidityMissing") {
     "2014), on every fiscal quarter between 2001 and 2024 of a firm that filed at least one contract.",
     "Each row is a group of firm-quarters: their number, how many of them have no fluidity value and",
     "the share that is, and the share in which the firm filed a contract. Loss is a negative quarterly",
-    "income; size quartiles are of winsorised total assets within fiscal year.",
+    "income; size quartiles are of winsorized total assets within fiscal year.",
     if (all(c("Loss firm", "Profit firm") %in% loss_$Level)) {
       paste0("Fluidity is missing on ", fin_fmt_num(100 * loss_$Share[loss_$Level == "Loss firm"], 1L),
              " percent of loss-firm quarters and ", fin_fmt_num(100 * loss_$Share[loss_$Level == "Profit firm"], 1L),
@@ -8583,7 +9250,7 @@ fin_deploy_paper <- function(.dirs, .dir_paper, .path_html, .manifest, .release,
   }
   # COMPLETE MEANS SOME FILE EXISTS. An author-only table writes a parquet and no tabular, which is
   # not a chunk that failed to run; a stem with nothing at all is.
-  incomplete_ <- .manifest$Stem[is.na(.manifest$Tex) & is.na(.manifest$Pdf) & is.na(.manifest$Data)]
+  incomplete_ <- .manifest$Stem[is.na(.manifest$Tex) & is.na(.manifest$Png) & is.na(.manifest$Data)]
   if (length(incomplete_) > 0L) {
     msg_ <- "{length(incomplete_)} registered exhibit{?s} without any file: {incomplete_}."
     if (.run) cli::cli_abort(c("Not deploying.", "x" = msg_)) else cli::cli_alert_warning(msg_)
@@ -8591,7 +9258,11 @@ fin_deploy_paper <- function(.dirs, .dir_paper, .path_html, .manifest, .release,
   cur_  <- fs::path(.dir_paper, "current")
   arch_ <- fs::path(.dir_paper, "_archive", format(Sys.time(), "%Y-%m-%d_%H%M"))
   srcs_ <- c(Figures = .dirs$DirFigures, Tables = .dirs$DirTables, Notes = .dirs$DirNotes)
-  n_files_ <- sum(purrr::map_int(srcs_, \(.d) length(fs::dir_ls(.d, type = "file"))))
+  # ONLY PNGS LEAVE THE FIGURES FOLDER: a pdf left there by an earlier render is not deployed.
+  files_ <- function(.d, .n) {
+    if (.n == "Figures") fs::dir_ls(.d, type = "file", glob = "*.png") else fs::dir_ls(.d, type = "file")
+  }
+  n_files_ <- sum(purrr::imap_int(srcs_, \(.d, .n) length(files_(.d = .d, .n = .n))))
   html_ok_ <- fs::file_exists(.path_html)
   if (!.run) {
     cli::cli_alert_info(
@@ -8608,7 +9279,7 @@ fin_deploy_paper <- function(.dirs, .dir_paper, .path_html, .manifest, .release,
   fs::dir_create(cur_)
   purrr::iwalk(srcs_, \(.d, .n) {
     fs::dir_create(fs::path(cur_, .n))
-    fs::file_copy(fs::dir_ls(.d, type = "file"), fs::path(cur_, .n), overwrite = TRUE)
+    fs::file_copy(files_(.d = .d, .n = .n), fs::path(cur_, .n), overwrite = TRUE)
   })
   fs::file_copy(fs::path(fs::path_dir(.dirs$DirFigures), "Manifest.csv"), cur_, overwrite = TRUE)
   html_line_ <- if (html_ok_) {
@@ -8653,4 +9324,3680 @@ fin_deploy_html <- function(.path_html, .dir_paper) {
   writeLines(lines_, ver_)
   cli::cli_alert_success("Copied the render to {.path {out_}}.")
   invisible(out_)
+}
+
+
+# 23. Moved from 50-Numbers: the two tibbles no exhibit holds, and the build helper ----------------------------------------
+
+#' Orders and references on the forms and in the period Ahci (2025) covers
+#'
+#' The manuscript's footnote compares our order and exhibit counts with Ahci (2025), whose sample is drawn from
+#' 10-K, 10-Q and 8-K filings and ends with the FAST Act. The release's CtoOrders is one row per exhibit reference
+#' an order makes, with the source form the reference names and the order's own filing date, so both restrictions
+#' are filters; the totals of the linkage funnel (chapter A's CtoLinkage) are the unrestricted counts the sentence
+#' before the footnote cites.
+#'
+#' Three counting rules per cell, because the comparison depends on them: every order (Kind "total"), orders that
+#' grant including extensions of an earlier grant (Kind "granting", the export's HasCto rule), and grants that are
+#' not extensions (Kind "granting-new", the rule the earlier text described as Ahci's). An order is counted where
+#' at least one of its references survives the filters, a reference where it names an exhibit number.
+#'
+#' @param .path_orders Character. The release's CtoOrders.parquet.
+#' @param .forms Character. The form types kept; amendments (form/A) are kept with their form.
+#' @param .to Integer. The last order year of the restricted period.
+#' @return Tibble: Row (form set), Period, Kind, Orders, References, Linked.
+num_data_cto_ahci <- function(.path_orders, .forms = c("10-K", "10-Q", "8-K"), .to = 2019L) {
+  if (FALSE) {
+    .path_orders <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "CtoOrders.parquet"
+    )
+    .forms <- c("10-K", "10-Q", "8-K")
+    .to    <- 2019L
+  }
+  ds_   <- arrow::open_dataset(sources = .path_orders)
+  need_ <- c("OrderDocID", "OrderDate", "Status", "IsExtension", "ExhibitNo", "SourceForm", "DocID")
+  miss_ <- setdiff(need_, names(ds_))
+  if (length(miss_) > 0L) {
+    cli::cli_abort("CtoOrders lacks {.val {miss_}}; the release has {.val {names(ds_)}}.")
+  }
+  ref_ <- ds_ |>
+    dplyr::select(dplyr::all_of(need_)) |>
+    dplyr::collect() |>
+    dplyr::mutate(
+      FormBase = sub("/A$", "", dplyr::coalesce(.data$SourceForm, "")),
+      OnForm   = .data$FormBase %in% .forms,
+      InPeriod = as.integer(format(as.Date(.data$OrderDate), "%Y")) <= .to,
+      HasRef   = !is.na(.data$ExhibitNo),
+      Linked   = !is.na(.data$DocID),
+      Grants   = dplyr::coalesce(.data$Status == "GRANTING", FALSE),
+      NewGrant = .data$Grants & dplyr::coalesce(as.integer(.data$IsExtension), 0L) == 0L
+    )
+  count_ <- function(.d, .row, .period, .kind) {
+    tibble::tibble(
+      Row        = .row,
+      Period     = .period,
+      Kind       = .kind,
+      Orders     = dplyr::n_distinct(.d$OrderDocID),
+      References = sum(.d$HasRef),
+      Linked     = sum(.d$Linked)
+    )
+  }
+  cell_ <- function(.d, .row, .period) {
+    dplyr::bind_rows(
+      count_(.d = .d, .row = .row, .period = .period, .kind = "total"),
+      count_(.d = dplyr::filter(.d, .data$Grants), .row = .row, .period = .period, .kind = "granting"),
+      count_(.d = dplyr::filter(.d, .data$NewGrant), .row = .row, .period = .period, .kind = "granting-new")
+    )
+  }
+  to_ <- paste0("through ", .to)
+  dplyr::bind_rows(
+    cell_(.d = ref_, .row = "All forms", .period = "all years"),
+    cell_(.d = dplyr::filter(ref_, .data$InPeriod), .row = "All forms", .period = to_),
+    cell_(.d = dplyr::filter(ref_, .data$OnForm), .row = "10-K, 10-Q and 8-K", .period = "all years"),
+    cell_(.d = dplyr::filter(ref_, .data$OnForm, .data$InPeriod), .row = "10-K, 10-Q and 8-K", .period = to_)
+  )
+}
+
+#' Orders against text markers, before the FAST Act
+#'
+#' The paper identifies redactions through orders until 2018 and through bracketed markers in the text from 2019.
+#' Both indicators exist for every year, so the years in which the order was mandatory are a test of the text
+#' rule: among unique contracts of 2008-2018 covered by a granted order, how many also carry at least one marker,
+#' and among those that carry a marker, how many are covered by an order. The first share is the one the manuscript
+#' cites; the second says how much the text rule finds beyond the orders.
+#'
+#' The marker definition is the published one: symbol and explicit markers, the two kinds that sit above base rate
+#' (see the redaction notes in the project). The threshold is an argument, so the five-marker robustness switch is
+#' one call away.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .from,.to Integer. The years of the comparison, 2008 to 2018 by default.
+#' @param .min_markers Integer. Markers a contract needs to count as redacted by text; 1 is the paper's rule.
+#' @return Tibble: Row, N, Share -- the two-by-two and its two conditional shares.
+num_data_cto_markers <- function(.path_contracts, .from = 2008L, .to = 2018L, .min_markers = 1L) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .from        <- 2008L
+    .to          <- 2018L
+    .min_markers <- 1L
+  }
+  ds_   <- arrow::open_dataset(sources = .path_contracts)
+  need_ <- c("DocID", "DateFiled", "PrimaryFiler", "DescSample", "HasCto", "nRedactSymbol", "nRedactExplicit")
+  miss_ <- setdiff(need_, names(ds_))
+  if (length(miss_) > 0L) {
+    cli::cli_abort("Contracts lacks {.val {miss_}}; the release has {.val {names(ds_)}}.")
+  }
+  tab_ <- ds_ |>
+    dplyr::select(dplyr::all_of(need_)) |>
+    dplyr::filter(.data$PrimaryFiler == 1L, .data$DescSample == 1L) |>
+    dplyr::collect() |>
+    dplyr::mutate(
+      Year    = as.integer(format(as.Date(.data$DateFiled), "%Y")),
+      Cto     = dplyr::coalesce(as.integer(.data$HasCto), 0L) == 1L,
+      Markers = dplyr::coalesce(.data$nRedactSymbol, 0L) + dplyr::coalesce(.data$nRedactExplicit, 0L),
+      Text    = .data$Markers >= .min_markers
+    ) |>
+    dplyr::filter(.data$Year >= .from, .data$Year <= .to)
+  n_cto_  <- sum(tab_$Cto)
+  n_text_ <- sum(tab_$Text)
+  n_both_ <- sum(tab_$Cto & tab_$Text)
+  tibble::tibble(
+    Row   = c("Unique contracts in the window", "Covered by a granted order", "With a text marker", "Both",
+              "Order only", "Marker only", "Neither",
+              "Share of ordered contracts with a marker", "Share of marked contracts with an order"),
+    N     = c(nrow(tab_), n_cto_, n_text_, n_both_, n_cto_ - n_both_, n_text_ - n_both_,
+              nrow(tab_) - n_cto_ - n_text_ + n_both_, NA_integer_, NA_integer_),
+    Share = c(rep(NA_real_, 7L),
+              if (n_cto_ > 0L) n_both_ / n_cto_ else NA_real_,
+              if (n_text_ > 0L) n_both_ / n_text_ else NA_real_)
+  )
+}
+
+#' Build one of this pair's tibbles, where its inputs or this library are newer than the parquet
+#'
+#' The layout is the chapters': Data/<Name>.parquet under this pair's output directory, which is what
+#' oa_read_exhibit() and the registry read. The build test is the appendix's, oa_build_needed(), so a changed
+#' release or a changed builder rebuilds and nothing else does.
+#'
+#' @param .name Character. The tibble's name, and the file stem.
+#' @param .fun Function. The builder; called with no arguments (wrap the paths in a closure).
+#' @param .inputs Character. The files the tibble depends on, this library among them.
+#' @param .dir_own Character. This pair's output directory.
+#' @param .force Logical. TRUE rebuilds regardless.
+#' @return Invisibly, "built" or "up to date".
+num_build <- function(.name, .fun, .inputs, .dir_own, .force) {
+  if (FALSE) {
+    .name    <- "CtoAhci"
+    .fun     <- \() num_data_cto_ahci(.path_orders = .path_orders)
+    .inputs  <- c(.path_orders, .path_lib)
+    .dir_own <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force   <- FALSE
+  }
+  out_ <- fs::path(.dir_own, "Data", paste0(.name, ".parquet"))
+  if (!oa_build_needed(.outputs = out_, .inputs = .inputs, .force = .force)) return(invisible("up to date"))
+  fs::dir_create(fs::path_dir(out_))
+  arrow::write_parquet(
+    x    = .fun(),
+    sink = out_
+  )
+  invisible("built")
+}
+
+
+# 24. Moved from 50-Numbers: Appendix A, filing requirements and distributions (oaa_) --------------------------------------
+
+#
+# 40-OnlineAppendix-A.R -- Appendix A, SEC filing requirements and distributions: the exhibits this chapter builds
+#
+#
+# 40-OnlineAppendix-A.qmd holds the chapter's text; _Commons/_OnlineAppendix.R holds everything the chapters share.
+# This library holds only the builders of the exhibits Appendix A writes itself, in 30's layout under this chapter's
+# output directory: the coverage table, the within-year figure, the confidential-treatment linkage funnel, and the
+# counts the text cites that no table prints. Two exhibits of the response memo are built here too, because their
+# data is this chapter's -- the exhibit-files table behind the 2001 start, and the seasoned-filer figure -- and the
+# memo pair sets them from here.
+#
+# THE PREFIX IS oaa_: online appendix, chapter A. Functions are compute (a tibble, no printing), plot (a ggplot) or
+# build (writes the exhibit's files where its inputs are newer, returns the status invisibly).
+
+
+# -- 24.1 The sample, as 30 reads it ---------------------------------------------------------------------------------------
+
+#' The unique contracts of the descriptive sample, as 30 selects them
+#'
+#' The one reader of the release every build here shares, so all of them count exactly the paper's sample: a
+#' contract is kept where DescSample is 1 and it is the primary copy of its attachment -- 30's Keep. The flags are
+#' compared after the collect, where an integer and a logical flag compare alike; in Arrow they need not.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .cols Character. The columns to keep besides the flags.
+#' @return Tibble: .cols, plus Date and Year, for 2001-2024.
+oaa_read_sample <- function(.path_contracts, .cols) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .cols <- c("FormType", "DateFiled")
+  }
+  arrow::open_dataset(sources = .path_contracts) |>
+    dplyr::select(dplyr::all_of(unique(c(.cols, "DateFiled", "PrimaryFiler", "DescSample")))) |>
+    dplyr::collect() |>
+    dplyr::filter(
+      dplyr::coalesce(as.integer(.data$PrimaryFiler), 0L) == 1L,
+      dplyr::coalesce(as.integer(.data$DescSample), 0L) == 1L
+    ) |>
+    dplyr::mutate(
+      Date = as.Date(.data$DateFiled),
+      Year = as.integer(format(.data$Date, "%Y"))
+    ) |>
+    dplyr::filter(dplyr::between(.data$Year, 2001L, 2024L)) |>
+    dplyr::select(-"PrimaryFiler", -"DescSample")
+}
+
+# -- 24.2 Coverage: every form that carries material contracts, and what the database holds of it --------------------------
+
+#' The coverage groups: every EDGAR form type that carries material contracts, and whether the database covers it
+#'
+#' One row per form type. Panel A lists the forms the database draws on, Panel B the forms outside its scope. The
+#' table states what the database and the master index hold: filings for every form, and contracts only for the
+#' forms the database downloaded -- the contracts of forms outside the scope were never downloaded, so they are not
+#' counted and not estimated. Form 20-F sits in Panel A: the database holds the contracts its filers number as
+#' Exhibit 10, while the form's own instructions list material contracts as Exhibit 4, which the note says.
+#'
+#' @return Tibble: FormType, Panel, Group.
+oaa_coverage_forms <- function() {
+  a_ <- "In the database"
+  b_ <- "Outside it"
+  tibble::tribble(
+    ~FormType,   ~Panel, ~Group,
+    "10-K",      a_,     "Annual reports",
+    "10-K/A",    a_,     "Annual reports",
+    "10-Q",      a_,     "Quarterly reports",
+    "10-Q/A",    a_,     "Quarterly reports",
+    "8-K",       a_,     "Current reports",
+    "8-K/A",     a_,     "Current reports",
+    "S-1",       a_,     "Registration statements",
+    "S-1/A",     a_,     "Registration statements",
+    "S-4",       a_,     "Registration statements",
+    "S-4/A",     a_,     "Registration statements",
+    "F-1",       a_,     "Registration statements",
+    "F-1/A",     a_,     "Registration statements",
+    "F-4",       a_,     "Registration statements",
+    "F-4/A",     a_,     "Registration statements",
+    "20-F",      a_,     "Foreign annual reports",
+    "20-F/A",    a_,     "Foreign annual reports",
+    "10QSB",     b_,     "Small business, periodic",
+    "10QSB/A",   b_,     "Small business, periodic",
+    "10KSB",     b_,     "Small business, periodic",
+    "10KSB/A",   b_,     "Small business, periodic",
+    "10KSB40",   b_,     "Small business, periodic",
+    "10KSB40/A", b_,     "Small business, periodic",
+    "SB-2",      b_,     "Small business, registration",
+    "SB-2/A",    b_,     "Small business, registration",
+    "SB-1",      b_,     "Small business, registration",
+    "SB-1/A",    b_,     "Small business, registration",
+    "10SB12G",   b_,     "Small business, registration",
+    "10SB12G/A", b_,     "Small business, registration",
+    "10SB12B",   b_,     "Small business, registration",
+    "10SB12B/A", b_,     "Small business, registration",
+    "10-K405",   b_,     "10-K variants",
+    "10-K405/A", b_,     "10-K variants",
+    "10KT405",   b_,     "10-K variants",
+    "10-KT",     b_,     "10-K variants",
+    "10-KT/A",   b_,     "10-K variants",
+    "10-12G",    b_,     "Exchange Act registrations",
+    "10-12G/A",  b_,     "Exchange Act registrations",
+    "10-12B",    b_,     "Exchange Act registrations",
+    "10-12B/A",  b_,     "Exchange Act registrations",
+    "S-11",      b_,     "Real-estate registrations",
+    "S-11/A",    b_,     "Real-estate registrations"
+  )
+}
+
+#' The coverage table's data: filings per group, and the contracts the database holds
+#'
+#' @param .dir_master Character. The master index's parquet directory.
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @return Tibble: Panel, Group, Forms, Years, Filings, Contracts, Basis, Kind (group, total or design); one row per
+#'   group, a total per panel, and one row for the forms out by design. Contracts is missing outside the database.
+oaa_data_coverage <- function(.dir_master, .path_contracts) {
+  if (FALSE) {
+    .dir_master <- rGetEDGAR::get_directories(
+      here::here("2_output", "01A-EdgarIndex", "GetEDGAR")
+    )$MasterIndex$DirParquet
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+  }
+  forms_ <- oaa_coverage_forms()
+  # FILINGS per form type, 2001-2024, from the master index
+  fil_ <- arrow::open_dataset(sources = .dir_master) |>
+    dplyr::filter(.data$FormType %in% forms_$FormType) |>
+    dplyr::select("FormType", "DateFiled") |>
+    dplyr::collect() |>
+    dplyr::mutate(Year = as.integer(format(as.Date(.data$DateFiled), "%Y"))) |>
+    dplyr::filter(dplyr::between(.data$Year, 2001L, 2024L)) |>
+    dplyr::summarise(Filings = dplyr::n(), First = min(.data$Year), Last = max(.data$Year), .by = "FormType")
+  # CONTRACTS the database holds: unique contracts of the descriptive sample, per form type
+  held_ <- oaa_read_sample(
+    .path_contracts = .path_contracts,
+    .cols           = "FormType"
+  ) |>
+    dplyr::count(.data$FormType, name = "Held")
+  # THE FORMS OF A GROUP, in the order the list above gives them, amendments folded into one mention
+  label_ <- function(.f) {
+    orig_ <- .f[!grepl("/A$", .f)]
+    paste0(paste(orig_, collapse = ", "), if (any(grepl("/A$", .f))) " (with /A)" else "")
+  }
+  out_ <- forms_ |>
+    dplyr::left_join(fil_, by = "FormType") |>
+    dplyr::left_join(held_, by = "FormType") |>
+    dplyr::mutate(Filings = dplyr::coalesce(.data$Filings, 0L)) |>
+    dplyr::summarise(
+      Forms     = label_(.f = .data$FormType),
+      Years     = paste0(min(.data$First, na.rm = TRUE), "-", max(.data$Last, na.rm = TRUE)),
+      Filings   = sum(.data$Filings),
+      Contracts = if (dplyr::first(.data$Panel) == "In the database") sum(.data$Held, na.rm = TRUE) else NA_real_,
+      .by       = c("Panel", "Group")
+    ) |>
+    dplyr::mutate(
+      Contracts = as.numeric(.data$Contracts),
+      Basis     = dplyr::case_when(
+        .data$Group == "Foreign annual reports" ~ "The release; Exhibit 10 only",
+        .data$Panel == "In the database"        ~ "The release",
+        .default                                = "Not downloaded"
+      ),
+      Kind = "group"
+    )
+  totals_ <- out_ |>
+    dplyr::summarise(Filings = sum(.data$Filings), Contracts = sum(.data$Contracts), .by = "Panel") |>
+    dplyr::mutate(Group = "Total", Forms = "", Years = "", Basis = "", Kind = "total")
+  design_ <- tibble::tibble(
+    Panel = "Out by design", Group = "Asset-backed issuers; foreign current reports",
+    Forms = "SF-1, SF-3, 10-D; 6-K", Years = "", Filings = NA_integer_, Contracts = NA_real_,
+    Basis = "Not operating firms; no exhibit numbering", Kind = "design"
+  )
+  dplyr::bind_rows(
+    dplyr::filter(out_, .data$Panel == "In the database"),
+    dplyr::filter(totals_, .data$Panel == "In the database"),
+    dplyr::filter(out_, .data$Panel == "Outside it"),
+    dplyr::filter(totals_, .data$Panel == "Outside it"),
+    design_
+  )
+}
+
+#' Build the coverage table
+#'
+#' @param .dir_master Character. The master index's parquet directory.
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .dir_own Character. This document's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oaa_build_coverage <- function(.dir_master, .path_contracts, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_master <- rGetEDGAR::get_directories(
+      here::here("2_output", "01A-EdgarIndex", "GetEDGAR")
+    )$MasterIndex$DirParquet
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "FormCoverage"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  ins_  <- c(.dir_master, .path_contracts, .path_lib)
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  tab_ <- oaa_data_coverage(
+    .dir_master     = .dir_master,
+    .path_contracts = .path_contracts
+  )
+  num_ <- function(.x) dplyr::if_else(is.na(.x), "", format(.x, big.mark = ",", trim = TRUE, scientific = FALSE))
+  cells_ <- tab_ |>
+    dplyr::transmute(
+      Panel     = .data$Panel,
+      Group     = oa_tex_escape(.x = .data$Group),
+      Forms     = oa_tex_escape(.x = .data$Forms),
+      Years     = gsub("-", "--", .data$Years, fixed = TRUE),
+      Filings   = num_(.x = .data$Filings),
+      Contracts = dplyr::if_else(.data$Panel == "Outside it", "--", num_(.x = .data$Contracts)),
+      Basis     = oa_tex_escape(.x = .data$Basis)
+    )
+  tot_ <- tab_$Kind == "total"
+  cells_[tot_, c("Group", "Filings", "Contracts")] <- lapply(cells_[tot_, c("Group", "Filings", "Contracts")],
+                                                             \(.x) paste0("\\textbf{", .x, "}"))
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("Group", "EDGAR form types", "Years", "Filings", "Contracts", "Basis"),
+      .spec   = c(oa_col_text(.share = 0.19), oa_col_text(.share = 0.21), "l",
+                  oa_col_num(.mm = 16), oa_col_num(.mm = 16), oa_col_text(.share = 0.15))
+    ),
+    .note    = paste(
+      "Filings are counted in EDGAR's master index, 2001-2024; contracts are the unique contracts of the descriptive",
+      "sample in the release. The forms outside the database were not downloaded, so their contracts are not",
+      "counted. Small business issuers reported under Regulation S-B, whose Item 601 required material contracts",
+      "as Exhibit 10 in the same way as Regulation S-K; the SB forms were phased out after SEC Release 33-8876 took",
+      "effect in February 2008. Form 20-F lists material contracts as Exhibit 4 (Instruction 4(a) of its",
+      "Instructions as to Exhibits); the database holds the 20-F contracts that filers number as Exhibit 10."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+# -- 24.3 Within the year: when contracts are filed ------------------------------------------------------------------------
+
+#' The within-year figure's data: the share of each report type's contracts filed on each calendar day
+#'
+#' Unique contracts of the descriptive sample (30's Keep), 2001-2024. For every report type and year, the share of
+#' that year's contracts filed on each day; the figure shows the mean over years, so every year counts equally.
+#' February 29 is folded into February 28, so all years share one calendar; days without a filing count as zero.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @return Tibble: Group, Day (a date of 2025, standing for the calendar day), Share (percent).
+oaa_data_within_year <- function(.path_contracts) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+  }
+  groups_ <- tibble::tribble(
+    ~FormType, ~Group,
+    "8-K",     "Current reports (8-K)",
+    "8-K/A",   "Current reports (8-K)",
+    "10-K",    "Annual reports (10-K)",
+    "10-K/A",  "Annual reports (10-K)",
+    "10-Q",    "Quarterly reports (10-Q)",
+    "10-Q/A",  "Quarterly reports (10-Q)"
+  )
+  con_ <- oaa_read_sample(
+    .path_contracts = .path_contracts,
+    .cols           = "FormType"
+  ) |>
+    dplyr::inner_join(groups_, by = "FormType") |>
+    dplyr::mutate(MD = sub("^02-29$", "02-28", format(.data$Date, "%m-%d")))
+  days_ <- format(seq(as.Date("2025-01-01"), as.Date("2025-12-31"), by = "day"), "%m-%d")
+  grid_ <- tidyr::expand_grid(Group = unique(groups_$Group), Year = 2001L:2024L, MD = days_)
+  con_ |>
+    dplyr::count(.data$Group, .data$Year, .data$MD, name = "N") |>
+    dplyr::right_join(grid_, by = c("Group", "Year", "MD")) |>
+    dplyr::mutate(N = dplyr::coalesce(.data$N, 0L)) |>
+    dplyr::mutate(Share = 100 * .data$N / sum(.data$N), .by = c("Group", "Year")) |>
+    dplyr::filter(!is.na(.data$Share)) |>
+    dplyr::summarise(Share = mean(.data$Share), .by = c("Group", "MD")) |>
+    dplyr::mutate(
+      Day   = as.Date(paste0("2025-", .data$MD)),
+      Group = factor(.data$Group, levels = unique(groups_$Group))
+    ) |>
+    dplyr::select("Group", "Day", "Share") |>
+    dplyr::arrange(.data$Group, .data$Day)
+}
+
+#' The within-year figure: one panel per report type, one scale, the filing windows shaded
+#'
+#' @param .tab Tibble from oaa_data_within_year().
+#' @return A ggplot.
+oaa_plot_within_year <- function(.tab) {
+  if (FALSE) .tab <- oaa_data_within_year(.path_contracts = "Contracts.parquet")
+  win_ <- tibble::tibble(
+    Start = as.Date(c("2025-01-01", "2025-04-01", "2025-07-01", "2025-10-01")),
+    End   = as.Date(c("2025-03-31", "2025-05-15", "2025-08-14", "2025-11-14")),
+    Label = c("10-K window", "10-Q window", "10-Q window", "10-Q window"),
+    Group = factor(levels(.tab$Group)[1L], levels = levels(.tab$Group))
+  )
+  top_ <- max(.tab$Share) * 1.08
+  ggplot2::ggplot(.tab, ggplot2::aes(x = .data$Day, y = .data$Share)) +
+    ggplot2::geom_rect(
+      data        = dplyr::select(win_, -"Group"),
+      mapping     = ggplot2::aes(xmin = .data$Start, xmax = .data$End, ymin = -Inf, ymax = Inf),
+      inherit.aes = FALSE,
+      fill        = "#EDEDED"
+    ) +
+    ggplot2::geom_text(
+      data        = win_,
+      mapping     = ggplot2::aes(x = .data$Start + (.data$End - .data$Start) / 2, y = top_, label = .data$Label),
+      inherit.aes = FALSE,
+      size        = 3.1,
+      colour      = "#595959",
+      family      = .plot_font,
+      vjust       = 1
+    ) +
+    ggplot2::geom_line(colour = plot_pal_cat(.n = 1L), linewidth = 0.35) +
+    ggplot2::facet_wrap(ggplot2::vars(.data$Group), ncol = 1L) +
+    ggplot2::scale_x_date(
+      breaks = seq(as.Date("2025-01-01"), as.Date("2025-12-01"), by = "month"),
+      labels = \(.d) format(.d, "%b"),
+      expand = c(0.005, 0.005)
+    ) +
+    ggplot2::scale_y_continuous(limits = c(0, top_), expand = c(0, 0)) +
+    ggplot2::labs(x = NULL, y = "Share of the year's contracts filed on the day, in %") +
+    plot_theme(.grid = "y", .legend = "none") +
+    ggplot2::theme(strip.text = ggplot2::element_text(face = "bold", hjust = 0))
+}
+
+#' Build the within-year figure
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .dir_own Character. This document's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oaa_build_within_year <- function(.path_contracts, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .dir_own        <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force          <- FALSE
+    .path_lib       <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "FilingsWithinYear"
+  outs_ <- c(fs::path(.dir_own, "Figures", paste0(name_, ".png")),
+             fs::path(.dir_own, c("Notes", "Data"), paste0(name_, c(".tex", ".parquet"))))
+  ins_  <- c(.path_contracts, .path_lib)
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  tab_ <- oaa_data_within_year(.path_contracts = .path_contracts)
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = NULL,
+    .note    = paste(
+      "Unique contracts, 2001-2024, filed with current reports (8-K), annual reports (10-K) and quarterly reports",
+      "(10-Q), each with its amendments. For each report type and year, the share of that year's contracts filed on",
+      "each calendar day; the lines show the mean over years. Shaded are the filing windows of December year-end",
+      "filers: 90 days after the fiscal year's end for the 10-K and 45 days after each quarter's end for the 10-Q.",
+      "Within them, the deadlines of 60, 75 and 90 days (10-K) and 40 and 45 days (10-Q) differ by filer status."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  plot_save(
+    .plot    = oaa_plot_within_year(.tab = tab_),
+    .name    = name_,
+    .dir     = fs::path(.dir_own, "Figures"),
+    .height  = 5.2,
+    .formats = "png"            # no pdf (decided 17 September)
+  )
+  invisible("built")
+}
+
+# -- 24.4 Confidential treatment orders: from the order to the contract it covers ------------------------------------------
+
+#' The linkage funnel's data: every reference an order makes, by where it ends
+#'
+#' The release's CtoOrders.parquet holds one row per reference an order makes to an exhibit, and LinkStatus records
+#' where each reference ended: linked to the attachment it names, or failed at one of nine named points in the chain
+#' from the order's text to the database. The codes are numbered in chain order, which is the order the table keeps.
+#' A linked reference is then classified by what the order does -- grants, extends, denies, revokes -- because the
+#' paper's redaction measure counts grants and their extensions and not denials. The last row is the release's own
+#' flag on the unique contracts of the sample, so the funnel ends where the paper's variable begins.
+#'
+#' @param .path_orders Character. The release's CtoOrders.parquet.
+#' @param .path_contracts Character. The release's Contracts.parquet, for the last row.
+#' @return Tibble: Panel, Step, Code, N, Share (of references), Kind (total / item / result).
+oaa_data_cto <- function(.path_orders, .path_contracts) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .path_orders <- fs::path(fs::path_dir(.path_contracts), "CtoOrders.parquet")
+  }
+  ref_ <- arrow::open_dataset(sources = .path_orders) |>
+    dplyr::select(dplyr::any_of(c("OrderDocID", "LinkStatus", "Status", "IsExtension"))) |>
+    dplyr::collect()
+  n_ref_ <- nrow(ref_)
+  # THE FAILURE POINTS, in chain order, in words. The code is the release's own; the words are the table's.
+  steps_ <- tibble::tribble(
+    ~Code,       ~Step,
+    "A-linked",  "Linked to the attachment it names",
+    "1-",        "No exhibit reference could be parsed from the order",
+    "2-",        "The reference is not to an Exhibit 10",
+    "3-",        "The order does not name the filing the exhibit came with",
+    "4-",        "The named filing is not in EDGAR's index",
+    "5-",        "The named filing matches several filings",
+    "6-",        "No exhibit of the named filing was downloaded (a form outside the frame)",
+    "7-",        "The exhibit number matches several attachments of the filing",
+    "8-",        "The exhibit number is lettered and cannot be matched",
+    "9-",        "The exhibit number is not among the attachments downloaded"
+  )
+  code_ <- dplyr::case_when(
+    ref_$LinkStatus == "A-linked" ~ "A-linked",
+    .default = paste0(stringi::stri_sub(ref_$LinkStatus, 1L, 1L), "-")
+  )
+  unknown_ <- setdiff(unique(code_), steps_$Code)
+  if (length(unknown_) > 0L) cli::cli_abort("LinkStatus code{?s} the funnel does not name: {.val {unknown_}}.")
+  by_code_ <- tibble::tibble(Code = code_) |>
+    dplyr::count(.data$Code, name = "N")
+  panel_a_ <- steps_ |>
+    dplyr::left_join(by_code_, by = "Code") |>
+    dplyr::mutate(N = dplyr::coalesce(.data$N, 0L), Kind = "item")
+  linked_ <- ref_[ref_$LinkStatus == "A-linked", , drop = FALSE]
+  ext_    <- dplyr::coalesce(as.integer(linked_$IsExtension), 0L) == 1L
+  st_     <- linked_$Status
+  panel_b_ <- tibble::tibble(
+    Code = c("", "", "", "", ""),
+    Step = c("Grants confidential treatment", "Extends an earlier grant", "Denies the request, in whole or in part",
+             "Revokes an earlier grant", "Order text not parsed, status unknown"),
+    N    = c(
+      sum(st_ == "GRANTING" & !ext_, na.rm = TRUE),
+      sum(st_ == "GRANTING" & ext_, na.rm = TRUE),
+      sum(st_ == "DENYING", na.rm = TRUE),
+      sum(st_ == "REVOKING", na.rm = TRUE),
+      sum(is.na(st_))
+    ),
+    Kind = "item"
+  )
+  # THE LAST ROW: the release's flag, on the unique contracts of the descriptive sample
+  con_ <- oaa_read_sample(
+    .path_contracts = .path_contracts,
+    .cols           = "HasCto"
+  )
+  n_cto_ <- sum(dplyr::coalesce(as.integer(con_$HasCto), 0L) == 1L)
+  dplyr::bind_rows(
+    tibble::tibble(Panel = "A. References, by where they end", Code = "", Step = "Orders in the release",
+                   N = dplyr::n_distinct(ref_$OrderDocID), Kind = "total"),
+    tibble::tibble(Panel = "A. References, by where they end", Code = "", Step = "References to exhibits they make",
+                   N = n_ref_, Kind = "total"),
+    dplyr::mutate(panel_a_, Panel = "A. References, by where they end"),
+    tibble::tibble(Panel = "B. Linked references, by what the order does", Code = "", Step = "Linked references",
+                   N = nrow(linked_), Kind = "total"),
+    dplyr::mutate(panel_b_, Panel = "B. Linked references, by what the order does"),
+    tibble::tibble(Panel = "C. In the sample", Code = "",
+                   Step = "Unique contracts of the descriptive sample with a grant or an extension",
+                   N = n_cto_, Kind = "result")
+  ) |>
+    dplyr::mutate(Share = dplyr::if_else(.data$Panel == "C. In the sample", NA_real_, .data$N / n_ref_)) |>
+    dplyr::select("Panel", "Step", "Code", "N", "Share", "Kind")
+}
+
+#' Build the linkage funnel
+#'
+#' @param .path_orders Character. The release's CtoOrders.parquet.
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oaa_build_cto <- function(.path_orders, .path_contracts, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .path_orders <- fs::path(fs::path_dir(.path_contracts), "CtoOrders.parquet")
+    .dir_own     <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force       <- FALSE
+    .path_lib    <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "CtoLinkage"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  ins_  <- c(.path_orders, .path_contracts, .path_lib)
+  if (!fs::file_exists(.path_orders)) return(invisible("waiting for CtoOrders.parquet in the release"))
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  tab_ <- oaa_data_cto(
+    .path_orders    = .path_orders,
+    .path_contracts = .path_contracts
+  )
+  num_ <- function(.x) format(.x, big.mark = ",", trim = TRUE, scientific = FALSE)
+  pct_ <- function(.x) dplyr::if_else(is.na(.x), "", formatC(100 * .x, format = "f", digits = 1L))
+  cells_ <- tab_ |>
+    dplyr::transmute(
+      Panel = .data$Panel,
+      Step  = dplyr::if_else(.data$Kind == "item", paste0("\\hspace{1em}", oa_tex_escape(.x = .data$Step)),
+                             oa_tex_escape(.x = .data$Step)),
+      N     = num_(.x = .data$N),
+      Share = pct_(.x = .data$Share)
+    )
+  tot_ <- tab_$Kind %in% c("total", "result")
+  cells_[tot_, c("Step", "N")] <- lapply(cells_[tot_, c("Step", "N")], \(.x) paste0("\\textbf{", .x, "}"))
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("", "N", "\\% of references"),
+      .spec   = c(oa_col_text(.share = 0.66), oa_col_num(.mm = 18), oa_col_num(.mm = 22))
+    ),
+    .note    = paste(
+      "Every confidential treatment order EDGAR lists (form type CT ORDER, from May 2008) is parsed for the exhibits",
+      "it covers; an order identifies an exhibit by the filing it came with and its exhibit number, and each such",
+      "reference is followed to the attachment in the database. Panel A counts references by where they end, in",
+      "the order the chain is followed. Panel B classifies the linked references by what the order does. Panel C",
+      "counts the unique contracts of the descriptive sample the release flags as covered by a grant or an",
+      "extension of a grant; denials and revocations are not counted, following Ahci (2025). Shares are of all",
+      "references."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# -- 24.5 The counts the text cites, which no table prints -----------------------------------------------------------------
+
+#' The counts the text of Appendix A cites, which no table prints
+#'
+#' Passages of the text name numbers that belong to no exhibit: how many rows the release holds and how many of
+#' them are unique attachments, how many of those the sample keeps, how many predate 2001, and what each quality
+#' rule flags. They are computed here on the release, written as a tibble like any other exhibit's data, and read by
+#' the numbers spec; nothing is printed.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @return Tibble: Key, Value.
+oaa_data_counts <- function(.path_contracts) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+  }
+  all_ <- arrow::open_dataset(sources = .path_contracts) |>
+    dplyr::select(dplyr::any_of(c("DocID", "DateFiled", "PrimaryFiler", "DescSample", "SampleStepCode", "Removed",
+                                  "RemClass", "nWords"))) |>
+    dplyr::collect() |>
+    dplyr::mutate(
+      Primary = dplyr::coalesce(as.integer(.data$PrimaryFiler), 0L) == 1L,
+      Sample  = dplyr::coalesce(as.integer(.data$DescSample), 0L) == 1L,
+      Flagged = dplyr::coalesce(as.integer(.data$Removed), 0L) == 1L,
+      Year    = as.integer(format(as.Date(.data$DateFiled), "%Y"))
+    )
+  uni_ <- dplyr::filter(all_, .data$Primary)
+  # THE RULES: RemClass names the rule that flagged a document, prefixed 1-, 2- or 3-; a flagged document without a
+  # rule is a placeholder that carries no text (the PDF and image references folded into the malformatted rung).
+  rule_ <- uni_ |>
+    dplyr::filter(.data$Flagged, !is.na(.data$RemClass)) |>
+    dplyr::count(.data$RemClass, name = "N")
+  pick_ <- function(.prefix) {
+    row_ <- rule_[startsWith(rule_$RemClass, .prefix), , drop = FALSE]
+    if (nrow(row_) == 0L) return(0)
+    sum(row_$N)
+  }
+  n_flag_ <- sum(uni_$Flagged)
+  n_rule_ <- pick_(.prefix = "1-") + pick_(.prefix = "2-") + pick_(.prefix = "3-")
+  tibble::tibble(
+    Key = c("DocsAll", "DocsUnique", "DocsSample", "DocsPre2001", "DocsFlagged", "RuleShort", "RuleStopwords",
+            "RuleNumeric", "Placeholders", "YearFirst", "YearLast"),
+    Value = c(
+      nrow(all_),
+      nrow(uni_),
+      sum(uni_$Sample),
+      sum(uni_$Year < 2001L, na.rm = TRUE),
+      n_flag_,
+      pick_(.prefix = "1-"),
+      pick_(.prefix = "2-"),
+      pick_(.prefix = "3-"),
+      max(n_flag_ - n_rule_, 0),
+      min(uni_$Year[uni_$Sample], na.rm = TRUE),
+      max(uni_$Year[uni_$Sample], na.rm = TRUE)
+    )
+  )
+}
+
+#' Build the counts the text cites
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oaa_build_counts <- function(.path_contracts, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "TextCounts"
+  outs_ <- fs::path(.dir_own, "Data", paste0(name_, ".parquet"))
+  ins_  <- c(.path_contracts, .path_lib)
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  fs::dir_create(fs::path(.dir_own, "Data"))
+  arrow::write_parquet(
+    x    = oaa_data_counts(.path_contracts = .path_contracts),
+    sink = outs_
+  )
+  invisible("built")
+}
+
+
+# -- 24.6 For the response memo: the exhibit files behind the 2001 start, and the seasoned filers --------------------------
+# Built here because their data is this chapter's; registered under Section "M", so the runbook shows them and the
+# fragment leaves them out. The memo pair sets them from this chapter's output directory.
+
+#' The exhibit-files table's data: per quarter, the Exhibit 10s EDGAR's index lists, and those that are files
+#'
+#' EDGAR's index page lists the documents of a filing back to 1993, read from the tags of the complete submission,
+#' but only a filing submitted through the modernised system disseminates each document as a file of its own. In
+#' 01B's links table the difference is one column: a listed exhibit that is a file carries a Document name, and one
+#' that is not carries NA and an address ending at the filer's folder. The table counts both, by quarter, across the
+#' years in which the change happened.
+#'
+#' @param .dir_links Character. 01A's mirrored links table, the directory of one parquet per quarter.
+#' @param .from Numeric. The first year-quarter, as 01A writes it (1998.1).
+#' @param .to Numeric. The last year-quarter, inclusive.
+#' @return Tibble: YearQuarter, Quarter (as text), Listed, WithFile, ShareFile.
+oaa_data_files <- function(.dir_links, .from, .to) {
+  if (FALSE) {
+    .dir_links <- rGetEDGAR::get_directories(
+      here::here("2_output", "01A-EdgarIndex", "GetEDGAR")
+    )$DocLinks$DirMain$Links
+    .from <- 1998.1
+    .to   <- 2001.2
+  }
+  arrow::open_dataset(sources = .dir_links) |>
+    dplyr::filter(.data$YearQuarter >= .from, .data$YearQuarter <= .to) |>
+    dplyr::select("YearQuarter", "Type", "Document") |>
+    dplyr::collect() |>
+    dplyr::filter(grepl("^EX-?10", toupper(.data$Type))) |>
+    dplyr::summarise(
+      Listed   = dplyr::n(),
+      WithFile = sum(!is.na(.data$Document)),
+      .by      = "YearQuarter"
+    ) |>
+    dplyr::mutate(
+      ShareFile = .data$WithFile / .data$Listed,
+      Quarter   = paste0(floor(.data$YearQuarter), " Q", round(10 * (.data$YearQuarter - floor(.data$YearQuarter))))
+    ) |>
+    dplyr::arrange(.data$YearQuarter) |>
+    dplyr::select("YearQuarter", "Quarter", "Listed", "WithFile", "ShareFile")
+}
+
+#' Build the exhibit-files table
+#'
+#' @param .dir_links Character. 01A's mirrored links table.
+#' @param .from Numeric. The first year-quarter.
+#' @param .to Numeric. The last year-quarter.
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oaa_build_files <- function(.dir_links, .from, .to, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_links <- rGetEDGAR::get_directories(
+      here::here("2_output", "01A-EdgarIndex", "GetEDGAR")
+    )$DocLinks$DirMain$Links
+    .from     <- 1998.1
+    .to       <- 2001.2
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "ExhibitFiles"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  ins_  <- c(.dir_links, .path_lib)
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  tab_ <- oaa_data_files(
+    .dir_links = .dir_links,
+    .from      = .from,
+    .to        = .to
+  )
+  num_ <- function(.x) format(.x, big.mark = ",", trim = TRUE, scientific = FALSE)
+  cells_ <- tab_ |>
+    dplyr::transmute(
+      Quarter   = .data$Quarter,
+      Listed    = num_(.x = .data$Listed),
+      WithFile  = num_(.x = .data$WithFile),
+      ShareFile = formatC(100 * .data$ShareFile, format = "f", digits = 1L)
+    )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("Quarter", "Exhibit 10s listed", "Of which files", "\\%"),
+      .spec   = c("l", oa_col_num(.mm = 24), oa_col_num(.mm = 22), oa_col_num(.mm = 14))
+    ),
+    .note    = paste(
+      "From the document lists of EDGAR's filing index pages, mirrored for every filing of the eight forms the",
+      "database covers, 1998 Q1 to 2001 Q2. Listed counts the attachments whose exhibit type begins EX-10; of which",
+      "files counts those that carry a file name and address of their own on the index page. An exhibit listed",
+      "without a file exists only inside the filing's complete submission text file."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+#' The seasoned-filer figure's data: four groups of filers, per year
+#'
+#' All filers; seasoned filers by 30's rule -- more than two years (2 x 365.25 days) past the CIK's first contract in
+#' the sample, which leaves firms already filing in 2001 unseasoned until 2003; seasoned filers by the CIK's first
+#' EDGAR filing of any form, from the master index, which starts in 1993 and does not date a firm by the filings
+#' under study; and the contracts of blank-check registrants, the filings whose SIC code is 6770, from 01A's landing
+#' pages. For each group and year: contracts, those filed with a registration statement (S-1, S-4, F-1, F-4 and
+#' their amendments), and the equity contracts. The label is the release's Class, the crowned engine's detailed
+#' label under a name that does not depend on the engine, which is also what 30 reads.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .path_landing Character. 01A's LandingPageAll.parquet, for the SIC code of each filing.
+#' @param .dir_master Character. The master index's parquet directory.
+#' @return Tibble: Year, Filers, N, NReg, ShareReg, NEquity, ShareEquity.
+oaa_data_seasoned <- function(.path_contracts, .path_landing, .dir_master) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .path_landing <- here::here("2_output", "01A-EdgarIndex", "Output", "LandingPageAll.parquet")
+    .dir_master   <- rGetEDGAR::get_directories(
+      here::here("2_output", "01A-EdgarIndex", "GetEDGAR")
+    )$MasterIndex$DirParquet
+  }
+  pad_ <- function(.x) sprintf("%010.0f", as.numeric(.x))
+  con_ <- oaa_read_sample(
+    .path_contracts = .path_contracts,
+    .cols           = c("CIK", "HashIndex", "FormType", "Class")
+  ) |>
+    dplyr::mutate(
+      CIK      = pad_(.x = .data$CIK),
+      IsReg    = sub("/A$", "", .data$FormType) %in% c("S-1", "S-4", "F-1", "F-4"),
+      IsEquity = dplyr::coalesce(.data$Class == "Financial Instruments: Equity", FALSE)
+    )
+  if (!any(con_$IsEquity)) {
+    cli::cli_abort("No contract's {.field Class} is {.val Financial Instruments: Equity}; the release's labels differ.")
+  }
+  # 30'S RULE: the first contract of the CIK in the sample
+  con_ <- con_ |>
+    dplyr::mutate(Entry = min(.data$Date), .by = "CIK") |>
+    dplyr::mutate(Seasoned = as.numeric(.data$Date - .data$Entry) / 365.25 > 2)
+  # THE CHECK: the first EDGAR filing of the CIK, any form, from the master index
+  first_ <- arrow::open_dataset(sources = .dir_master) |>
+    dplyr::select("CIK", "DateFiled") |>
+    dplyr::mutate(Date = as.Date(.data$DateFiled)) |>
+    dplyr::group_by(.data$CIK) |>
+    dplyr::summarise(First = min(.data$Date, na.rm = TRUE)) |>
+    dplyr::collect() |>
+    dplyr::mutate(CIK = pad_(.x = .data$CIK)) |>
+    dplyr::summarise(First = min(.data$First), .by = "CIK")
+  con_ <- con_ |>
+    dplyr::left_join(first_, by = "CIK") |>
+    dplyr::mutate(SeasonedEdgar = dplyr::coalesce(as.numeric(.data$Date - .data$First) / 365.25 > 2, FALSE))
+  # BLANK-CHECK REGISTRANTS: the filing's SIC code
+  sic_ <- tibble::as_tibble(arrow::read_parquet(file = .path_landing, col_select = c("HashIndex", "SIC"))) |>
+    dplyr::distinct(.data$HashIndex, .keep_all = TRUE)
+  con_ <- con_ |>
+    dplyr::left_join(sic_, by = "HashIndex") |>
+    dplyr::mutate(BlankCheck = dplyr::coalesce(trimws(as.character(.data$SIC)) == "6770", FALSE))
+  one_ <- function(.rows, .label) {
+    .rows |>
+      dplyr::summarise(
+        N       = dplyr::n(),
+        NReg    = sum(.data$IsReg),
+        NEquity = sum(.data$IsEquity),
+        .by     = "Year"
+      ) |>
+      tidyr::complete(Year = 2001L:2024L, fill = list(N = 0L, NReg = 0L, NEquity = 0L)) |>
+      dplyr::mutate(Filers = .label)
+  }
+  dplyr::bind_rows(
+    one_(.rows = con_,                                   .label = "All filers"),
+    one_(.rows = dplyr::filter(con_, .data$Seasoned),      .label = "Seasoned filers"),
+    one_(.rows = dplyr::filter(con_, .data$SeasonedEdgar), .label = "Seasoned, by first EDGAR filing"),
+    one_(.rows = dplyr::filter(con_, .data$BlankCheck),    .label = "Blank-check registrants (SIC 6770)")
+  ) |>
+    dplyr::mutate(
+      ShareReg    = dplyr::if_else(.data$N > 0L, .data$NReg / .data$N, NA_real_),
+      ShareEquity = dplyr::if_else(.data$N > 0L, .data$NEquity / .data$N, NA_real_)
+    ) |>
+    dplyr::select("Year", "Filers", "N", "NReg", "ShareReg", "NEquity", "ShareEquity") |>
+    dplyr::arrange(.data$Filers, .data$Year)
+}
+
+#' The seasoned-filer figure: contracts, registration share and equity share, all filers against seasoned filers
+#'
+#' @param .tab Tibble from oaa_data_seasoned().
+#' @return A ggplot.
+oaa_plot_seasoned <- function(.tab) {
+  if (FALSE) .tab <- oaa_data_seasoned(.path_contracts = "C", .path_landing = "L", .dir_master = "M")
+  lv_ <- c("All filers", "Seasoned filers", "Seasoned, by first EDGAR filing", "Blank-check registrants (SIC 6770)")
+  pa_ <- c("A. Contracts per year, in 1,000s", "B. Filed with a registration statement, in %",
+           "C. Equity contracts, in %")
+  two_ <- c("All filers", "Seasoned filers")
+  dat_ <- dplyr::bind_rows(
+    dplyr::transmute(.tab, .data$Year, .data$Filers, Value = .data$N / 1000, Panel = pa_[1L]),
+    dplyr::transmute(dplyr::filter(.tab, .data$Filers %in% two_), .data$Year, .data$Filers,
+                     Value = 100 * .data$ShareReg, Panel = pa_[2L]),
+    dplyr::transmute(dplyr::filter(.tab, .data$Filers %in% two_), .data$Year, .data$Filers,
+                     Value = 100 * .data$ShareEquity, Panel = pa_[3L])
+  ) |>
+    dplyr::filter(!is.na(.data$Value)) |>
+    dplyr::mutate(
+      Filers = factor(.data$Filers, levels = lv_),
+      Panel  = factor(.data$Panel, levels = pa_)
+    )
+  cat_ <- plot_pal_cat(.n = 3L)
+  ggplot2::ggplot(dat_, ggplot2::aes(x = .data$Year, y = .data$Value, colour = .data$Filers,
+                                     linetype = .data$Filers)) +
+    ggplot2::geom_line(linewidth = 0.5) +
+    ggplot2::geom_point(size = 0.9) +
+    ggplot2::facet_wrap(ggplot2::vars(.data$Panel), ncol = 1L, scales = "free_y") +
+    ggplot2::scale_colour_manual(values = stats::setNames(cat_[c(1L, 2L, 2L, 3L)], lv_), drop = FALSE) +
+    ggplot2::scale_linetype_manual(values = stats::setNames(c("solid", "solid", "dashed", "solid"), lv_), drop = FALSE) +
+    ggplot2::scale_x_continuous(breaks = seq(2002L, 2024L, 2L), expand = c(0.01, 0.01)) +
+    ggplot2::labs(x = NULL, y = NULL, colour = NULL, linetype = NULL) +
+    plot_theme(.grid = "y", .legend = "bottom") +
+    ggplot2::theme(strip.text = ggplot2::element_text(face = "bold", hjust = 0)) +
+    ggplot2::guides(colour = ggplot2::guide_legend(nrow = 2L), linetype = ggplot2::guide_legend(nrow = 2L))
+}
+
+#' Build the seasoned-filer figure
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .path_landing Character. 01A's LandingPageAll.parquet.
+#' @param .dir_master Character. The master index's parquet directory.
+#' @param .dir_own Character. This document's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oaa_build_seasoned <- function(.path_contracts, .path_landing, .dir_master, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .path_landing <- here::here("2_output", "01A-EdgarIndex", "Output", "LandingPageAll.parquet")
+    .dir_master   <- rGetEDGAR::get_directories(
+      here::here("2_output", "01A-EdgarIndex", "GetEDGAR")
+    )$MasterIndex$DirParquet
+    .dir_own      <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force        <- FALSE
+    .path_lib     <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "SeasonedFilers"
+  outs_ <- c(fs::path(.dir_own, "Figures", paste0(name_, ".png")),
+             fs::path(.dir_own, c("Notes", "Data"), paste0(name_, c(".tex", ".parquet"))))
+  ins_  <- c(.path_contracts, .path_landing, .dir_master, .path_lib)
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  tab_ <- oaa_data_seasoned(
+    .path_contracts = .path_contracts,
+    .path_landing   = .path_landing,
+    .dir_master     = .dir_master
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = NULL,
+    .note    = paste(
+      "Unique contracts of the descriptive sample, 2001-2024. A seasoned filer is one more than two years past its",
+      "first contract in the sample, so that firms already filing in 2001 count as seasoned from 2003; the dashed",
+      "line dates a filer by its first EDGAR filing of any form instead, from EDGAR's master index, which starts in",
+      "1993. Blank-check registrants are the filings under SIC code 6770. Registration statements are Forms S-1,",
+      "S-4, F-1 and F-4 with their amendments; equity contracts are those classified as Financial Instruments:",
+      "Equity."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  plot_save(
+    .plot    = oaa_plot_seasoned(.tab = tab_),
+    .name    = name_,
+    .dir     = fs::path(.dir_own, "Figures"),
+    .height  = 7.2,
+    .formats = "png"            # no pdf (decided 17 September)
+  )
+  invisible("built")
+}
+
+
+# -- 24.7 The exhibit table: row (10) of 17 C.F.R. 229.601(a), with what the database covers -------------------------------
+
+#' Row (10) of the exhibit table, one line per form, with the database's coverage beside it
+#'
+#' The exhibit table in Item 601(a) lists, for every form, which exhibits must be filed with it; row (10) is the
+#' material contracts. The content is the regulation's and is kept here as a tibble so that the table is an exhibit
+#' like any other. Required is the X of the table; Covered is whether the database downloads Exhibit 10 from the
+#' form. Read from the eCFR on 14 Sep 2026; the two footnotes of the table (S-4 and F-4, 8-K) are stated in the note.
+#'
+#' @return Tibble: Form, Act, Required, Covered, Note.
+oaa_data_exhibit_table <- function() {
+  tibble::tribble(
+    ~Form,    ~Act,             ~Required, ~Covered, ~Note,
+    "S-1",    "Securities Act", TRUE,      TRUE,     "",
+    "S-3",    "Securities Act", FALSE,     FALSE,    "",
+    "SF-1",   "Securities Act", TRUE,      FALSE,    "asset-backed issuers",
+    "SF-3",   "Securities Act", TRUE,      FALSE,    "asset-backed issuers",
+    "S-4",    "Securities Act", TRUE,      TRUE,     "footnote 1 of the table",
+    "S-8",    "Securities Act", FALSE,     FALSE,    "",
+    "S-11",   "Securities Act", TRUE,      FALSE,    "real-estate companies",
+    "F-1",    "Securities Act", TRUE,      TRUE,     "",
+    "F-3",    "Securities Act", FALSE,     FALSE,    "",
+    "F-4",    "Securities Act", TRUE,      TRUE,     "footnote 1 of the table",
+    "10",     "Exchange Act",   TRUE,      FALSE,    "registration under the Exchange Act",
+    "8-K",    "Exchange Act",   FALSE,     TRUE,     "footnote 2 of the table; Item 1.01 announces the contract",
+    "10-D",   "Exchange Act",   TRUE,      FALSE,    "asset-backed issuers",
+    "10-Q",   "Exchange Act",   TRUE,      TRUE,     "",
+    "10-K",   "Exchange Act",   TRUE,      TRUE,     "",
+    "ABS-EE", "Exchange Act",   FALSE,     FALSE,    "asset-backed issuers"
+  )
+}
+
+#' Build the exhibit table
+#'
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library, the table's only input.
+#' @return Invisibly, the build's status.
+oaa_build_exhibit_table <- function(.dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "ExhibitRequired"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  if (!oa_build_needed(.outputs = outs_, .inputs = .path_lib, .force = .force)) return(invisible("up to date"))
+  tab_ <- oaa_data_exhibit_table()
+  cells_ <- tibble::tibble(
+    Panel    = paste(tab_$Act, "forms"),
+    Form     = oa_tex_escape(.x = tab_$Form),
+    Required = dplyr::if_else(tab_$Required, "X", "--"),
+    Covered  = dplyr::if_else(tab_$Covered, "X", "--"),
+    Note     = dplyr::if_else(nzchar(tab_$Note), oa_tex_escape(.x = tab_$Note), "--")
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("Form", "Exhibit 10 required", "In the database", "Note"),
+      .spec   = c(oa_col_text(.share = 0.12), oa_col_num(.mm = 30), oa_col_num(.mm = 26), oa_col_text(.share = 0.40))
+    ),
+    .note    = paste(
+      "Row (10), material contracts, of the exhibit table in Item 601(a) of Regulation S-K (17 C.F.R. 229.601(a)),",
+      "read on September 14, 2026: an X marks a form with which a material contract must be filed as Exhibit 10.",
+      "The table's footnote 1 exempts a company from providing the exhibit on Form S-4 or F-4 where it has elected",
+      "to provide information at the level of Form S-3 or F-3 and that form would not require it; footnote 2 limits",
+      "Form 8-K exhibits to those relevant to the subject matter of the report. In the database marks the forms from",
+      "which the database downloads Exhibit 10; the 8-K is covered although the table does not require the contract",
+      "there, because filers attach it to the announcement under Item 1.01 (Section A.1)."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# -- 24.8 What the forms are: the CFR sections that establish them ---------------------------------------------------------
+
+#' The sixteen forms of the exhibit table, each with the CFR section that establishes it and its purpose
+#'
+#' Securities Act forms are established in 17 C.F.R. Part 239 and Exchange Act forms in Part 249; each section's
+#' heading states what the form is for, and that heading is the description printed. Kept here as a tibble so that
+#' the table is an exhibit like any other; the runbook's source register links every section.
+#'
+#' @return Tibble: Form, Act, Section, Description, Url.
+oaa_data_form_descriptions <- function() {
+  ecfr_ <- function(.part, .section) sprintf("https://www.ecfr.gov/current/title-17/chapter-II/part-%s/section-%s",
+                                             .part, .section)
+  tibble::tribble(
+    ~Form,    ~Act,             ~Section,    ~Description,
+    "S-1",    "Securities Act", "239.11",    "Registration statement under the Securities Act of 1933; the general form",
+    "S-3",    "Securities Act", "239.13",    "Registration statement for specified transactions by certain issuers (shelf registration)",
+    "SF-1",   "Securities Act", "239.44",    "Registration statement under the Securities Act of 1933 for offerings of asset-backed securities",
+    "SF-3",   "Securities Act", "239.45",    "Registration statement for offerings of asset-backed securities offered pursuant to certain types of transactions (shelf)",
+    "S-4",    "Securities Act", "239.25",    "Registration of securities issued in business combination transactions",
+    "S-8",    "Securities Act", "239.16b",   "Registration of securities to be offered to employees pursuant to employee benefit plans",
+    "S-11",   "Securities Act", "239.18",    "Registration of securities of certain real estate companies",
+    "F-1",    "Securities Act", "239.31",    "Registration statement for securities of certain foreign private issuers",
+    "F-3",    "Securities Act", "239.33",    "Registration statement for specified transactions by certain foreign private issuers",
+    "F-4",    "Securities Act", "239.34",    "Registration statement for securities of certain foreign private issuers issued in certain business combination transactions",
+    "10",     "Exchange Act",   "249.210",
+    "General form for registration of securities pursuant to section 12(b) or (g) of the Exchange Act",
+    "8-K",    "Exchange Act",   "249.308",   "Current report",
+    "10-D",   "Exchange Act",   "249.312",   "Asset-backed issuer distribution report",
+    "10-Q",   "Exchange Act",   "249.308a",  "Quarterly report",
+    "10-K",   "Exchange Act",   "249.310",   "Annual report",
+    "ABS-EE", "Exchange Act",   "249.1401",  "Asset-backed securities: submission of asset data file and related documents"
+  ) |>
+    dplyr::mutate(
+      Part = dplyr::if_else(.data$Act == "Securities Act", "239", "249"),
+      Url  = ecfr_(.part = .data$Part, .section = .data$Section)
+    ) |>
+    dplyr::select("Form", "Act", "Section", "Description", "Url")
+}
+
+#' Build the form-descriptions table
+#'
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library, the table's only input.
+#' @return Invisibly, the build's status.
+oaa_build_form_descriptions <- function(.dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "FormDescriptions"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  if (!oa_build_needed(.outputs = outs_, .inputs = .path_lib, .force = .force)) return(invisible("up to date"))
+  tab_ <- oaa_data_form_descriptions()
+  cells_ <- tibble::tibble(
+    Panel       = paste(tab_$Act, "forms"),
+    Form        = oa_tex_escape(.x = tab_$Form),
+    Section     = paste0("17 C.F.R. ", tab_$Section),
+    Description = oa_tex_escape(.x = tab_$Description)
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("Form", "Established in", "What the form is for"),
+      .spec   = c(oa_col_text(.share = 0.10), oa_col_text(.share = 0.20), oa_col_text(.share = 0.62))
+    ),
+    .note    = paste(
+      "The forms of the exhibit table, each with the section of the Code of Federal Regulations that establishes it",
+      "-- Part 239 for forms under the Securities Act of 1933, Part 249 for forms under the Securities Exchange Act",
+      "of 1934 -- and the purpose that section's heading states. Amendments to a form are filed under the same form",
+      "type with the suffix /A."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# 25. Moved from 50-Numbers: Appendix B, software (oab_) -------------------------------------------------------------------
+
+#
+# 40-OnlineAppendix-B.R -- Appendix B, the software: the exhibits this chapter builds
+#
+#
+# 40-OnlineAppendix-B.qmd holds the chapter's text; _Commons/_OnlineAppendix.R holds everything the chapters share.
+# This library holds the two things Appendix B writes itself: the pipeline table, whose content is text rather than
+# data and is kept here as a tibble so that it deploys through the same machinery as every other exhibit, and the
+# versions of the two packages, read from the installed packages so that the text cannot name a version that is not
+# the one the database was built with.
+#
+# THE PREFIX IS oab_: online appendix, chapter B.
+
+
+# -- 25.1 The pipeline, stage by stage -------------------------------------------------------------------------------------
+
+#' The pipeline table's content: six stages, what each does, what it produces, where it is described
+#'
+#' Written as a tibble rather than as prose in the text so that the table is an exhibit like any other -- built,
+#' numbered, deployed and read through \\oaown -- and so that its wording is in one place. It names no script: the
+#' stages are the ones a reader needs to place the chapters, and the code's own numbering is not part of the paper.
+#'
+#' @return Tibble: Stage, Does, Produces, Where.
+oab_data_stages <- function() {
+  tibble::tribble(
+    ~Stage, ~Does, ~Produces, ~Where,
+    "Acquisition",
+    paste("Reads EDGAR's index, visits every selected filing, downloads its documents and converts them",
+          "to text"),
+    "Every Exhibit 10, Item 1.01 current report and confidential treatment order, as text",
+    "A.1; rGetEDGAR (B.2)",
+    "Database",
+    paste("Identifies unique attachments, flags text that failed conversion, links orders and",
+          "announcements to contracts"),
+    "One row per contract, with its filing, its copies and its links",
+    "A.4",
+    "Labelling",
+    "Two annotators assign each contract of a stratified sample a category and an amendment flag",
+    "The labeled sample",
+    "C.1; rLabelDocs (B.3)",
+    "Classification",
+    paste("Fine-tunes a transformer and derives a keyword table on the labeled sample, out of fold, and",
+          "applies both to the corpus"),
+    "A category, its probability and a keyword label per contract",
+    "C; the classifier (B.4)",
+    "Entity extraction",
+    paste("Finds partners, places, dates, amounts and redaction markers as spans, and turns spans into",
+          "variables by rule"),
+    "The content variables per contract",
+    "D; the extractors (B.4)",
+    "Release",
+    "Exports the contract rows, the linked orders and announcements, and the codebook",
+    "The published files",
+    "F"
+  )
+}
+
+#' Build the pipeline table
+#'
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library, the table's only input.
+#' @return Invisibly, the build's status.
+oab_build_stages <- function(.dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "PipelineStages"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  if (!oa_build_needed(.outputs = outs_, .inputs = .path_lib, .force = .force)) return(invisible("up to date"))
+  tab_ <- oab_data_stages()
+  cells_ <- tab_ |>
+    dplyr::transmute(
+      Stage    = paste0("\\textbf{", oa_tex_escape(.x = .data$Stage), "}"),
+      Does     = oa_tex_escape(.x = .data$Does),
+      Produces = oa_tex_escape(.x = .data$Produces),
+      Where    = oa_tex_escape(.x = .data$Where)
+    )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("Stage", "What it does", "What it produces", "Described in"),
+      .spec   = c(oa_col_text(.share = 0.14), oa_col_text(.share = 0.40), oa_col_text(.share = 0.28),
+                  oa_col_text(.share = 0.14))
+    ),
+    .note    = paste(
+      "The six stages of the pipeline, in the order they run. Each stage reads what the previous one produced and",
+      "writes its own result, so a stage can be rerun without repeating the ones before it. The two R packages and",
+      "the classification and extraction code described in this appendix are the software behind the stages named",
+      "beside them; the remaining stages are scripts of the pipeline itself."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# -- 25.2 The package versions, read from the packages ---------------------------------------------------------------------
+
+#' The versions of the two packages, as installed
+#'
+#' The text names the versions the database was built with. Read from the installed packages rather than typed, so
+#' the sentence follows an upgrade; a package that is not installed resolves to NA and the number reports it.
+#'
+#' @return Tibble: Key, Value -- rGetEDGAR and rLabelDocs, as "0.1.0".
+oab_data_versions <- function() {
+  ver_ <- function(.pkg) {
+    if (!requireNamespace(.pkg, quietly = TRUE)) return(NA_character_)
+    as.character(utils::packageVersion(.pkg))
+  }
+  tibble::tibble(
+    Key   = c("rGetEDGAR", "rLabelDocs"),
+    Value = c(ver_(.pkg = "rGetEDGAR"), ver_(.pkg = "rLabelDocs"))
+  )
+}
+
+#' Build the versions tibble
+#'
+#' Rebuilt on every render, since an installed package can change without any file of the pipeline changing.
+#'
+#' @param .dir_own Character. This chapter's output directory.
+#' @return Invisibly, the build's status.
+oab_build_versions <- function(.dir_own) {
+  if (FALSE) .dir_own <- here::here("2_output", "30-FinalExhibits", "Output")
+  fs::dir_create(fs::path(.dir_own, "Data"))
+  arrow::write_parquet(
+    x    = oab_data_versions(),
+    sink = fs::path(.dir_own, "Data", "PackageVersions.parquet")
+  )
+  invisible("built")
+}
+
+
+# 26. Moved from 50-Numbers: Appendix C, classification (oac_) -------------------------------------------------------------
+# 31: THE CUTS READ THE FULL TABLES. In one output folder a cut and the table it reads cannot share a name, so
+# the full tables are ...Full (ClassLabelledFull, ClassArmsFullCeiling, ...) and each cut reads its ...Full
+# tibble and writes under the plain name the appendix inputs. ClassSweep is read as it is; it has no cut of its own.
+#
+
+#
+# 40-OnlineAppendix-C.R -- Appendix C, the classification approach: the exhibits this chapter builds
+#
+#
+# 40-OnlineAppendix-C.qmd holds the chapter's text; _Commons/_OnlineAppendix.R holds everything the chapters share.
+# Every table of the chapter is written here, in the appendix's own cut: most from the data tibbles 30 writes beside
+# its own tables (the labeled sample, the sweep, the scores by category, the confusion matrix, the amendment flag,
+# the keyword table, the arms and the ceiling), with fewer columns, no fold uncertainty and numbered categories;
+# two from other sources -- the descriptions filers give their contracts, from the release, and the second-label
+# table, from 03B's out-of-fold classification. 30 stays the manuscript's writer; nothing of 30 is changed or rerun.
+#
+# THE CATEGORY NUMBERS follow the order of the paper's categories table, which is the order 30 prints, so an error
+# that stays inside a parent sits next to the diagonal of the confusion matrix. One vector, .oac_categories, holds
+# it; every table reads its numbers from there.
+#
+# THE PREFIX IS oac_: online appendix, chapter C.
+
+
+# -- 26.1 The sample, as 30 reads it ---------------------------------------------------------------------------------------
+
+#' The unique contracts of the descriptive sample, as 30 selects them
+#'
+#' The one reader of the release every build here shares, so all of them count exactly the paper's sample: a
+#' contract is kept where DescSample is 1 and it is the primary copy of its attachment -- 30's Keep. The flags are
+#' compared after the collect, where an integer and a logical flag compare alike; in Arrow they need not.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .cols Character. The columns to keep besides the flags.
+#' @return Tibble: .cols, plus Date and Year, for 2001-2024.
+oac_read_sample <- function(.path_contracts, .cols) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .cols <- c("FormType", "DateFiled")
+  }
+  arrow::open_dataset(sources = .path_contracts) |>
+    dplyr::select(dplyr::all_of(unique(c(.cols, "DateFiled", "PrimaryFiler", "DescSample")))) |>
+    dplyr::collect() |>
+    dplyr::filter(
+      dplyr::coalesce(as.integer(.data$PrimaryFiler), 0L) == 1L,
+      dplyr::coalesce(as.integer(.data$DescSample), 0L) == 1L
+    ) |>
+    dplyr::mutate(
+      Date = as.Date(.data$DateFiled),
+      Year = as.integer(format(.data$Date, "%Y"))
+    ) |>
+    dplyr::filter(dplyr::between(.data$Year, 2001L, 2024L)) |>
+    dplyr::select(-"PrimaryFiler", -"DescSample")
+}
+
+# -- 26.2 What filers call their contracts, per category -------------------------------------------------------------------
+
+#' The most frequent descriptions filers give their contracts, per category
+#'
+#' The filer's own description is the only human-written label an attachment carries, so it shows what a category
+#' holds in the words of the people who file. Free text: filers write what they like, and many write nothing beyond
+#' the exhibit number. Three rules make the descriptions comparable. A leading exhibit number is stripped, so that
+#' "10.1 Credit Agreement" counts with "Credit Agreement". A description that carries no words beyond an exhibit
+#' number or a form name is dropped as uninformative, and the share it accounts for is reported per category.
+#' Descriptions are grouped case- and punctuation-insensitively, and the group is printed in its most frequent
+#' original spelling.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .n Integer. Descriptions per category.
+#' @return Tibble: Class, Kind, Rank, Description, N, Share (of the category's contracts that carry a description),
+#'   plus nClass, nNamed and pNamed per category.
+oac_data_titles <- function(.path_contracts, .n) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .n <- 10L
+  }
+  # A LEADING EXHIBIT NUMBER, in the spellings filers use: EX-10.1, EXHIBIT 10.23, 10.1, (10.1), 10.1 -
+  # It must carry a decimal point, or the word EX or EXHIBIT: a bare number is part of the title -- a year in
+  # "2020 Equity Incentive Plan", a count in "3 Year Supply Agreement" -- and stripping it would corrupt the text.
+  .re_number <- paste0(
+    "(?i)^[\\s(\\[]*(",
+    "ex(hibit)?[\\s.-]*\\d{1,3}([.(][a-z0-9]+\\)?)*",   # EX-10.1, EXHIBIT 10, EX 10.23(a), Ex. 10(a)
+    "|\\d{1,3}([.(][a-z0-9]+\\)?)+",                    # 10.1, 10(a), 10.23a
+    ")[\\s)\\]:.,-]*"
+  )
+  # NOTHING BUT A WORD FOR THE EXHIBIT ITSELF, or a form name: no description at all
+  .re_unnamed <- paste0(
+    "(?i)^(ex|exhibit|exhibits|document|attachment|annex|appendix|material contract[s]?|agreement|contract|",
+    "8-k|10-k|10-q|20-f|s-1|s-4|f-1|f-4)$"
+  )
+  con_ <- oac_read_sample(
+    .path_contracts = .path_contracts,
+    .cols           = c("Class", "DocDesc")
+  ) |>
+    dplyr::filter(!is.na(.data$Class))
+  if (nrow(con_) == 0L) cli::cli_abort("No contract carries a {.field Class}; the release's labels differ.")
+  clean_ <- con_ |>
+    dplyr::mutate(
+      Desc = trimws(dplyr::coalesce(.data$DocDesc, "")),
+      Desc = stringi::stri_replace_first_regex(.data$Desc, .re_number, ""),
+      Desc = trimws(stringi::stri_replace_all_regex(.data$Desc, "\\s+", " ")),
+      # UNINFORMATIVE: nothing left, or nothing but a form name or a word for the exhibit itself
+      Named = nzchar(.data$Desc) & !stringi::stri_detect_regex(.data$Desc, .re_unnamed),
+      Key = toupper(stringi::stri_replace_all_regex(.data$Desc, "[^[:alnum:] ]", " ")),
+      Key = trimws(stringi::stri_replace_all_regex(.data$Key, "\\s+", " "))
+    )
+  per_class_ <- clean_ |>
+    dplyr::summarise(nClass = dplyr::n(), pNamed = mean(.data$Named), .by = "Class")
+  # A READABLE SPELLING. Filers most often write in capitals, and a table of capitals is hard to read and says
+  # nothing the lower-case spelling does not. The most frequent spelling that is not all capitals is printed where
+  # there is one; otherwise the capitals are set in title case, with the short words that belong inside a title
+  # left lower-case.
+  pretty_ <- function(.x) {
+    small_ <- c("a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "with")
+    words_ <- strsplit(tolower(.x), " ", fixed = TRUE)[[1L]]
+    up_    <- paste0(toupper(substring(words_, 1L, 1L)), substring(words_, 2L))
+    out_   <- ifelse(words_ %in% small_ & seq_along(words_) > 1L, words_, up_)
+    paste(out_, collapse = " ")
+  }
+  n_named_ <- clean_ |>
+    dplyr::filter(.data$Named) |>
+    dplyr::summarise(nNamed = dplyr::n(), .by = "Class")
+  top_ <- clean_ |>
+    dplyr::filter(.data$Named) |>
+    dplyr::count(.data$Class, .data$Key, .data$Desc, name = "nSpelling") |>
+    dplyr::arrange(dplyr::desc(.data$nSpelling)) |>
+    dplyr::summarise(
+      Description = {
+        mixed_ <- .data$Desc[.data$Desc != toupper(.data$Desc)]
+        if (length(mixed_) > 0L) mixed_[[1L]] else pretty_(.x = .data$Desc[[1L]])
+      },
+      N           = sum(.data$nSpelling),
+      .by         = c("Class", "Key")
+    ) |>
+    dplyr::arrange(.data$Class, dplyr::desc(.data$N)) |>
+    dplyr::slice_head(n = .n, by = "Class") |>
+    dplyr::mutate(Rank = dplyr::row_number(), .by = "Class") |>
+    dplyr::left_join(per_class_, by = "Class") |>
+    dplyr::left_join(n_named_, by = "Class") |>
+    dplyr::mutate(Share = .data$N / .data$nNamed, Kind = "title") |>
+    dplyr::select("Class", "Kind", "Rank", "Description", "N", "Share", "nClass", "nNamed", "pNamed")
+  dplyr::arrange(top_, .data$Class, .data$Rank)
+}
+
+#' Build the table of filer descriptions by category, one row per category
+#'
+#' The reviewer asked for example titles; a list of ten per category runs to a page and a half, and the same content
+#' fits twelve rows: the category, its most frequent descriptions on one line with their counts, and the share of
+#' its contracts that carry a description at all.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .n Integer. Descriptions per category.
+#' @param .dir_own Character. This document's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oac_build_titles <- function(.path_contracts, .n, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .n        <- 5L
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "CategoryTitles"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  ins_  <- c(.path_contracts, .path_lib)
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  tab_ <- oac_data_titles(
+    .path_contracts = .path_contracts,
+    .n              = .n
+  )
+  num_ <- function(.x) format(.x, big.mark = ",", trim = TRUE, scientific = FALSE)
+  rows_ <- tab_ |>
+    dplyr::arrange(.data$Class, .data$Rank) |>
+    dplyr::summarise(
+      Descriptions = paste0(oa_tex_escape(.x = .data$Description), " (", num_(.x = .data$N), ")", collapse = "; "),
+      pNamed       = dplyr::first(.data$pNamed),
+      .by          = "Class"
+    ) |>
+    dplyr::mutate(Order = oac_number(.name = .data$Class)) |>
+    dplyr::arrange(.data$Order)
+  cells_ <- tibble::tibble(
+    Category     = oac_label(.class = rows_$Class),
+    Descriptions = rows_$Descriptions,
+    Named        = formatC(100 * rows_$pNamed, format = "f", digits = 0L)
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("Category", paste("The", .n, "most frequent descriptions (contracts)"), "\\% described"),
+      .spec   = c(oa_col_text(.share = 0.22), oa_col_text(.share = 0.62), oa_col_num(.mm = 18))
+    ),
+    .note    = paste(
+      "The", .n, "most frequent descriptions filers give their contracts, by category, over the unique contracts of",
+      "the descriptive sample; the category is the classifier's label. A description is the filer's own free text,",
+      "the only human-written label an attachment carries. A leading exhibit number is stripped before counting, and",
+      "a description that says nothing beyond an exhibit or form name is treated as no description; the last column",
+      "is the share of a category's contracts that carry one. Descriptions are grouped without regard to case and",
+      "punctuation and printed in the most frequent spelling that is not in capitals."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# -- 26.3 The chapter's cut of 30's classification tables ------------------------------------------------------------------
+# 30 writes the manuscript's version of each table and, beside it, the data tibble it printed. The appendix prints
+# the same numbers with fewer columns, no fold uncertainty and numbered categories. Each builder reads 30's tibble,
+# writes the appendix's table under this chapter's directory, and keeps the tibble it read as its own data, so the
+# numbers in the text resolve from the same file whichever copy is found first.
+
+# THE CATEGORIES, in the order of the paper's categories table. Class is the label 30's tibbles carry.
+.oac_categories <- tibble::tibble(
+  Short  = c("Credit", "Equity", "Compensation", "Legal", "Assets", "R&D", "Customer / Supplier", "Licenses",
+             "Leases", "Peer Agreements", "M&A", "Other"),
+  Number = 1:12
+)
+
+#' A category's number, from any of the names it goes by
+#'
+#' 30's tibbles carry the short name in Row and a qualified name in Class ("Employment: Compensation"); the release
+#' carries the qualified name, and M&A's qualified name is "Investment and Merger". The number is looked up on the
+#' short name, taken as the part after the parent where there is one, with that alias.
+#'
+#' @param .name Character. Short or qualified category names.
+#' @return Integer, NA where the name is not one of the twelve.
+oac_number <- function(.name) {
+  if (FALSE) .name <- c("Employment: Compensation", "R&D", "Business Structure: Investment and Merger")
+  short_ <- sub("^.*: ", "", as.character(.name))
+  short_[short_ %in% c("Investment and Merger", "Investment & Merger", "Mergers and Acquisitions")] <- "M&A"
+  match(short_, .oac_categories$Short)
+}
+
+#' A category's printed label: its number and its short name, escaped for LaTeX
+#'
+#' @param .class Character. Category names, short or qualified.
+#' @return Character, "(3) Compensation"; NA where the class is not one of the twelve.
+oac_label <- function(.class) {
+  if (FALSE) .class <- c("Employment: Compensation", "R&D")
+  i_ <- oac_number(.name = .class)
+  dplyr::if_else(is.na(i_), NA_character_,
+                 paste0("(", .oac_categories$Number[i_], ") ", oa_tex_escape(.x = .oac_categories$Short[i_])))
+}
+
+#' 30's data tibble for one exhibit, or an abort that names the file
+#'
+#' @param .dir_data Character. 30's Output/Data.
+#' @param .name Character. The exhibit's stem.
+#' @return Tibble.
+oac_read_30 <- function(.dir_data, .name) {
+  if (FALSE) {
+    .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
+    .name     <- "ClassLabelled"
+  }
+  p_ <- fs::path(.dir_data, paste0(.name, ".parquet"))
+  if (!fs::file_exists(p_)) cli::cli_abort("{.file {p_}} is missing: the full tables are built before their cuts.")
+  arrow::read_parquet(p_)
+}
+
+#' The row labels of a category table: numbered leaves, bold parents, bold total
+#'
+#' 30's category tibbles carry Row (the printed name) and Kind (super, sub, total). A sub row is a leaf under its
+#' parent, indented and numbered; a super row whose name is one of the twelve -- Licenses, Leases, Other -- is a leaf
+#' of its own and is numbered in bold; any other super row is a parent, in bold without a number.
+#'
+#' @param .tab Tibble with Row and Kind.
+#' @return Character, one label per row, escaped.
+oac_row_labels <- function(.tab) {
+  if (FALSE) .tab <- tibble::tibble(Row = c("Employment", "Compensation", "Licenses", "Total"),
+                                    Kind = c("super", "sub", "super", "total"))
+  lab_ <- oac_label(.class = .tab$Row)
+  dplyr::case_when(
+    .tab$Kind == "total"              ~ paste0("\\textbf{", oa_tex_escape(.x = .tab$Row), "}"),
+    !is.na(lab_) & .tab$Kind == "sub" ~ paste0("\\hspace{1em}", lab_),
+    !is.na(lab_)                      ~ paste0("\\textbf{", lab_, "}"),
+    .default                          = paste0("\\textbf{", oa_tex_escape(.x = .tab$Row), "}")
+  )
+}
+
+#' Whether a build of one of 30's tables is due
+#'
+#' @param .dir_own,.name,.path_30,.path_lib,.force As in the builders.
+#' @return Logical.
+oac_due <- function(.dir_own, .name, .path_30, .path_lib, .force) {
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(.name, c(".tex", ".tex", ".parquet")))
+  oa_build_needed(.outputs = outs_, .inputs = c(.path_30, .path_lib), .force = .force)
+}
+
+oac_fmt3 <- function(.x) dplyr::if_else(is.na(.x), "--", formatC(.x, format = "f", digits = 3L))
+oac_fmtn <- function(.x) format(.x, big.mark = ",", trim = TRUE, scientific = FALSE)
+
+#' Build the labeled-sample table: N, share and second labels per category
+#'
+#' @param .dir_data Character. 30's Output/Data.
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oac_build_labelled <- function(.dir_data, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "ClassLabelled"
+  p30_  <- fs::path(.dir_data, paste0(name_, "Full.parquet"))
+  if (!oac_due(.dir_own = .dir_own, .name = name_, .path_30 = p30_, .path_lib = .path_lib, .force = .force)) {
+    return(invisible("up to date"))
+  }
+  tab_ <- oac_read_30(.dir_data = .dir_data, .name = paste0(name_, "Full"))
+  # THE AMENDMENT BLOCK -- Original / Amended under an "Amendment label" heading -- is a second table's worth of
+  # rows; the appendix states the two counts in the text and prints the categories alone.
+  cat_ <- tab_ |>
+    dplyr::filter(is.na(.data$Level1) | .data$Level1 != "Amendment")
+  cells_ <- tibble::tibble(
+    Row    = oac_row_labels(.tab = cat_),
+    N      = oac_fmtn(.x = cat_$N),
+    Share  = formatC(cat_$Share, format = "f", digits = 1L),  # 30 stores the share as a percent
+    Second = oac_fmtn(.x = dplyr::coalesce(cat_$Second, 0L))
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("", "N", "\\%", "Second label"),
+      .spec   = c(oa_col_text(.share = 0.52), oa_col_num(.mm = 18), oa_col_num(.mm = 14), oa_col_num(.mm = 24))
+    ),
+    .note    = paste(
+      "The labeled sample: contracts with readable text and a label, by category. Parent rows sum their",
+      "sub-categories. Second label counts the contracts that carry a second valid category, recorded beside the",
+      "primary and never used in training. The numbers in parentheses are the categories' numbers throughout this",
+      "appendix, in the order of the paper's categories table."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+#' Build the deployed-models table from the sweep: what was crowned and what was deployed, per task
+#'
+#' The sweep itself is stated in the text -- the grid, how many configurations, how the winner was chosen. The table
+#' shows only the configurations that left the sweep: the one that ships per task and the ones deployed beside it.
+#'
+#' @inheritParams oac_build_labelled
+#' @return Invisibly, the build's status.
+oac_build_deployed <- function(.dir_data, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "ClassDeployed"
+  p30_  <- fs::path(.dir_data, "ClassSweep.parquet")
+  if (!oac_due(.dir_own = .dir_own, .name = name_, .path_30 = p30_, .path_lib = .path_lib, .force = .force)) {
+    return(invisible("up to date"))
+  }
+  tab_ <- oac_read_30(.dir_data = .dir_data, .name = "ClassSweep") |>
+    dplyr::mutate(Crown = dplyr::coalesce(as.logical(.data$Crown), FALSE),
+                  Deployed = dplyr::coalesce(as.logical(.data$Deployed), FALSE)) |>
+    dplyr::filter(.data$Crown | .data$Deployed) |>
+    dplyr::mutate(
+      TaskOrder = match(.data$LabelCol, c("ClassDetailed", "ClassBroad", "AmendType")),
+      Status    = dplyr::if_else(.data$Crown, "ships", "deployed")
+    ) |>
+    dplyr::arrange(.data$TaskOrder, dplyr::desc(.data$Crown), .data$MaxLen)
+  cells_ <- tibble::tibble(
+    Task     = oa_tex_escape(.x = as.character(tab_$Task)),
+    Model    = oa_tex_escape(.x = sub("^.*/", "", as.character(tab_$Model))),
+    Context  = as.character(tab_$MaxLen),
+    Accuracy = oac_fmt3(.x = tab_$Accuracy),
+    MacroF1  = oac_fmt3(.x = tab_$MacroF1),
+    Status   = tab_$Status
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("Task", "Encoder", "Context", "Accuracy", "Macro-F1", ""),
+      .spec   = c(oa_col_text(.share = 0.20), oa_col_text(.share = 0.30), oa_col_num(.mm = 16), oa_col_num(.mm = 20),
+                  oa_col_num(.mm = 20), "l")
+    ),
+    .note    = paste(
+      "The configurations that left the sweep: per task, the one crowned by the highest mean out-of-fold macro-F1,",
+      "which labels the corpus (ships), and the ones refitted beside it (deployed). Context is the number of tokens",
+      "read from the start of a contract. Accuracy and macro-F1 are pooled out of fold over the five folds."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+#' Build a scores-by-category table in the appendix's cut, from one of 30's engine tibbles
+#'
+#' Serves the transformer and the keyword table, which share 30's layout. No fold uncertainty; the columns the
+#' text reads: support, and per category precision, recall and F1, with lenient recall for the transformer and
+#' coverage for the keyword table.
+#'
+#' @param .name Character. "ClassTransformer" or "ClassKeyword".
+#' @param .columns Character. The score columns to print, from 30's tibble.
+#' @param .header Character. Their printed headers.
+#' @param .note Character. The table's note.
+#' @inheritParams oac_build_labelled
+#' @return Invisibly, the build's status.
+oac_build_scores <- function(.name, .columns, .header, .note, .dir_data, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .name     <- "ClassTransformer"
+    .columns  <- c("Precision", "Recall", "F1", "RecallLenient")
+    .header   <- c("Precision", "Recall", "F1", "Lenient recall")
+    .note     <- "..."
+    .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  p30_ <- fs::path(.dir_data, paste0(.name, "Full.parquet"))
+  if (!oac_due(.dir_own = .dir_own, .name = .name, .path_30 = p30_, .path_lib = .path_lib, .force = .force)) {
+    return(invisible("up to date"))
+  }
+  tab_ <- oac_read_30(.dir_data = .dir_data, .name = paste0(.name, "Full"))
+  miss_ <- setdiff(.columns, names(tab_))
+  if (length(miss_) > 0L) cli::cli_abort("30's {.val {(.name)}} lacks {.field {miss_}}.")
+  cells_ <- dplyr::bind_cols(
+    tibble::tibble(Row = oac_row_labels(.tab = tab_), N = oac_fmtn(.x = tab_$Support)),
+    tab_ |>
+      dplyr::select(dplyr::all_of(.columns)) |>
+      dplyr::mutate(dplyr::across(dplyr::everything(), \(.x) oac_fmt3(.x = .x)))
+  )
+  oa_write_exhibit(
+    .name    = .name,
+    .lines   = fin_tex_frame(
+      .name   = .name,
+      .tab    = cells_,
+      .header = c("", "N", .header),
+      .spec   = c(oa_col_text(.share = 0.34), oa_col_num(.mm = 16), rep(oa_col_num(.mm = 18), length(.columns)))
+    ),
+    .note    = .note,
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+#' Build the confusion matrix with numbered categories on both axes
+#'
+#' @inheritParams oac_build_labelled
+#' @return Invisibly, the build's status.
+oac_build_confusion <- function(.dir_data, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "ClassConfusion"
+  p30_  <- fs::path(.dir_data, paste0(name_, "Full.parquet"))
+  if (!oac_due(.dir_own = .dir_own, .name = name_, .path_30 = p30_, .path_lib = .path_lib, .force = .force)) {
+    return(invisible("up to date"))
+  }
+  tab_ <- oac_read_30(.dir_data = .dir_data, .name = paste0(name_, "Full"))
+  cols_ <- .oac_categories$Short
+  miss_ <- setdiff(cols_, names(tab_))
+  if (length(miss_) > 0L) cli::cli_abort("30's confusion matrix lacks the column{?s} {.val {miss_}}.")
+  tab_ <- tab_[match(cols_, tab_$True), , drop = FALSE]
+  # A CONTRACT COUNTS ONCE, in the row of its true category and the column of its prediction, so the matrix is not
+  # symmetric: (1, 2) counts credit contracts predicted as equity, (2, 1) equity contracts predicted as credit. Rows
+  # sum to a category's contracts, columns to how often the model chose it. The diagonal -- the contracts classified
+  # correctly -- is bold; any other zero is a blank, so the errors stand out, as in the second-label table.
+  k_   <- length(cols_)
+  m_   <- as.matrix(tab_[, cols_])
+  v_   <- as.vector(m_)
+  chr_ <- matrix(dplyr::if_else(v_ == 0, "", oac_fmtn(.x = v_)), nrow = k_)
+  diag(chr_) <- paste0("\\textbf{", oac_fmtn(.x = diag(m_)), "}")
+  cells_ <- dplyr::bind_cols(
+    tibble::tibble(True = oac_label(.class = tab_$True)),
+    tibble::as_tibble(chr_, .name_repair = \(.x) cols_)
+  )
+  lines_ <- fin_tex_frame(
+    .name   = name_,
+    .tab    = cells_,
+    .header = c("True category", paste0("(", .oac_categories$Number, ")")),
+    .spec   = c(oa_col_text(.share = 0.22), rep(oa_col_num(.mm = 9), k_))
+  )
+  # THE PREDICTION NAMES THE COLUMNS, in a spanning row above their numbers.
+  lines_ <- append(
+    x      = lines_,
+    values = c(
+      paste0(" & \\multicolumn{", k_, "}{c}{Predicted category} \\\\"),
+      paste0("\\cmidrule(lr){2-", k_ + 1L, "}")
+    ),
+    after  = which(lines_ == "\\hline\\hline")[1L]
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = lines_,
+    .note    = paste(
+      "Confusion matrix of the transformer that ships on the labeled sample, out of fold: rows are the true category,",
+      "columns the predicted one, numbered as in the labeled-sample table; cells are numbers of contracts, blank where",
+      "zero, and the diagonal, in bold, counts the contracts classified correctly. Each contract counts once, in the",
+      "row of its true category and the column of its prediction, so the table is not symmetric: a row sums to the",
+      "category's contracts, a column to how often the model predicted the category. Categories are in taxonomic",
+      "order, so an error that stays inside a parent sits next to the diagonal and one that crosses a parent sits",
+      "further from it."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+#' Build the amendment table: the two labels and the total, without fold uncertainty
+#'
+#' @inheritParams oac_build_labelled
+#' @return Invisibly, the build's status.
+oac_build_amendment <- function(.dir_data, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "ClassAmendment"
+  p30_  <- fs::path(.dir_data, paste0(name_, "Full.parquet"))
+  if (!oac_due(.dir_own = .dir_own, .name = name_, .path_30 = p30_, .path_lib = .path_lib, .force = .force)) {
+    return(invisible("up to date"))
+  }
+  tab_ <- oac_read_30(.dir_data = .dir_data, .name = paste0(name_, "Full"))
+  tot_ <- tab_$Label == "Total"
+  acc_ <- oac_fmt3(.x = tab_$Accuracy[tot_][1L])
+  cells_ <- tibble::tibble(
+    Label     = dplyr::if_else(tot_, paste0("\\textbf{", oa_tex_escape(.x = tab_$Label), "}"),
+                               oa_tex_escape(.x = tab_$Label)),
+    N         = oac_fmtn(.x = tab_$Support),
+    Predicted = oac_fmtn(.x = tab_$Predicted),
+    Precision = oac_fmt3(.x = tab_$Precision),
+    Recall    = oac_fmt3(.x = tab_$Recall),
+    F1        = oac_fmt3(.x = tab_$F1)
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("", "N", "Predicted", "Precision", "Recall", "F1"),
+      .spec   = c(oa_col_text(.share = 0.30), rep(oa_col_num(.mm = 18), 5L))
+    ),
+    .note    = paste(
+      "Out-of-fold scores of the amendment classifier that ships on the labeled sample. N is the number of",
+      "contracts with the label, Predicted the number the classifier assigned it. The Total row reports macro",
+      paste0("precision, recall and F1 over the two labels; overall accuracy is ", acc_, ".")
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+#' Build the arms table: every engine on every task, and the ceiling, without fold uncertainty
+#'
+#' @inheritParams oac_build_labelled
+#' @return Invisibly, the build's status.
+oac_build_arms <- function(.dir_data, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_data <- here::here("2_output", "30-FinalExhibits", "Output", "Data")
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "ClassArms"
+  p30_  <- fs::path(.dir_data, c("ClassArmsFull.parquet", "ClassArmsFullCeiling.parquet"))
+  if (!oac_due(.dir_own = .dir_own, .name = name_, .path_30 = p30_, .path_lib = .path_lib, .force = .force)) {
+    return(invisible("up to date"))
+  }
+  arms_ <- oac_read_30(.dir_data = .dir_data, .name = "ClassArmsFull")
+  ceil_ <- oac_read_30(.dir_data = .dir_data, .name = "ClassArmsFullCeiling")
+  task_ <- c(ClassDetailed = "Detailed (12)", ClassBroad = "Broad (7)", AmendType = "Amendment (2)")
+  eng_  <- c(Bert256 = "Transformer, 256 tokens", Bert512 = "Transformer, 512 tokens", Kw = "Keyword table",
+             Llm = "Language model")
+  arms_ <- arms_ |>
+    dplyr::mutate(TaskOrder = match(.data$Task, names(task_)), EngOrder = match(.data$Engine, names(eng_))) |>
+    dplyr::arrange(.data$TaskOrder, .data$EngOrder)
+  a_ <- tibble::tibble(
+    Panel    = unname(dplyr::coalesce(task_[arms_$Task], arms_$Task)),
+    Engine   = paste0(oa_tex_escape(.x = unname(dplyr::coalesce(eng_[arms_$Engine], arms_$Engine))),
+                      dplyr::if_else(dplyr::coalesce(as.logical(arms_$Ships), FALSE), " (ships)", "")),
+    Coverage = oac_fmt3(.x = arms_$Coverage),
+    Accuracy = oac_fmt3(.x = arms_$Accuracy),
+    AccSel   = oac_fmt3(.x = arms_$AccuracySel),
+    MacroF1  = oac_fmt3(.x = arms_$MacroF1)
+  )
+  c_ <- tibble::tibble(
+    Panel    = "Detailed, ceiling of perfect routing",
+    Engine   = oa_tex_escape(.x = as.character(ceil_$Engines)),
+    Coverage = "",
+    Accuracy = oac_fmt3(.x = ceil_$Accuracy),
+    AccSel   = "",
+    MacroF1  = paste0("+", oac_fmt3(.x = ceil_$Marginal))
+  )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = dplyr::bind_rows(a_, c_),
+      .header = c("", "Coverage", "Accuracy", "Accuracy where committed", "Macro-F1"),
+      .spec   = c(oa_col_text(.share = 0.36), oa_col_num(.mm = 18), oa_col_num(.mm = 18), oa_col_num(.mm = 30),
+                  oa_col_num(.mm = 18))
+    ),
+    .note    = paste(
+      "Every engine on every task, out of fold on the same five folds. Coverage is the share of contracts an engine",
+      "labels; the transformer and the language model label every contract, the keyword table abstains where no",
+      "term fires. Accuracy is over all contracts, an abstention counting as wrong; accuracy where committed is over",
+      "the contracts the engine labeled. The last rows are the ceiling: the accuracy perfect routing would reach on",
+      "the detailed task, taking for every contract whichever of the engines named is right, which needs the true",
+      "label and cannot be run; the last column is what each added engine gains over the ones before it."
+    ),
+    .data    = dplyr::bind_rows(dplyr::mutate(arms_, Block = "arms"), dplyr::mutate(ceil_, Block = "ceiling")),
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# -- 26.3 The second label against the runner-up ---------------------------------------------------------------------------
+
+#' The second-label data: every dual-labeled document with the model's two choices beside its two labels
+#'
+#' 03A records a second valid category for the minority of labeled documents that fit two, reviewed by hand so that
+#' the primary is the intended one; training never uses it. 03B's classification file carries, for every labeled
+#' document, the model's first and second choice with their probabilities, out of fold, and the second label beside
+#' them. Two tables are built from it: the matrix of primary against second label, which shows where the annotators
+#' saw two answers, and, per primary category, how often the model's first choice is the primary and its runner-up
+#' the second label. The margin between the model's two choices, on documents with two labels and with one, is kept
+#' in the data for the text.
+#'
+#' @param .path_class Character. 03B's crowned_classification.parquet for the detailed task.
+#' @return Tibble: DocID, Primary, Second, Top1, Top2, Top1Prob, Margin, Dual.
+oac_data_second <- function(.path_class) {
+  if (FALSE) {
+    .path_class <- here::here("2_output", "03B-ClassifyTrainBERT", "classification", "crowned_classification.parquet")
+  }
+  tab_ <- arrow::read_parquet(.path_class) |>
+    dplyr::select(dplyr::any_of(c("DocID", "TrueLabel", "Top1Class", "Top1Prob", "Top2Class", "Margin",
+                                  "ClassDetailed2")))
+  need_ <- setdiff(c("TrueLabel", "Top1Class", "Top2Class", "Top1Prob", "Margin", "ClassDetailed2"), names(tab_))
+  if (length(need_) > 0L) cli::cli_abort("The classification file lacks {.field {need_}}.")
+  tab_ |>
+    dplyr::transmute(
+      DocID    = .data$DocID,
+      Primary  = as.character(.data$TrueLabel),
+      Second   = as.character(.data$ClassDetailed2),
+      Top1     = as.character(.data$Top1Class),
+      Top2     = as.character(.data$Top2Class),
+      Top1Prob = .data$Top1Prob,
+      Margin   = .data$Margin,
+      Dual     = !is.na(.data$Second) & nzchar(.data$Second)
+    )
+}
+
+#' The per-category hits and the margins, from the second-label data
+#'
+#' @param .tab Tibble from oac_data_second().
+#' @return Tibble: Row (a category or Total), Kind, N (documents with two labels), Hit1, Hit2, Both, plus the
+#'   two margin rows (Kind "margin": N is the group's size, Value its mean margin).
+oac_second_summary <- function(.tab) {
+  if (FALSE) .tab <- oac_data_second(.path_class = here::here("2_output", "03B-ClassifyTrainBERT", "classification",
+                                                                 "crowned_classification.parquet"))
+  dual_ <- dplyr::filter(.tab, .data$Dual) |>
+    dplyr::mutate(
+      Hit1 = .data$Top1 == .data$Primary,
+      Hit2 = .data$Top2 == .data$Second,
+      Both = .data$Hit1 & .data$Hit2,
+      Order = oac_number(.name = .data$Primary)
+    )
+  by_ <- dual_ |>
+    dplyr::summarise(N = dplyr::n(), Hit1 = sum(.data$Hit1), Hit2 = sum(.data$Hit2), Both = sum(.data$Both),
+                     .by = c("Primary", "Order")) |>
+    dplyr::arrange(.data$Order) |>
+    dplyr::transmute(Row = .data$Primary, Kind = "category", N = .data$N, Hit1 = .data$Hit1, Hit2 = .data$Hit2,
+                     Both = .data$Both, Value = NA_real_)
+  tot_ <- tibble::tibble(Row = "Total", Kind = "total", N = nrow(dual_), Hit1 = sum(dual_$Hit1),
+                         Hit2 = sum(dual_$Hit2), Both = sum(dual_$Both), Value = NA_real_)
+  mar_ <- .tab |>
+    dplyr::summarise(N = dplyr::n(), Value = mean(.data$Margin, na.rm = TRUE), .by = "Dual") |>
+    dplyr::transmute(Row = dplyr::if_else(.data$Dual, "Margin, two labels", "Margin, one label"), Kind = "margin",
+                     N = .data$N, Hit1 = NA_integer_, Hit2 = NA_integer_, Both = NA_integer_, Value = .data$Value)
+  dplyr::bind_rows(by_, tot_, mar_)
+}
+
+#' Build the two second-label tables: the matrix of label pairs, and the model's hits per category
+#'
+#' @param .path_class Character. 03B's crowned_classification.parquet.
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oac_build_second <- function(.path_class, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_class <- here::here("2_output", "03B-ClassifyTrainBERT", "classification", "crowned_classification.parquet")
+    .dir_own    <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force      <- FALSE
+    .path_lib   <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  names_ <- c("ClassSecondPairs", "ClassSecond")
+  outs_  <- unlist(purrr::map(names_, \(.n) fs::path(.dir_own, c("Tables", "Notes", "Data"),
+                                                       paste0(.n, c(".tex", ".tex", ".parquet")))))
+  if (!fs::file_exists(.path_class)) return(invisible("waiting for 03B's crowned_classification.parquet"))
+  if (!oa_build_needed(.outputs = outs_, .inputs = c(.path_class, .path_lib), .force = .force)) {
+    return(invisible("up to date"))
+  }
+  tab_  <- oac_data_second(.path_class = .path_class)
+  dual_ <- dplyr::filter(tab_, .data$Dual)
+  # THE MATRIX: primary label down, second label across, both numbered; a zero prints as a blank so the pairs stand out
+  k_ <- nrow(.oac_categories)
+  m_ <- matrix(0L, nrow = k_, ncol = k_)
+  i_ <- oac_number(.name = dual_$Primary)
+  j_ <- oac_number(.name = dual_$Second)
+  if (anyNA(i_) || anyNA(j_)) cli::cli_abort("A second-label category is not one of the twelve.")
+  for (r_ in seq_along(i_)) m_[i_[r_], j_[r_]] <- m_[i_[r_], j_[r_]] + 1L
+  pairs_ <- tibble::as_tibble(m_, .name_repair = \(.x) .oac_categories$Short) |>
+    dplyr::mutate(Primary = .oac_categories$Short, .before = 1L)
+  # A CONTRACT COUNTS ONCE, in the row of its primary label and the column of its second, so the matrix is not
+  # symmetric: (2, 1) counts equity contracts whose second label is credit, (1, 2) credit contracts whose second
+  # label is equity. The diagonal is empty by construction -- a second label differs from the primary -- and
+  # prints as a dash; any other zero is a blank, so the pairs stand out.
+  v_   <- as.vector(m_)
+  chr_ <- matrix(dplyr::if_else(v_ == 0L, "", oac_fmtn(.x = v_)), nrow = k_)
+  diag(chr_) <- "--"
+  cells_p_ <- dplyr::bind_cols(
+    tibble::tibble(Primary = oac_label(.class = pairs_$Primary)),
+    tibble::as_tibble(chr_, .name_repair = \(.x) .oac_categories$Short)
+  )
+  lines_p_ <- fin_tex_frame(
+    .name   = names_[1L],
+    .tab    = cells_p_,
+    .header = c("Primary label", paste0("(", .oac_categories$Number, ")")),
+    .spec   = c(oa_col_text(.share = 0.22), rep(oa_col_num(.mm = 9), k_))
+  )
+  # THE SECOND LABEL NAMES THE COLUMNS, in a spanning row above their numbers.
+  lines_p_ <- append(
+    x      = lines_p_,
+    values = c(
+      paste0(" & \\multicolumn{", k_, "}{c}{Second label} \\\\"),
+      paste0("\\cmidrule(lr){2-", k_ + 1L, "}")
+    ),
+    after  = which(lines_p_ == "\\hline\\hline")[1L]
+  )
+  oa_write_exhibit(
+    .name    = names_[1L],
+    .lines   = lines_p_,
+    .note    = paste(
+      "The", oac_fmtn(.x = nrow(dual_)), "labeled contracts that carry a second valid category: rows are the",
+      "primary label, columns the second, numbered as in the labeled-sample table; cells are numbers of contracts,",
+      "blank where zero. Each contract counts once, in the row of its primary label and the column of its second, so",
+      "the table is not symmetric: (2, 1) counts equity contracts whose second label is credit, (1, 2) credit",
+      "contracts whose second label is equity, and a row sums to the second-label count of its category in the",
+      "labeled-sample table. Every such contract was reviewed and the intended primary recorded, so the direction is",
+      "informative. The diagonal is empty by construction, since a second label differs from the primary."
+    ),
+    .data    = pairs_,
+    .dir_own = .dir_own
+  )
+  # THE HITS: per primary category, the model's first choice against the primary and its runner-up against the second
+  sum_ <- oac_second_summary(.tab = tab_)
+  rows_ <- dplyr::filter(sum_, .data$Kind %in% c("category", "total"))
+  pct_ <- function(.n, .d) paste0(oac_fmtn(.x = .n), " (", formatC(100 * .n / .d, format = "f", digits = 0L), ")")
+  cells_h_ <- tibble::tibble(
+    Row  = dplyr::if_else(rows_$Kind == "total", paste0("\\textbf{", rows_$Row, "}"),
+                          dplyr::coalesce(oac_label(.class = rows_$Row), oa_tex_escape(.x = rows_$Row))),
+    N    = oac_fmtn(.x = rows_$N),
+    Hit1 = pct_(.n = rows_$Hit1, .d = rows_$N),
+    Hit2 = pct_(.n = rows_$Hit2, .d = rows_$N),
+    Both = pct_(.n = rows_$Both, .d = rows_$N)
+  )
+  oa_write_exhibit(
+    .name    = names_[2L],
+    .lines   = fin_tex_frame(
+      .name   = names_[2L],
+      .tab    = cells_h_,
+      .header = c("Primary label", "Two labels", "First choice is the primary (\\%)",
+                  "Runner-up is the second label (\\%)", "Both (\\%)"),
+      .spec   = c(oa_col_text(.share = 0.26), oa_col_num(.mm = 18), oa_col_num(.mm = 30), oa_col_num(.mm = 32),
+                  oa_col_num(.mm = 20))
+    ),
+    .note    = paste(
+      "The contracts with two labels, by primary label, against the detailed transformer's first and second choice",
+      "out of fold: how many the model's first choice labels with the primary, how many its runner-up labels with",
+      "the second label, and how many both. Shares are of the row's contracts."
+    ),
+    .data    = sum_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# 27. Moved from 50-Numbers: Appendix D, entity extraction (oad_) ----------------------------------------------------------
+
+#
+# 40-OnlineAppendix-D.R -- Appendix D, entity extraction and the rules: the exhibits this chapter builds
+#
+#
+# 40-OnlineAppendix-D.qmd holds the chapter's text; _Commons/_OnlineAppendix.R holds everything the chapters share.
+# This library builds the chapter's own exhibits: what each extractor found on the labeled sample, counted from the
+# three span stores 04A wrote; where in a contract each extractor's candidates fall, and how far the extractors agree,
+# computed from the same stores with 04A's definitions; where each contract's end date comes from, and what the content
+# variables are worth under the naive and the rule-based reading, both from the release. The naive-against-rule
+# coverage by category is 30's.
+#
+# THE PREFIX IS oad_: online appendix, chapter D.
+
+
+# -- 27.1 The sample, as 30 reads it ---------------------------------------------------------------------------------------
+
+#' The unique contracts of the descriptive sample, as 30 selects them
+#'
+#' The one reader of the release every build here shares, so all of them count exactly the paper's sample: a
+#' contract is kept where DescSample is 1 and it is the primary copy of its attachment -- 30's Keep. The flags are
+#' compared after the collect, where an integer and a logical flag compare alike; in Arrow they need not.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .cols Character. The columns to keep besides the flags.
+#' @return Tibble: .cols, plus Date and Year, for 2001-2024.
+oad_read_sample <- function(.path_contracts, .cols) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .cols <- c("FormType", "DateFiled")
+  }
+  arrow::open_dataset(sources = .path_contracts) |>
+    dplyr::select(dplyr::all_of(unique(c(.cols, "DateFiled", "PrimaryFiler", "DescSample")))) |>
+    dplyr::collect() |>
+    dplyr::filter(
+      dplyr::coalesce(as.integer(.data$PrimaryFiler), 0L) == 1L,
+      dplyr::coalesce(as.integer(.data$DescSample), 0L) == 1L
+    ) |>
+    dplyr::mutate(
+      Date = as.Date(.data$DateFiled),
+      Year = as.integer(format(.data$Date, "%Y"))
+    ) |>
+    dplyr::filter(dplyr::between(.data$Year, 2001L, 2024L)) |>
+    dplyr::select(-"PrimaryFiler", -"DescSample")
+}
+
+# -- 27.2 What each extractor found on the labeled sample -----------------------------------------------------------------
+
+#' Spans and coverage per family, model and entity, from 04A's stores
+#'
+#' 04A writes one DuckDB file per family under its Output/Store, holding one table per entity, every row a span with
+#' its document and its offsets; spaCy's tables also carry the model. The stores are opened read-only and counted:
+#' spans, and the documents in which the family found at least one, over the documents of the sample. Coverage is
+#' not a quality measure -- an extractor that tags every capitalized word reaches complete coverage -- and the text
+#' says so; what it establishes is what each extractor attempts and how much it proposes.
+#'
+#' @param .dir_store Character. 04A's Output, holding matcon.duckdb, spacy.duckdb and lexnlp.duckdb.
+#' @param .path_sample Character. 04A's sample_text.parquet, the documents every store indexes.
+#' @return Tibble: Family, Model, Entity, Spans, Docs, Coverage, over nDocs documents (as an attribute-free column).
+oad_data_coverage <- function(.dir_store, .path_sample) {
+  if (FALSE) {
+    .dir_store   <- here::here("2_output", "04A-EntityExtract", "Output")
+    .path_sample <- here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet")
+  }
+  n_docs_ <- nrow(arrow::read_parquet(.path_sample, col_select = "DocID"))
+  meta_   <- c("ledger", "manifest", "bench", "failures", "corpus_index", "sample")
+  read_family_ <- function(.family) {
+    p_ <- fs::path(.dir_store, paste0(.family, ".duckdb"))
+    if (!fs::file_exists(p_)) cli::cli_abort("04A's store {.file {p_}} does not exist.")
+    con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = as.character(p_), read_only = TRUE)
+    on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+    tabs_ <- setdiff(DBI::dbListTables(con_), meta_)
+    purrr::map_dfr(tabs_, \(.t) {
+      cols_ <- DBI::dbListFields(con_, .t)
+      if (!"DocID" %in% cols_) return(NULL)
+      by_model_ <- "Model" %in% cols_
+      sql_ <- if (by_model_) {
+        sprintf("SELECT Model, COUNT(*) AS Spans, COUNT(DISTINCT DocID) AS Docs FROM \"%s\" GROUP BY Model", .t)
+      } else {
+        sprintf("SELECT '%s' AS Model, COUNT(*) AS Spans, COUNT(DISTINCT DocID) AS Docs FROM \"%s\"", .family, .t)
+      }
+      DBI::dbGetQuery(con_, sql_) |>
+        tibble::as_tibble() |>
+        dplyr::mutate(Family = .family, Entity = toupper(.t), .before = 1L)
+    })
+  }
+  purrr::map_dfr(c("lexnlp", "spacy", "matcon"), read_family_) |>
+    dplyr::mutate(
+      Spans    = as.integer(.data$Spans),
+      Docs     = as.integer(.data$Docs),
+      Coverage = .data$Docs / n_docs_,
+      nDocs    = n_docs_
+    ) |>
+    dplyr::arrange(.data$Family, .data$Model, .data$Entity)
+}
+
+#' Build the extractor-coverage table
+#'
+#' Rows are the entities the chapter discusses, in the order it discusses them; columns are the three families, spaCy
+#' represented by the transformer model 04A ran. A dash marks an entity a family does not attempt.
+#'
+#' @param .dir_store Character. 04A's Output.
+#' @param .path_sample Character. 04A's sample_text.parquet.
+#' @param .spacy_model Character. The spaCy model to print, "en_core_web_trf".
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oad_build_coverage <- function(.dir_store, .path_sample, .spacy_model, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_store   <- here::here("2_output", "04A-EntityExtract", "Output")
+    .path_sample <- here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet")
+    .spacy_model <- "en_core_web_trf"
+    .dir_own     <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force       <- FALSE
+    .path_lib    <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "EntityCoverage"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  ins_  <- c(fs::path(.dir_store, paste0(c("lexnlp", "spacy", "matcon"), ".duckdb")), .path_lib)
+  if (!all(fs::file_exists(ins_[1:3]))) return(invisible("waiting for 04A's stores"))
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  tab_ <- oad_data_coverage(
+    .dir_store   = .dir_store,
+    .path_sample = .path_sample
+  )
+  ent_ <- tibble::tribble(
+    ~Entity,  ~Label,
+    "ORG",    "Organizations",
+    "PERSON", "Persons",
+    "GPE",    "Places",
+    "DATE",   "Dates",
+    "TERM",   "Stated periods",
+    "REDACT", "Redaction markers",
+    "LAW",    "Governing-law clauses"
+  )
+  fam_ <- c("lexnlp", "spacy", "matcon")
+  pick_ <- tab_ |>
+    dplyr::filter(.data$Family != "spacy" | .data$Model == .spacy_model) |>
+    dplyr::summarise(Spans = sum(.data$Spans), Docs = max(.data$Docs), Coverage = max(.data$Coverage),
+                     .by = c("Family", "Entity"))
+  cell_ <- function(.f, .e) {
+    r_ <- pick_[pick_$Family == .f & pick_$Entity == .e, , drop = FALSE]
+    if (nrow(r_) == 0L) return(c("--", "--"))
+    c(format(r_$Spans, big.mark = ",", trim = TRUE), formatC(100 * r_$Coverage, format = "f", digits = 0L))
+  }
+  cells_ <- purrr::map_dfr(seq_len(nrow(ent_)), \(.i) {
+    v_ <- unlist(purrr::map(fam_, \(.f) cell_(.f = .f, .e = ent_$Entity[.i])))
+    tibble::tibble(Entity = ent_$Label[.i], L1 = v_[1], L2 = v_[2], S1 = v_[3], S2 = v_[4], M1 = v_[5], M2 = v_[6])
+  })
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("", "LexNLP", "\\%", "spaCy", "\\%", "Patterns", "\\%"),
+      .spec   = c(oa_col_text(.share = 0.28), rep(oa_col_num(.mm = 17), 6L))
+    ),
+    .note    = paste(
+      "What each extractor proposed on the", format(tab_$nDocs[1], big.mark = ","), "contracts of the labeled",
+      "sample: LexNLP, spaCy (its transformer model) and the pattern and gazetteer extractors written for the",
+      "database (Patterns). Under each, the number of text spans proposed and the share of contracts",
+      "in which the extractor found at least one. A dash marks an entity the extractor does not attempt. Coverage is",
+      "not a quality measure: an extractor that tags every capitalized word reaches complete coverage."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# -- 27.3 Where each contract's end date comes from ------------------------------------------------------------------------
+
+#' Where each contract's end date comes from, and what the two durations look like
+#'
+#' The cascade answers from the first of four sources present, so the rungs partition the sample: a stated term, an
+#' open-ended clause, which establishes that there is no end date, a future date beside a termination cue, and the
+#' farthest future date. The naive measure uses the last of these alone. Both durations run from the same start, so
+#' they differ only in the end they take, and the quartiles below are over the contracts each measure is defined on.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @return Tibble: Rung, Label, N, Share, plus the quartiles of the rule-based and the naive duration.
+oad_data_duration <- function(.path_contracts) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+  }
+  con_ <- oad_read_sample(
+    .path_contracts = .path_contracts,
+    .cols           = c("DurationSource", "DurationDropped", "DurationYears", "NaiveYears")
+  )
+  rungs_ <- tibble::tribble(
+    ~Rung,     ~Label,
+    "term",    "A stated term",
+    "open",    "An open-ended clause",
+    "cue",     "A future date beside a termination cue",
+    "maxdate", "The farthest future date",
+    "none",    "No end established"
+  )
+  q_ <- function(.x, .p) {
+    x_ <- .x[!is.na(.x)]
+    if (length(x_) == 0L) return(NA_real_)
+    unname(stats::quantile(x_, probs = .p, type = 7L))
+  }
+  n_all_ <- nrow(con_)
+  by_rung_ <- con_ |>
+    dplyr::mutate(Rung = dplyr::coalesce(.data$DurationSource, "none")) |>
+    dplyr::summarise(
+      N       = dplyr::n(),
+      Defined = sum(!is.na(.data$DurationYears)),
+      Q1      = q_(.x = .data$DurationYears, .p = 0.25),
+      Med     = q_(.x = .data$DurationYears, .p = 0.50),
+      Q3      = q_(.x = .data$DurationYears, .p = 0.75),
+      .by     = "Rung"
+    )
+  out_ <- rungs_ |>
+    dplyr::left_join(by_rung_, by = "Rung") |>
+    dplyr::mutate(dplyr::across(c("N", "Defined"), \(.x) dplyr::coalesce(.x, 0L))) |>
+    dplyr::mutate(Kind = "rung")
+  # THE TWO MEASURES, each over the contracts it is defined on, so the comparison is of what each one yields
+  totals_ <- tibble::tibble(
+    Rung    = c("all-rule", "all-naive"),
+    Label   = c("Rule-based duration", "Naive duration"),
+    N       = c(n_all_, n_all_),
+    Defined = c(sum(!is.na(con_$DurationYears)), sum(!is.na(con_$NaiveYears))),
+    Q1      = c(q_(.x = con_$DurationYears, .p = 0.25), q_(.x = con_$NaiveYears, .p = 0.25)),
+    Med     = c(q_(.x = con_$DurationYears, .p = 0.50), q_(.x = con_$NaiveYears, .p = 0.50)),
+    Q3      = c(q_(.x = con_$DurationYears, .p = 0.75), q_(.x = con_$NaiveYears, .p = 0.75)),
+    Kind    = "measure"
+  )
+  # A COMPLETE ACCOUNT OF WHAT IS MISSING. The panel is built over the contracts that have no duration, so its rows
+  # sum to exactly that number; a contract whose reason the release does not record is a row of its own rather than
+  # a silent remainder.
+  # THE REASON COMES FROM THE RUNG, not from the release's DurationDropped column, which records "no end" for only
+  # part of the contracts without a source and left 54,683 as "No reason recorded" (found 23 Sep 2026). A contract
+  # without a duration either reached no source, reached an open-ended clause, or was dropped by a filter; that is
+  # the whole account, and it reconciles with the first panel row by row.
+  dropped_ <- con_ |>
+    dplyr::filter(is.na(.data$DurationYears)) |>
+    dplyr::mutate(Reason = dplyr::case_when(
+      .data$DurationDropped %in% c("capped", "negative") ~ .data$DurationDropped,
+      dplyr::coalesce(.data$DurationSource, "none") == "open" ~ "open",
+      .default = "no end"
+    )) |>
+    dplyr::count(.data$Reason, name = "N") |>
+    dplyr::transmute(
+      Rung    = paste0("dropped-", .data$Reason),
+      Label   = dplyr::case_match(
+        .data$Reason,
+        "capped"     ~ "Longer than thirty years, dropped",
+        "negative"   ~ "The end precedes the start, dropped",
+        "no end"     ~ "No end date established",
+        "open"       ~ "An open-ended clause, no end date",
+        .default     = .data$Reason
+      ),
+      N       = .data$N,
+      Defined = 0L,
+      Q1      = NA_real_,
+      Med     = NA_real_,
+      Q3      = NA_real_,
+      Kind    = "dropped"
+    ) |>
+    dplyr::arrange(dplyr::desc(.data$N))
+  dplyr::bind_rows(out_, dropped_, totals_) |>
+    dplyr::mutate(Share = .data$N / n_all_, Contracts = n_all_) |>
+    dplyr::select("Rung", "Label", "Kind", "N", "Share", "Defined", "Q1", "Med", "Q3", "Contracts")
+}
+
+#' Build the table of duration sources
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .dir_own Character. This document's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oad_build_duration <- function(.path_contracts, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "DurationRungs"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  if (!oa_build_needed(.outputs = outs_, .inputs = c(.path_contracts, .path_lib), .force = .force)) {
+    return(invisible("up to date"))
+  }
+  tab_ <- oad_data_duration(.path_contracts = .path_contracts)
+  num_ <- function(.x) format(.x, big.mark = ",", trim = TRUE, scientific = FALSE)
+  yrs_ <- function(.x) dplyr::if_else(is.na(.x), "--", formatC(.x, format = "f", digits = 1L))
+  panel_ <- c(rung = "Which rung answered", dropped = "Why a duration is missing",
+              measure = "The two measures, over the contracts each is defined on")
+  cells_ <- tab_ |>
+    dplyr::transmute(
+      Panel   = unname(panel_[.data$Kind]),
+      Label   = oa_tex_escape(.x = .data$Label),
+      N       = num_(.x = .data$N),
+      Share   = paste0(formatC(100 * .data$Share, format = "f", digits = 1L), "\\%"),
+      Defined = dplyr::if_else(.data$Kind == "dropped", "--", num_(.x = .data$Defined)),
+      Q1      = yrs_(.x = .data$Q1),
+      Med     = yrs_(.x = .data$Med),
+      Q3      = yrs_(.x = .data$Q3)
+    )
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = fin_tex_frame(
+      .name   = name_,
+      .tab    = cells_,
+      .header = c("Source", "Contracts", "Share", "Defined", "25th", "Median", "75th"),
+      .spec   = c(oa_col_text(.share = 0.25), oa_col_num(.mm = 16), oa_col_num(.mm = 12),
+                  oa_col_num(.mm = 15), oa_col_num(.mm = 11), oa_col_num(.mm = 13), oa_col_num(.mm = 11))
+    ),
+    .note    = paste(
+      "The unique contracts of the descriptive sample. The cascade takes the first source present, so the rungs",
+      "partition the sample: a stated term; an open-ended clause, which establishes that the contract has no end",
+      "date and therefore no duration; a future date within a termination cue's reach; and the farthest future date.",
+      "Defined counts the contracts of the row for which a duration could be computed, and the quartiles are in",
+      "years, over those contracts. Shares are of all contracts throughout, so the second panel accounts for every",
+      "contract that lacks a duration and the first for every contract.",
+      "The naive duration takes the farthest future date for every contract, and both",
+      "measures run from the same start date, so they differ only in the end they take."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+#' The counts the text of Appendix A cites, which no table prints
+#'
+#' Three passages name numbers that belong to no exhibit: what each quality rule flags, what the confidential
+#' treatment orders cover, and how many Item 1.01 announcements the sample keeps. They are computed here, written as
+#' a tibble like any other exhibit's data, and read by the numbers spec; nothing is printed.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .path_orders Character. The release's CtoOrders.parquet, one row per reference an order makes.
+#' @return Tibble: Key, Value.
+
+
+# -- 27.4 Where candidates fall, and how far the extractors agree: computed from 04A's stores ------------------------------
+# 04A reports positions, contrast, consensus and pairwise agreement in its runbook and saves none of them. They are
+# recomputed here from the same stores, with the same definitions: every span binned by its position in its document;
+# contrast as the share in the first and last decile over the share through the middle deciles; overlapping spans of
+# one entity in one document merged into a mention, whatever produced them; consensus as the number of producers that
+# found each mention; agreement as the Jaccard index over mentions, and exact agreement as the share of mentions both
+# found whose boundaries coincide.
+
+#' Every span of the entities compared, from the three stores, as one table in DuckDB
+#'
+#' Opens the three stores read-only in one connection, checks that each entity table carries a document key and
+#' half-open offsets, and unions the spans of the entities asked for into a temporary table on the connection:
+#' Producer, Entity, DocID, Start, Stop. spaCy is represented by one model. The connection is returned so that the
+#' callers can run their SQL on the table; they close it.
+#'
+#' @param .dir_store Character. 04A's Output, holding matcon.duckdb, spacy.duckdb and lexnlp.duckdb.
+#' @param .spacy_model Character. The spaCy model to include.
+#' @param .entities Character. The entity tables to read, upper case.
+#' @return A DBI connection holding the temporary table "spans".
+oad_spans_open <- function(.dir_store, .spacy_model, .entities) {
+  if (FALSE) {
+    .dir_store   <- here::here("2_output", "04A-EntityExtract", "Output")
+    .spacy_model <- "en_core_web_trf"
+    .entities    <- c("ORG", "PERSON", "GPE", "LAW", "DATE", "TERM", "MONEY", "REDACT")
+  }
+  con_ <- DBI::dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+  fam_ <- c("lexnlp", "spacy", "matcon")
+  for (f_ in fam_) {
+    p_ <- fs::path(.dir_store, paste0(f_, ".duckdb"))
+    if (!fs::file_exists(p_)) {
+      DBI::dbDisconnect(con_, shutdown = TRUE)
+      cli::cli_abort("04A's store {.file {p_}} does not exist.")
+    }
+    DBI::dbExecute(con_, sprintf("ATTACH '%s' AS %s (READ_ONLY)", as.character(p_), f_))
+  }
+  parts_ <- character(0)
+  for (f_ in fam_) {
+    tabs_ <- DBI::dbGetQuery(con_, sprintf(
+      "SELECT table_name FROM information_schema.tables WHERE table_catalog = '%s' AND table_schema = 'main'", f_
+    ))$table_name
+    for (e_ in .entities) {
+      t_ <- tolower(e_)
+      if (!t_ %in% tabs_) next
+      cols_ <- DBI::dbListFields(con_, DBI::Id(catalog = f_, schema = "main", table = t_))
+      need_ <- setdiff(c("DocID", "Start", "Stop"), cols_)
+      if (length(need_) > 0L) {
+        DBI::dbDisconnect(con_, shutdown = TRUE)
+        cli::cli_abort("{f_}.{t_} lacks {.field {need_}}; it has {.field {cols_}}.")
+      }
+      prod_  <- if (f_ == "spacy") paste0("spacy:", sub("^en_core_web_", "", .spacy_model)) else f_
+      where_ <- if (f_ == "spacy" && "Model" %in% cols_) sprintf(" WHERE Model = '%s'", .spacy_model) else ""
+      parts_ <- c(parts_, sprintf(
+        "SELECT '%s' AS Producer, '%s' AS Entity, DocID, CAST(Start AS BIGINT) AS Start, CAST(Stop AS BIGINT) AS Stop
+         FROM %s.main.%s%s", prod_, e_, f_, t_, where_
+      ))
+    }
+  }
+  if (length(parts_) == 0L) {
+    DBI::dbDisconnect(con_, shutdown = TRUE)
+    cli::cli_abort("None of the entity tables asked for exists in the three stores.")
+  }
+  DBI::dbExecute(con_, paste("CREATE TEMP TABLE spans AS", paste(parts_, collapse = " UNION ALL ")))
+  con_
+}
+
+#' Positions and contrast: where in its document each candidate falls, per producer and entity
+#'
+#' @param .con A connection from oad_spans_open().
+#' @param .path_sample Character. 04A's sample_text.parquet, for the length of every document.
+#' @param .bins Integer. Bins per document, a multiple of ten.
+#' @return List of two tibbles: positions (Producer, Entity, Bin, N, Share) and contrast (Producer, Entity,
+#'   MidShare, EndShare, Contrast).
+oad_data_positions <- function(.con, .path_sample, .bins = 30L) {
+  if (FALSE) {
+    .con         <- oad_spans_open(here::here("2_output", "04A-EntityExtract", "Output"), "en_core_web_trf", "ORG")
+    .path_sample <- here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet")
+    .bins        <- 30L
+  }
+  # THE TEXT EVERY OFFSET INDEXES: DocID and TextRaw. Its length in code points is what the offsets are relative to.
+  len_ <- arrow::open_dataset(.path_sample) |>
+    dplyr::select("DocID", "TextRaw") |>
+    dplyr::collect() |>
+    dplyr::transmute(DocID = .data$DocID, Length = nchar(.data$TextRaw, type = "chars"))
+  DBI::dbWriteTable(.con, "doclen", as.data.frame(len_), temporary = TRUE, overwrite = TRUE)
+  pos_ <- DBI::dbGetQuery(.con, sprintf(
+    "SELECT s.Producer, s.Entity,
+            LEAST(%d, 1 + CAST(FLOOR(%d * s.Start / GREATEST(d.Length, 1)) AS INTEGER)) AS Bin,
+            COUNT(*) AS N
+     FROM spans s JOIN doclen d USING (DocID)
+     GROUP BY 1, 2, 3", .bins, .bins
+  )) |>
+    tibble::as_tibble() |>
+    dplyr::mutate(N = as.integer(.data$N)) |>
+    tidyr::complete(tidyr::nesting(Producer, Entity), Bin = seq_len(.bins), fill = list(N = 0L)) |>
+    dplyr::mutate(Share = .data$N / sum(.data$N), .by = c("Producer", "Entity")) |>
+    dplyr::arrange(.data$Producer, .data$Entity, .data$Bin)
+  # CONTRAST: the first and last decile against the middle, the second and ninth deciles left out as shoulders
+  dec_ <- .bins / 10L
+  con_ <- pos_ |>
+    dplyr::mutate(Zone = dplyr::case_when(
+      .data$Bin <= dec_ | .data$Bin > .bins - dec_ ~ "end",
+      .data$Bin <= 2L * dec_ | .data$Bin > .bins - 2L * dec_ ~ "shoulder",
+      .default = "mid"
+    )) |>
+    dplyr::filter(.data$Zone != "shoulder") |>
+    dplyr::summarise(Share = mean(.data$Share), .by = c("Producer", "Entity", "Zone")) |>
+    tidyr::pivot_wider(names_from = "Zone", values_from = "Share") |>
+    dplyr::transmute(Producer = .data$Producer, Entity = .data$Entity, MidShare = .data$mid, EndShare = .data$end,
+                     Contrast = .data$end / .data$mid)
+  list(positions = pos_, contrast = con_)
+}
+
+#' Consensus and pairwise agreement over mentions
+#'
+#' Overlapping spans of one entity in one document, from any producer, are merged into a mention by gaps and
+#' islands; a mention's producers are whoever contributed a span to it. Consensus counts mentions by how many
+#' producers found them. Pairwise agreement, for every pair of producers that attempt an entity, is the Jaccard
+#' index over mentions -- both over either -- and exact agreement is the share of mentions both found on which
+#' their outermost boundaries coincide.
+#'
+#' @param .con A connection from oad_spans_open().
+#' @return List of two tibbles: consensus (Entity, NProducer, NMentions, Share, Eligible) and pairwise (Entity,
+#'   ProducerA, ProducerB, Both, Exact, MentionsA, MentionsB, Jaccard, ExactShare).
+oad_data_agreement <- function(.con) {
+  if (FALSE) .con <- oad_spans_open(here::here("2_output", "04A-EntityExtract", "Output"), "en_core_web_trf", "GPE")
+  DBI::dbExecute(.con, "
+    CREATE OR REPLACE TEMP TABLE mentions AS
+    WITH o AS (
+      SELECT *, MAX(Stop) OVER (PARTITION BY DocID, Entity ORDER BY Start, Stop
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS PrevMax
+      FROM spans
+    ),
+    g AS (
+      SELECT *, CASE WHEN PrevMax IS NULL OR Start >= PrevMax THEN 1 ELSE 0 END AS NewGroup FROM o
+    ),
+    m AS (
+      SELECT *, SUM(NewGroup) OVER (PARTITION BY DocID, Entity ORDER BY Start, Stop
+                                    ROWS UNBOUNDED PRECEDING) AS MentionID
+      FROM g
+    )
+    SELECT DocID, Entity, MentionID, Producer, MIN(Start) AS Start, MAX(Stop) AS Stop
+    FROM m GROUP BY 1, 2, 3, 4
+  ")
+  cons_ <- DBI::dbGetQuery(.con, "
+    WITH per AS (SELECT Entity, DocID, MentionID, COUNT(DISTINCT Producer) AS NProducer
+                 FROM mentions GROUP BY 1, 2, 3),
+         elig AS (SELECT Entity, COUNT(DISTINCT Producer) AS Eligible FROM spans GROUP BY 1)
+    SELECT p.Entity, p.NProducer, COUNT(*) AS NMentions, e.Eligible
+    FROM per p JOIN elig e USING (Entity) GROUP BY 1, 2, 4 ORDER BY 1, 2
+  ") |>
+    tibble::as_tibble() |>
+    dplyr::mutate(NMentions = as.integer(.data$NMentions), Eligible = as.integer(.data$Eligible)) |>
+    dplyr::mutate(Share = .data$NMentions / sum(.data$NMentions), .by = "Entity")
+  pair_ <- DBI::dbGetQuery(.con, "
+    WITH prods AS (SELECT DISTINCT Entity, Producer FROM spans),
+         pairs AS (SELECT a.Entity, a.Producer AS A, b.Producer AS B
+                   FROM prods a JOIN prods b ON a.Entity = b.Entity AND a.Producer < b.Producer),
+         cnt AS (SELECT Entity, Producer, COUNT(*) AS N FROM mentions GROUP BY 1, 2),
+         overlap AS (SELECT x.Entity, x.Producer AS A, y.Producer AS B,
+                         COUNT(*) AS Both,
+                         SUM(CASE WHEN x.Start = y.Start AND x.Stop = y.Stop THEN 1 ELSE 0 END) AS Exact
+                  FROM mentions x JOIN mentions y
+                    ON x.Entity = y.Entity AND x.DocID = y.DocID AND x.MentionID = y.MentionID
+                   AND x.Producer < y.Producer
+                  GROUP BY 1, 2, 3)
+    SELECT p.Entity, p.A AS ProducerA, p.B AS ProducerB,
+           COALESCE(b.Both, 0) AS Both, COALESCE(b.Exact, 0) AS Exact,
+           ca.N AS MentionsA, cb.N AS MentionsB
+    FROM pairs p
+    LEFT JOIN overlap b ON b.Entity = p.Entity AND b.A = p.A AND b.B = p.B
+    JOIN cnt ca ON ca.Entity = p.Entity AND ca.Producer = p.A
+    JOIN cnt cb ON cb.Entity = p.Entity AND cb.Producer = p.B
+    ORDER BY 1, 2, 3
+  ") |>
+    tibble::as_tibble() |>
+    dplyr::mutate(
+      dplyr::across(c("Both", "Exact", "MentionsA", "MentionsB"), as.integer),
+      Jaccard    = .data$Both / (.data$MentionsA + .data$MentionsB - .data$Both),
+      ExactShare = dplyr::if_else(.data$Both > 0L, .data$Exact / .data$Both, NA_real_)
+    )
+  list(consensus = cons_, pairwise = pair_)
+}
+
+#' The positions figure: share of candidates by position in the document, one panel per entity, one line per producer
+#'
+#' @param .tab Tibble: Producer, Entity, Bin, Share.
+#' @return A ggplot.
+oad_plot_positions <- function(.tab) {
+  if (FALSE) {
+    .tab <- tibble::tibble(Producer = "lexnlp", Entity = "ORG", Bin = 1:30, Share = rep(1 / 30, 30))
+  }
+  ent_ <- c("ORG", "PERSON", "GPE", "LAW", "DATE", "TERM", "REDACT")
+  lab_ <- c(ORG = "Organizations", PERSON = "Persons", GPE = "Places", LAW = "Governing law", DATE = "Dates",
+            TERM = "Stated periods", REDACT = "Redaction markers")
+  prod_ <- c("lexnlp", "spacy:trf", "matcon")
+  plab_ <- c(lexnlp = "LexNLP", `spacy:trf` = "spaCy", matcon = "Patterns")
+  tab_ <- .tab |>
+    dplyr::filter(.data$Entity %in% ent_, .data$Producer %in% prod_) |>
+    dplyr::mutate(
+      Entity   = factor(unname(lab_[.data$Entity]), levels = unname(lab_)),
+      Producer = factor(unname(plab_[.data$Producer]), levels = unname(plab_)),
+      Position = (.data$Bin - 0.5) / max(.data$Bin)
+    )
+  ggplot2::ggplot(tab_, ggplot2::aes(x = .data$Position, y = .data$Share, colour = .data$Producer)) +
+    ggplot2::geom_line(linewidth = 0.45) +
+    ggplot2::facet_wrap(ggplot2::vars(.data$Entity), ncol = 4L, scales = "free_y") +
+    ggplot2::scale_x_continuous(labels = scales::label_percent(accuracy = 1), breaks = c(0.25, 0.5, 0.75)) +
+    ggplot2::scale_y_continuous(labels = scales::label_percent(accuracy = 1), limits = c(0, NA),
+                                expand = ggplot2::expansion(mult = c(0, 0.05))) +
+    ggplot2::scale_colour_manual(values = plot_pal_cat(.n = 3L), drop = FALSE) +
+    ggplot2::labs(x = "Position in the contract", y = "Share of the producer's candidates", colour = NULL) +
+    plot_theme(.grid = "y", .legend = "bottom") +
+    ggplot2::theme(strip.text = ggplot2::element_text(face = "bold", hjust = 0))
+}
+
+#' The agreement figure: pairwise agreement over mentions, one panel per entity two producers reach
+#'
+#' @param .tab Tibble: Entity, ProducerA, ProducerB, Jaccard.
+#' @return A ggplot.
+oad_plot_agreement <- function(.tab) {
+  if (FALSE) .tab <- tibble::tibble(Entity = "GPE", ProducerA = "lexnlp", ProducerB = "matcon", Jaccard = 0.66)
+  plab_ <- c(lexnlp = "LexNLP", `spacy:trf` = "spaCy", matcon = "Patterns")
+  lab_  <- c(ORG = "Organizations", GPE = "Places", DATE = "Dates")
+  lvl_  <- unname(plab_)
+  pairs_ <- .tab |>
+    dplyr::filter(.data$Entity %in% names(lab_)) |>
+    dplyr::transmute(Entity = .data$Entity, A = unname(plab_[.data$ProducerA]), B = unname(plab_[.data$ProducerB]),
+                     Jaccard = .data$Jaccard) |>
+    # THE LOWER TRIANGLE: the row is the later producer, the column the earlier, whichever order the pair arrived
+    # in, so no pair lands above the diagonal and leaves its mirror cell empty (spaCy / Patterns, 23 Sep 2026).
+    dplyr::mutate(
+      Lo = pmin(match(.data$A, lvl_), match(.data$B, lvl_)),
+      Hi = pmax(match(.data$A, lvl_), match(.data$B, lvl_)),
+      A  = lvl_[.data$Lo],
+      B  = lvl_[.data$Hi]
+    ) |>
+    dplyr::select(-"Lo", -"Hi")
+  diag_ <- pairs_ |>
+    dplyr::select("Entity", "A", "B") |>
+    tidyr::pivot_longer(cols = c("A", "B"), values_to = "P") |>
+    dplyr::distinct(.data$Entity, .data$P) |>
+    dplyr::transmute(Entity = .data$Entity, A = .data$P, B = .data$P, Jaccard = 1)
+  cells_ <- dplyr::bind_rows(pairs_, diag_) |>
+    dplyr::mutate(
+      A      = factor(.data$A, levels = lvl_),
+      B      = factor(.data$B, levels = rev(lvl_)),
+      Entity = factor(unname(lab_[.data$Entity]), levels = unname(lab_)),
+      Label  = formatC(.data$Jaccard, format = "f", digits = 2L),
+      Dark   = .data$Jaccard > 0.5
+    )
+  ggplot2::ggplot(cells_, ggplot2::aes(x = .data$A, y = .data$B, fill = .data$Jaccard)) +
+    ggplot2::geom_tile(colour = "white", linewidth = 0.6) +
+    ggplot2::geom_text(ggplot2::aes(label = .data$Label, colour = .data$Dark), family = .plot_font, size = 3.2,
+                       show.legend = FALSE) +
+    ggplot2::scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "grey20")) +
+    ggplot2::scale_fill_gradient(low = "#EEF0F4", high = plot_pal_cat(.n = 1L), limits = c(0, 1)) +
+    ggplot2::facet_wrap(ggplot2::vars(.data$Entity), ncol = 2L, scales = "free") +
+    ggplot2::labs(x = NULL, y = NULL, fill = "Agreement") +
+    plot_theme(.grid = "none", .legend = "right") +
+    ggplot2::theme(strip.text = ggplot2::element_text(face = "bold", hjust = 0),
+                   axis.text.x = ggplot2::element_text(angle = 30, hjust = 1))
+}
+
+#' Build the positions and the agreement figures together, from one pass over the stores
+#'
+#' One connection, one spans table, both computations; written as two exhibits. The build is keyed on the three
+#' stores and this library.
+#'
+#' @param .dir_store Character. 04A's Output, holding the three stores.
+#' @param .path_sample Character. 04A's sample_text.parquet.
+#' @param .spacy_model Character. The spaCy model compared.
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oad_build_alignment <- function(.dir_store, .path_sample, .spacy_model, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .dir_store   <- here::here("2_output", "04A-EntityExtract", "Output")
+    .path_sample <- here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet")
+    .spacy_model <- "en_core_web_trf"
+    .dir_own     <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force       <- FALSE
+    .path_lib    <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  names_ <- c("EntityPositions", "EntityAgreement")
+  outs_  <- unlist(purrr::map(names_, \(.n) c(
+    fs::path(.dir_own, "Figures", paste0(.n, ".png")),
+    fs::path(.dir_own, c("Notes", "Data"), paste0(.n, c(".tex", ".parquet")))
+  )))
+  ins_   <- c(fs::path(.dir_store, paste0(c("lexnlp", "spacy", "matcon"), ".duckdb")), .path_sample, .path_lib)
+  if (!all(fs::file_exists(ins_[1:4]))) return(invisible("waiting for 04A's stores"))
+  if (!oa_build_needed(.outputs = outs_, .inputs = ins_, .force = .force)) return(invisible("up to date"))
+  con_ <- oad_spans_open(
+    .dir_store   = .dir_store,
+    .spacy_model = .spacy_model,
+    .entities    = c("ORG", "PERSON", "GPE", "LAW", "DATE", "TERM", "MONEY", "REDACT")
+  )
+  on.exit(DBI::dbDisconnect(con_, shutdown = TRUE), add = TRUE)
+  pos_ <- oad_data_positions(.con = con_, .path_sample = .path_sample)
+  agr_ <- oad_data_agreement(.con = con_)
+  oa_write_exhibit(
+    .name    = names_[1L],
+    .lines   = NULL,
+    .note    = paste(
+      "Every candidate span each extractor proposed on the labeled sample, by its position in the contract: the",
+      "contract is divided into thirty bins of equal length, and each line is the share of the producer's candidates",
+      "for that entity that fall in each bin. LexNLP, spaCy (its transformer model) and the pattern and gazetteer",
+      "extractors written for the database (Patterns); an extractor absent from a panel does not attempt that",
+      "entity. A producer that spreads an entity evenly through the text draws a flat line."
+    ),
+    .data    = dplyr::left_join(pos_$positions, pos_$contrast, by = c("Producer", "Entity")),
+    .dir_own = .dir_own
+  )
+  plot_save(
+    .plot    = oad_plot_positions(.tab = pos_$positions),
+    .name    = names_[1L],
+    .dir     = fs::path(.dir_own, "Figures"),
+    .height  = 4.6,
+    .formats = "png"            # no pdf (decided 17 September)
+  )
+  oa_write_exhibit(
+    .name    = names_[2L],
+    .lines   = NULL,
+    .note    = paste(
+      "Agreement between extractors on the labeled sample, for the entities two of them attempt. Overlapping spans",
+      "of one entity within a contract are merged into a mention -- a place in the text where something was found",
+      "-- and agreement is the Jaccard index over mentions: the share of mentions both producers found among those",
+      "either found. It measures agreement about what is there; agreement about where a mention ends is a separate",
+      "quantity and is not shown. The diagonal is a producer against itself."
+    ),
+    .data    = dplyr::bind_rows(dplyr::mutate(agr_$pairwise, Block = "pairwise"),
+                                dplyr::mutate(agr_$consensus, Block = "consensus")),
+    .dir_own = .dir_own
+  )
+  plot_save(
+    .plot    = oad_plot_agreement(.tab = agr_$pairwise),
+    .name    = names_[2L],
+    .dir     = fs::path(.dir_own, "Figures"),
+    .height  = 4.4,
+    .formats = "png"            # no pdf (decided 17 September)
+  )
+  invisible("built")
+}
+
+
+# -- 27.5 What the variables are worth under the naive and the rule-based reading ------------------------------------------
+
+#' The values companion's data: by category, the typical value of each measure under both readings
+#'
+#' 30's contrast table counts on how many contracts each measure is defined; this one reports what it is worth on
+#' them. Duration: the median years under the naive end (the farthest future date) and under the cascade. Parties:
+#' the mean number of distinct organization spellings (naive) and of registrants, co-registrants and counterparties
+#' (rule). Countries and states: the mean number under the naive count (any mention outside a governing-law clause)
+#' and attached to the registrant and to the counterparties by the 200-character rule, the two reported apart
+#' because a country attached to both is one country.
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @return Tibble: Row, Kind, Level1, Class, N, and one column per measure and reading.
+oad_data_values <- function(.path_contracts) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+  }
+  cols_ <- c("Class", "DurationYears", "NaiveYears", "nUniSpellingsNaive", "nUniRegistrant",
+             "nUniCofiler", "nUniCounterparty", "nUniCountryNaive", "nUniCountryRegistrant",
+             "nUniCountryCounterparty", "nUniStateNaive", "nUniStateRegistrant", "nUniStateCounterparty")
+  con_ <- oad_read_sample(
+    .path_contracts = .path_contracts,
+    .cols           = cols_
+  ) |>
+    dplyr::mutate(
+      # THE TWO LEVELS, from the release's Class: "Employment: Compensation" is parent and sub; "Licenses" is both;
+      # two Purchases-and-Sales sub-categories are released without their parent and are put back under it.
+      Level2 = dplyr::if_else(grepl(": ", .data$Class, fixed = TRUE), sub("^.*: ", "", .data$Class), .data$Class),
+      Level2 = dplyr::if_else(.data$Level2 == "Investment and Merger", "M&A", .data$Level2),
+      Level1 = dplyr::case_when(
+        grepl(": ", .data$Class, fixed = TRUE)            ~ sub(": .*$", "", .data$Class),
+        .data$Class %in% c("R&D", "Customer / Supplier") ~ "Purchases and Sales",
+        .default                                          = .data$Class
+      ),
+      PartiesRule = dplyr::coalesce(.data$nUniRegistrant, 0L) + dplyr::coalesce(.data$nUniCofiler, 0L) +
+        dplyr::coalesce(.data$nUniCounterparty, 0L)
+    )
+  stat_ <- function(.d) {
+    tibble::tibble(
+      N            = nrow(.d),
+      DurNaive     = stats::median(.d$NaiveYears, na.rm = TRUE),
+      DurRule      = stats::median(.d$DurationYears, na.rm = TRUE),
+      PartNaive    = mean(.d$nUniSpellingsNaive, na.rm = TRUE),
+      PartRule     = mean(.d$PartiesRule, na.rm = TRUE),
+      CtryNaive    = mean(.d$nUniCountryNaive, na.rm = TRUE),
+      CtryReg      = mean(.d$nUniCountryRegistrant, na.rm = TRUE),
+      CtryCpty     = mean(.d$nUniCountryCounterparty, na.rm = TRUE),
+      StateNaive   = mean(.d$nUniStateNaive, na.rm = TRUE),
+      StateReg     = mean(.d$nUniStateRegistrant, na.rm = TRUE),
+      StateCpty    = mean(.d$nUniStateCounterparty, na.rm = TRUE)
+    )
+  }
+  lab_ <- dplyr::filter(con_, !is.na(.data$Class))
+  # THE ROWS: parents with their sub-categories, leaf parents alone, then the total, in taxonomic order
+  l1_ <- c("Financial Instruments", "Employment", "Purchases and Sales", "Licenses", "Leases", "Business Structure",
+           "Other")
+  rows_ <- purrr::map_dfr(l1_, \(.p) {
+    d1_ <- dplyr::filter(lab_, .data$Level1 == .p)
+    if (nrow(d1_) == 0L) return(NULL)
+    order_ <- c("Credit", "Equity", "Compensation", "Legal", "Assets", "R&D", "Customer / Supplier",
+                "Peer Agreements", "M&A")
+    subs_ <- unique(d1_$Level2[!is.na(d1_$Level2) & d1_$Level2 != .p])
+    subs_ <- subs_[order(match(subs_, order_))]
+    top_ <- dplyr::bind_cols(tibble::tibble(Row = .p, Kind = "super", Level1 = .p, Class = NA_character_),
+                             stat_(.d = d1_))
+    if (length(subs_) == 0L) return(top_)
+    sub_ <- purrr::map_dfr(subs_, \(.s) {
+      d2_ <- dplyr::filter(d1_, .data$Level2 == .s)
+      dplyr::bind_cols(tibble::tibble(Row = .s, Kind = "sub", Level1 = .p, Class = d2_$Class[1]), stat_(.d = d2_))
+    })
+    dplyr::bind_rows(top_, sub_)
+  })
+  dplyr::bind_rows(
+    rows_,
+    dplyr::bind_cols(tibble::tibble(Row = "Total", Kind = "total", Level1 = NA_character_, Class = NA_character_),
+                     stat_(.d = con_))
+  )
+}
+
+#' Build the values companion
+#'
+#' @param .path_contracts Character. The release's Contracts.parquet.
+#' @param .dir_own Character. This chapter's output directory.
+#' @param .force Logical. TRUE rebuilds regardless of the inputs.
+#' @param .path_lib Character. This library.
+#' @return Invisibly, the build's status.
+oad_build_values <- function(.path_contracts, .dir_own, .force, .path_lib) {
+  if (FALSE) {
+    .path_contracts <- fs::path(
+      "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
+      "100_Data_Export",
+      "Contracts.parquet"
+    )
+    .dir_own  <- here::here("2_output", "30-FinalExhibits", "Output")
+    .force    <- FALSE
+    .path_lib <- here::here("1_code", "30-FinalExhibits.R")
+  }
+  name_ <- "ContentValues"
+  outs_ <- fs::path(.dir_own, c("Tables", "Notes", "Data"), paste0(name_, c(".tex", ".tex", ".parquet")))
+  if (!oa_build_needed(.outputs = outs_, .inputs = c(.path_contracts, .path_lib), .force = .force)) {
+    return(invisible("up to date"))
+  }
+  tab_ <- oad_data_values(.path_contracts = .path_contracts)
+  f1_ <- function(.x) formatC(.x, format = "f", digits = 1L)
+  f2_ <- function(.x) formatC(.x, format = "f", digits = 2L)
+  lab_ <- dplyr::case_when(
+    tab_$Kind == "total" ~ paste0("\\textbf{", oa_tex_escape(.x = tab_$Row), "}"),
+    tab_$Kind == "sub"   ~ paste0("\\hspace{1em}", oa_tex_escape(.x = tab_$Row)),
+    .default             = paste0("\\textbf{", oa_tex_escape(.x = tab_$Row), "}")
+  )
+  cells_ <- tibble::tibble(
+    Row        = lab_,
+    DurNaive   = f1_(.x = tab_$DurNaive),
+    DurRule    = f1_(.x = tab_$DurRule),
+    PartNaive  = f2_(.x = tab_$PartNaive),
+    PartRule   = f2_(.x = tab_$PartRule),
+    CtryNaive  = f2_(.x = tab_$CtryNaive),
+    CtryReg    = f2_(.x = tab_$CtryReg),
+    CtryCpty   = f2_(.x = tab_$CtryCpty),
+    StateNaive = f2_(.x = tab_$StateNaive),
+    StateReg   = f2_(.x = tab_$StateReg),
+    StateCpty  = f2_(.x = tab_$StateCpty)
+  )
+  lines_ <- fin_tex_frame(
+    .name   = name_,
+    .tab    = cells_,
+    .header = c("", "Naive", "Rule", "Naive", "Rule", "Naive", "Reg.", "Cpty.", "Naive", "Reg.", "Cpty."),
+    .spec   = c(oa_col_text(.share = 0.26), rep(oa_col_num(.mm = 10), 10L))
+  )
+  # A GROUP ROW ABOVE THE COLUMN HEADERS, so the reader sees which measure a Naive / Rule pair belongs to. The
+  # frame writes one header row; the group row goes in above it, right after the double rule, once the frame
+  # has fitted the table (the group cells are short, so the fit is unaffected).
+  group_ <- paste(
+    " & \\multicolumn{2}{c}{Duration (years)} & \\multicolumn{2}{c}{Parties} & \\multicolumn{3}{c}{Countries}",
+    "& \\multicolumn{3}{c}{States} \\\\"
+  )
+  top_ <- which(lines_ == "\\hline\\hline")[1L]
+  if (is.na(top_)) cli::cli_abort("{name_}: the frame has no double rule to put the group row under.")
+  lines_ <- append(lines_, group_, after = top_)
+  oa_write_exhibit(
+    .name    = name_,
+    .lines   = lines_,
+    .note    = paste(
+      "The companion to the coverage contrast: what each measure is worth, by category, on the unique contracts of",
+      "the descriptive sample, under the naive reading of the spans and under the rule. Duration (years) is the",
+      "median over the contracts on which each reading defines it: the naive end is the farthest future date, the",
+      "rule's end the first source present of a stated term, an open-ended clause, a cued date and the farthest",
+      "date, dropped above thirty years. Parties is the mean number per contract of distinct organization spellings",
+      "(naive) and of registrants, co-registrants and counterparties (rule). Countries and states are the mean",
+      "number per contract of distinct mentions outside a governing-law clause (naive) and of those attached to",
+      "the registrant (Reg.) and to the counterparties (Cpty.) by the 200-character rule, reported apart because a",
+      "place attached to both is one place. The column groups are, from left to right, duration, parties, countries",
+      "and states."
+    ),
+    .data    = tab_,
+    .dir_own = .dir_own
+  )
+  invisible("built")
+}
+
+
+# 28. The store: showing what the moved builders wrote, and checking the move ------------------------------------------
+# The builders moved from 40 write files and return a status; they print nothing. fin_show_built() shows what they
+# wrote -- the figure, the table as html, or the head of a data-only tibble, each with its note -- so this runbook
+# holds every exhibit. fin_check_migration() compares this document's files with the ones 30 and 40 wrote, stem by
+# stem, while those two still write theirs; it reads their output directories and goes when 31 moves back to 30.
+
+#' Show the exhibits a moved builder wrote to disk
+#'
+#' A figure is embedded from its png, a table is converted from its tex by pandoc as the appendix chapters convert
+#' theirs, and a stem with neither shows the head of its tibble. The note follows, with LaTeX's escapes undone. The
+#' chunk that calls it needs `results: asis`.
+#'
+#' @param .names Character. The stems to show, in order.
+#' @param .dirs List. .lP$Output.
+#' @param .rows Integer. Rows shown of a data-only tibble.
+#' @return Invisibly, a tibble: Stem, Shown (figure, table, data or missing).
+fin_show_built <- function(.names, .dirs, .rows = 10L) {
+  if (FALSE) {
+    .names <- c("FilingsWithinYear", "CtoLinkage", "CtoAhci")
+    .dirs  <- .lP$Output
+    .rows  <- 10L
+  }
+  pandoc_ <- oa_pandoc_bin()
+  shown_ <- purrr::map_chr(.names, \(.n) {
+    png_  <- fs::path(.dirs$DirFigures, paste0(.n, ".png"))
+    tex_  <- fs::path(.dirs$DirTables, paste0(.n, ".tex"))
+    note_ <- fs::path(.dirs$DirNotes, paste0(.n, ".tex"))
+    data_ <- fs::path(.dirs$DirData, paste0(.n, ".parquet"))
+    cat(
+      "\n\n#### ",
+      .n,
+      "\n\n",
+      sep = ""
+    )
+    kind_ <- "missing"
+    if (fs::file_exists(png_)) {
+      cat(
+        "\n```{=html}\n<img src=\"",
+        xfun::base64_uri(png_),
+        "\" style=\"width:100%\" alt=\"",
+        .n,
+        "\">\n```\n\n",
+        sep = ""
+      )
+      kind_ <- "figure"
+    } else if (fs::file_exists(tex_)) {
+      html_ <- oa_table_html(
+        .path_tex = tex_,
+        .pandoc   = pandoc_
+      )$Html
+      if (is.na(html_)) {
+        cli::cli_alert_warning("{(.n)}: pandoc could not convert the table; the tibble is shown instead.")
+        if (fs::file_exists(data_)) {
+          fin_show_table(
+            .tab   = utils::head(arrow::read_parquet(data_), .rows),
+            .title = .n
+          )
+        }
+      } else {
+        cat(
+          "\n```{=html}\n",
+          html_,
+          "\n```\n\n",
+          sep = ""
+        )
+      }
+      kind_ <- "table"
+    } else if (fs::file_exists(data_)) {
+      fin_show_table(
+        .tab   = utils::head(arrow::read_parquet(data_), .rows),
+        .title = .n
+      )
+      kind_ <- "data"
+    }
+    if (fs::file_exists(note_)) {
+      text_ <- gsub("\\\\([%&$#_])", "\\1", oa_note_text(.path = note_))
+      cat(
+        "\n```{=html}\n<p class=\"table-note\"><em>Notes:</em> ",
+        text_,
+        "</p>\n```\n\n",
+        sep = ""
+      )
+    }
+    if (kind_ == "missing") cli::cli_alert_warning("{(.n)}: nothing under Output/ to show.")
+    kind_
+  })
+  invisible(tibble::tibble(Stem = .names, Shown = shown_))
+}
+
+#' Compare this document's exhibit files with the ones 30 and 40 wrote
+#'
+#' Stem by stem, from the registry's Origin and OriginStem. A tibble is "same" (identical), "equal" (within numerical
+#' tolerance), "reordered" (the same rows in another order: a query without a full ORDER BY returns tied rows in any
+#' order) or "differs", with Detail saying how. A tabular and a note are compared by their bytes. A png is "redrawn"
+#' where its bytes differ but its dimensions and size agree: the rasterizer's antialiasing is not reproducible byte
+#' for byte, and the figure's content is its tibble and its note. "--" is a file neither side has; "new" marks a
+#' stem first built in 31, with nothing to compare against. A reference
+#' written from an older release differs for that reason alone, so the check reports and never stops the render.
+#' The chunk that calls it needs `results: asis`.
+#'
+#' @param .registry Tibble. The exhibit registry, with Topic, Origin and OriginStem.
+#' @param .dirs List. .lP$Output.
+#' @param .refs Named character. The output directory of each origin, named "30" and "40"; origin "31" has none.
+#' @param .tolerance Numeric. The relative difference in png file size still read as a redraw.
+#' @return Invisibly, a tibble: Topic, Stem, Origin, Data, Tex, Note, Png, Detail.
+fin_check_migration <- function(.registry = .fin_registry, .dirs, .refs, .tolerance = 0.05) {
+  if (FALSE) {
+    .registry  <- .fin_registry
+    .dirs      <- .lP$Output
+    .refs      <- .lP$Migration
+    .tolerance <- 0.05
+  }
+  sides_ <- function(.a, .b) {
+    dplyr::case_when(
+      !fs::file_exists(.a) & !fs::file_exists(.b) ~ "--",
+      !fs::file_exists(.a)                         ~ "missing in 31",
+      !fs::file_exists(.b)                         ~ "missing in ref",
+      .default                                     = NA_character_
+    )
+  }
+  same_file_ <- function(.a, .b) {
+    out_ <- unname(sides_(.a, .b))
+    if (!is.na(out_)) return(out_)
+    if (identical(unname(tools::md5sum(.a)), unname(tools::md5sum(.b)))) "same" else "differs"
+  }
+  same_png_ <- function(.a, .b) {
+    out_ <- same_file_(.a, .b)
+    if (out_ != "differs") return(out_)
+    dims_  <- function(.p) readBin(con = .p, what = "raw", n = 24L)[17:24]   # width and height from the IHDR chunk
+    ratio_ <- as.numeric(fs::file_size(.a)) / as.numeric(fs::file_size(.b))
+    if (identical(dims_(.a), dims_(.b)) && abs(ratio_ - 1) < .tolerance) "redrawn" else "differs"
+  }
+  sort_rows_ <- function(.d) {
+    keys_ <- .d[vapply(.d, is.atomic, logical(1))]
+    if (ncol(keys_) == 0L) return(.d)
+    out_ <- .d[do.call(order, unname(as.list(keys_))), , drop = FALSE]
+    rownames(out_) <- NULL
+    out_
+  }
+  same_data_ <- function(.a, .b) {
+    out_ <- unname(sides_(.a, .b))
+    if (!is.na(out_)) return(c(out_, ""))
+    a_ <- as.data.frame(arrow::read_parquet(.a))
+    b_ <- as.data.frame(arrow::read_parquet(.b))
+    if (identical(a_, b_)) return(c("same", ""))
+    if (!identical(names(a_), names(b_))) {
+      return(c("differs", paste0(
+        "columns only in 31: ", paste(setdiff(names(a_), names(b_)), collapse = " "),
+        "; only in the reference: ", paste(setdiff(names(b_), names(a_)), collapse = " ")
+      )))
+    }
+    if (nrow(a_) != nrow(b_)) {
+      return(c("differs", paste0("rows: ", nrow(a_), " in 31, ", nrow(b_), " in the reference")))
+    }
+    if (isTRUE(all.equal(a_, b_, check.attributes = FALSE))) return(c("equal", "within numerical tolerance"))
+    a_ <- sort_rows_(a_)
+    b_ <- sort_rows_(b_)
+    if (isTRUE(all.equal(a_, b_, check.attributes = FALSE))) return(c("reordered", "the same rows in another order"))
+    cols_ <- names(a_)[!purrr::map2_lgl(a_, b_, \(.x, .y) isTRUE(all.equal(.x, .y, check.attributes = FALSE)))]
+    c("differs", paste("values in", paste(utils::head(cols_, 5L), collapse = ", ")))
+  }
+  reg_ <- .registry |>
+    dplyr::mutate(
+      RefDir  = unname(.refs[.data$Origin]),
+      RefStem = dplyr::coalesce(.data$OriginStem, .data$Stem)
+    )
+  cmp_ <- purrr::pmap(
+    .l = list(reg_$Stem, reg_$RefDir, reg_$RefStem),
+    .f = \(.s, .r, .rs) {
+      if (is.na(.r)) {
+        return(tibble::tibble(Data = "new", Tex = "new", Note = "new", Png = "new", Detail = "first built in 31"))
+      }
+      data_ <- same_data_(
+        fs::path(.dirs$DirData, paste0(.s, ".parquet")),
+        fs::path(.r, "Data", paste0(.rs, ".parquet"))
+      )
+      tibble::tibble(
+        Data   = data_[1L],
+        Tex    = same_file_(
+          fs::path(.dirs$DirTables, paste0(.s, ".tex")),
+          fs::path(.r, "Tables", paste0(.rs, ".tex"))
+        ),
+        Note   = same_file_(
+          fs::path(.dirs$DirNotes, paste0(.s, ".tex")),
+          fs::path(.r, "Notes", paste0(.rs, ".tex"))
+        ),
+        Png    = same_png_(
+          fs::path(.dirs$DirFigures, paste0(.s, ".png")),
+          fs::path(.r, "Figures", paste0(.rs, ".png"))
+        ),
+        Detail = data_[2L]
+      )
+    }
+  ) |>
+    purrr::list_rbind()
+  out_ <- dplyr::bind_cols(
+    dplyr::select(reg_, "Topic", "Stem", "Origin"),
+    cmp_
+  )
+  cells_ <- unlist(dplyr::select(out_, "Data", "Tex", "Note", "Png"), use.names = FALSE)
+  n_off_     <- sum(cells_ %in% c("differs", "missing in 31", "missing in ref"))
+  n_redrawn_ <- sum(cells_ == "redrawn")
+  n_ordered_ <- sum(cells_ == "reordered")
+  n_new_     <- sum(out_$Data == "new")
+  if (n_off_ == 0L) {
+    cli::cli_alert_success("Every file of every stem matches its origin.")
+  } else {
+    cli::cli_alert_warning("{n_off_} file{?s} differ{?s/} from {?its/their} origin or {?is/are} missing on one side.")
+  }
+  cli::cli_alert_info("{n_redrawn_} png{?s} redrawn; {n_ordered_} tibble{?s} with the same rows in another order.")
+  cli::cli_alert_info("{n_new_} stem{?s} first built in 31, with nothing to compare against.")
+  fin_show_table(
+    .tab   = out_,
+    .title = "31 against the files 30 and 40 wrote"
+  )
+  invisible(out_)
+}
+
+
+# 29. Table: the two readings of the content variables, totals -----------------------------------------------------
+# First built in 31 (16 September 2026) to replace, in the online appendix, the observation contrast and the values
+# table with one compact table: a row per measure, the share of contracts on which it takes a value and what it is
+# worth, under the naive and the rule-based reading. It computes nothing new: it reads the content, money and values
+# tibbles this document wrote, and checks the means that two of those builders compute separately against each other.
+
+#' The two readings of the content variables, totals only: the share with a value and the value, per measure
+#'
+#' Duration is a median over the contracts on which a reading defines it; the other measures are means over all
+#' contracts, zero where nothing was extracted. The rule-based countries and states are the paper's content table's --
+#' places attached to any recital party -- and the rows beneath them split that count by the registrant and the
+#' counterparties. The chunk that calls it needs `results: asis`.
+#'
+#' @param .dirs List. .lP$Output; the four tibbles are read from DirData.
+#' @param .name Character. The stem every file takes.
+#' @return Invisibly, the table tibble: Key, Row, Kind, Statistic, NaiveShare, NaiveValue, RuleShare, RuleValue, N.
+fin_table_content_readings <- function(.dirs, .name = "ContentReadings") {
+  if (FALSE) {
+    .dirs <- .lP$Output
+    .name <- "ContentReadings"
+  }
+  total_ <- function(.stem) {
+    p_ <- fs::path(.dirs$DirData, paste0(.stem, ".parquet"))
+    if (!fs::file_exists(p_)) cli::cli_abort("{.file {p_}} is missing; its table is built earlier in this topic.")
+    tab_ <- arrow::read_parquet(p_)
+    tab_[tab_$Kind == "total", , drop = FALSE]
+  }
+  rul_ <- total_(.stem = "ContentRule")
+  nai_ <- total_(.stem = "ContentNaive")
+  mon_ <- total_(.stem = "MoneyDetail")
+  val_ <- total_(.stem = "ContentValues")
+  ns_  <- c(ContentRule = rul_$N, ContentNaive = nai_$N, MoneyDetail = mon_$N, ContentValues = val_$N)
+  if (length(unique(ns_)) != 1L) {
+    cli::cli_abort("The four tibbles are not on one sample: {paste(names(ns_), ns_, collapse = ', ')}.")
+  }
+  n_ <- unname(ns_[[1L]])
+
+  # COMPUTED TWICE, CHECKED HERE. The values table recomputes from the release what the content and money tables
+  # compute from the prepared contracts. Amounts are left out: the values table drops the contracts on which no
+  # amount was read, while the paper counts those as zero, which is the money table's mean and the one printed.
+  twice_ <- tibble::tibble(
+    Quantity = c("Parties, naive", "Parties, rule-based", "Countries, naive", "States, naive"),
+    Content  = c(nai_$PartMean, rul_$PartMean, nai_$CtryMean, nai_$StateMean),
+    Values   = c(val_$PartNaive, val_$PartRule, val_$CtryNaive, val_$StateNaive)
+  ) |>
+    dplyr::mutate(Agree = abs(.data$Content - .data$Values) < 1e-9)
+  if (all(twice_$Agree)) {
+    cli::cli_alert_success("The means both the content and the values builders compute agree.")
+  } else {
+    cli::cli_alert_warning("The content and the values builders disagree on: {twice_$Quantity[!twice_$Agree]}.")
+    tbl_out(
+      .tab   = twice_,
+      .title = "Means computed twice"
+    )
+  }
+
+  pct_ <- function(.k) 100 * .k / n_
+  tab_ <- tibble::tibble(
+    Key        = c("Duration", "Parties", "Countries", "CountriesRegistrant", "CountriesCounterparty", "States",
+                   "StatesRegistrant", "StatesCounterparty", "Amounts"),
+    Row        = c("Duration, median years", "Parties, mean per contract", "Countries, mean per contract",
+                   "attached to the registrant", "attached to a counterparty", "States, mean per contract",
+                   "attached to the registrant", "attached to a counterparty", "Amounts, mean per contract"),
+    Kind       = c("measure", "measure", "measure", "split", "split", "measure", "split", "split", "measure"),
+    Statistic  = c("median", rep("mean", 8L)),
+    NaiveShare = c(pct_(nai_$DurN), pct_(nai_$PartN), pct_(nai_$CtryN), NA, NA, pct_(nai_$StateN), NA, NA,
+                   mon_$NaiveShare),
+    NaiveValue = c(val_$DurNaive, nai_$PartMean, nai_$CtryMean, NA, NA, nai_$StateMean, NA, NA, mon_$NaiveMean),
+    RuleShare  = c(pct_(rul_$DurN), pct_(rul_$PartN), pct_(rul_$CtryN), NA, NA, pct_(rul_$StateN), NA, NA,
+                   mon_$UsdShare),
+    RuleValue  = c(val_$DurRule, rul_$PartMean, rul_$CtryMean, val_$CtryReg, val_$CtryCpty, rul_$StateMean,
+                   val_$StateReg, val_$StateCpty, mon_$UsdMean),
+    N          = n_
+  )
+  fin_save_data(
+    .tab  = tab_,
+    .name = .name,
+    .dir  = .dirs$DirData
+  )
+
+  # THE CELLS: shares with one decimal, values with two, a dash where a reading has no such quantity.
+  fmt_ <- function(.x, .d) dplyr::if_else(is.na(.x), "--", formatC(.x, format = "f", digits = .d))
+  cells_ <- tibble::tibble(
+    Row        = tab_$Row,
+    NaiveShare = fmt_(tab_$NaiveShare, 1L),
+    NaiveValue = fmt_(tab_$NaiveValue, 2L),
+    RuleShare  = fmt_(tab_$RuleShare, 1L),
+    RuleValue  = fmt_(tab_$RuleValue, 2L)
+  )
+  body_ <- purrr::map_chr(seq_len(nrow(cells_)), \(.i) {
+    lab_ <- fin_tex_escape(cells_$Row[.i])
+    if (tab_$Kind[.i] == "split") lab_ <- paste0("\\hspace{1em}", lab_)
+    paste0(paste(c(lab_, unlist(cells_[.i, -1L])), collapse = " & "), " \\\\")
+  })
+  fin_tex_write(
+    .lines = c(
+      "\\begin{tabular}{l r r r r}",
+      "\\toprule",
+      " & \\multicolumn{2}{c}{Naive reading} & \\multicolumn{2}{c}{Rule-based reading} \\\\",
+      "\\cmidrule(lr){2-3} \\cmidrule(lr){4-5}",
+      " & With a value (\\%) & Value & With a value (\\%) & Value \\\\",
+      "\\midrule",
+      body_,
+      "\\bottomrule",
+      "\\end{tabular}"
+    ),
+    .path  = fs::path(.dirs$DirTables, paste0(.name, ".tex"))
+  )
+
+  note_ <- c(
+    "This table sets the naive reading of the extracted spans against the rule-based reading on the unique-contract",
+    paste0("sample (N = ", format(n_, big.mark = ","), "): for each content measure, the share of contracts on which it"),
+    "takes a value and what it is worth. Duration is the median, in years, over the contracts on which a reading",
+    "defines it: the naive end is the farthest date after the filing; the rule-based end is the first of a stated",
+    "term, an open-ended clause, a cue-word date and the farthest future date, and durations above 30 years are",
+    "dropped. The other measures are means over all contracts, a contract without a value counting as zero.",
+    "Parties are the distinct organization names the extractor proposed (naive) and the registrants, co-registrants",
+    "and counterparties they are grouped into (rule-based). Countries and states are the distinct places named",
+    "outside a governing-law clause (naive) and those attached to a registrant, co-registrant or counterparty",
+    "(rule-based), as in the content table of the paper; the rows beneath split the rule-based places into those",
+    "attached to the registrant and those attached to the counterparties, which overlap and leave out the",
+    "co-registrants, so they do not add up to the row above. Amounts are the distinct figures read with a currency",
+    "marker (naive) and those kept in U.S. dollars after the zero and par-value filters (rule-based). A dash marks a",
+    "cell that is not defined."
+  )
+  fin_note_write(
+    .text = note_,
+    .path = fs::path(.dirs$DirNotes, paste0(.name, ".tex"))
+  )
+
+  shown_ <- dplyr::mutate(cells_, dplyr::across(-"Row", \(.x) dplyr::if_else(.x == "--", "-", .x)))
+  names(shown_) <- c(" ", "With a value (%)", "Value", "With a value (%)", "Value")
+  k_ <- shown_ |>
+    knitr::kable(
+      format   = "html",
+      escape   = TRUE,
+      caption  = "The two readings of the content variables, totals",
+      align    = "lrrrr",
+      booktabs = TRUE
+    ) |>
+    kableExtra::kable_styling(
+      full_width        = FALSE,
+      position          = "left",
+      bootstrap_options = c("hover", "condensed"),
+      font_size         = 12
+    ) |>
+    kableExtra::add_header_above(c(" " = 1, "Naive reading" = 2, "Rule-based reading" = 2)) |>
+    kableExtra::add_indent(which(tab_$Kind == "split")) |>
+    kableExtra::footnote(
+      general           = paste(note_, collapse = " "),
+      general_title     = "Notes:",
+      footnote_as_chunk = TRUE,
+      threeparttable    = TRUE
+    )
+  fin_emit_kable(
+    .kable = k_,
+    .ncol  = ncol(shown_)
+  )
+  invisible(tab_)
+}
+
+
+# 30. Figure: firm fundamentals, the layouts under choice ----------------------------------------------------------
+# First built in 31 (16 September 2026). The figure 30 builds is ten inches wide; set at the manuscript's text width
+# of 5.65 inches it prints 11-point type at about six points. These forms use the standard 7.5-inch canvas: three
+# stack the two panels and differ only in Panel A's time axis, two split the figure in two. The data are 30's
+# (fin_data_size_channel(), fin_data_industry()); only the smoothing of Panel A and the layout are new.
+
+#' Panel A's data on the time axis a form plots
+#'
+#' The saw-tooth of the periodic series is the 10-K quarter: contracts attached to the annual report arrive once a
+#' year. "year" averages the four quarters of each complete fiscal year (2002 to 2023; the window's first and last
+#' fiscal years are partial); "roll4" is a trailing mean over four fiscal quarters, from the fourth quarter in.
+#'
+#' @param .size Tibble from fin_data_size_channel().
+#' @param .smooth Character. "quarter", "year" or "roll4".
+#' @return Tibble: X (the plotted time), Size, Periodic, Current.
+fin_data_size_smooth <- function(.size, .smooth = c("quarter", "year", "roll4")) {
+  if (FALSE) {
+    .size   <- fin_data_size_channel(.ds_quarter = lst_ds$Quarter)
+    .smooth <- "year"
+  }
+  .smooth <- match.arg(.smooth)
+  roll_ <- function(.x) {
+    as.numeric(stats::filter(
+      x      = .x,
+      filter = rep(0.25, 4L),
+      sides  = 1L
+    ))
+  }
+  out_ <- switch(
+    .smooth,
+    quarter = dplyr::mutate(.size, X = .data$YQ),
+    year    = .size |>
+      dplyr::filter(dplyr::n() == 4L, .by = c("fyear", "Size")) |>          # complete fiscal years only
+      dplyr::summarise(
+        Periodic = mean(.data$Periodic),
+        Current  = mean(.data$Current),
+        .by      = c("fyear", "Size")
+      ) |>
+      dplyr::mutate(X = .data$fyear),
+    roll4   = .size |>
+      dplyr::arrange(.data$Size, .data$YQ) |>
+      dplyr::mutate(
+        Periodic = roll_(.x = .data$Periodic),
+        Current  = roll_(.x = .data$Current),
+        .by      = "Size"
+      ) |>
+      dplyr::filter(!is.na(.data$Periodic)) |>
+      dplyr::mutate(X = .data$YQ)
+  )
+  dplyr::select(out_, "X", "Size", "Periodic", "Current")
+}
+
+#' The firm-fundamentals figure in one of the layouts under choice
+#'
+#' @param .size Tibble from fin_data_size_smooth().
+#' @param .industry Tibble from fin_data_industry().
+#' @param .panels Character. "stack" (Panel A above Panel B), "size" (A alone) or "industry" (B alone).
+#' @param .smooth Character. Panel A's time axis, for its label: "quarter", "year" or "roll4".
+#' @return A ggplot, or a patchwork for "stack".
+fin_plot_firm_forms <- function(.size, .industry, .panels = c("stack", "size", "industry"), .smooth = "quarter") {
+  if (FALSE) {
+    .size     <- fin_data_size_smooth(.size = fin_data_size_channel(.ds_quarter = lst_ds$Quarter), .smooth = "year")
+    .industry <- fin_data_industry(.ds_quarter = lst_ds$Quarter)
+    .panels   <- "stack"
+    .smooth   <- "year"
+  }
+  .panels <- match.arg(.panels)
+  stack_  <- .panels == "stack"
+  blues_  <- plot_pal_seq(3L)
+  cols_   <- c(Small = blues_[[2L]], Large = blues_[[3L]])
+  title_  <- ggplot2::theme(
+    plot.title          = ggplot2::element_text(
+      family = .plot_font,
+      size   = .plot_base,
+      face   = "bold",
+      hjust  = 0,
+      margin = ggplot2::margin(b = 6)
+    ),
+    plot.title.position = "plot"
+  )
+  long_ <- .size |>
+    tidyr::pivot_longer(c("Periodic", "Current"), names_to = "Channel", values_to = "Mean") |>
+    dplyr::mutate(
+      Channel = factor(dplyr::if_else(.data$Channel == "Periodic", "Periodic filings", "Current reports"),
+                       levels = c("Periodic filings", "Current reports")),
+      Size    = factor(.data$Size, levels = c("Small", "Large"))
+    )
+  a_ <- long_ |>
+    ggplot2::ggplot(ggplot2::aes(x = .data$X, y = .data$Mean, colour = .data$Size, linetype = .data$Size)) +
+    ggplot2::geom_line(linewidth = 0.6) +
+    ggplot2::facet_wrap(ggplot2::vars(.data$Channel), ncol = 2L) +
+    ggplot2::scale_colour_manual(values = cols_, name = NULL) +
+    ggplot2::scale_linetype_manual(values = c(Small = "solid", Large = "dashed"), name = NULL) +
+    ggplot2::scale_y_continuous(
+      labels = scales::label_number(accuracy = 0.1),
+      limits = c(0, NA),
+      expand = ggplot2::expansion(mult = c(0, 0.05))
+    ) +
+    ggplot2::scale_x_continuous(breaks = seq(2004, 2024, 4), expand = ggplot2::expansion(mult = 0.02)) +
+    ggplot2::labs(
+      title = if (stack_) "Panel A: Firm size" else NULL,
+      x     = switch(.smooth, quarter = NULL, year = "Fiscal year", roll4 = "Fiscal quarter, mean of the last four"),
+      y     = "Contracts per firm-quarter"
+    ) +
+    plot_theme(.grid = "y", .legend = if (stack_) "top" else "bottom") +
+    ggplot2::theme(panel.spacing.x = ggplot2::unit(14, "pt")) +
+    title_
+  b_ <- ggplot2::ggplot(.industry, ggplot2::aes(y = forcats::fct_rev(.data$FfInd), x = .data$Mean)) +
+    ggplot2::geom_col(
+      fill      = blues_[[1L]],
+      colour    = .plot_ref,
+      linewidth = .plot_line,
+      width     = 0.7
+    ) +
+    ggplot2::geom_text(
+      mapping = ggplot2::aes(label = formatC(.data$Mean, format = "f", digits = 2)),
+      hjust   = -0.15,
+      size    = .plot_base / ggplot2::.pt * 0.9,
+      family  = .plot_font
+    ) +
+    ggplot2::scale_x_continuous(expand = ggplot2::expansion(mult = c(0, 0.1))) +
+    ggplot2::labs(
+      title = if (stack_) "Panel B: Industry" else NULL,
+      x     = "Contracts per firm-quarter",
+      y     = NULL
+    ) +
+    plot_theme(.grid = "x", .legend = "none") +
+    title_
+  switch(
+    .panels,
+    # EACH PANEL KEEPS ITS OWN MARGINS. Stacked, patchwork lines the two plot areas up, and Panel B's industry
+    # names are wide enough that the alignment pushes Panel A's axis title away from its own axis. Wrapped as
+    # elements, the panels are laid out side by side without that alignment: the title sits by the axis it names.
+    stack    = patchwork::wrap_plots(
+      patchwork::wrap_elements(full = a_),
+      patchwork::wrap_elements(full = b_),
+      ncol    = 1L,
+      heights = c(1, 1.1)
+    ),
+    size     = a_,
+    industry = b_
+  )
+}
+
+#' One firm-fundamentals form, built, saved and shown
+#'
+#' "a" to "c" stack Panel A above Panel B on the standard canvas, with Panel A by fiscal quarter, as fiscal-year
+#' means or as trailing four-quarter means; "size" and "industry" are the two halves of a split, the first on
+#' fiscal-year means. The chunk that calls it needs `results: asis`.
+#'
+#' @param .ds_quarter The prepared Quarter dataset.
+#' @param .form Character. "a", "b", "c", "size" or "industry".
+#' @param .dirs List. .lP$Output.
+#' @param .name Character or NULL. The stem; NULL takes the form's own.
+#' @return Invisibly, a list: Plot, Data, Files.
+fin_figure_firm_forms <- function(.ds_quarter, .form = c("a", "b", "c", "size", "industry"), .dirs, .name = NULL) {
+  if (FALSE) {
+    .ds_quarter <- lst_ds$Quarter
+    .form       <- "b"
+    .dirs       <- .lP$Output
+    .name       <- NULL
+  }
+  .form <- match.arg(.form)
+  spec_ <- switch(
+    .form,
+    a        = list(Panels = "stack", Smooth = "quarter", Stem = "FirmFundamentalsA", Rows = 18L),
+    b        = list(Panels = "stack", Smooth = "year", Stem = "FirmFundamentalsB", Rows = 18L),
+    c        = list(Panels = "stack", Smooth = "roll4", Stem = "FirmFundamentalsC", Rows = 18L),
+    size     = list(Panels = "size", Smooth = "year", Stem = "FirmSize", Rows = 8L),
+    industry = list(Panels = "industry", Smooth = "year", Stem = "FirmIndustry", Rows = 12L)
+  )
+  name_ <- if (is.null(.name)) spec_$Stem else .name
+  size_ <- fin_data_size_smooth(
+    .size   = fin_data_size_channel(.ds_quarter = .ds_quarter),
+    .smooth = spec_$Smooth
+  )
+  ind_ <- fin_data_industry(.ds_quarter = .ds_quarter)
+  n_q_ <- .ds_quarter |>
+    dplyr::filter(.data$S5_Quarter) |>
+    dplyr::count() |>
+    dplyr::collect() |>
+    dplyr::pull("n")
+  when_ <- switch(
+    spec_$Smooth,
+    quarter = "by fiscal quarter from 2001q2 to 2024q1.",
+    year    = "averaged over the four quarters of each complete fiscal year from 2002 to 2023.",
+    roll4   = "as a trailing mean over four fiscal quarters from 2002q1 to 2024q1."
+  )
+  size_txt_ <- paste(
+    "the mean number of contracts per firm-quarter for firms in the smallest and the largest quartile of winsorized",
+    "total assets, quartiles defined within each fiscal year, separately for periodic filings (10-K, 10-Q, 20-F) and",
+    "current reports (every other form, registration statements included),",
+    when_
+  )
+  ind_txt_ <- "the mean number of contracts per firm-quarter by Fama-French 12 industry."
+  lead_ <- paste0(
+    "This figure shows filing activity by firm characteristics on the firm-quarter panel: every fiscal quarter ",
+    "between 2001 and 2024 of every firm that filed at least one contract in the sample (",
+    format(n_q_, big.mark = ","), " firm-quarters), non-filing quarters included."
+  )
+  note_ <- switch(
+    spec_$Panels,
+    stack    = c(lead_, paste("Panel A gives", size_txt_), paste("Panel B gives", ind_txt_)),
+    size     = c(lead_, paste("It gives", size_txt_)),
+    industry = c(lead_, paste("It gives", ind_txt_))
+  )
+  ind_chr_ <- dplyr::mutate(ind_, FfInd = as.character(.data$FfInd))
+  data_ <- switch(
+    spec_$Panels,
+    stack    = dplyr::bind_rows(
+      dplyr::mutate(size_, Panel = "A"),
+      dplyr::mutate(ind_chr_, Panel = "B")
+    ),
+    size     = size_,
+    industry = ind_chr_
+  )
+  fin_figure_save(
+    .plot   = fin_plot_firm_forms(
+      .size     = size_,
+      .industry = ind_,
+      .panels   = spec_$Panels,
+      .smooth   = spec_$Smooth
+    ),
+    .data   = data_,
+    .note   = note_,
+    .name   = name_,
+    .dirs   = .dirs,
+    .height = plot_height(spec_$Rows)
+  )
 }

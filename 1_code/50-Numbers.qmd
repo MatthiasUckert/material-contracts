@@ -47,7 +47,7 @@ purrr::walk(
   .f = \(.p) source(file = .p, encoding = "UTF-8")
 )
 
-.name_script <- "40-Numbers"
+.name_script <- "50-Numbers"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(
@@ -118,7 +118,7 @@ registry yet; when they come, they come from the release through 30, not as type
 .lP$Input <- list(
   Contracts = fs::path(.lP$Root, "100_Data_Export", "Contracts.parquet"), # the release
   Orders    = fs::path(.lP$Root, "100_Data_Export", "CtoOrders.parquet"), # one row per reference an order makes
-  Lib       = here::here("1_code", "40-Numbers.R"),                      # a changed builder rebuilds
+  Lib       = here::here("1_code", "50-Numbers.R"),                      # a changed builder rebuilds
   # 30'S OUTPUT, read in place: Data/ for the tibbles its tables print from.
   DirExhibits = here::here("2_output", "30-FinalExhibits", "Output"),
   DirData30   = here::here("2_output", "30-FinalExhibits", "Output", "Data"),
@@ -130,16 +130,15 @@ registry yet; when they come, they come from the release through 30, not as type
                          "crowned_classification.parquet"),
   DirStore  = here::here("2_output", "04A-EntityExtract", "Output"),                        # D: the span stores
   Sample    = here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet"), # D: the documents
+  Package   = here::here("2_output", "40B-PublishData", "Stage", "sample", "package_numbers.csv"), # F: 50B's report
   # THE DATA DIRECTORIES, in search order: 31's first (the moved builders write there), then 30's, then this pair's own.
   DirData   = c(
-    here::here("2_output", "31-FinalExhibits", "Output", "Data"),   # the moved builders' data (A, C, D) live here now
-    here::here("2_output", "30-FinalExhibits", "Output", "Data"),
-    here::here("2_output", "40-Numbers", "Output", "Data")
+    here::here("2_output", "30-FinalExhibits", "Output", "Data"),   # the exhibits' data (A, C, D) live here
+    here::here("2_output", "50-Numbers", "Output", "Data")
   ),
-  # THE FILES THAT CITE KEYS, scanned under Validation: the manuscript's section files as exported from Overleaf
-  # (a folder of .tex, optional) and the appendix chapters' sources.
-  DirManuscript = fs::path(.lP$Root, "200-Paper_figures", "Manuscript"),
-  Chapters      = here::here("1_code", c("41-Methods.qmd", paste0("42-OnlineAppendix-", c("A", "B", "C", "D"), ".qmd")))
+  # THE FILES THAT CITE KEYS, scanned under Validation: the manuscript's and the appendix's .tex files as exported
+  # from Overleaf (a folder of .tex, optional).
+  DirManuscript = fs::path(.lP$Root, "200-Paper_figures", "Manuscript")
 )
 
 .lP$Output <- list(
@@ -150,7 +149,7 @@ registry yet; when they come, they come from the release through 30, not as type
 
 # THE SECTIONS OF THE REGISTER, in print order: the manuscript's sections first, then the appendix chapters. A key
 # is filed under the first section that cites it.
-.num_sections <- c("Intro", "3.1", "3.2", "3.3", "3.4", "4.1", "OA-A", "OA-B", "OA-C", "OA-D")
+.num_sections <- c("Intro", "3.1", "3.2", "3.3", "3.4", "4.1", "OA-A", "OA-B", "OA-C", "OA-D", "OA-F")
 
 oa_state_reset()
 ```
@@ -334,6 +333,22 @@ st_d <- c(
 oa_report_builds(.status = c(st_own, st_a, st_b, st_c, st_d))
 ```
 
+```{r}
+#| label: build-appendix-f
+# CHAPTER F reads what 50B reported about the package it published. 50B runs after this document in the numbering
+# but before it in time: the package must exist for the appendix to describe it, so a missing report stops here.
+st_f <- c(
+  PackageNumbers = oaf_build_package(
+    .path_numbers = .lP$Input$Package,    # 50B's package_numbers.csv, beside the staged sample
+    .dir_own      = .lP$Output$DirOwn,
+    .force        = .lP$Params$Rebuild,
+    .path_lib     = .lP$Input$Lib
+  )
+)
+
+oa_report_builds(.status = st_f)
+```
+
 # The registry
 
 One row per number. `Where` is a filter over the tibble's own columns, evaluated as written; `Fun` reduces the
@@ -464,6 +479,10 @@ spec_a <- tibble::tribble(
   "DocsReleaseUnique",  "TextCounts",     "Value",       "one", "count", "Key == 'DocsUnique'",
   "DocsReleaseFlagged", "TextCounts",     "Value",       "one", "count", "Key == 'DocsFlagged'",
   "DocsPre2001",        "TextCounts",     "Value",       "one", "count", "Key == 'DocsPre2001'",
+  "RowsPre2001",        "TextCounts",     "Value",       "one", "count", "Key == 'RowsPre2001'",
+  "RowsFlagged",        "TextCounts",     "Value",       "one", "count", "Key == 'RowsFlagged'",
+  "DocsSample2008",     "TextCounts",     "Value",       "one", "count", "Key == 'DocsSample2008'",
+  "NSeasonedAll",       "SeasonedFilers", "N",           "sum", "count", "Filers == 'Seasoned filers'",
   "CovInside",          "FormCoverage",   "Filings",     "one", "count", .where_in,
   "CovSmallBusiness",   "FormCoverage",   "Filings",     "sum", "count", "grepl('Small business', Group)",
   "CovTenKVariants",    "FormCoverage",   "Filings",     "one", "count", "Group == '10-K variants'",
@@ -661,6 +680,41 @@ spec_d <- tibble::tribble(
 ```
 
 ```{r}
+#| label: registry-appendix-f
+# CHAPTER F's rows: the package as 50B reported it. Rows the manuscript already owns (DocsRelease, Docs8K, OrderRefs,
+# NLabelled, Orders) are not repeated; the appendix cites those keys.
+.where_pkg <- \(.k) paste0("Key == '", .k, "'")
+
+spec_f <- tibble::tribble(
+  ~Key,             ~Exhibit,         ~Column, ~Fun,  ~Format, ~Where,
+  "PkgVersion",     "PackageNumbers", "Text",  "one", "text",  .where_pkg(.k = "package.version"),
+  "PkgFiles",       "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "package.files"),
+  "PkgSizeGB",      "PackageNumbers", "Value", "one", "num1",  .where_pkg(.k = "package.gb"),
+  "FilesCore",      "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "folder.files.core"),
+  "FilesSpans",     "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "folder.files.spans"),
+  "FilesText",      "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "folder.files.text"),
+  "FilesModels",    "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "folder.files.models"),
+  "FilesLexnlp",    "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "folder.files.lexnlp"),
+  "SizeCoreGB",     "PackageNumbers", "Value", "one", "num1",  .where_pkg(.k = "folder.gb.core"),
+  "SizeSpansGB",    "PackageNumbers", "Value", "one", "num1",  .where_pkg(.k = "folder.gb.spans"),
+  "SizeTextGB",     "PackageNumbers", "Value", "one", "num1",  .where_pkg(.k = "folder.gb.text"),
+  "SizeModelsGB",   "PackageNumbers", "Value", "one", "num1",  .where_pkg(.k = "folder.gb.models"),
+  "SizeLexnlpGB",   "PackageNumbers", "Value", "one", "num1",  .where_pkg(.k = "folder.gb.lexnlp"),
+  "RowsPlaces",     "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "rows.places"),
+  "RowsTermDocs",   "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "rows.termdocs"),
+  "KwTerms",        "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "rows.keywordterms"),
+  "SpansTotal",     "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "spans.total"),
+  "Texts8K",        "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "text.documents.8k"),
+  "Texts8KA",       "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "text.documents.8ka"),
+  "ModelsCount",    "PackageNumbers", "Value", "one", "count", .where_pkg(.k = "models.count")
+) |>
+  dplyr::mutate(
+    Section = "OA-F",
+    Note    = paste0("Appendix F, read from ", .data$Exhibit, " where ", .data$Where)
+  )
+```
+
+```{r}
 #| label: registry-assemble
 tab_numbers_spec <- dplyr::bind_rows(
   spec_manuscript,
@@ -669,7 +723,8 @@ tab_numbers_spec <- dplyr::bind_rows(
   spec_a,
   spec_b,
   spec_c,
-  spec_d
+  spec_d,
+  spec_f
 ) |>
   num_registry_check(.sections = .num_sections)
 
@@ -715,10 +770,7 @@ written, and is listed so the registry stays honest.
 
 ```{r}
 #| label: validate-citations
-paths_cite <- c(
-  if (fs::dir_exists(.lP$Input$DirManuscript)) fs::dir_ls(.lP$Input$DirManuscript, glob = "*.tex"),
-  .lP$Input$Chapters
-)
+paths_cite <- if (fs::dir_exists(.lP$Input$DirManuscript)) fs::dir_ls(.lP$Input$DirManuscript, glob = "*.tex")
 
 tab_cited <- num_cited_keys(.paths = paths_cite)
 
@@ -746,10 +798,10 @@ is whether to upload it.
 
 ```r
 source(here::here("1_code", "_Commons", "_OnlineAppendix.R"), encoding = "UTF-8")
-source(here::here("1_code", "40-Numbers.R"), encoding = "UTF-8")
+source(here::here("1_code", "50-Numbers.R"), encoding = "UTF-8")
 
 num_deploy(
-  .path_numbers = here::here("2_output", "40-Numbers", "Output", "Numbers.tex"),
+  .path_numbers = here::here("2_output", "50-Numbers", "Output", "Numbers.tex"),
   .dir_deploy   = fs::path(
     "/Users/matthiasuckert/Dropbox/MyPapers/MaterialContracts/MatContractPipeline",
     "200-Paper_figures",

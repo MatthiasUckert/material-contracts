@@ -49,7 +49,7 @@ fs::dir_create(fs::path_dir(path_report))
 while (sink.number() > 0L) sink()
 sink(file = path_report, split = TRUE)
 
-dir_pkg <- fs::path(here::here("2_output", "50B-PublishData"), "Stage", "matcon-data", "v1.0.0")
+dir_pkg <- fs::path(here::here("2_output", "40B-PublishData"), "Stage", "matcon-data", "v1.0.0")
 cat("spotcheck-package.R |", format(Sys.time(), "%Y-%m-%d %H:%M"), "\n")
 cat("package:", as.character(dir_pkg), "| exists:", fs::dir_exists(dir_pkg), "\n")
 

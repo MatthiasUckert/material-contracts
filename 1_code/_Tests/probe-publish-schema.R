@@ -10,7 +10,7 @@
 # writes ~/Downloads/probe-publish-schema.txt plus a folder ~/Downloads/probe-files/. Attach the .txt and the folder's
 # files in the chat. A few minutes.
 
-dir_pkg   <- here::here("2_output", "50B-PublishData", "Stage", "matcon-data", "v1.0.0")
+dir_pkg   <- here::here("2_output", "40B-PublishData", "Stage", "matcon-data", "v1.0.0")
 dir_mod   <- here::here("2_output", "03B-ClassifyTrainBERT", "model_final")
 dir_files <- fs::path_expand("~/Downloads/probe-files")
 path_rep  <- fs::path_expand("~/Downloads/probe-publish-schema.txt")

@@ -44,7 +44,7 @@ purrr::walk(
   .f = \(.p) source(file = .p, encoding = "UTF-8")
 )
 
-.name_script <- "50B-PublishData"
+.name_script <- "40B-PublishData"
 
 cat("Main Directory: ")
 (.dir_main <- init_create_script_dir(

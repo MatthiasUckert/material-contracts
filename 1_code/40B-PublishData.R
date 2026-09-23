@@ -1,4 +1,4 @@
-# 50B-PublishData: the data package ------------------------------------------------------------------------------------
+# 40B-PublishData: the data package ------------------------------------------------------------------------------------
 #
 # WHAT THIS FILE DOES
 # It builds the published data package from what the pipeline stages wrote, checks it against its sources and against
