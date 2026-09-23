@@ -1615,7 +1615,7 @@ oaa_build_form_descriptions <- function(.dir_own, .force, .path_lib) {
 #
 # 40-OnlineAppendix-C.qmd holds the chapter's text; _Commons/_OnlineAppendix.R holds everything the chapters share.
 # Every table of the chapter is written here, in the appendix's own cut: most from the data tibbles 30 writes beside
-# its own tables (the labelled sample, the sweep, the scores by category, the confusion matrix, the amendment flag,
+# its own tables (the labeled sample, the sweep, the scores by category, the confusion matrix, the amendment flag,
 # the keyword table, the arms and the ceiling), with fewer columns, no fold uncertainty and numbered categories;
 # two from other sources -- the descriptions filers give their contracts, from the release, and the second-label
 # table, from 03B's out-of-fold classification. 30 stays the manuscript's writer; nothing of 30 is changed or rerun.
@@ -1910,7 +1910,7 @@ oac_due <- function(.dir_own, .name, .path_30, .path_lib, .force) {
 oac_fmt3 <- function(.x) dplyr::if_else(is.na(.x), "--", formatC(.x, format = "f", digits = 3L))
 oac_fmtn <- function(.x) format(.x, big.mark = ",", trim = TRUE, scientific = FALSE)
 
-#' Build the labelled-sample table: N, share and second labels per category
+#' Build the labeled-sample table: N, share and second labels per category
 #'
 #' @param .dir_data Character. 30's Output/Data.
 #' @param .dir_own Character. This chapter's output directory.
@@ -1948,7 +1948,7 @@ oac_build_labelled <- function(.dir_data, .dir_own, .force, .path_lib) {
       .spec   = c(oa_col_text(.share = 0.52), oa_col_num(.mm = 18), oa_col_num(.mm = 14), oa_col_num(.mm = 24))
     ),
     .note    = paste(
-      "The labelled sample: contracts with readable text and a label, by category. Parent rows sum their",
+      "The labeled sample: contracts with readable text and a label, by category. Parent rows sum their",
       "sub-categories. Second label counts the contracts that carry a second valid category, recorded beside the",
       "primary and never used in training. The numbers in parentheses are the categories' numbers throughout this",
       "appendix, in the order of the paper's categories table."
@@ -2099,8 +2099,8 @@ oac_build_confusion <- function(.dir_data, .dir_own, .force, .path_lib) {
       .spec   = c(oa_col_text(.share = 0.22), rep(oa_col_num(.mm = 9), 12L))
     ),
     .note    = paste(
-      "Confusion matrix of the transformer that ships on the labelled sample, out of fold: rows are the true category,",
-      "columns the predicted one, numbered as in the labelled-sample table; cells are numbers of contracts.",
+      "Confusion matrix of the transformer that ships on the labeled sample, out of fold: rows are the true category,",
+      "columns the predicted one, numbered as in the labeled-sample table; cells are numbers of contracts.",
       "Categories are in taxonomic order, so an error that stays inside a parent sits next to the diagonal and one",
       "that crosses a parent sits further from it."
     ),
@@ -2145,7 +2145,7 @@ oac_build_amendment <- function(.dir_data, .dir_own, .force, .path_lib) {
       .spec   = c(oa_col_text(.share = 0.30), rep(oa_col_num(.mm = 18), 5L))
     ),
     .note    = paste(
-      "Out-of-fold scores of the amendment classifier that ships on the labelled sample. N is the number of",
+      "Out-of-fold scores of the amendment classifier that ships on the labeled sample. N is the number of",
       "contracts with the label, Predicted the number the classifier assigned it. The Total row reports overall",
       "accuracy in the precision column and macro recall and macro-F1 beside it."
     ),
@@ -2208,7 +2208,7 @@ oac_build_arms <- function(.dir_data, .dir_own, .force, .path_lib) {
       "Every engine on every task, out of fold on the same five folds. Coverage is the share of contracts an engine",
       "labels; the transformer and the language model label every contract, the keyword table abstains where no",
       "term fires. Accuracy is over all contracts, an abstention counting as wrong; accuracy where committed is over",
-      "the contracts the engine labelled. The last rows are the ceiling: the accuracy perfect routing would reach on",
+      "the contracts the engine labeled. The last rows are the ceiling: the accuracy perfect routing would reach on",
       "the detailed task, taking for every contract whichever of the engines named is right, which needs the true",
       "label and cannot be run; the last column is what each added engine gains over the ones before it."
     ),
@@ -2221,10 +2221,10 @@ oac_build_arms <- function(.dir_data, .dir_own, .force, .path_lib) {
 
 # 3. The second label against the runner-up --------------------------------------------------------------------------
 
-#' The second-label data: every dual-labelled document with the model's two choices beside its two labels
+#' The second-label data: every dual-labeled document with the model's two choices beside its two labels
 #'
-#' 03A records a second valid category for the minority of labelled documents that fit two, reviewed by hand so that
-#' the primary is the intended one; training never uses it. 03B's classification file carries, for every labelled
+#' 03A records a second valid category for the minority of labeled documents that fit two, reviewed by hand so that
+#' the primary is the intended one; training never uses it. 03B's classification file carries, for every labeled
 #' document, the model's first and second choice with their probabilities, out of fold, and the second label beside
 #' them. Two tables are built from it: the matrix of primary against second label, which shows where the annotators
 #' saw two answers, and, per primary category, how often the model's first choice is the primary and its runner-up
@@ -2331,8 +2331,8 @@ oac_build_second <- function(.path_class, .dir_own, .force, .path_lib) {
       .spec   = c(oa_col_text(.share = 0.22), rep(oa_col_num(.mm = 9), k_))
     ),
     .note    = paste(
-      "The", oac_fmtn(.x = nrow(dual_)), "labelled contracts that carry a second valid category: rows are the",
-      "primary label, columns the second, numbered as in the labelled-sample table; cells are numbers of contracts,",
+      "The", oac_fmtn(.x = nrow(dual_)), "labeled contracts that carry a second valid category: rows are the",
+      "primary label, columns the second, numbered as in the labeled-sample table; cells are numbers of contracts,",
       "blank where zero. Every such contract was reviewed and the intended primary recorded, so the order of the two",
       "labels is informative."
     ),
@@ -2381,7 +2381,7 @@ oac_build_second <- function(.path_class, .dir_own, .force, .path_lib) {
 # ======================================================================================================================
 #
 # 40-OnlineAppendix-D.qmd holds the chapter's text; _Commons/_OnlineAppendix.R holds everything the chapters share.
-# This library builds the chapter's own exhibits: what each extractor found on the labelled sample, counted from the
+# This library builds the chapter's own exhibits: what each extractor found on the labeled sample, counted from the
 # three span stores 04A wrote; where in a contract each extractor's candidates fall, and how far the extractors agree,
 # computed from the same stores with 04A's definitions; where each contract's end date comes from, and what the content
 # variables are worth under the naive and the rule-based reading, both from the release. The naive-against-rule
@@ -2425,14 +2425,14 @@ oad_read_sample <- function(.path_contracts, .cols) {
     dplyr::select(-"PrimaryFiler", -"DescSample")
 }
 
-# 2. What each extractor found on the labelled sample ------------------------------------------------------------------
+# 2. What each extractor found on the labeled sample ------------------------------------------------------------------
 
 #' Spans and coverage per family, model and entity, from 04A's stores
 #'
 #' 04A writes one DuckDB file per family under its Output/Store, holding one table per entity, every row a span with
 #' its document and its offsets; spaCy's tables also carry the model. The stores are opened read-only and counted:
 #' spans, and the documents in which the family found at least one, over the documents of the sample. Coverage is
-#' not a quality measure -- an extractor that tags every capitalised word reaches complete coverage -- and the text
+#' not a quality measure -- an extractor that tags every capitalized word reaches complete coverage -- and the text
 #' says so; what it establishes is what each extractor attempts and how much it proposes.
 #'
 #' @param .dir_store Character. 04A's Output, holding matcon.duckdb, spacy.duckdb and lexnlp.duckdb.
@@ -2507,12 +2507,11 @@ oad_build_coverage <- function(.dir_store, .path_sample, .spacy_model, .dir_own,
   )
   ent_ <- tibble::tribble(
     ~Entity,  ~Label,
-    "ORG",    "Organisations",
+    "ORG",    "Organizations",
     "PERSON", "Persons",
     "GPE",    "Places",
     "DATE",   "Dates",
     "TERM",   "Stated periods",
-    "MONEY",  "Monetary amounts",
     "REDACT", "Redaction markers",
     "LAW",    "Governing-law clauses"
   )
@@ -2538,11 +2537,11 @@ oad_build_coverage <- function(.dir_store, .path_sample, .spacy_model, .dir_own,
       .spec   = c(oa_col_text(.share = 0.28), rep(oa_col_num(.mm = 17), 6L))
     ),
     .note    = paste(
-      "What each extractor proposed on the", format(tab_$nDocs[1], big.mark = ","), "contracts of the labelled",
+      "What each extractor proposed on the", format(tab_$nDocs[1], big.mark = ","), "contracts of the labeled",
       "sample: LexNLP, spaCy (its transformer model) and the pattern and gazetteer extractors written for the",
       "database (Patterns). Under each, the number of text spans proposed and the share of contracts",
       "in which the extractor found at least one. A dash marks an entity the extractor does not attempt. Coverage is",
-      "not a quality measure: an extractor that tags every capitalised word reaches complete coverage."
+      "not a quality measure: an extractor that tags every capitalized word reaches complete coverage."
     ),
     .data    = tab_,
     .dir_own = .dir_own
@@ -2909,9 +2908,9 @@ oad_plot_positions <- function(.tab) {
   if (FALSE) {
     .tab <- tibble::tibble(Producer = "lexnlp", Entity = "ORG", Bin = 1:30, Share = rep(1 / 30, 30))
   }
-  ent_ <- c("ORG", "PERSON", "GPE", "LAW", "DATE", "TERM", "MONEY", "REDACT")
-  lab_ <- c(ORG = "Organisations", PERSON = "Persons", GPE = "Places", LAW = "Governing law", DATE = "Dates",
-            TERM = "Stated periods", MONEY = "Amounts", REDACT = "Redaction markers")
+  ent_ <- c("ORG", "PERSON", "GPE", "LAW", "DATE", "TERM", "REDACT")
+  lab_ <- c(ORG = "Organizations", PERSON = "Persons", GPE = "Places", LAW = "Governing law", DATE = "Dates",
+            TERM = "Stated periods", REDACT = "Redaction markers")
   prod_ <- c("lexnlp", "spacy:trf", "matcon")
   plab_ <- c(lexnlp = "LexNLP", `spacy:trf` = "spaCy", matcon = "Patterns")
   tab_ <- .tab |>
@@ -2940,12 +2939,21 @@ oad_plot_positions <- function(.tab) {
 oad_plot_agreement <- function(.tab) {
   if (FALSE) .tab <- tibble::tibble(Entity = "GPE", ProducerA = "lexnlp", ProducerB = "matcon", Jaccard = 0.66)
   plab_ <- c(lexnlp = "LexNLP", `spacy:trf` = "spaCy", matcon = "Patterns")
-  lab_  <- c(ORG = "Organisations", GPE = "Places", DATE = "Dates", MONEY = "Amounts")
+  lab_  <- c(ORG = "Organizations", GPE = "Places", DATE = "Dates")
   lvl_  <- unname(plab_)
   pairs_ <- .tab |>
     dplyr::filter(.data$Entity %in% names(lab_)) |>
     dplyr::transmute(Entity = .data$Entity, A = unname(plab_[.data$ProducerA]), B = unname(plab_[.data$ProducerB]),
-                     Jaccard = .data$Jaccard)
+                     Jaccard = .data$Jaccard) |>
+    # THE LOWER TRIANGLE: the row is the later producer, the column the earlier, whichever order the pair arrived
+    # in, so no pair lands above the diagonal and leaves its mirror cell empty (spaCy / Patterns, 23 Sep 2026).
+    dplyr::mutate(
+      Lo = pmin(match(.data$A, lvl_), match(.data$B, lvl_)),
+      Hi = pmax(match(.data$A, lvl_), match(.data$B, lvl_)),
+      A  = lvl_[.data$Lo],
+      B  = lvl_[.data$Hi]
+    ) |>
+    dplyr::select(-"Lo", -"Hi")
   diag_ <- pairs_ |>
     dplyr::select("Entity", "A", "B") |>
     tidyr::pivot_longer(cols = c("A", "B"), values_to = "P") |>
@@ -3013,7 +3021,7 @@ oad_build_alignment <- function(.dir_store, .path_sample, .spacy_model, .dir_own
     .name    = names_[1L],
     .lines   = NULL,
     .note    = paste(
-      "Every candidate span each extractor proposed on the labelled sample, by its position in the contract: the",
+      "Every candidate span each extractor proposed on the labeled sample, by its position in the contract: the",
       "contract is divided into thirty bins of equal length, and each line is the share of the producer's candidates",
       "for that entity that fall in each bin. LexNLP, spaCy (its transformer model) and the pattern and gazetteer",
       "extractors written for the database (Patterns); an extractor absent from a panel does not attempt that",
@@ -3032,7 +3040,7 @@ oad_build_alignment <- function(.dir_store, .path_sample, .spacy_model, .dir_own
     .name    = names_[2L],
     .lines   = NULL,
     .note    = paste(
-      "Agreement between extractors on the labelled sample, for the entities two of them attempt. Overlapping spans",
+      "Agreement between extractors on the labeled sample, for the entities two of them attempt. Overlapping spans",
       "of one entity within a contract are merged into a mention -- a place in the text where something was found",
       "-- and agreement is the Jaccard index over mentions: the share of mentions both producers found among those",
       "either found. It measures agreement about what is there; agreement about where a mention ends is a separate",
@@ -3058,11 +3066,10 @@ oad_build_alignment <- function(.dir_store, .path_sample, .spacy_model, .dir_own
 #'
 #' 30's contrast table counts on how many contracts each measure is defined; this one reports what it is worth on
 #' them. Duration: the median years under the naive end (the farthest future date) and under the cascade. Parties:
-#' the mean number of distinct organisation spellings (naive) and of registrants, co-registrants and counterparties
+#' the mean number of distinct organization spellings (naive) and of registrants, co-registrants and counterparties
 #' (rule). Countries and states: the mean number under the naive count (any mention outside a governing-law clause)
 #' and attached to the registrant and to the counterparties by the 200-character rule, the two reported apart
-#' because a country attached to both is one country. Amounts: the mean number of distinct figures read (naive)
-#' and kept after the zero and par-value filters, in U.S. dollars.
+#' because a country attached to both is one country.
 #'
 #' @param .path_contracts Character. The release's Contracts.parquet.
 #' @return Tibble: Row, Kind, Level1, Class, N, and one column per measure and reading.
@@ -3076,8 +3083,7 @@ oad_data_values <- function(.path_contracts) {
   }
   cols_ <- c("Class", "DurationYears", "NaiveYears", "nUniSpellingsNaive", "nUniRegistrant",
              "nUniCofiler", "nUniCounterparty", "nUniCountryNaive", "nUniCountryRegistrant",
-             "nUniCountryCounterparty", "nUniStateNaive", "nUniStateRegistrant", "nUniStateCounterparty",
-             "nUniAmountNaive", "nUniAmountUSD")
+             "nUniCountryCounterparty", "nUniStateNaive", "nUniStateRegistrant", "nUniStateCounterparty")
   con_ <- oad_read_sample(
     .path_contracts = .path_contracts,
     .cols           = cols_
@@ -3107,9 +3113,7 @@ oad_data_values <- function(.path_contracts) {
       CtryCpty     = mean(.d$nUniCountryCounterparty, na.rm = TRUE),
       StateNaive   = mean(.d$nUniStateNaive, na.rm = TRUE),
       StateReg     = mean(.d$nUniStateRegistrant, na.rm = TRUE),
-      StateCpty    = mean(.d$nUniStateCounterparty, na.rm = TRUE),
-      AmtNaive     = mean(.d$nUniAmountNaive, na.rm = TRUE),
-      AmtRule      = mean(.d$nUniAmountUSD, na.rm = TRUE)
+      StateCpty    = mean(.d$nUniStateCounterparty, na.rm = TRUE)
     )
   }
   lab_ <- dplyr::filter(con_, !is.na(.data$Class))
@@ -3181,30 +3185,36 @@ oad_build_values <- function(.path_contracts, .dir_own, .force, .path_lib) {
     CtryCpty   = f2_(.x = tab_$CtryCpty),
     StateNaive = f2_(.x = tab_$StateNaive),
     StateReg   = f2_(.x = tab_$StateReg),
-    StateCpty  = f2_(.x = tab_$StateCpty),
-    AmtNaive   = f2_(.x = tab_$AmtNaive),
-    AmtRule    = f2_(.x = tab_$AmtRule)
+    StateCpty  = f2_(.x = tab_$StateCpty)
   )
+  lines_ <- oa_frame_table(
+    .tab    = cells_,
+    .header = c("", "Naive", "Rule", "Naive", "Rule", "Naive", "Reg.", "Cpty.", "Naive", "Reg.", "Cpty."),
+    .spec   = c(oa_col_text(.share = 0.26), rep(oa_col_num(.mm = 10), 10L))
+  )
+  # A GROUP ROW ABOVE THE COLUMN HEADERS, so the reader sees which measure a Naive / Rule pair belongs to. The
+  # frame writes one header row; the group row is put in above it, right after the double rule.
+  group_ <- paste(
+    " & \\multicolumn{2}{c}{Duration (years)} & \\multicolumn{2}{c}{Parties} & \\multicolumn{3}{c}{Countries}",
+    "& \\multicolumn{3}{c}{States} \\\\"
+  )
+  top_ <- which(lines_ == "\\hline\\hline")[1L]
+  if (is.na(top_)) cli::cli_abort("{name_}: the frame has no double rule to put the group row under.")
+  lines_ <- append(lines_, group_, after = top_)
   oa_write_exhibit(
     .name    = name_,
-    .lines   = oa_frame_table(
-      .tab    = cells_,
-      .header = c("", "Naive", "Rule", "Naive", "Rule", "Naive", "Reg.", "Cpty.", "Naive", "Reg.", "Cpty.",
-                  "Naive", "Rule"),
-      .spec   = c(oa_col_text(.share = 0.20), rep(oa_col_num(.mm = 10), 12L))
-    ),
+    .lines   = lines_,
     .note    = paste(
       "The companion to the coverage contrast: what each measure is worth, by category, on the unique contracts of",
       "the descriptive sample, under the naive reading of the spans and under the rule. Duration (years) is the",
       "median over the contracts on which each reading defines it: the naive end is the farthest future date, the",
       "rule's end the first source present of a stated term, an open-ended clause, a cued date and the farthest",
-      "date, dropped above thirty years. Parties is the mean number per contract of distinct organisation spellings",
+      "date, dropped above thirty years. Parties is the mean number per contract of distinct organization spellings",
       "(naive) and of registrants, co-registrants and counterparties (rule). Countries and states are the mean",
       "number per contract of distinct mentions outside a governing-law clause (naive) and of those attached to",
       "the registrant (Reg.) and to the counterparties (Cpty.) by the 200-character rule, reported apart because a",
-      "place attached to both is one place. Amounts is the mean number of distinct figures read with a currency",
-      "marker (naive) and kept in U.S. dollars after the zero and par-value filters (rule). The column groups are,",
-      "from left to right, duration, parties, countries, states and amounts."
+      "place attached to both is one place. The column groups are, from left to right, duration, parties, countries",
+      "and states."
     ),
     .data    = tab_,
     .dir_own = .dir_own
@@ -3254,10 +3264,10 @@ oab_data_stages <- function() {
     "A.4",
     "Labelling",
     "Two annotators assign each contract of a stratified sample a category and an amendment flag",
-    "The labelled sample",
+    "The labeled sample",
     "C.1; rLabelDocs (B.3)",
     "Classification",
-    paste("Fine-tunes a transformer and derives a keyword table on the labelled sample, out of fold, and",
+    paste("Fine-tunes a transformer and derives a keyword table on the labeled sample, out of fold, and",
           "applies both to the corpus"),
     "A category, its probability and a keyword label per contract",
     "C; the classifier (B.4)",

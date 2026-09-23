@@ -130,8 +130,9 @@ registry yet; when they come, they come from the release through 30, not as type
                          "crowned_classification.parquet"),
   DirStore  = here::here("2_output", "04A-EntityExtract", "Output"),                        # D: the span stores
   Sample    = here::here("2_output", "04A-EntityExtract", "Output", "sample_text.parquet"), # D: the documents
-  # THE DATA DIRECTORIES, in search order: 30's first, then this pair's own.
+  # THE DATA DIRECTORIES, in search order: 31's first (the moved builders write there), then 30's, then this pair's own.
   DirData   = c(
+    here::here("2_output", "31-FinalExhibits", "Output", "Data"),   # the moved builders' data (A, C, D) live here now
     here::here("2_output", "30-FinalExhibits", "Output", "Data"),
     here::here("2_output", "40-Numbers", "Output", "Data")
   ),
@@ -571,6 +572,9 @@ spec_c <- tibble::tribble(
   "AccLlm",       "ClassArms",        "Accuracy", "one", "prop3", .where_llm,
   "AccBert",      "ClassArms",        "Accuracy", "one", "prop3", .where_bert,
   "AccCeiling",   "ClassArmsCeiling", "Accuracy", "max", "prop3", "TRUE",
+  "CeilGain512",  "ClassArmsCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512'",
+  "CeilGainKw",   "ClassArmsCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512 or Kw'",
+  "CeilGainLlm",  "ClassArmsCeiling", "Marginal", "one", "prop3", "Engines == 'Bert256 or Bert512 or Kw or Llm'",
   "SecondDocs",   "ClassSecond",      "N",       "one",  "count", "Kind == 'total'",
   "SecondHit1",   "ClassSecond",      "Hit1 / N", "one", "pct1",  "Kind == 'total'",
   "SecondHit2",   "ClassSecond",      "Hit2 / N", "one", "pct1",  "Kind == 'total'",
@@ -642,8 +646,6 @@ spec_d <- tibble::tribble(
                        "Block == 'consensus' & Entity == 'GPE' & NProducer == 1",
   "OneProducerOrg",    "EntityAgreement", "Share",      "one", "pct1",
                        "Block == 'consensus' & Entity == 'ORG' & NProducer == 1",
-  "ValAmtNaive",       "ContentValues",   "AmtNaive",   "one", "num2",  "Kind == 'total'",
-  "ValAmtRule",        "ContentValues",   "AmtRule",    "one", "num2",  "Kind == 'total'",
   "DurOpen",           "DurationRungs",   "Share",      "one", "pct1",  "Rung == 'open'",
   "DurCue",            "DurationRungs",   "Share",      "one", "pct1",  "Rung == 'cue'",
   "DurMaxDate",        "DurationRungs",   "Share",      "one", "pct1",  "Rung == 'maxdate'",

@@ -1049,11 +1049,12 @@ st_class <- c(
     .columns = c("Precision", "Recall", "F1", "RecallLenient"),
     .header  = c("Precision", "Recall", "F1", "Lenient recall"),
     .note    = paste(
-      "Out-of-fold scores of the transformer that ships on the labelled sample. Sub-category rows score the",
+      "Out-of-fold scores of the transformer that ships on the labeled sample. Sub-category rows score the",
       "detailed prediction against the detailed label; parent rows score the same predictions rolled up to their",
       "parent, so an error inside a parent does not count there. Precision, recall and F1 are per category; the",
       "Total row reports their macro averages. Lenient recall credits a prediction that equals the contract's",
-      "second valid category."
+      "second valid category; in the Total row it is overall accuracy under lenient scoring, the figure the main",
+      "text cites."
     )
   ))),
   ClassConfusion   = do.call(oac_build_confusion, .b_c),
@@ -1063,11 +1064,12 @@ st_class <- c(
     .columns = c("Coverage", "Precision", "RecallSel", "F1"),
     .header  = c("Coverage", "Precision", "Recall where committed", "F1"),
     .note    = paste(
-      "Out-of-fold scores of the published keyword table on the labelled sample. Coverage is the share of a",
+      "Out-of-fold scores of the published keyword table on the labeled sample. Coverage is the share of a",
       "category's contracts on which a term of the table fired; the table abstains on the rest. Precision is",
       "over the contracts assigned the category; recall where committed is over the contracts of the category on",
-      "which the table committed; F1 combines them. A dash marks a score that is undefined because the table never",
-      "assigned the category to any contract. The Total row reports the macro averages."
+      "which the table committed; F1 combines precision with recall over all contracts of the category, so an",
+      "abstention counts as a miss. A dash marks a score that is undefined because the table never assigned the",
+      "category to any contract. The Total row reports the macro averages."
     )
   ))),
   ClassArms        = do.call(oac_build_arms, .b_c),
