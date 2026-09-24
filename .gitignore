@@ -56,3 +56,7 @@ _stata/
 # the 8,000-document chunk size comes from -- so a reviewer must be able to open it.
 #
 # NOTE THE /* RATHER THAN /. Git cannot re-include a file whose parent directory is excluded.
+1_code/_Tests/*
+!1_code/_Tests/Parse-Check.R
+!1_code/_Tests/04D-Preflight.R
+1_code/_Publish/SITE-UPDATE.md
